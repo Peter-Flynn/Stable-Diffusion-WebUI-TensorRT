@@ -495,10 +495,16 @@ class TrtUnet(sd_unet.SdUnet):
         if self.engine is not None and getattr(self.engine, "engine", None) is not None:
             self.engine.release_activation_memory()
 
-    def deactivate(self):
+    def release_engine(self):
+        """Free the engine's VRAM without touching the PyTorch UNet."""
         if self.engine is not None:
-            self.engine.reset()  # release the engine's VRAM before PyTorch needs it back
+            self.engine.reset()
         self.engine = None
+
+    def deactivate(self):
+        """Called by the WebUI when switching away from TensorRT: free the engine, then give the
+        PyTorch UNet back its normal (fully loaded) state."""
+        self.release_engine()
         unet_memory.restore_torch_unet()
 
 
@@ -523,7 +529,6 @@ def patch_unet_forward():
     execution backend and does not have the classic A1111 sd_hijack unet forward patch enabled.
     """
     unet_memory.install_sampling_hook(_trt_active, on_sampling_done=_release_activation_memory)
-    unet_memory.install_text_encoder_hook()
 
     targets = [
         ("ldm_patched.ldm.modules.diffusionmodules.openaimodel", "UNetModel"),
@@ -791,9 +796,6 @@ class TensorRTScript(scripts.Script):
 
     def process(self, p, *args):
         patch_unet_forward()
-        # reForge builds SDXL conditioning on the text encoder's current device; make sure it's
-        # loaded after our exports/builds unloaded everything.
-        unet_memory.ensure_text_encoder_loaded()
 
         # Until a TensorRT UNet is set up below, this generation uses PyTorch.
         self.torch_unet = True
@@ -904,7 +906,9 @@ class TensorRTScript(scripts.Script):
             return
 
         if sd_unet.current_unet is not None:
-            sd_unet.current_unet.deactivate()
+            # Just free the old engine; the PyTorch UNet is restored or offloaded below.
+            release = getattr(sd_unet.current_unet, "release_engine", None)
+            (release or sd_unet.current_unet.deactivate)()
 
         if self.torch_unet:
             print("[TensorRT] Using PyTorch for this generation.", flush=True)
