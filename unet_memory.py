@@ -170,3 +170,20 @@ def free_vram_for_export():
     free_all_models()
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def ensure_text_encoder_loaded():
+    """reForge creates SDXL size-conditioning tensors on the text encoder's *current* device
+    (sd_models_xl.get_learned_conditioning) while the text embeddings are computed on the GPU.
+    If the text encoder was unloaded (e.g. by our export/build cleanup), that mismatches
+    ("Expected all tensors to be on the same device ... wrapper_CUDA_cat"). Load it first."""
+    if not IS_FORGE_BACKEND or not torch.cuda.is_available():
+        return
+    try:
+        clip = getattr(getattr(shared.sd_model, "forge_objects", None), "clip", None)
+        patcher = getattr(clip, "patcher", None)
+        device = getattr(getattr(patcher, "model", None), "device", None)
+        if patcher is not None and device is not None and torch.device(device).type == "cpu":
+            _model_management().load_model_gpu(patcher)
+    except Exception as e:
+        print(f"[TensorRT] Could not load the text encoder: {e}", flush=True)

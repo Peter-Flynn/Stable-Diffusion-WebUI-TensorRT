@@ -729,6 +729,12 @@ class TensorRTScript(scripts.Script):
 
     def process(self, p, *args):
         patch_unet_forward()
+        # reForge builds SDXL conditioning on the text encoder's current device; make sure it's
+        # loaded after our exports/builds unloaded everything.
+        unet_memory.ensure_text_encoder_loaded()
+
+        # Until a TensorRT UNet is set up below, this generation uses PyTorch.
+        self.torch_unet = True
 
         # before unet_init
         sd_unet_option = sd_unet.get_unet_option()
@@ -852,7 +858,7 @@ class TensorRTScript(scripts.Script):
 
     def process_batch(self, p, *args, **kwargs):
         # Called for each batch count
-        if self.torch_unet:
+        if self.torch_unet or not isinstance(sd_unet.current_unet, TrtUnet):
             return super().process_batch(p, *args, **kwargs)
 
         # Check if prompts were expanded by wildcard extensions during process()
