@@ -26,6 +26,12 @@ Supports Stable Diffusion 1.5, 2.1, SDXL, SDXL Turbo, and LCM.
   `TRT_EXTENSION_SKIP_INSTALL=1` to make it install nothing at all (useful for Nix or other managed environments).
 - **reForge support.** Hooks `ldm_patched`'s `UNetModel.forward`, uses an ONNX-exportable attention during export, and
   forces the TorchScript ONNX exporter (`dynamo=False`).
+- **Plays nicely with reForge's model manager.** The PyTorch UNet is unloaded through the manager (never moved behind
+  its back, which caused "Expected all tensors to be on the same device" errors), and while an engine is active reForge
+  keeps the UNet's weights in system RAM instead of loading them into VRAM next to the engine.
+- **Out-of-memory handling.** Builds report kernels TensorRT skipped for lack of VRAM (they make engines slower) and
+  free models first. At runtime an OOM is retried once, then the generation finishes on PyTorch; inputs no engine
+  profile covers also run on PyTorch instead of failing. Load errors distinguish "out of memory" from "rebuild needed".
 - Respects `SD Unet: None`, shows errors in the UI instead of swallowing them, and warns when ControlNet inputs are
   ignored by a TensorRT engine.
 
