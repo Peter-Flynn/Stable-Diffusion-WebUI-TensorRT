@@ -43,7 +43,48 @@ except ImportError:  # pragma: no cover
             pass
 
 
-TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
+_MEMORY_HINTS = ("insufficient memory", "memory is insufficient", "could not be allocated", "out of memory")
+
+
+class TRTLogger(trt.ILogger):
+    """Prints TensorRT errors (and, during builds, warnings once each), keeps the errors of
+    the current operation so they can be shown in exceptions, and counts messages about
+    tactics skipped for lack of GPU memory, which TensorRT otherwise reports only quietly."""
+
+    def __init__(self):
+        trt.ILogger.__init__(self)
+        self.print_warnings = False
+        self.begin()
+
+    def begin(self, print_warnings=False):
+        self.print_warnings = print_warnings
+        self.errors = []
+        self.memory_messages = 0
+        self.first_memory_message = None
+        self._printed = set()
+
+    def log(self, severity, msg):
+        level = int(severity)
+        if level > int(trt.ILogger.Severity.INFO):
+            return  # VERBOSE: ignore cheaply
+        if any(h in msg.lower() for h in _MEMORY_HINTS):
+            self.memory_messages += 1
+            if self.first_memory_message is None:
+                self.first_memory_message = msg
+            if level > int(trt.ILogger.Severity.ERROR):
+                return  # summarized after the build instead of printed one by one
+        if level <= int(trt.ILogger.Severity.ERROR):
+            self.errors.append(msg)
+            print(f"[TensorRT] ERROR: {msg}", flush=True)
+        elif level == int(trt.ILogger.Severity.WARNING) and self.print_warnings and msg not in self._printed:
+            self._printed.add(msg)
+            print(f"[TensorRT] Warning: {msg}", flush=True)
+
+    def error_text(self):
+        return "\n".join(self.errors[-5:])
+
+
+TRT_LOGGER = TRTLogger()
 
 TRT_VERSION = tuple(int(x) for x in trt.__version__.split(".")[:2] if x.isdigit())
 
@@ -221,6 +262,8 @@ class Engine:
         progress_callback=None,
     ):
         print(f"[TensorRT] Building engine for {onnx_path}: {self.engine_path}", flush=True)
+        TRT_LOGGER.begin(print_warnings=True)
+        self.build_memory_messages = 0
         builder = trt.Builder(TRT_LOGGER)
 
         strongly_typed = HAS_STRONG_TYPING and not HAS_WEAK_TYPING
@@ -288,7 +331,18 @@ class Engine:
             serialized = builder.build_serialized_network(network, config)
         except Exception as e:
             error(f"Failed to build engine: {e}")
-            return 1
+            serialized = None
+        finally:
+            TRT_LOGGER.print_warnings = False
+            self.build_memory_messages = TRT_LOGGER.memory_messages
+
+        if self.build_memory_messages:
+            warning(
+                f"TensorRT reported {self.build_memory_messages} memory allocation failures while building "
+                f"(e.g. \"{TRT_LOGGER.first_memory_message}\"). Kernels that didn't fit were skipped, so the "
+                "engine may be slower than it could be. Close other GPU programs or reduce the profile's "
+                "maximum resolution / batch size and rebuild for best performance."
+            )
         if serialized is None:
             error("Failed to build engine: TensorRT returned no engine (see errors above).")
             return 1
@@ -335,13 +389,14 @@ class Engine:
             data = f.read()
         if self.runtime is None:
             self.runtime = trt.Runtime(TRT_LOGGER)
-        self.engine = self.runtime.deserialize_cuda_engine(data)
+        TRT_LOGGER.begin()
+        try:
+            self.engine = self.runtime.deserialize_cuda_engine(data)
+        except Exception as e:
+            TRT_LOGGER.errors.append(str(e))
+            self.engine = None
         if self.engine is None:
-            raise RuntimeError(
-                f"TensorRT could not load {os.path.basename(self.engine_path)}. Engines only work with "
-                f"the TensorRT version and GPU they were built with (installed: TensorRT {trt.__version__}). "
-                "Rebuild it from the TensorRT tab (enable 'Force Rebuild')."
-            )
+            raise RuntimeError(self._load_failure_message())
 
         self.io_tensors = []
         for i in range(self.engine.num_io_tensors):
@@ -349,6 +404,30 @@ class Engine:
             is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
             dtype = trt_to_torch_dtype(self.engine.get_tensor_dtype(name))
             self.io_tensors.append((name, is_input, dtype))
+
+    def _load_failure_message(self):
+        name = os.path.basename(self.engine_path)
+        details = TRT_LOGGER.error_text()
+        text = details.lower()
+        if TRT_LOGGER.memory_messages or "memory" in text or "alloc" in text:
+            reason = (
+                "There isn't enough free GPU memory to load it. Free VRAM (close other GPU programs, "
+                "use a smaller engine profile) and try again."
+            )
+        elif any(w in text for w in ("version", "serializ", "magic", "compatib", "platform", "plan")):
+            reason = (
+                f"It was built with a different TensorRT version or GPU (installed: TensorRT {trt.__version__}). "
+                "Rebuild it from the TensorRT tab (Advanced Settings -> Force Rebuild)."
+            )
+        else:
+            reason = (
+                "Either it was built with a different TensorRT version / GPU (rebuild it with Force Rebuild), "
+                "or there isn't enough free GPU memory."
+            )
+        msg = f"TensorRT could not load {name}. {reason}"
+        if details:
+            msg += f"\nTensorRT said: {details}"
+        return msg
 
     def activate(self, reuse_device_memory=False):
         """Create the execution context.

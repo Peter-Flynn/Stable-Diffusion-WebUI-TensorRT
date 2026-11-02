@@ -1,3 +1,4 @@
+import gc
 import os
 import sys
 import math
@@ -26,6 +27,7 @@ from modules import shared
 from utilities import Engine
 from datastructures import ProfileSettings
 from model_helper import UNetModel
+import unet_memory
 
 
 def _import_lora_networks():
@@ -332,6 +334,20 @@ def _export_onnx(
     print(f"[TensorRT] ONNX model ready at: {path}", flush=True)
 
 
+def free_gpu_memory():
+    """Release as much VRAM as possible before a TensorRT build: unload models held by
+    reForge/Forge's model manager (they're reloaded on the next generation) and empty
+    PyTorch's cache. TensorRT skips kernels that don't fit, so free memory = faster engines."""
+    unet_memory.free_all_models()
+    gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        free, total = torch.cuda.mem_get_info()
+        print(f"[TensorRT] Free GPU memory for the build: {free / 2**30:.1f} / {total / 2**30:.1f} GiB", flush=True)
+    except Exception:
+        pass
+
+
 def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, use_fp16: bool, optimization_level: int = None, progress_callback=None):
     print(f"[TensorRT] Starting TensorRT engine compilation...", flush=True)
     print(f"[TensorRT] ONNX Input: {onnx_path}", flush=True)
@@ -340,13 +356,15 @@ def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, 
     engine = Engine(trt_path)
 
     model = None
-    if hasattr(shared, "sd_model") and shared.sd_model is not None:
+    # reForge/Forge: free_gpu_memory() unloads everything through the model manager instead;
+    # moving the model by hand would desync the manager (device mismatch errors later).
+    if not unet_memory.IS_FORGE_BACKEND and getattr(shared, "sd_model", None) is not None:
         try:
             print(f"[TensorRT] Freeing VRAM: moving base model to RAM...", flush=True)
             model = shared.sd_model.cpu()
-            torch.cuda.empty_cache()
         except Exception as e:
             print(f"[TensorRT] Warning: failed to move model to CPU: {e}", flush=True)
+    free_gpu_memory()
 
     try:
         s = time.time()
@@ -362,6 +380,16 @@ def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, 
         )
         e = time.time()
         print(f"[TensorRT] TensorRT engine compilation time: {(e-s):.2f}s", flush=True)
+        if getattr(engine, "build_memory_messages", 0):
+            try:
+                import gradio as gr
+
+                gr.Warning(
+                    "TensorRT skipped some kernels for lack of GPU memory; the engine may be slower. "
+                    "See the console for details."
+                )
+            except Exception:
+                pass
         return ret
     finally:
         if model is not None:

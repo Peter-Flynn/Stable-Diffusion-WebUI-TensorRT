@@ -40,6 +40,7 @@ from utilities import Engine
 from model_manager import TRT_MODEL_DIR, modelmanager
 from datastructures import ModelType
 from scripts.lora import apply_loras
+import unet_memory
 
 
 def format_profile_summary(config) -> str:
@@ -169,6 +170,32 @@ def get_max_prompt_token_count(p) -> (int, dict):
     return final_tokens, info
 
 
+class NoProfileError(RuntimeError):
+    pass
+
+
+class TrtFallback(Exception):
+    """Raised by TrtUnet.forward to have the hooked UNet forward run PyTorch instead."""
+
+
+def _notify(message: str):
+    print(f"[TensorRT] {message}", flush=True)
+    try:
+        gr.Warning(f"TensorRT: {message}")
+    except Exception:
+        pass
+
+
+def _free_cuda_cache():
+    try:
+        import ldm_patched.modules.model_management as model_management
+
+        model_management.soft_empty_cache(force=True)
+    except Exception:
+        pass
+    torch.cuda.empty_cache()
+
+
 class TrtUnetOption(sd_unet.SdUnetOption):
     def __init__(
         self,
@@ -215,6 +242,13 @@ class TrtUnet(sd_unet.SdUnet):
         self.step_idx = 0
         self._last_signature = None
         self._warned_unsupported = set()
+        self._fallback_reason = None  # set for the rest of a generation after an unrecoverable OOM
+        self._unsupported_signature = None  # input shapes no profile covers -> run PyTorch for them
+
+    def reset_generation_state(self):
+        self.step_idx = 0
+        self._fallback_reason = None
+        self._unsupported_signature = None
 
     def forward(
         self,
@@ -224,6 +258,14 @@ class TrtUnet(sd_unet.SdUnet):
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        if self._fallback_reason is not None:
+            raise TrtFallback(self._fallback_reason)
+        if self.engine is None or getattr(self.engine, "engine", None) is None:
+            # The engine was released after an OOM fallback: free the PyTorch UNet's VRAM again
+            # (as apply_unet does on activation) and reload the engine.
+            unet_memory.offload_torch_unet()
+            self.activate()
+
         nvtx.range_push("forward")
 
         self.step_idx = getattr(self, "step_idx", 0) + 1
@@ -278,14 +320,43 @@ class TrtUnet(sd_unet.SdUnet):
         # Re-check the profile whenever the input shapes change (first step, Hires. fix pass,
         # CFG 1 steps, ...), not only on the first step.
         signature = tuple((k, tuple(v.shape)) for k, v in feed_dict.items() if v is not None)
+        if signature == self._unsupported_signature:
+            nvtx.range_pop()
+            raise TrtFallback("unsupported input shapes")
         if signature != self._last_signature:
-            self._select_profile(feed_dict)
+            try:
+                self._select_profile(feed_dict)
+            except NoProfileError as e:
+                self._unsupported_signature = signature
+                nvtx.range_pop()
+                _notify(f"{e} Using PyTorch for these steps.")
+                raise TrtFallback(str(e))
             self._last_signature = signature
 
         feed_dict = self._pad_to_profile(feed_dict)
 
-        stream = torch.cuda.current_stream().cuda_stream
-        out = self.engine.infer(feed_dict, stream)["latent"]
+        out = None
+        for attempt in range(2):
+            try:
+                stream = torch.cuda.current_stream().cuda_stream
+                out = self.engine.infer(feed_dict, stream)["latent"]
+                break
+            except torch.cuda.OutOfMemoryError:
+                if attempt == 0:
+                    print("[TensorRT] Out of GPU memory; freeing cached memory and retrying...", flush=True)
+                    _free_cuda_cache()
+                    continue
+                # Give the engine's memory back so PyTorch can run, and stay on PyTorch for this generation.
+                self._fallback_reason = "out of GPU memory"
+                self.engine.reset()
+                self._last_signature = None
+                _free_cuda_cache()
+                nvtx.range_pop()
+                _notify(
+                    "Out of GPU memory running the engine; finishing this generation with PyTorch. "
+                    "A smaller engine profile or freeing VRAM avoids this."
+                )
+                raise TrtFallback(self._fallback_reason)
 
         nvtx.range_pop()
         return out[:b] if out.shape[0] != b else out
@@ -300,10 +371,11 @@ class TrtUnet(sd_unet.SdUnet):
         if not valid_models:
             if is_compat:
                 return
-            shapes = {k: tuple(v.shape) for k, v in feed_dict.items() if v is not None}
-            raise RuntimeError(
-                f"No TensorRT profile of {self.model_name} supports these inputs: {shapes}. "
-                "Export an engine covering this resolution / batch size / prompt length, or set SD Unet to None."
+            x = feed_dict["sample"]
+            ctx = feed_dict.get("encoder_hidden_states")
+            raise NoProfileError(
+                f"No engine profile of {self.model_name} covers {x.shape[3] * 8}x{x.shape[2] * 8}, "
+                f"batch {x.shape[0]}, {ctx.shape[1] if ctx is not None else '?'} tokens."
             )
         best_idx = idx[int(np.argmin(distances))]
         if best_idx != self.profile_idx or self.loaded_config is None:
@@ -369,22 +441,18 @@ class TrtUnet(sd_unet.SdUnet):
         self.engine.activate()
 
     def deactivate(self):
-        try:
-            if (
-                hasattr(shared, "sd_model")
-                and shared.sd_model is not None
-                and hasattr(shared.sd_model, "model")
-                and hasattr(shared.sd_model.model, "diffusion_model")
-            ):
-                shared.sd_model.model.diffusion_model.to(devices.device)
-        except Exception:
-            pass
         if self.engine is not None:
-            self.engine.reset()
+            self.engine.reset()  # release the engine's VRAM before PyTorch needs it back
         self.engine = None
+        unet_memory.restore_torch_unet()
 
 
 _patched_unet_classes = set()
+
+
+def _trt_active() -> bool:
+    unet = sd_unet.current_unet
+    return isinstance(unet, TrtUnet) and unet._fallback_reason is None
 
 
 def patch_unet_forward():
@@ -393,6 +461,8 @@ def patch_unet_forward():
     This is required for Stable Diffusion WebUI reForge (and Forge), which uses ldm_patched as its
     execution backend and does not have the classic A1111 sd_hijack unet forward patch enabled.
     """
+    unet_memory.install_sampling_hook(_trt_active)
+
     targets = [
         ("ldm_patched.ldm.modules.diffusionmodules.openaimodel", "UNetModel"),
         ("ldm.modules.diffusionmodules.openaimodel", "UNetModel"),
@@ -416,9 +486,21 @@ def patch_unet_forward():
 
             def make_replacement(original_fn, module_label):
                 def unet_forward(self, x, timesteps=None, context=None, *args, **kwargs):
-                    if sd_unet.current_unet is not None:
-                        return sd_unet.current_unet.forward(x, timesteps, context, *args, **kwargs)
-                    return original_fn(self, x, timesteps, context, *args, **kwargs)
+                    trt_unet = sd_unet.current_unet
+                    if trt_unet is None:
+                        return original_fn(self, x, timesteps, context, *args, **kwargs)
+                    try:
+                        return trt_unet.forward(x, timesteps, context, *args, **kwargs)
+                    except TrtFallback:
+                        pass
+                    # PyTorch fallback. The UNet weights may have been moved off the GPU for TensorRT.
+                    unet_memory.ensure_module_on(self, x.device)
+                    # Hide the TensorRT UNet so wrapped forwards (e.g. A1111's own hook) don't call it again.
+                    sd_unet.current_unet = None
+                    try:
+                        return original_fn(self, x, timesteps, context, *args, **kwargs)
+                    finally:
+                        sd_unet.current_unet = trt_unet
                 return unet_forward
 
             cls._orig_trt_forward = orig_forward
@@ -710,7 +792,7 @@ class TensorRTScript(scripts.Script):
 
         self.apply_unet(sd_unet_option)
         if sd_unet.current_unet is not None:
-            sd_unet.current_unet.step_idx = 0
+            sd_unet.current_unet.reset_generation_state()
 
     def apply_unet(self, sd_unet_option):
         if (
@@ -735,17 +817,10 @@ class TensorRTScript(scripts.Script):
             gr.Warning("Enabling PyTorch fallback as no engine was found.")
             sd_unet.current_unet = None
             sd_unet.current_unet_option = sd_unet_option
-            try:
-                shared.sd_model.model.diffusion_model.to(devices.device)
-            except Exception:
-                pass
+            unet_memory.restore_torch_unet()
             return
         else:
-            try:
-                shared.sd_model.model.diffusion_model.to(devices.cpu)
-                devices.torch_gc()
-            except Exception:
-                pass
+            unet_memory.offload_torch_unet()
             if self.lora_refit_dict:
                 self.update_lora = True
         sd_unet.current_unet = sd_unet_option.create_unet()

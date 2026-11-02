@@ -15,6 +15,7 @@ from modules.ui_common import refresh_symbol
 from modules.ui_components import ToolButton
 
 from model_helper import UNetModel
+import unet_memory
 from exporter import export_onnx, export_trt, export_lora
 from model_manager import modelmanager, cc_major, TRT_MODEL_DIR
 from datastructures import SDVersion, ProfilePrests, ProfileSettings
@@ -139,7 +140,9 @@ def export_unet_to_trt(
 
         try:
             target_device = devices.device if hasattr(devices, "device") else torch.device("cuda")
-            if hasattr(shared, "sd_model") and shared.sd_model is not None:
+            # A1111 only: on reForge/Forge the model manager loaded the UNet above, and moving
+            # weights behind its back desyncs it (device mismatch errors in later generations).
+            if not unet_memory.IS_FORGE_BACKEND and getattr(shared, "sd_model", None) is not None:
                 shared.sd_model.model.diffusion_model.to(target_device)
                 for param in shared.sd_model.model.diffusion_model.parameters():
                     if param.device != target_device:
@@ -241,6 +244,14 @@ def export_unet_to_trt(
             f"### ❌ Error during export: `{e}`\n\n"
             f"Detailed traceback is available in the WebUI terminal/console."
         )
+    finally:
+        # ONNX tracing moves weights directly; hand the UNet back to the model manager in a clean
+        # state (unloaded) so the next PyTorch generation loads it properly.
+        if unet_memory.IS_FORGE_BACKEND:
+            try:
+                unet_memory.unload_unet_from_manager()
+            except Exception as e:
+                print(f"[TensorRT] Could not reset the UNet in the model manager: {e}", flush=True)
 
 
 def export_lora_to_trt(lora_name, force_export):
