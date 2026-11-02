@@ -60,6 +60,7 @@ def export_unet_to_trt(
     force_export,
     static_shapes,
     preset,
+    optimization_level=3,
     progress=gr.Progress(track_tqdm=True),
 ):
     try:
@@ -193,6 +194,7 @@ def export_unet_to_trt(
                 timing_cache,
                 profile=profile,
                 use_fp16=not use_fp32,
+                optimization_level=optimization_level,
             )
             if ret:
                 yield (
@@ -485,6 +487,25 @@ def engine_profile_card():
     return model_md, loras_md
 
 
+def get_engine_choices() -> dict:
+    """Label -> engine filename for every recorded engine (all GPUs / TensorRT versions)."""
+    choices = {}
+    for cc, base_model, m in modelmanager.all_engines():
+        config = m["config"]
+        sample = config.profile.get("sample", [[0] * 4] * 3)
+        _min, _opt, _max = sample
+        if _min == _max:
+            res = f"{_opt[3] * 8}x{_opt[2] * 8} static"
+        else:
+            res = f"{_min[3] * 8}x{_min[2] * 8}-{_max[3] * 8}x{_max[2] * 8}"
+        trt_ver = getattr(config, "trt_version", "") or "unknown"
+        label = f"{base_model} | {res} | batch {max(_min[0] // 2, 1)}-{max(_max[0] // 2, 1)} | {cc}, TensorRT {trt_ver}"
+        while label in choices:
+            label += " "
+        choices[label] = m["filepath"]
+    return choices
+
+
 def on_ui_tabs():
     with gr.Blocks(analytics_enabled=False) as trt_interface:
         with gr.Row(equal_height=True):
@@ -620,6 +641,16 @@ def on_ui_tabs():
                                     value=default_vals.t_max,
                                     elem_id="trt_opt_token_count_max",
                                 )
+
+                            trt_optimization_level = gr.Slider(
+                                minimum=0,
+                                maximum=5,
+                                step=1,
+                                label="Builder optimization level",
+                                info="TensorRT default is 3. Higher values search more kernels: much slower builds, sometimes slightly faster engines.",
+                                value=3,
+                                elem_id="trt_optimization_level",
+                            )
 
                             with FormRow(
                                 elem_classes="checkboxes-row", variant="compact"
@@ -769,9 +800,42 @@ def on_ui_tabs():
                     elem_id=f"trt_profiles_markdown", value=get_trt_profiles_markdown()
                 )
 
+            with gr.Accordion("Manage engines", open=False):
+                gr.Markdown(
+                    "Engines only load with the TensorRT version and GPU they were built with. "
+                    "Delete ones you no longer need (the file and its entry are removed)."
+                )
+                with gr.Row(equal_height=True):
+                    engine_dropdown = gr.Dropdown(
+                        label="Engine",
+                        choices=list(get_engine_choices()),
+                        elem_id="trt_engine_manage",
+                    )
+                    button_delete_engine = gr.Button(
+                        value="Delete engine", variant="stop", elem_id="trt_delete_engine"
+                    )
+
+        def refresh_profiles():
+            return (
+                gr.update(value=get_trt_profiles_markdown()),
+                gr.update(choices=list(get_engine_choices()), value=None),
+            )
+
+        def delete_engine(choice):
+            choices = get_engine_choices()
+            if choice in choices:
+                modelmanager.delete_engine(choices[choice])
+                print(f"[TensorRT] Deleted engine {choices[choice]}", flush=True)
+            return refresh_profiles()
+
         button_refresh_profiles.click(
-            lambda: gr.Markdown.update(value=get_trt_profiles_markdown()),
-            outputs=[trt_profiles_markdown],
+            refresh_profiles,
+            outputs=[trt_profiles_markdown, engine_dropdown],
+        )
+        button_delete_engine.click(
+            delete_engine,
+            inputs=[engine_dropdown],
+            outputs=[trt_profiles_markdown, engine_dropdown],
         )
 
         button_export_unet.click(
@@ -792,6 +856,7 @@ def on_ui_tabs():
                 force_rebuild,
                 static_shapes,
                 version,
+                trt_optimization_level,
             ],
             outputs=[trt_result],
         )
@@ -814,6 +879,7 @@ def on_ui_tabs():
                 force_rebuild,
                 static_shapes,
                 version,
+                trt_optimization_level,
             ],
             outputs=[trt_result],
         )

@@ -1,3 +1,5 @@
 __pycache__
 /TensorRT-*
 .DS_Store
+# Generated per machine by engine builds
+/timing_caches/

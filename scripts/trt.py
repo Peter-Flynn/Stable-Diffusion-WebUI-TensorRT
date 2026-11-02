@@ -1,6 +1,8 @@
 import os
 import sys
 import re
+import math
+import importlib.util
 from typing import List
 
 # Compatibility patch for newer onnx versions (>= 1.17) where float32_to_bfloat16 was removed from onnx.helper
@@ -122,6 +124,23 @@ def count_clip_tokens(text: str) -> int:
     return chunks * 77
 
 
+IS_FORGE_BACKEND = importlib.util.find_spec("ldm_patched") is not None
+
+
+def batched_token_count(pos_tokens: int, neg_tokens: int) -> int:
+    """Token length the UNet will actually see when cond and uncond are batched.
+
+    reForge/Forge (ComfyUI sampling) pad both to the least common multiple of their
+    lengths by repetition, as long as that is at most 4x the shorter one; otherwise they
+    run separately. A1111 pads to the longer one."""
+    pos_tokens, neg_tokens = max(pos_tokens, 77), max(neg_tokens, 77)
+    if IS_FORGE_BACKEND:
+        lcm = math.lcm(pos_tokens, neg_tokens)
+        if lcm // min(pos_tokens, neg_tokens) <= 4:
+            return lcm
+    return max(pos_tokens, neg_tokens)
+
+
 def get_max_prompt_token_count(p) -> (int, dict):
     pos_texts = []
     if hasattr(p, "prompt") and p.prompt:
@@ -137,7 +156,7 @@ def get_max_prompt_token_count(p) -> (int, dict):
 
     pos_tokens = max([count_clip_tokens(t) for t in pos_texts]) if pos_texts else 77
     neg_tokens = max([count_clip_tokens(t) for t in neg_texts]) if neg_texts else 77
-    final_tokens = max(pos_tokens, neg_tokens, 77)
+    final_tokens = batched_token_count(pos_tokens, neg_tokens)
 
     has_wildcards = any("__" in t or "{" in t for t in pos_texts + neg_texts)
     info = {
@@ -193,6 +212,7 @@ class TrtUnet(sd_unet.SdUnet):
 
         self.engine = None
         self.step_idx = 0
+        self._last_signature = None
         self._warned_unsupported = set()
 
     def forward(
@@ -254,40 +274,66 @@ class TrtUnet(sd_unet.SdUnet):
             if isinstance(v, torch.Tensor) and v.device.type != "cuda":
                 feed_dict[k] = v.to(device=devices.device)
 
-        if self.step_idx == 1:
-            cur_config = self.loaded_config["config"] if self.loaded_config else None
-            is_compat = False
-            if cur_config:
-                is_compat, _ = cur_config.is_compatible_from_dict(feed_dict)
+        # Re-check the profile whenever the input shapes change (first step, Hires. fix pass,
+        # CFG 1 steps, ...), not only on the first step.
+        signature = tuple((k, tuple(v.shape)) for k, v in feed_dict.items() if v is not None)
+        if signature != self._last_signature:
+            self._select_profile(feed_dict)
+            self._last_signature = signature
 
-            if getattr(self, "is_auto", True) or not is_compat:
-                valid_models, distances, idx = modelmanager.get_valid_models_from_dict(self.model_name, feed_dict)
-                if len(valid_models) > 0:
-                    best_idx = idx[np.argmin(distances)]
-                    if best_idx != self.profile_idx:
-                        tokens = context.shape[1] if context is not None else "?"
-                        h_px = x.shape[2] * 8
-                        w_px = x.shape[3] * 8
-                        print(
-                            f"[TensorRT] Step 1 runtime shape check: Switching from Profile {self.profile_idx} "
-                            f"to Profile {best_idx} for exact shape {w_px}x{h_px} (exact runtime CLIP tokens: {tokens})",
-                            flush=True,
-                        )
-                        self.profile_idx = best_idx
-                        self.switch_engine()
-                        self.step_idx = 1
-                elif not is_compat:
-                    print(
-                        f"[TensorRT] Warning: Active Profile {self.profile_idx} is incompatible with runtime input shapes "
-                        f"(tokens: {context.shape[1] if context is not None else '?'}, latents: {tuple(x.shape)}).",
-                        flush=True,
-                    )
+        feed_dict = self._pad_to_profile(feed_dict)
 
         stream = torch.cuda.current_stream().cuda_stream
         out = self.engine.infer(feed_dict, stream)["latent"]
 
         nvtx.range_pop()
-        return out
+        return out[:b] if out.shape[0] != b else out
+
+    def _select_profile(self, feed_dict: dict):
+        cur_config = self.loaded_config["config"] if self.loaded_config else None
+        is_compat = cur_config is not None and cur_config.is_compatible_from_dict(feed_dict)[0]
+        if is_compat and not self.is_auto:
+            return
+
+        valid_models, distances, idx = modelmanager.get_valid_models_from_dict(self.model_name, feed_dict)
+        if not valid_models:
+            if is_compat:
+                return
+            shapes = {k: tuple(v.shape) for k, v in feed_dict.items() if v is not None}
+            raise RuntimeError(
+                f"No TensorRT profile of {self.model_name} supports these inputs: {shapes}. "
+                "Export an engine covering this resolution / batch size / prompt length, or set SD Unet to None."
+            )
+        best_idx = idx[int(np.argmin(distances))]
+        if best_idx != self.profile_idx or self.loaded_config is None:
+            x = feed_dict["sample"]
+            ctx = feed_dict.get("encoder_hidden_states")
+            print(
+                f"[TensorRT] Switching to Profile {best_idx} for {x.shape[3] * 8}x{x.shape[2] * 8}, "
+                f"batch {x.shape[0]}, {ctx.shape[1] if ctx is not None else '?'} tokens",
+                flush=True,
+            )
+            self.profile_idx = best_idx
+            self.switch_engine()
+
+    def _pad_to_profile(self, feed_dict: dict) -> dict:
+        """Pad inputs below the profile minimum by repetition, which doesn't change the result:
+        the batch (e.g. CFG 1 with a static 2B engine) and the token axis (repeating all
+        context tokens leaves cross-attention unchanged)."""
+        config = self.loaded_config["config"]
+        b = feed_dict["sample"].shape[0]
+        min_b = config.min_batch()
+        if b < min_b:
+            reps = -(-min_b // b)
+            feed_dict = {
+                k: (v.repeat(reps, *([1] * (v.dim() - 1)))[:min_b] if v is not None else v)
+                for k, v in feed_dict.items()
+            }
+        ctx = feed_dict.get("encoder_hidden_states")
+        min_t = config.min_tokens()
+        if ctx is not None and ctx.shape[1] < min_t and min_t % ctx.shape[1] == 0:
+            feed_dict["encoder_hidden_states"] = ctx.repeat(1, min_t // ctx.shape[1], 1)
+        return feed_dict
 
     def apply_loras(self, refit_dict: dict):
         if not self.refitted_keys.issubset(set(refit_dict.keys())):
@@ -307,6 +353,7 @@ class TrtUnet(sd_unet.SdUnet):
         else:
             self.engine = Engine(engine_path)
         self.step_idx = 0
+        self._last_signature = None
         self.activate()
 
     def activate(self):
