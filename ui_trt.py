@@ -181,7 +181,7 @@ def export_unet_to_trt(
 
         if not os.path.exists(trt_path) or force_export:
             yield (
-                f"### ⚙️ [Step 2/3] Building TensorRT engine for RTX 5070 Ti (sm_120)...\n"
+                f"### ⚙️ [Step 2/3] Building TensorRT engine...\n"
                 f"- **Target File:** `{trt_engine_filename}`\n"
                 f"- **Status:** TensorRT is profiling compute tactics for your GPU.\n"
                 f"*This step takes 2–6 minutes. Progress updates are visible in the console.*"
@@ -244,7 +244,8 @@ def export_lora_to_trt(lora_name, force_export):
     is_xl = shared.sd_model.is_sdxl
 
     available_lora_models = get_lora_checkpoints()
-    lora_name = lora_name.split(" ")[0]
+    # Dropdown entries look like "<name> (<version>)"; names may contain spaces.
+    lora_name = lora_name.rsplit(" (", 1)[0]
     lora_model = available_lora_models.get(lora_name, None)
     if lora_model is None:
         return f"## No LoRA model found for {lora_name}"
@@ -324,21 +325,28 @@ def get_version_from_filename(name):
 def get_lora_checkpoints():
     available_lora_models = {}
     allowed_extensions = ["pt", "ckpt", "safetensors"]
-    candidates = [
-        p
-        for p in os.listdir(cmd_opts.lora_dir)
-        if p.split(".")[-1] in allowed_extensions
-    ]
+    lora_dir = cmd_opts.lora_dir
+    candidates = []
+    if os.path.isdir(lora_dir):
+        # Include LoRAs in subfolders, like the WebUI's own LoRA browser does.
+        for root, _, files in os.walk(lora_dir, followlinks=True):
+            for f in sorted(files):
+                if f.split(".")[-1] in allowed_extensions:
+                    candidates.append(os.path.relpath(os.path.join(root, f), lora_dir))
 
     for filename in candidates:
         metadata = {}
-        name, ext = os.path.splitext(filename)
-        config_file = os.path.join(cmd_opts.lora_dir, name + ".json")
+        path_no_ext, ext = os.path.splitext(filename)
+        name = os.path.basename(path_no_ext)
+        config_file = os.path.join(lora_dir, path_no_ext + ".json")
 
         if ext == ".safetensors":
-            metadata = sd_models.read_metadata_from_safetensors(
-                os.path.join(cmd_opts.lora_dir, filename)
-            )
+            try:
+                metadata = sd_models.read_metadata_from_safetensors(
+                    os.path.join(lora_dir, filename)
+                )
+            except Exception as e:
+                print(f"[TensorRT] Could not read metadata from {filename}: {e}")
         else:
             print(
                 """LoRA {} is not a safetensor. This might cause issues when exporting to TensorRT.
@@ -349,20 +357,14 @@ def get_lora_checkpoints():
 
         base_model = metadata.get("ss_sd_model_name", "Unknown")
         if os.path.exists(config_file):
-            with open(config_file, "r") as f:
-                config = json.load(f)
             try:
+                with open(config_file, "r", encoding="utf-8") as f:
+                    config = json.load(f)
                 version = SDVersion.from_str(config["sd version"])
-            except:
+            except Exception:
                 version = SDVersion.Unknown
-
         else:
             version = SDVersion.Unknown
-            print(
-                "No config file found for {}. You can generate it in the LoRA tab.".format(
-                    name
-                )
-            )
 
         available_lora_models[name] = {
             "filename": filename,
