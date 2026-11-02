@@ -26,9 +26,27 @@ profile_presets = ProfilePrests()
 logging.basicConfig(level=logging.INFO)
 
 
-def load_unet_for_tracing(purpose: str):
-    """Clear VRAM, then put only the UNet on the GPU (fully, via the model manager on reForge)."""
+def clear_vram_for_export():
+    """Record what's loaded, then clear VRAM. Pass the result to restore_vram_after_export()."""
+    snapshot = unet_memory.snapshot_loaded_models()
     unet_memory.free_vram_for_export()
+    unet_memory.report_free_vram("after clearing VRAM for export")
+    return snapshot
+
+
+def restore_vram_after_export(snapshot):
+    """Put back what was loaded before the export, the way it was loaded."""
+    try:
+        unet_memory.free_all_models()  # whatever the export itself loaded
+        unet_memory.restore_loaded_models(snapshot)
+        sd_hijack.model_hijack.apply_optimizations()  # undo apply_torch_model's "None" (A1111; no-op on reForge)
+    except Exception as e:
+        print(f"[TensorRT] Could not restore the previous model state: {e}", flush=True)
+
+
+def load_unet_for_tracing(purpose: str):
+    """Put only the UNet on the GPU (fully, via the model manager on reForge). VRAM must already
+    have been cleared with clear_vram_for_export()."""
     try:
         if unet_memory.IS_FORGE_BACKEND:
             import ldm_patched.modules.model_management as model_management
@@ -86,6 +104,7 @@ def export_unet_to_trt(
     optimization_level=3,
     progress=gr.Progress(),
 ):
+    snapshot = None
     try:
         sd_hijack.model_hijack.apply_optimizations("None")
 
@@ -135,19 +154,28 @@ def export_unet_to_trt(
         diable_optimizations = is_xl
         embedding_dim = get_context_dim()
 
-        # The UNet weights are only needed on the GPU to trace the ONNX graph.
-        if not os.path.exists(onnx_path):
-            load_unet_for_tracing("for ONNX export")
-
         modelobj = UNetModel(
             shared.sd_model.model.diffusion_model,
             embedding_dim,
             text_minlen=profile_settings.t_min,
             is_xl=is_xl,
         )
+        profile = modelobj.get_input_profile(profile_settings)
+        trt_engine_filename, trt_path = modelmanager.get_trt_path(
+            model_name, model_hash, profile, static_shapes
+        )
+        needs_onnx = not os.path.exists(onnx_path)
+        needs_engine = not os.path.exists(trt_path) or force_export
+
+        if needs_onnx or needs_engine:
+            # Before apply_torch_model(): its apply_unet("None") would otherwise deactivate an
+            # active TensorRT UNet and reload the PyTorch UNet just before we unload everything.
+            snapshot = clear_vram_for_export()
         modelobj.apply_torch_model()
 
-        profile = modelobj.get_input_profile(profile_settings)
+        # The UNet weights are only needed on the GPU to trace the ONNX graph.
+        if needs_onnx:
+            load_unet_for_tracing("for ONNX export")
 
         if not os.path.exists(onnx_path):
             yield (
@@ -165,11 +193,7 @@ def export_unet_to_trt(
         gc.collect()
         torch.cuda.empty_cache()
 
-        trt_engine_filename, trt_path = modelmanager.get_trt_path(
-            model_name, model_hash, profile, static_shapes
-        )
-
-        if not os.path.exists(trt_path) or force_export:
+        if needs_engine:
             yield (
                 f"### ⚙️ [Step 2/3] Building TensorRT engine...\n"
                 f"- **Target File:** `{trt_engine_filename}`\n"
@@ -232,19 +256,8 @@ def export_unet_to_trt(
             f"Detailed traceback is available in the WebUI terminal/console."
         )
     finally:
-        # Export switched cross-attention optimizations off for tracing; restore them (A1111 -
-        # a no-op on reForge) so later PyTorch generations don't run slow, memory-hungry attention.
-        try:
-            sd_hijack.model_hijack.apply_optimizations()
-        except Exception as e:
-            print(f"[TensorRT] Could not restore attention optimizations: {e}", flush=True)
-        # ONNX tracing moves weights directly; hand the UNet back to the model manager in a clean
-        # state (unloaded) so the next PyTorch generation loads it properly.
-        if unet_memory.IS_FORGE_BACKEND:
-            try:
-                unet_memory.unload_unet_from_manager()
-            except Exception as e:
-                print(f"[TensorRT] Could not reset the UNet in the model manager: {e}", flush=True)
+        if snapshot is not None:
+            restore_vram_after_export(snapshot)
 
 
 def export_lora_to_trt(lora_name, force_export):
@@ -285,6 +298,7 @@ def export_lora_to_trt(lora_name, force_export):
         print("[TensorRT] This LoRA was already converted. Enable 'Force Rebuild' to convert it again.")
         return "## Exported Successfully \n"
 
+    snapshot = clear_vram_for_export()
     try:
         embedding_dim = get_context_dim()
         load_unet_for_tracing("for LoRA export")
@@ -312,12 +326,7 @@ def export_lora_to_trt(lora_name, force_export):
 
         save_file(refit_dict, lora_trt_path)
     finally:
-        try:
-            sd_hijack.model_hijack.apply_optimizations()  # undo apply_torch_model's "None" (A1111)
-        except Exception:
-            pass
-        if unet_memory.IS_FORGE_BACKEND:
-            unet_memory.unload_unet_from_manager()  # hand the UNet back in a clean state, even on errors
+        restore_vram_after_export(snapshot)
 
 
     return "## Exported Successfully \n"
