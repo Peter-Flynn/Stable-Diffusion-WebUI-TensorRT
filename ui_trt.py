@@ -200,12 +200,13 @@ def export_unet_to_trt(
                 profile,
                 static_shapes,
                 fp32=use_fp32,
-                inpaint=True if modelobj.in_channels == 6 else False,
+                inpaint=modelobj.in_channels == 9,  # inpainting UNets take 9 input channels
                 refit=True,
                 vram=0,
                 unet_hidden_dim=modelobj.in_channels,
                 lora=False,
             )
+            refresh_unet_options()
         else:
             print(
                 f"[TensorRT] TensorRT engine already exists: {trt_path}. Skipping compilation.", flush=True
@@ -231,6 +232,12 @@ def export_unet_to_trt(
             f"Detailed traceback is available in the WebUI terminal/console."
         )
     finally:
+        # Export switched cross-attention optimizations off for tracing; restore them (A1111 -
+        # a no-op on reForge) so later PyTorch generations don't run slow, memory-hungry attention.
+        try:
+            sd_hijack.model_hijack.apply_optimizations()
+        except Exception as e:
+            print(f"[TensorRT] Could not restore attention optimizations: {e}", flush=True)
         # ONNX tracing moves weights directly; hand the UNet back to the model manager in a clean
         # state (unloaded) so the next PyTorch generation loads it properly.
         if unet_memory.IS_FORGE_BACKEND:
@@ -305,6 +312,10 @@ def export_lora_to_trt(lora_name, force_export):
 
         save_file(refit_dict, lora_trt_path)
     finally:
+        try:
+            sd_hijack.model_hijack.apply_optimizations()  # undo apply_torch_model's "None" (A1111)
+        except Exception:
+            pass
         if unet_memory.IS_FORGE_BACKEND:
             unet_memory.unload_unet_from_manager()  # hand the UNet back in a clean state, even on errors
 
@@ -484,6 +495,22 @@ def engine_profile_card():
         loras_md[f"{lora}"] = ""
 
     return model_md, loras_md
+
+
+def refresh_unet_options():
+    """Rebuild the SD Unet options from model.json so new/deleted engines take effect without a
+    restart, and drop the active TensorRT UNet (it holds the old engine list); the WebUI
+    re-creates it on the next generation."""
+    from modules import sd_unet
+
+    try:
+        if sd_unet.current_unet is not None and hasattr(sd_unet.current_unet, "configs"):
+            sd_unet.current_unet.deactivate()
+            sd_unet.current_unet = None
+            sd_unet.current_unet_option = None
+        sd_unet.list_unets()
+    except Exception as e:
+        print(f"[TensorRT] Could not refresh the SD Unet list: {e}", flush=True)
 
 
 def get_engine_choices() -> dict:
@@ -825,6 +852,7 @@ def on_ui_tabs():
             if choice in choices:
                 modelmanager.delete_engine(choices[choice])
                 print(f"[TensorRT] Deleted engine {choices[choice]}", flush=True)
+                refresh_unet_options()
             return refresh_profiles()
 
         button_refresh_profiles.click(

@@ -207,7 +207,8 @@ class UNetModel(torch.nn.Module):
     def export_weights_map(self, onnx_opt_path: str, weights_map_path: dict):
         onnx_opt_dir = os.path.dirname(onnx_opt_path)
         state_dict = self.unet.state_dict()
-        onnx_opt_model = onnx.load(onnx_opt_path)
+        # Initializers are read one at a time below; don't load all external data (~5 GB for SDXL).
+        onnx_opt_model = onnx.load(onnx_opt_path, load_external_data=False)
 
         # Create initializer data hashes
         def init_hash_map(onnx_opt_model):
