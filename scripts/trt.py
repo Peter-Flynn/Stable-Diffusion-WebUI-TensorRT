@@ -29,7 +29,6 @@ except Exception:
 import numpy as np
 import torch
 from torch.cuda import nvtx
-from polygraphy.logger import G_LOGGER
 import gradio as gr
 
 from modules import script_callbacks, sd_unet, devices, scripts, shared
@@ -39,8 +38,6 @@ from utilities import Engine
 from model_manager import TRT_MODEL_DIR, modelmanager
 from datastructures import ModelType
 from scripts.lora import apply_loras
-
-G_LOGGER.module_severity = G_LOGGER.ERROR
 
 
 def format_profile_summary(config) -> str:
@@ -95,7 +92,7 @@ def count_clip_tokens(text: str) -> int:
                     tok_len = len(tok.encode(text))
                     chunks = max(1, (tok_len + 74) // 75)
                     return chunks * 77
-            if hasattr(shared, "sd_model", None) and hasattr(shared.sd_model, "forge_objects"):
+            if getattr(shared, "sd_model", None) is not None and hasattr(shared.sd_model, "forge_objects"):
                 clip = shared.sd_model.forge_objects.get("clip", None)
                 if clip is not None:
                     tok = getattr(clip, "tokenizer", None)
@@ -192,12 +189,11 @@ class TrtUnet(sd_unet.SdUnet):
         self.loaded_config = None
         self.is_auto = True
 
-        self.engine_vram_req = 0
         self.refitted_keys = set()
 
         self.engine = None
-        self.device_memory_buffer = None
         self.step_idx = 0
+        self._warned_unsupported = set()
 
     def forward(
         self,
@@ -210,8 +206,15 @@ class TrtUnet(sd_unet.SdUnet):
         nvtx.range_push("forward")
 
         self.step_idx = getattr(self, "step_idx", 0) + 1
-        if self.step_idx == 1:
-            print(f"[TensorRT] Step 1: Executing accelerated TensorRT inference on Blackwell engine...", flush=True)
+
+        # Features the TensorRT engine cannot express: tell the user once instead of failing silently.
+        if kwargs.get("control") is not None and "control" not in self._warned_unsupported:
+            self._warned_unsupported.add("control")
+            print(
+                "[TensorRT] Warning: ControlNet inputs are ignored by TensorRT engines. "
+                "Set SD Unet to 'None' to use ControlNet.",
+                flush=True,
+            )
 
         if timesteps is None and "timesteps" in kwargs:
             timesteps = kwargs["timesteps"]
@@ -280,30 +283,11 @@ class TrtUnet(sd_unet.SdUnet):
                         flush=True,
                     )
 
-        if (
-            getattr(self.engine, "is_reusing_device_memory", False)
-            and self.engine_vram_req > 0
-            and hasattr(self.engine.context, "device_memory")
-        ):
-            try:
-                if (
-                    self.device_memory_buffer is None
-                    or self.device_memory_buffer.numel() < self.engine_vram_req
-                ):
-                    self.device_memory_buffer = torch.empty(
-                        self.engine_vram_req, dtype=torch.uint8, device=devices.device
-                    )
-                self.engine.context.device_memory = self.device_memory_buffer.data_ptr()
-            except Exception:
-                pass
-
-        self.cudaStream = torch.cuda.current_stream().cuda_stream
-        self.engine.allocate_buffers(feed_dict)
-
-        out = self.engine.infer(feed_dict, self.cudaStream)["latent"]
+        stream = torch.cuda.current_stream().cuda_stream
+        out = self.engine.infer(feed_dict, stream)["latent"]
 
         nvtx.range_pop()
-        return out.clone()
+        return out
 
     def apply_loras(self, refit_dict: dict):
         if not self.refitted_keys.issubset(set(refit_dict.keys())):
@@ -333,17 +317,8 @@ class TrtUnet(sd_unet.SdUnet):
         elif getattr(self.engine, "engine", None) is None:
             self.engine.engine_path = engine_path
         self.engine.load()
-        try:
-            print(f"\n[TensorRT] Loaded Profile: {self.profile_idx}")
-            print(self.engine)
-        except Exception:
-            pass
-        self.engine_vram_req = getattr(
-            self.engine.engine,
-            "device_memory_size_v2",
-            getattr(self.engine.engine, "device_memory_size", 0),
-        )
-        self.engine.activate(reuse_device_memory=False)
+        print(f"[TensorRT] Loaded Profile {self.profile_idx}:\n{self.engine}", flush=True)
+        self.engine.activate()
 
     def deactivate(self):
         try:
@@ -356,8 +331,8 @@ class TrtUnet(sd_unet.SdUnet):
                 shared.sd_model.model.diffusion_model.to(devices.device)
         except Exception:
             pass
-        self.device_memory_buffer = None
-        del self.engine
+        if self.engine is not None:
+            self.engine.reset()
         self.engine = None
 
 
@@ -446,9 +421,11 @@ class TensorRTScript(scripts.Script):
         return super().setup(p, *args)
 
     def before_process(self, p, *args):  # 1
-        # Check divisibilty
+        if getattr(shared.opts, "sd_unet", "Automatic") == "None":
+            return
+        # TensorRT engines need latents divisible by 8 (images divisible by 64).
         if p.width % 64 or p.height % 64:
-            gr.Error("Target resolution must be divisible by 64 in both dimensions.")
+            gr.Warning("TensorRT: resolution should be divisible by 64 in both dimensions.")
 
         if self.is_img2img:
             return
@@ -456,8 +433,8 @@ class TensorRTScript(scripts.Script):
             hr_w = int(p.width * p.hr_scale)
             hr_h = int(p.height * p.hr_scale)
             if hr_w % 64 or hr_h % 64:
-                gr.Error(
-                    "HIRES Fix resolution must be divisible by 64 in both dimensions. Please change the upscale factor or disable HIRES Fix."
+                gr.Warning(
+                    "TensorRT: Hires. fix resolution should be divisible by 64 in both dimensions."
                 )
 
     def get_profile_idx(self, p, model_name: str, model_type: ModelType, prompt_tokens: int = None) -> (int, int):
@@ -496,9 +473,9 @@ class TensorRTScript(scripts.Script):
             )
 
         if len(valid_models) == 0:
-            gr.Error(
-                f"""No valid profile found for ({model_name}) LOWRES ({p.width}x{p.height}, bs={p.batch_size}, tokens={prompt_tokens}). 
-                Please go to the TensorRT tab and generate an engine with the necessary profile, or use PyTorch fallback."""
+            gr.Warning(
+                f"TensorRT: no engine profile for {model_name} at {p.width}x{p.height}, batch {p.batch_size}, "
+                f"{prompt_tokens} tokens. Using PyTorch instead; export a matching engine from the TensorRT tab."
             )
             return None, None
 
@@ -534,9 +511,7 @@ class TensorRTScript(scripts.Script):
                     77,
                 )
             if len(valid_models_hr) == 0:
-                gr.Error(
-                    f"""No valid profile found for ({model_name}) HIRES ({hr_w}x{hr_h}). Please generate an engine for the upscaled resolution."""
-                )
+                print(f"[TensorRT] No engine profile covers the Hires. fix resolution {hr_w}x{hr_h}.", flush=True)
             merged_idx = [i for i, id in enumerate(idx) if id in idx_hr]
             if len(merged_idx) == 0:
                 gr.Warning(
@@ -577,11 +552,16 @@ class TensorRTScript(scripts.Script):
             return
 
         # Get pathes
-        print("Apllying LoRAs: " + str(loras))
+        print("[TensorRT] Applying LoRAs: " + str(loras))
         available = modelmanager.available_loras()
         for lora in loras:
-            lora_name, lora_scale = lora.split(":")[1:]
-            lora_scales.append(float(lora_scale))
+            # <lora:name> or <lora:name:scale> (extra fields after the scale are ignored)
+            lora_parts = lora.split(":")[1:]
+            if not lora_parts or not lora_parts[0]:
+                raise ValueError(f"Invalid LoRA tag: <{lora}>")
+            lora_name = lora_parts[0]
+            lora_scale = float(lora_parts[1]) if len(lora_parts) > 1 and lora_parts[1] else 1.0
+            lora_scales.append(lora_scale)
             if lora_name not in available:
                 raise Exception(
                     f"Please export the LoRA checkpoint {lora_name} first from the TensorRT LoRA tab"
@@ -602,6 +582,9 @@ class TensorRTScript(scripts.Script):
         # before unet_init
         sd_unet_option = sd_unet.get_unet_option()
         if sd_unet_option is None:
+            # Respect an explicit "None" (PyTorch) selection; only auto-detect for "Automatic".
+            if getattr(shared.opts, "sd_unet", "Automatic") != "Automatic":
+                return
             # Try auto-detecting matching engine if unet_options was not yet populated or set to None
             avail = modelmanager.available_models()
             model_name = getattr(p, "sd_model_name", None) or getattr(
@@ -626,7 +609,7 @@ class TensorRTScript(scripts.Script):
                 return
 
         if not sd_unet_option.model_name == p.sd_model_name:
-            gr.Error(
+            raise gr.Error(
                 """Selected torch model ({}) does not match the selected TensorRT U-Net ({}). 
                 Please ensure that both models are the same or select Automatic from the SD UNet dropdown.""".format(
                     p.sd_model_name, sd_unet_option.model_name
@@ -675,8 +658,7 @@ class TensorRTScript(scripts.Script):
             if not self.torch_unet:
                 self.get_loras(p)
         except Exception as e:
-            gr.Error(e)
-            raise e
+            raise gr.Error(str(e))
 
         self.apply_unet(sd_unet_option)
         if sd_unet.current_unet is not None:
