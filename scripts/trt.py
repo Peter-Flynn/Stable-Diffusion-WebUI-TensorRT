@@ -32,6 +32,8 @@ import numpy as np
 import torch
 from torch.cuda import nvtx
 import gradio as gr
+from modules.ui_common import refresh_symbol
+from modules.ui_components import ToolButton
 
 from modules import script_callbacks, sd_unet, devices, scripts, shared
 
@@ -50,7 +52,7 @@ def format_profile_summary(config) -> str:
         if not sample:
             return "Static" if getattr(config, "static_shapes", False) else "Dynamic"
         _min, _opt, _max = sample
-        opt_bs = _opt[0] // 2
+        opt_bs = max(1, _opt[0] // 2)
         opt_h = _opt[2] * 8
         opt_w = _opt[3] * 8
         tok_str = ""
@@ -62,7 +64,8 @@ def format_profile_summary(config) -> str:
         else:
             min_w, max_w = _min[3] * 8, _max[3] * 8
             min_h, max_h = _min[2] * 8, _max[2] * 8
-            min_bs, max_bs = _min[0] // 2, _max[0] // 2
+            # sample batch = 2 x batch size (cond + uncond); the minimum may be 1x for CFG 1
+            min_bs, max_bs = max(1, (_min[0] + 1) // 2), max(1, _max[0] // 2)
             if min_w == max_w and min_h == max_h and min_bs == max_bs:
                 return f"{opt_w}x{opt_h} (bs={opt_bs}{tok_str}, Static)"
             if min_w == max_w and min_h == max_h:
@@ -511,6 +514,23 @@ def patch_unet_forward():
             pass
 
 
+AUTO_PROFILE = "Auto (Best Match / SD Unet default)"  # same text as before, so saved UI settings stay valid
+
+
+def profile_choices(model_name: str = None) -> List[str]:
+    """Profile override choices: Auto plus the engines that actually exist for the checkpoint."""
+    if model_name is None:
+        info = getattr(getattr(shared, "sd_model", None), "sd_checkpoint_info", None)
+        model_name = getattr(info, "model_name", None)
+    choices = [AUTO_PROFILE]
+    try:
+        for i, entry in enumerate(modelmanager.available_models().get(model_name, [])):
+            choices.append(f"Profile {i}: {format_profile_summary(entry['config'])}")
+    except Exception:
+        pass
+    return choices
+
+
 class TensorRTScript(scripts.Script):
     def __init__(self) -> None:
         self.loaded_model = None
@@ -529,22 +549,23 @@ class TensorRTScript(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
+        tab = "img2img" if is_img2img else "txt2img"
         with gr.Accordion("TensorRT Profile", open=False):
-            profile_override = gr.Dropdown(
-                label="Profile Selection Override",
-                choices=[
-                    "Auto (Best Match / SD Unet default)",
-                    "Profile 0",
-                    "Profile 1",
-                    "Profile 2",
-                    "Profile 3",
-                    "Profile 4",
-                    "Profile 5",
-                ],
-                value="Auto (Best Match / SD Unet default)",
-                elem_id=f"trt_profile_override_{'img2img' if is_img2img else 'txt2img'}",
-                info="Force a specific profile index or use Auto to match resolution and batch size.",
-            )
+            with gr.Row():
+                profile_override = gr.Dropdown(
+                    label="Profile Selection Override",
+                    choices=profile_choices(),
+                    value=AUTO_PROFILE,
+                    elem_id=f"trt_profile_override_{tab}",
+                    info="Engines exported for the current checkpoint. Refresh after changing checkpoints or exporting.",
+                )
+                refresh = ToolButton(value=refresh_symbol, elem_id=f"trt_profile_refresh_{tab}")
+
+        def refresh_choices(current):
+            choices = profile_choices()
+            return gr.update(choices=choices, value=current if current in choices else AUTO_PROFILE)
+
+        refresh.click(refresh_choices, inputs=[profile_override], outputs=[profile_override])
         return [profile_override]
 
     def setup(self, p, *args):
@@ -749,12 +770,9 @@ class TensorRTScript(scripts.Script):
         # Check for UI override from accordion dropdown
         profile_override = None
         if len(args) > 0 and isinstance(args[0], str):
-            val = args[0].strip()
-            if val.startswith("Profile "):
-                try:
-                    profile_override = int(val.split()[1])
-                except Exception:
-                    profile_override = None
+            match = re.match(r"Profile (\d+)", args[0].strip())
+            if match:
+                profile_override = int(match.group(1))
 
         if profile_override is not None:
             self.idx = profile_override
