@@ -13,6 +13,8 @@ def merge_loras(loras: List[str], scales: List[str]) -> dict:
     for lora, scale in zip(loras, scales):
         lora_dict = load_file(lora)
         for k, v in lora_dict.items():
+            # Accumulate in fp32 (also handles fp8/bf16 files); refit casts to the engine's dtype.
+            v = v.float()
             if k in refit_dict:
                 refit_dict[k] += scale * v
             else:
@@ -38,7 +40,7 @@ def apply_loras(base_path: str, loras: List[str], scales: List[str]) -> dict:
         initializer_data = numpy_helper.to_array(
             initializer, base_dir=onnx_opt_dir
         ).astype(np.float16)
-        delta = torch.tensor(initializer_data).to(wt.device) + wt
+        delta = torch.from_numpy(initializer_data).to(wt.device).float() + wt
 
         refit_dict[initializer.name] = delta.contiguous()
 

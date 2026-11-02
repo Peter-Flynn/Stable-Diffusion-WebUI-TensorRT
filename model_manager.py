@@ -106,7 +106,8 @@ class ModelManager:
                 if len(tmp_config_list) == 0:
                     self.all_models[cc].pop(base_model)
                 else:
-                    self.all_models[cc][base_model] = models
+                    # Drop entries whose engine file is gone (and duplicates).
+                    self.all_models[cc][base_model] = tmp_config_list
 
         self.write_json()
 
@@ -172,11 +173,13 @@ class ModelManager:
         parent_dir = os.path.dirname(os.path.abspath(self.model_file))
         if parent_dir and not os.path.exists(parent_dir):
             os.makedirs(parent_dir, exist_ok=True)
-        with open(self.model_file, "w") as f:
+        tmp_file = self.model_file + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(self.all_models, f, indent=4, cls=ModelConfigEncoder)
+        os.replace(tmp_file, self.model_file)
 
     def read_json(self, encode_config=True):
-        with open(self.model_file, "r") as f:
+        with open(self.model_file, "r", encoding="utf-8") as f:
             out = json.load(f)
 
         if not encode_config:
@@ -224,7 +227,7 @@ class ModelManager:
         distances = []
         idx = []
         models = self.available_models()
-        for i, model in enumerate(models[base_model]):
+        for i, model in enumerate(models.get(base_model, [])):
             valid, distance = model["config"].is_compatible_from_dict(feed_dict)
             if valid:
                 valid_models.append(model)
@@ -245,7 +248,7 @@ class ModelManager:
         distances = []
         idx = []
         models = self.available_models()
-        for i, model in enumerate(models[base_model]):
+        for i, model in enumerate(models.get(base_model, [])):
             valid, distance = model["config"].is_compatible(
                 width, height, batch_size, max_embedding
             )

@@ -14,29 +14,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# TensorRT engine wrapper built directly on the TensorRT Python API (no Polygraphy).
+# Supports TensorRT 10.x (weakly typed FP16 builds) and TensorRT 11+ (strongly typed
+# builds, where BuilderFlag.FP16 no longer exists and precision comes from the ONNX graph).
+
 import os
-import sys
-import copy
-import logging
-from logging import warning, info, error
+from collections import OrderedDict
+from logging import error, warning
+
 import torch
 from torch.cuda import nvtx
-from collections import OrderedDict
-import numpy as np
-from polygraphy.backend.common import bytes_from_path
-from polygraphy import util
-from polygraphy.backend.trt import ModifyNetworkOutputs, Profile
-from polygraphy.backend.trt import (
-    engine_from_bytes,
-    engine_from_network,
-    network_from_onnx_path,
-    save_engine,
-)
-from polygraphy.logger import G_LOGGER
 import tensorrt as trt
+
 try:
     from tqdm import tqdm
-except ImportError:
+except ImportError:  # pragma: no cover
+
     class tqdm:
         def __init__(self, *args, **kwargs):
             self.total = kwargs.get("total", 0)
@@ -48,31 +42,44 @@ except ImportError:
         def refresh(self):
             pass
 
+
 TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
-G_LOGGER.module_severity = G_LOGGER.ERROR
 
-# Map of numpy dtype -> torch dtype
-numpy_to_torch_dtype_dict = {
-    np.uint8: torch.uint8,
-    np.int8: torch.int8,
-    np.int16: torch.int16,
-    np.int32: torch.int32,
-    np.int64: torch.int64,
-    np.float16: torch.float16,
-    np.float32: torch.float32,
-    np.float64: torch.float64,
-    np.complex64: torch.complex64,
-    np.complex128: torch.complex128,
-}
-if np.version.full_version >= "1.24.0":
-    numpy_to_torch_dtype_dict[np.bool_] = torch.bool
-else:
-    numpy_to_torch_dtype_dict[np.bool] = torch.bool
+TRT_VERSION = tuple(int(x) for x in trt.__version__.split(".")[:2] if x.isdigit())
 
-# Map of torch dtype -> numpy dtype
-torch_to_numpy_dtype_dict = {
-    value: key for (key, value) in numpy_to_torch_dtype_dict.items()
-}
+# TensorRT 11 removed the weakly typed precision flags; networks must be strongly typed.
+HAS_WEAK_TYPING = hasattr(trt.BuilderFlag, "FP16")
+HAS_STRONG_TYPING = hasattr(trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED")
+
+_TRT_TO_TORCH = {}
+for _trt_name, _torch_name in (
+    ("FLOAT", "float32"),
+    ("HALF", "float16"),
+    ("BF16", "bfloat16"),
+    ("INT8", "int8"),
+    ("UINT8", "uint8"),
+    ("INT32", "int32"),
+    ("INT64", "int64"),
+    ("BOOL", "bool"),
+    ("FP8", "float8_e4m3fn"),
+):
+    if hasattr(trt.DataType, _trt_name) and hasattr(torch, _torch_name):
+        _TRT_TO_TORCH[getattr(trt.DataType, _trt_name)] = getattr(torch, _torch_name)
+
+
+def trt_to_torch_dtype(dtype):
+    try:
+        return _TRT_TO_TORCH[dtype]
+    except KeyError:
+        raise TypeError(f"Unsupported TensorRT dtype: {dtype}")
+
+
+def _atomic_write(path, data: bytes):
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+    os.replace(tmp_path, path)
+
 
 class TQDMProgressMonitor(trt.IProgressMonitor):
     def __init__(self):
@@ -104,124 +111,67 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
                 "parent_phase": parent_phase,
             }
         except KeyboardInterrupt:
-            # The phase_start callback cannot directly cancel the build, so request the cancellation from within step_complete.
+            # phase_start cannot cancel the build directly; request it from step_complete.
             self._step_result = False
 
     def phase_finish(self, phase_name):
         try:
-            if phase_name in self._active_phases.keys():
-                self._active_phases[phase_name]["tq"].update(
-                    self._active_phases[phase_name]["tq"].total
-                    - self._active_phases[phase_name]["tq"].n
-                )
+            if phase_name in self._active_phases:
+                tq = self._active_phases[phase_name]["tq"]
+                tq.update(tq.total - tq.n)
 
                 parent_phase = self._active_phases[phase_name].get("parent_phase", None)
-                while parent_phase is not None:
+                while parent_phase is not None and parent_phase in self._active_phases:
                     self._active_phases[parent_phase]["tq"].refresh()
                     parent_phase = self._active_phases[parent_phase].get(
                         "parent_phase", None
                     )
-                if (
-                    self._active_phases[phase_name]["parent_phase"]
-                    in self._active_phases.keys()
-                ):
-                    self._active_phases[
-                        self._active_phases[phase_name]["parent_phase"]
-                    ]["tq"].refresh()
                 del self._active_phases[phase_name]
-            pass
         except KeyboardInterrupt:
             self._step_result = False
 
     def step_complete(self, phase_name, step):
         try:
-            if phase_name in self._active_phases.keys():
-                self._active_phases[phase_name]["tq"].update(
-                    step - self._active_phases[phase_name]["tq"].n
-                )
+            if phase_name in self._active_phases:
+                tq = self._active_phases[phase_name]["tq"]
+                tq.update(step - tq.n)
             return self._step_result
         except KeyboardInterrupt:
-            # There is no need to propagate this exception to TensorRT. We can simply cancel the build.
+            # No need to propagate this to TensorRT; just cancel the build.
             return False
 
 
 class Engine:
-    def __init__(
-        self,
-        engine_path,
-    ):
+    def __init__(self, engine_path):
         self.engine_path = engine_path
+        self.runtime = None
         self.engine = None
         self.context = None
-        self.buffers = OrderedDict()
+        self._clear_state()
+
+    def _clear_state(self):
+        # Staging buffers for inputs that can't be bound directly (wrong dtype / non-contiguous).
         self.tensors = OrderedDict()
-        self.cuda_graph_instance = None  # cuda graph
+        # (name, is_input, torch dtype) for every I/O tensor of the engine.
+        self.io_tensors = []
+        self._input_shapes = {}
+        self._device_memory = None
+        self._user_managed_memory = False
 
     def __del__(self):
-        for attr in ("context", "engine", "buffers", "tensors"):
-            if hasattr(self, attr):
-                try:
-                    delattr(self, attr)
-                except Exception:
-                    pass
+        try:
+            self.reset(None)
+        except Exception:
+            pass
 
     def reset(self, engine_path=None):
-        for attr in ("context", "engine", "buffers", "tensors"):
-            if hasattr(self, attr):
-                try:
-                    delattr(self, attr)
-                except Exception:
-                    pass
+        # Order matters: the context must be destroyed before its engine.
+        self.context = None
+        self.engine = None
+        self._clear_state()
         self.engine_path = engine_path
 
-        self.buffers = OrderedDict()
-        self.tensors = OrderedDict()
-        self.is_reusing_device_memory = False
-        self.inputs = {}
-        self.outputs = {}
-
-    def refit_from_dict(self, refit_weights, is_fp16):
-        # Initialize refitter
-        refitter = trt.Refitter(self.engine, TRT_LOGGER)
-
-        refitted_weights = set()
-        # In TRT 10: get_all_weights() returns list of weight names
-        trt_weight_names = refitter.get_all_weights()
-        for trt_weight_name in trt_weight_names:
-            if trt_weight_name not in refit_weights:
-                continue
-
-            # get weight from state dict
-            trt_datatype = trt.DataType.FLOAT
-            if is_fp16:
-                refit_weights[trt_weight_name] = refit_weights[trt_weight_name].half()
-                trt_datatype = trt.DataType.HALF
-
-            refit_weights[trt_weight_name] = refit_weights[trt_weight_name].contiguous()
-            trt_wt_tensor = trt.Weights(
-                trt_datatype,
-                refit_weights[trt_weight_name].data_ptr(),
-                torch.numel(refit_weights[trt_weight_name]),
-            )
-            trt_wt_location = (
-                trt.TensorLocation.DEVICE
-                if refit_weights[trt_weight_name].is_cuda
-                else trt.TensorLocation.HOST
-            )
-
-            # In TRT 10, set_named_weights supports (name, weights, location) or (name, weights)
-            try:
-                refitter.set_named_weights(trt_weight_name, trt_wt_tensor, trt_wt_location)
-            except TypeError:
-                refitter.set_named_weights(trt_weight_name, trt_wt_tensor)
-
-            refitted_weights.add(trt_weight_name)
-
-        assert set(refitted_weights) == set(refit_weights.keys())
-        if not refitter.refit_cuda_engine():
-            raise RuntimeError("Error: failed to refit new weights into TensorRT engine.")
-
-        print(f"[I] Total refitted weights {len(refitted_weights)}.")
+    # ------------------------------------------------------------------ build
 
     def build(
         self,
@@ -229,217 +179,306 @@ class Engine:
         fp16,
         input_profile=None,
         enable_refit=False,
-        enable_preview=False,
-        enable_all_tactics=False,
+        enable_preview=False,  # kept for API compatibility (Polygraphy-only option)
+        enable_all_tactics=False,  # kept for API compatibility (Polygraphy-only option)
         timing_cache=None,
         update_output_names=None,
     ):
-        print(f"Building TensorRT engine for {onnx_path}: {self.engine_path}")
-        p = [Profile()]
-        if input_profile:
-            p = [Profile() for i in range(len(input_profile))]
-            for _p, i_profile in zip(p, input_profile):
-                for name, dims in i_profile.items():
-                    assert len(dims) == 3
-                    _p.add(name, min=dims[0], opt=dims[1], max=dims[2])
+        print(f"[TensorRT] Building engine for {onnx_path}: {self.engine_path}", flush=True)
+        builder = trt.Builder(TRT_LOGGER)
 
-        config_kwargs = {}
-        if not enable_all_tactics:
-            config_kwargs["tactic_sources"] = []
+        strongly_typed = HAS_STRONG_TYPING and not HAS_WEAK_TYPING
+        network_flags = 0
+        if strongly_typed:
+            network_flags |= 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+        network = builder.create_network(network_flags)
 
-        network_flags = []
-        if hasattr(trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED"):
-            network_flags.append(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
-        elif hasattr(trt.OnnxParserFlag, "NATIVE_INSTANCENORM"):
-            network_flags.append(trt.OnnxParserFlag.NATIVE_INSTANCENORM)
+        parser = trt.OnnxParser(network, TRT_LOGGER)
+        if hasattr(trt.OnnxParserFlag, "NATIVE_INSTANCENORM"):
+            parser.set_flag(trt.OnnxParserFlag.NATIVE_INSTANCENORM)
+        if not parser.parse_from_file(str(onnx_path)):
+            errors = "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
+            error(f"TensorRT could not parse {onnx_path}:\n{errors}")
+            return 1
 
-        network = network_from_onnx_path(
-            onnx_path, flags=network_flags
-        )
         if update_output_names:
-            print(f"Updating network outputs to {update_output_names}")
-            network = ModifyNetworkOutputs(network, update_output_names)
+            self._set_network_outputs(network, update_output_names)
 
-        builder = network[0]
         config = builder.create_builder_config()
         config.progress_monitor = TQDMProgressMonitor()
 
-        # In TRT 10 strongly typed mode, precision is determined by the ONNX graph; set FP16 only if not strongly typed
-        is_strongly_typed = getattr(network[1], "has_strongly_typed_layers", False) if hasattr(network[1], "has_strongly_typed_layers") else False
-        if fp16 and hasattr(trt.BuilderFlag, "FP16") and not is_strongly_typed:
-            try:
-                config.set_flag(trt.BuilderFlag.FP16)
-            except Exception:
-                pass
+        if strongly_typed:
+            print(
+                f"[TensorRT] TensorRT {trt.__version__}: strongly typed build "
+                "(precision taken from the ONNX graph).",
+                flush=True,
+            )
+        elif fp16:
+            config.set_flag(trt.BuilderFlag.FP16)
 
-        if enable_refit and hasattr(trt.BuilderFlag, "REFIT"):
-            config.set_flag(trt.BuilderFlag.REFIT)
+        if enable_refit:
+            refit_flag = getattr(trt.BuilderFlag, "REFIT", None)
+            if refit_flag is not None:
+                config.set_flag(refit_flag)
+            else:
+                warning("This TensorRT version has no BuilderFlag.REFIT; LoRA refitting will be unavailable.")
 
-        cache = None
         if timing_cache:
-            timing_cache_dir = os.path.dirname(os.path.abspath(timing_cache))
-            if timing_cache_dir and not os.path.exists(timing_cache_dir):
-                os.makedirs(timing_cache_dir, exist_ok=True)
-
             try:
-                if os.path.exists(timing_cache) and os.path.getsize(timing_cache) > 0:
-                    with util.LockFile(timing_cache):
-                        timing_cache_data = util.load_file(
-                            timing_cache, description="tactic timing cache"
-                        )
-                        cache = config.create_timing_cache(timing_cache_data)
-                else:
-                    cache = config.create_timing_cache(b"")
-            except Exception as e:
-                warning(
-                    f"Timing cache error ({e}), initializing fresh empty timing cache."
-                )
-                try:
-                    cache = config.create_timing_cache(b"")
-                except Exception:
-                    cache = None
-
-            if cache is not None:
+                cache_data = b""
+                if os.path.isfile(timing_cache):
+                    with open(timing_cache, "rb") as f:
+                        cache_data = f.read()
+                cache = config.create_timing_cache(cache_data)
                 config.set_timing_cache(cache, ignore_mismatch=True)
+            except Exception as e:
+                warning(f"Could not load timing cache {timing_cache} ({e}); starting with an empty one.")
+                config.set_timing_cache(config.create_timing_cache(b""), ignore_mismatch=True)
 
-        profiles = copy.deepcopy(p)
-        for profile in profiles:
-            calib_profile = profile.fill_defaults(network[1]).to_trt(
-                builder, network[1]
-            )
-            config.add_optimization_profile(calib_profile)
+        for profile_shapes in input_profile or []:
+            profile = builder.create_optimization_profile()
+            for name, dims in profile_shapes.items():
+                if len(dims) != 3:
+                    raise ValueError(f"Profile for '{name}' needs (min, opt, max) shapes, got {dims}")
+                profile.set_shape(name, min=dims[0], opt=dims[1], max=dims[2])
+            config.add_optimization_profile(profile)
+
+        print("[TensorRT] Compiling engine (this can take several minutes)...", flush=True)
+        try:
+            serialized = builder.build_serialized_network(network, config)
+        except Exception as e:
+            error(f"Failed to build engine: {e}")
+            return 1
+        if serialized is None:
+            error("Failed to build engine: TensorRT returned no engine (see errors above).")
+            return 1
 
         try:
-            print(f"[TensorRT] Compiling network and profiling kernel tactics (engine_from_network)...", flush=True)
-            print(f"[TensorRT] This may take 2 to 8 minutes depending on model and resolution. Please wait...", flush=True)
-            engine = engine_from_network(
-                network,
-                config,
-                save_timing_cache=timing_cache,
-            )
+            os.makedirs(os.path.dirname(os.path.abspath(self.engine_path)), exist_ok=True)
+            _atomic_write(self.engine_path, bytes(serialized))
         except Exception as e:
-            print(f"[TensorRT ERROR] TensorRT engine compilation failed: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
+            error(f"Failed to save engine: {e}")
             return 1
-        try:
-            print(f"[TensorRT] Saving compiled engine to: {self.engine_path}", flush=True)
-            save_engine(engine, path=self.engine_path)
-            print(f"[TensorRT] TensorRT engine saved to disk successfully!", flush=True)
-        except Exception as e:
-            print(f"[TensorRT ERROR] Failed to save engine file: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-            return 1
+
+        if timing_cache:
+            try:
+                cache = config.get_timing_cache()
+                if cache is not None:
+                    os.makedirs(os.path.dirname(os.path.abspath(timing_cache)), exist_ok=True)
+                    _atomic_write(timing_cache, bytes(cache.serialize()))
+            except Exception as e:
+                warning(f"Could not save timing cache {timing_cache}: {e}")
+
+        print(f"[TensorRT] Engine saved: {self.engine_path}", flush=True)
         return 0
 
+    @staticmethod
+    def _set_network_outputs(network, names):
+        tensors = {}
+        for i in range(network.num_layers):
+            layer = network.get_layer(i)
+            for j in range(layer.num_outputs):
+                t = layer.get_output(j)
+                tensors[t.name] = t
+        for i in reversed(range(network.num_outputs)):
+            network.unmark_output(network.get_output(i))
+        for name in names:
+            if name not in tensors:
+                raise ValueError(f"Tensor '{name}' not found in network")
+            network.mark_output(tensors[name])
+
+    # -------------------------------------------------------------- runtime
+
     def load(self):
-        print(f"Loading TensorRT engine: {self.engine_path}")
-        self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
+        print(f"[TensorRT] Loading engine: {self.engine_path}", flush=True)
+        with open(self.engine_path, "rb") as f:
+            data = f.read()
+        if self.runtime is None:
+            self.runtime = trt.Runtime(TRT_LOGGER)
+        self.engine = self.runtime.deserialize_cuda_engine(data)
+        if self.engine is None:
+            raise RuntimeError(
+                f"TensorRT could not load {os.path.basename(self.engine_path)}. Engines only work with "
+                f"the TensorRT version and GPU they were built with (installed: TensorRT {trt.__version__}). "
+                "Rebuild it from the TensorRT tab (enable 'Force Rebuild')."
+            )
+
+        self.io_tensors = []
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+            dtype = trt_to_torch_dtype(self.engine.get_tensor_dtype(name))
+            self.io_tensors.append((name, is_input, dtype))
 
     def activate(self, reuse_device_memory=False):
-        self.is_reusing_device_memory = False
-        if reuse_device_memory and hasattr(self.engine, "create_execution_context_without_device_memory"):
+        """Create the execution context.
+
+        When available, activation memory is user managed and allocated through
+        PyTorch's caching allocator, sized for the shapes actually in use rather
+        than the profile maximum. That memory is shared with the rest of the WebUI
+        instead of being held privately by TensorRT."""
+        self.context = None
+        self._user_managed_memory = False
+        self._device_memory = None
+        self._input_shapes = {}
+
+        strategy = getattr(trt, "ExecutionContextAllocationStrategy", None)
+        if strategy is not None and hasattr(strategy, "USER_MANAGED") and hasattr(
+            trt.IExecutionContext, "set_device_memory"
+        ):
             try:
-                self.context = self.engine.create_execution_context_without_device_memory()
-                self.is_reusing_device_memory = True
-                return
+                self.context = self.engine.create_execution_context(strategy.USER_MANAGED)
+                self._user_managed_memory = self.context is not None
             except Exception:
-                pass
-        self.context = self.engine.create_execution_context()
+                self.context = None
 
-    def allocate_buffers(self, shape_dict=None, device="cuda", additional_shapes=None):
-        nvtx.range_push("allocate_buffers")
-        # Pass 1: Set shapes for all input tensors first, so dynamic output shapes are resolved by TensorRT
-        for idx in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(idx)
-            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
-                if shape_dict and name in shape_dict:
-                    shape = tuple(shape_dict[name].shape)
-                elif additional_shapes and name in additional_shapes:
-                    shape = tuple(additional_shapes[name])
-                else:
-                    shape = tuple(self.context.get_tensor_shape(name))
-                self.context.set_input_shape(name, shape)
+        if self.context is None:
+            self.context = self.engine.create_execution_context()
+        if self.context is None:
+            raise RuntimeError("Failed to create a TensorRT execution context (out of GPU memory?)")
 
-        # Pass 2: Allocate or reuse buffers for all I/O tensors
-        for idx in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(idx)
-            is_input = (self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT)
-            if is_input and shape_dict and name in shape_dict:
-                shape = tuple(shape_dict[name].shape)
-            elif additional_shapes and name in additional_shapes:
-                shape = tuple(additional_shapes[name])
-            else:
-                shape = tuple(self.context.get_tensor_shape(name))
-
-            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
-            torch_dtype = numpy_to_torch_dtype_dict.get(dtype, torch.float32)
-
-            target_device = torch.device(device)
-            # Reuse buffer if already allocated with matching shape, dtype, and device
-            if (
-                name in self.tensors
-                and self.tensors[name].shape == shape
-                and self.tensors[name].dtype == torch_dtype
-                and self.tensors[name].device.type == target_device.type
-            ):
+    def _set_input_shapes(self, feed_dict):
+        changed = False
+        for name, is_input, _ in self.io_tensors:
+            if not is_input or name not in feed_dict:
                 continue
+            shape = tuple(feed_dict[name].shape)
+            if self._input_shapes.get(name) == shape:
+                continue
+            if not self.context.set_input_shape(name, shape):
+                raise ValueError(
+                    f"Input '{name}' with shape {shape} is outside the engine's optimization profile.\n{self}"
+                )
+            self._input_shapes[name] = shape
+            changed = True
 
-            self.tensors[name] = torch.zeros(shape, dtype=torch_dtype, device=device)
-        nvtx.range_pop()
+        if changed or (self._user_managed_memory and self._device_memory is None):
+            self._update_device_memory()
+
+    def _update_device_memory(self):
+        if not self._user_managed_memory:
+            return
+        size = 0
+        if hasattr(self.context, "update_device_memory_size_for_shapes"):
+            try:
+                size = int(self.context.update_device_memory_size_for_shapes())
+            except Exception:
+                size = 0
+        if size <= 0:
+            size = int(getattr(self.engine, "device_memory_size_v2", 0) or self.engine.device_memory_size)
+        size = max(size, 1)
+
+        if self._device_memory is None or self._device_memory.numel() < size:
+            self._device_memory = None  # release the old block first
+            self._device_memory = torch.empty(size, dtype=torch.uint8, device="cuda")
+        self.context.set_device_memory(self._device_memory.data_ptr(), self._device_memory.numel())
+
+    def allocate_buffers(self, shape_dict=None, device="cuda"):
+        """Kept for API compatibility: sets input shapes. Buffers are handled in infer()."""
+        if shape_dict:
+            self._set_input_shapes(shape_dict)
 
     def infer(self, feed_dict, stream, use_cuda_graph=False):
-        nvtx.range_push("set_tensors")
-        for name, buf in feed_dict.items():
-            if name in self.tensors:
-                self.tensors[name].copy_(buf)
+        """Run the engine on `stream` and return a dict of freshly allocated output tensors.
 
-        for name, tensor in self.tensors.items():
-            self.context.set_tensor_address(name, tensor.data_ptr())
+        Inputs already on the GPU with the engine's dtype are bound directly (no copy);
+        anything else is copied into a reusable staging buffer."""
+        nvtx.range_push("set_tensors")
+        self._set_input_shapes(feed_dict)
+
+        outputs = {}
+        bound_inputs = []  # keep references alive until the call returns
+        for name, is_input, dtype in self.io_tensors:
+            if is_input:
+                t = feed_dict[name]
+                if t.dtype != dtype or not t.is_cuda or not t.is_contiguous():
+                    buf = self.tensors.get(name)
+                    if buf is None or buf.shape != t.shape:
+                        buf = torch.empty(t.shape, dtype=dtype, device="cuda")
+                        self.tensors[name] = buf
+                    buf.copy_(t)
+                    t = buf
+                bound_inputs.append(t)
+                self.context.set_tensor_address(name, t.data_ptr())
+            else:
+                shape = tuple(self.context.get_tensor_shape(name))
+                out = torch.empty(shape, dtype=dtype, device="cuda")
+                outputs[name] = out
+                self.context.set_tensor_address(name, out.data_ptr())
         nvtx.range_pop()
 
         nvtx.range_push("execute")
-        noerror = self.context.execute_async_v3(stream)
-        if not noerror:
-            raise ValueError("ERROR: TensorRT inference failed.")
+        ok = self.context.execute_async_v3(stream)
         nvtx.range_pop()
-        return self.tensors
+        if not ok:
+            raise RuntimeError("TensorRT inference failed.")
+        return outputs
+
+    def refit_from_dict(self, refit_weights, is_fp16):
+        """Refit engine weights. Each weight is converted to the dtype the engine expects
+        (required for strongly typed engines, where weights may be FP32 or FP16)."""
+        refitter = trt.Refitter(self.engine, TRT_LOGGER)
+        refittable = set(refitter.get_all_weights())
+        default_dtype = trt.DataType.HALF if is_fp16 else trt.DataType.FLOAT
+
+        keep_alive = []
+        missing = []
+        for name, wt in refit_weights.items():
+            if name not in refittable:
+                missing.append(name)
+                continue
+
+            trt_dtype = default_dtype
+            expected_size = None
+            if hasattr(refitter, "get_weights_prototype"):
+                try:
+                    proto = refitter.get_weights_prototype(name)
+                    trt_dtype = proto.dtype
+                    expected_size = proto.size
+                except Exception:
+                    pass
+
+            t = wt.detach().to(dtype=trt_to_torch_dtype(trt_dtype)).contiguous()
+            if expected_size is not None and t.numel() != expected_size:
+                raise RuntimeError(
+                    f"Refit weight '{name}' has {t.numel()} elements, engine expects {expected_size}."
+                )
+            keep_alive.append(t)
+
+            weights = trt.Weights(trt_dtype, t.data_ptr(), t.numel())
+            location = trt.TensorLocation.DEVICE if t.is_cuda else trt.TensorLocation.HOST
+            try:
+                ok = refitter.set_named_weights(name, weights, location)
+            except TypeError:  # older bindings without the location argument
+                t_host = t.cpu() if t.is_cuda else t
+                keep_alive.append(t_host)
+                ok = refitter.set_named_weights(
+                    name, trt.Weights(trt_dtype, t_host.data_ptr(), t_host.numel())
+                )
+            if ok is False:
+                raise RuntimeError(f"TensorRT rejected refit weight '{name}'.")
+
+        if missing:
+            warning(f"{len(missing)} LoRA weights are not refittable in this engine and were skipped.")
+
+        if not refitter.refit_cuda_engine():
+            raise RuntimeError("Failed to refit new weights into the TensorRT engine.")
+        print(f"[TensorRT] Refitted {len(keep_alive)} weights.", flush=True)
 
     def __str__(self):
+        if self.engine is None:
+            return f"TensorRT engine ({self.engine_path}, not loaded)"
         try:
             out = ""
-            for opt_profile in range(self.engine.num_optimization_profiles):
-                out += f"Profile {opt_profile}:\n"
-                if hasattr(self.engine, "num_io_tensors"):
-                    for binding in range(self.engine.num_io_tensors):
-                        name = self.engine.get_tensor_name(binding)
-                        shape = "unknown"
-                        try:
-                            is_input = (
-                                hasattr(self.engine, "get_tensor_mode")
-                                and self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
-                            )
-                            if is_input and hasattr(self.engine, "get_tensor_profile_shape"):
-                                shape = self.engine.get_tensor_profile_shape(name, opt_profile)
-                            elif hasattr(self.engine, "get_tensor_shape"):
-                                shape = self.engine.get_tensor_shape(name)
-                            elif hasattr(self.engine, "get_profile_shape"):
-                                shape = self.engine.get_profile_shape(opt_profile, name)
-                        except Exception:
-                            try:
-                                shape = self.engine.get_tensor_shape(name)
-                            except Exception:
-                                pass
-                        out += f"\t{name} = {shape}\n"
-                elif hasattr(self.engine, "num_bindings"):
-                    for binding_idx in range(self.engine.num_bindings):
-                        name = self.engine.get_binding_name(binding_idx)
-                        try:
-                            shape = self.engine.get_profile_shape(opt_profile, name)
-                        except Exception:
-                            shape = "unknown"
-                        out += f"\t{name} = {shape}\n"
+            for p in range(self.engine.num_optimization_profiles):
+                out += f"Profile {p}:\n"
+                for name, is_input, _ in self.io_tensors:
+                    if is_input:
+                        shape = self.engine.get_tensor_profile_shape(name, p)
+                        shape = " / ".join(str(tuple(s)) for s in shape)
+                    else:
+                        shape = tuple(self.engine.get_tensor_shape(name))
+                    out += f"\t{name} = {shape}\n"
             return out
         except Exception:
-            return f"TensorRT Engine ({self.engine_path})"
+            return f"TensorRT engine ({self.engine_path})"

@@ -14,26 +14,11 @@ import torch.nn.functional as F
 import numpy as np
 import onnx
 from onnx import numpy_helper
-try:
-    from optimum.onnx.utils import (
-        _get_onnx_external_data_tensors,
-        check_model_uses_external_data,
-    )
-except ImportError:
-    def check_model_uses_external_data(model):
-        for initializer in model.graph.initializer:
-            if getattr(initializer, "data_location", None) == onnx.TensorProto.EXTERNAL:
-                return True
-        return False
+from onnx.external_data_helper import uses_external_data
 
-    def _get_onnx_external_data_tensors(model):
-        paths = []
-        for initializer in model.graph.initializer:
-            if getattr(initializer, "data_location", None) == onnx.TensorProto.EXTERNAL:
-                for entry in initializer.external_data:
-                    if entry.key == "location":
-                        paths.append(entry.value)
-        return paths
+
+def check_model_uses_external_data(model) -> bool:
+    return any(uses_external_data(init) for init in model.graph.initializer)
 
 
 from modules import shared
@@ -43,27 +28,70 @@ from datastructures import ProfileSettings
 from model_helper import UNetModel
 
 
-def apply_lora(model: torch.nn.Module, lora_path: str, inputs: Tuple[torch.Tensor]) -> torch.nn.Module:
+def _import_lora_networks():
     try:
-        import sys
+        import networks  # importable once the built-in Lora extension is loaded
 
-        sys.path.append("extensions-builtin/Lora")
-        import importlib
+        return networks
+    except ImportError:
+        pass
+    import importlib
 
-        networks = importlib.import_module("networks")
-        network = importlib.import_module("network")
-        lora_net = importlib.import_module("extra_networks_lora")
+    sys.path.append(os.path.join("extensions-builtin", "Lora"))
+    try:
+        return importlib.import_module("networks")
     except Exception as e:
-        error(e)
-        error("LoRA not found. Please install LoRA extension first from ...")
-    model.forward(*inputs)
+        raise RuntimeError(f"The built-in Lora extension could not be imported: {e}")
+
+
+def _forge_patched_state_dict(unet: torch.nn.Module):
+    """reForge/Forge attach LoRAs to the UNet's ModelPatcher instead of merging them into
+    the torch weights, so the module's state_dict() never changes. Compute the merged
+    weights for the patched keys without modifying the live model. Returns None on A1111."""
+    try:
+        import ldm_patched.modules.lora as forge_lora
+
+        patcher = shared.sd_model.forge_objects.unet
+        patches = patcher.patches
+    except Exception:
+        return None
+    if not patches:
+        return None
+
+    state_dict = dict(unet.state_dict())
+    prefix = "diffusion_model."
+    merged = 0
+    for key, key_patches in patches.items():
+        name = key[len(prefix):] if key.startswith(prefix) else key
+        if name not in state_dict:
+            continue
+        weight = state_dict[name].detach().to(dtype=torch.float32, copy=True)
+        state_dict[name] = forge_lora.calculate_weight(key_patches, weight, key)
+        merged += 1
+    print(f"[TensorRT] Merged LoRA patches into {merged} UNet weights.", flush=True)
+    return state_dict
+
+
+def apply_lora(model: torch.nn.Module, lora_path: str, inputs: Tuple[torch.Tensor]) -> dict:
+    """Load a LoRA through the WebUI and return the UNet state dict with the LoRA merged in."""
+    networks = _import_lora_networks()
     lora_name = os.path.splitext(os.path.basename(lora_path))[0]
-    networks.load_networks(
-        [lora_name], [1.0], [1.0], [None]
-    )
 
     model.forward(*inputs)
-    return model
+    networks.load_networks([lora_name], [1.0], [1.0], [None])
+
+    state_dict = _forge_patched_state_dict(model)
+    if state_dict is not None:
+        # Undo the LoRA selection so it doesn't leak into the next PyTorch generation.
+        try:
+            networks.load_networks([], [], [], [])
+        except Exception:
+            pass
+        return state_dict
+
+    # A1111: the LoRA is merged into the module weights during forward.
+    model.forward(*inputs)
+    return model.state_dict()
 
 
 def get_refit_weights(
@@ -95,9 +123,9 @@ def get_refit_weights(
             wt = torch.reshape(wt, initializer_shape)
 
         # include weight if hashes differ
-        wt_hash = hash(wt.cpu().detach().numpy().astype(np.float16).data.tobytes())
+        wt_hash = hash(wt.detach().to(torch.float16).cpu().numpy().data.tobytes())
         if initializer_hash != wt_hash:
-            delta = wt - torch.tensor(onnx_data_mapping[initializer_name]).to(wt.device)
+            delta = wt.to(torch.float16) - torch.tensor(onnx_data_mapping[initializer_name]).to(wt.device)
             refit_weights[initializer_name] = delta.contiguous()
 
     return refit_weights
@@ -110,11 +138,11 @@ def export_lora(
     lora_name: str,
     profile: ProfileSettings,
 ) -> dict:
-    info("Exporting to ONNX...")
+    info("Exporting LoRA weights...")
     inputs = modelobj.get_sample_input(
-        profile.bs_opt * 2,
-        profile.h_opt // 8,
-        profile.w_opt // 8,
+        2,
+        min(profile.h_opt, TRACE_RESOLUTION) // 8,
+        min(profile.w_opt, TRACE_RESOLUTION) // 8,
         profile.t_opt,
     )
 
@@ -123,12 +151,12 @@ def export_lora(
         [weights_name_mapping, weights_shape_mapping] = json.load(fp_wts)
 
     with torch.inference_mode(), torch.autocast("cuda"):
-        modelobj.unet = apply_lora(
+        state_dict = apply_lora(
             modelobj.unet, os.path.splitext(lora_name)[0], inputs
         )
 
         refit_dict = get_refit_weights(
-            modelobj.unet.state_dict(),
+            state_dict,
             onnx_path,
             weights_name_mapping,
             weights_shape_mapping,
@@ -153,6 +181,9 @@ def _math_scaled_dot_product_attention(
             scores = scores + attn_mask
     attn_weights = torch.softmax(scores, dim=-1)
     return torch.matmul(attn_weights, value)
+
+
+TRACE_RESOLUTION = 512
 
 
 def swap_sdpa(func):
@@ -186,10 +217,12 @@ def export_onnx(
     diable_optimizations: bool = False,
 ):
     print(f"[TensorRT] Preparing weights for ONNX export...", flush=True)
+    # The exported graph has dynamic batch/height/width/token axes, so the trace
+    # resolution doesn't affect the engine. Tracing small keeps VRAM use low.
     inputs = modelobj.get_sample_input(
-        profile.bs_opt * 2,
-        profile.h_opt // 8,
-        profile.w_opt // 8,
+        2,
+        min(profile.h_opt, TRACE_RESOLUTION) // 8,
+        min(profile.w_opt, TRACE_RESOLUTION) // 8,
         profile.t_opt,
     )
 
@@ -211,18 +244,6 @@ def export_onnx(
 def _export_onnx(
     model: torch.nn.Module, inputs: Tuple[torch.Tensor], path: str, opset: int, in_names: List[str], out_names: List[str], dyn_axes: dict, optimizer=None
 ):
-    try:
-        import onnxscript
-    except ImportError:
-        try:
-            print("[TensorRT] Missing required 'onnxscript' package for modern PyTorch. Installing in background...", flush=True)
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "onnxscript"])
-            import onnxscript
-            print("[TensorRT] Package 'onnxscript' installed successfully!", flush=True)
-        except Exception as err:
-            print(f"[TensorRT] Warning: Automatic installation of onnxscript failed: {err}", flush=True)
-
     tmp_dir = os.path.abspath("onnx_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
     tmp_path = os.path.join(tmp_dir, "model.onnx")
@@ -280,7 +301,6 @@ def _export_onnx(
 
     if model_uses_external_data:
         print(f"[TensorRT] Model exceeds 2GB (using external weight data). Saving...", flush=True)
-        tensors_paths = _get_onnx_external_data_tensors(onnx_model)
         onnx_model = onnx.load(tmp_path, load_external_data=True)
         onnx.save(
             onnx_model,

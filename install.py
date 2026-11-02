@@ -1,5 +1,7 @@
-import sys
+import os
 import re
+import sys
+from importlib import metadata
 
 python = sys.executable
 
@@ -13,8 +15,7 @@ except ImportError:
         @staticmethod
         def is_installed(package):
             try:
-                from importlib.metadata import version
-                version(package)
+                metadata.version(package)
                 return True
             except Exception:
                 return False
@@ -22,8 +23,7 @@ except ImportError:
         @staticmethod
         def run_pip(args, desc="", live=True):
             print(f"[TensorRT Extension] Running pip {args} ({desc})")
-            cmd = [sys.executable, "-m", "pip"] + args.split()
-            subprocess.run(cmd, check=True)
+            subprocess.run([sys.executable, "-m", "pip"] + args.split(), check=True)
 
         @staticmethod
         def run(cmd, desc=""):
@@ -33,122 +33,61 @@ except ImportError:
     launch = MockLaunch()
 
 
-def get_installed_version(package_name):
-    try:
-        from importlib.metadata import version
-        return version(package_name)
-    except Exception:
-        try:
-            import importlib_metadata
-            return importlib_metadata.version(package_name)
-        except Exception:
-            return None
+MIN_TRT_VERSION = (10, 0)
+NVIDIA_INDEX = "--extra-index-url https://pypi.nvidia.com"
 
 
 def parse_version(v_str):
-    if not v_str:
-        return (0, 0, 0)
-    parts = [int(p) for p in re.findall(r"\d+", v_str)]
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts[:3])
+    parts = [int(p) for p in re.findall(r"\d+", v_str or "")]
+    return tuple((parts + [0, 0, 0])[:3])
 
 
-MIN_TRT_VERSION = (10, 8, 0)  # TensorRT 10.8.0 introduces native Blackwell (sm_120) support
+def installed_tensorrt():
+    """Return (distribution, version) of any installed TensorRT Python package
+    (tensorrt, tensorrt-cu12, tensorrt-cu13, ...), or (None, None)."""
+    found = []
+    for dist in metadata.distributions():
+        name = (dist.metadata.get("Name") or "").lower().replace("_", "-")
+        if name == "tensorrt" or re.fullmatch(r"tensorrt-cu\d+(-bindings)?", name):
+            found.append((name, dist.version))
+    if not found:
+        return None, None
+    # Prefer the meta package if present.
+    found.sort(key=lambda x: (x[0] != "tensorrt", x[0]))
+    return found[0]
 
 
 def install():
-    # Remove obsolete CUDA 11 cuDNN if left from previous old versions
-    if launch.is_installed("nvidia-cudnn-cu11"):
-        print("[TensorRT Extension] Removing legacy nvidia-cudnn-cu11...")
-        launch.run(
-            [python, "-m", "pip", "uninstall", "-y", "nvidia-cudnn-cu11"],
-            "removing legacy nvidia-cudnn-cu11",
+    if os.environ.get("TRT_EXTENSION_SKIP_INSTALL", "").lower() in ("1", "true", "yes"):
+        print("[TensorRT Extension] TRT_EXTENSION_SKIP_INSTALL is set; not installing anything.")
+        return
+
+    # TensorRT: never uninstall or replace a user-installed version.
+    trt_pkg, trt_ver = installed_tensorrt()
+    if trt_pkg is None:
+        print("[TensorRT Extension] TensorRT is not installed. Installing the latest release...")
+        launch.run_pip(f"install tensorrt {NVIDIA_INDEX}", "tensorrt", live=True)
+    elif parse_version(trt_ver) < MIN_TRT_VERSION:
+        print(
+            f"[TensorRT Extension] Warning: {trt_pkg}=={trt_ver} is older than "
+            f"{'.'.join(map(str, MIN_TRT_VERSION))} and is not supported. Please upgrade it "
+            f"(e.g. pip install -U tensorrt {NVIDIA_INDEX})."
         )
 
-    # Check TensorRT
-    trt_pkg = None
-    trt_ver = None
-    if launch.is_installed("tensorrt"):
-        trt_pkg = "tensorrt"
-        trt_ver = get_installed_version("tensorrt")
-    elif launch.is_installed("tensorrt-cu12"):
-        trt_pkg = "tensorrt-cu12"
-        trt_ver = get_installed_version("tensorrt-cu12")
+    # Required for ONNX export.
+    for pkg in ("onnx", "onnxscript"):
+        if not launch.is_installed(pkg):
+            launch.run_pip(f"install {pkg}", pkg, live=True)
 
-    needs_trt_install = False
-    if trt_pkg and trt_ver:
-        parsed_ver = parse_version(trt_ver)
-        if parsed_ver >= MIN_TRT_VERSION:
-            print(
-                f"[TensorRT Extension] Found {trt_pkg}=={trt_ver} (>= 10.8.0), fully compatible with Blackwell (sm_120)."
-            )
-        else:
-            print(
-                f"[TensorRT Extension] Installed {trt_pkg}=={trt_ver} is too old for Blackwell sm_120 (requires >= 10.8.0). Upgrading..."
-            )
-            launch.run(
-                [python, "-m", "pip", "uninstall", "-y", trt_pkg],
-                f"removing outdated {trt_pkg}",
-            )
-            needs_trt_install = True
-    else:
-        needs_trt_install = True
-
-    if needs_trt_install:
-        print("[TensorRT Extension] Installing TensorRT >= 10.8.0 for CUDA 12 / Blackwell...")
-        launch.run_pip(
-            "install tensorrt>=10.8.0 --extra-index-url https://pypi.nvidia.com --no-cache-dir",
-            "tensorrt",
-            live=True,
-        )
-
-    # Polygraphy
+    # Optional ONNX graph cleanup / constant folding before the TensorRT build.
+    if not launch.is_installed("onnx-graphsurgeon"):
+        launch.run_pip(f"install onnx-graphsurgeon {NVIDIA_INDEX}", "onnx-graphsurgeon", live=True)
     if not launch.is_installed("polygraphy"):
-        print("[TensorRT Extension] Installing Polygraphy...")
-        launch.run_pip(
-            "install polygraphy --extra-index-url https://pypi.nvidia.com",
-            "polygraphy",
-            live=True,
-        )
-
-    # ONNX GraphSurgeon (do not pin obsolete protobuf==3.20.2)
-    if not launch.is_installed("onnx_graphsurgeon"):
-        print("[TensorRT Extension] Installing ONNX-GraphSurgeon...")
-        launch.run_pip(
-            "install onnx-graphsurgeon --extra-index-url https://pypi.nvidia.com",
-            "onnx-graphsurgeon",
-            live=True,
-        )
-
-    # ONNX
-    if not launch.is_installed("onnx"):
-        print("[TensorRT Extension] Installing ONNX...")
-        launch.run_pip(
-            "install onnx",
-            "onnx",
-            live=True,
-        )
-
-    # Optimum
-    if not launch.is_installed("optimum"):
-        print("[TensorRT Extension] Installing Optimum...")
-        launch.run_pip(
-            "install optimum",
-            "optimum",
-            live=True,
-        )
-
-    # onnxscript (required by PyTorch torch.onnx.export in PyTorch >= 2.2)
-    if not launch.is_installed("onnxscript"):
-        print("[TensorRT Extension] Installing onnxscript...")
-        launch.run_pip(
-            "install onnxscript",
-            "onnxscript",
-            live=True,
-        )
+        launch.run_pip(f"install polygraphy {NVIDIA_INDEX}", "polygraphy", live=True)
 
 
 if __name__ == "__main__" or "launch" in sys.modules:
-    install()
-
+    try:
+        install()
+    except Exception as e:
+        print(f"[TensorRT Extension] Dependency installation failed: {e}")

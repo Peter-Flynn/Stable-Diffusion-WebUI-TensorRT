@@ -46,12 +46,44 @@ try:
 except Exception:
     pass
 
-import onnx_graphsurgeon as gs
-from polygraphy.backend.onnx.loader import fold_constants
+# Graph cleanup / constant folding is optional: without these packages the raw
+# ONNX graph is handed to TensorRT, which performs the same optimizations itself.
+try:
+    import onnx_graphsurgeon as gs
+except ImportError:
+    gs = None
+try:
+    from polygraphy.backend.onnx.loader import fold_constants
+except ImportError:
+    fold_constants = None
 
 from modules import sd_hijack, sd_unet
 
 from datastructures import ProfileSettings
+
+
+def infer_onnx_shapes(onnx_graph):
+    is_large = False
+    try:
+        is_large = onnx_graph.ByteSize() > 2147483648
+    except Exception:
+        is_large = True
+
+    if not is_large:
+        return shape_inference.infer_shapes(onnx_graph)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        onnx_orig_path = os.path.join(temp_dir, "model.onnx")
+        onnx_inferred_path = os.path.join(temp_dir, "inferred.onnx")
+        onnx.save_model(
+            onnx_graph,
+            onnx_orig_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            convert_attribute=False,
+        )
+        onnx.shape_inference.infer_shapes_path(onnx_orig_path, onnx_inferred_path)
+        return onnx.load(onnx_inferred_path)
 
 
 class UNetModel(torch.nn.Module):
@@ -199,7 +231,8 @@ class UNetModel(torch.nn.Module):
         initializers_mapped = set()
         for wt_name, wt in state_dict.items():
             # get weight hash
-            wt = wt.cpu().detach().numpy().astype(np.float16)
+            # Go through torch for the fp16 cast: numpy has no bf16/fp8 dtypes.
+            wt = wt.detach().to(torch.float16).cpu().numpy()
             wt_hash = hash(wt.data.tobytes())
             wt_t_hash = hash(np.transpose(wt).data.tobytes())
 
@@ -238,12 +271,16 @@ class UNetModel(torch.nn.Module):
 
     @staticmethod
     def optimize(name, onnx_graph, verbose=False):
+        if gs is None:
+            print("[TensorRT] onnx-graphsurgeon not installed; skipping ONNX graph cleanup.", flush=True)
+            return infer_onnx_shapes(onnx_graph)
         opt = Optimizer(onnx_graph, verbose=verbose)
         opt.info(name + ": original")
         opt.cleanup()
         opt.info(name + ": cleanup")
-        opt.fold_constants()
-        opt.info(name + ": fold constants")
+        if fold_constants is not None:
+            opt.fold_constants()
+            opt.info(name + ": fold constants")
         opt.infer_shapes()
         opt.info(name + ": shape inference")
         onnx_opt_graph = opt.cleanup(return_onnx=True)
@@ -282,30 +319,7 @@ class Optimizer:
             return onnx_graph
 
     def infer_shapes(self, return_onnx=False):
-        onnx_graph = gs.export_onnx(self.graph)
-        is_large = False
-        try:
-            is_large = onnx_graph.ByteSize() > 2147483648
-        except Exception:
-            is_large = True
-
-        if is_large:
-            temp_dir = tempfile.TemporaryDirectory().name
-            os.makedirs(temp_dir, exist_ok=True)
-            onnx_orig_path = os.path.join(temp_dir, "model.onnx")
-            onnx_inferred_path = os.path.join(temp_dir, "inferred.onnx")
-            onnx.save_model(
-                onnx_graph,
-                onnx_orig_path,
-                save_as_external_data=True,
-                all_tensors_to_one_file=True,
-                convert_attribute=False,
-            )
-            onnx.shape_inference.infer_shapes_path(onnx_orig_path, onnx_inferred_path)
-            onnx_graph = onnx.load(onnx_inferred_path)
-        else:
-            onnx_graph = shape_inference.infer_shapes(onnx_graph)
-
+        onnx_graph = infer_onnx_shapes(gs.export_onnx(self.graph))
         self.graph = gs.import_onnx(onnx_graph)
         if return_onnx:
             return onnx_graph
