@@ -33,7 +33,11 @@ def load_unet_for_tracing(purpose: str):
         if unet_memory.IS_FORGE_BACKEND:
             import ldm_patched.modules.model_management as model_management
 
-            unet_patcher = getattr(shared.sd_model.forge_objects, "unet", None)
+            # The *original* patcher: forge_objects.unet may carry the last generation's LoRA
+            # patches, which get merged into the weights when it's loaded and would be baked into
+            # the traced graph / weights map.
+            original = getattr(shared.sd_model, "forge_objects_original", None)
+            unet_patcher = getattr(original, "unet", None) or getattr(shared.sd_model.forge_objects, "unet", None)
             if unet_patcher is not None:
                 model_management.load_models_gpu([unet_patcher], force_full_load=True)
         else:
@@ -249,7 +253,7 @@ def export_lora_to_trt(lora_name, force_export):
     version = lora_model.get("version", SDVersion.Unknown)
     if version == SDVersion.Unknown:
         print(
-            "LoRA SD version couldm't be determined. Please ensure the correct SD Checkpoint is selected."
+            "LoRA SD version couldn't be determined. Please ensure the correct SD Checkpoint is selected."
         )
 
     model_name = shared.sd_model.sd_checkpoint_info.model_name
@@ -269,42 +273,40 @@ def export_lora_to_trt(lora_name, force_export):
     if not os.path.exists(onnx_base_path):
         return f"## Please export the base model ({model_name}) first."
 
-    embedding_dim = get_context_dim()
-    load_unet_for_tracing("for LoRA export")
-
-    modelobj = UNetModel(
-        shared.sd_model.model.diffusion_model,
-        embedding_dim,
-        text_minlen=profile_settings.t_min,
-        is_xl=is_xl,
-    )
-    modelobj.apply_torch_model()
-
-    weights_map_path = modelmanager.get_weights_map_path(model_name)
-    if not os.path.exists(weights_map_path):
-        modelobj.export_weights_map(onnx_base_path, weights_map_path)
-
-    lora_trt_name = f"{lora_name}.lora"
-    lora_trt_path = os.path.join(TRT_MODEL_DIR, lora_trt_name)
-
+    lora_trt_path = os.path.join(TRT_MODEL_DIR, f"{lora_name}.lora")
     if os.path.exists(lora_trt_path) and not force_export:
-        print(
-            "TensorRT engine found. Skipping build. You can enable Force Export in the Advanced Settings to force a rebuild if needed."
-        )
+        print("[TensorRT] This LoRA was already converted. Enable 'Force Rebuild' to convert it again.")
         return "## Exported Successfully \n"
 
-    profile = modelobj.get_input_profile(profile_settings)
-    refit_dict = export_lora(
-        modelobj,
-        onnx_base_path,
-        weights_map_path,
-        lora_model["filename"],
-        profile_settings,
-    )
+    try:
+        embedding_dim = get_context_dim()
+        load_unet_for_tracing("for LoRA export")
 
-    save_file(refit_dict, lora_trt_path)
-    if unet_memory.IS_FORGE_BACKEND:
-        unet_memory.unload_unet_from_manager()  # hand the UNet back in a clean state
+        modelobj = UNetModel(
+            shared.sd_model.model.diffusion_model,
+            embedding_dim,
+            text_minlen=profile_settings.t_min,
+            is_xl=is_xl,
+        )
+        modelobj.apply_torch_model()
+
+        weights_map_path = modelmanager.get_weights_map_path(model_name)
+        if not os.path.exists(weights_map_path):
+            modelobj.export_weights_map(onnx_base_path, weights_map_path)
+
+        profile = modelobj.get_input_profile(profile_settings)
+        refit_dict = export_lora(
+            modelobj,
+            onnx_base_path,
+            weights_map_path,
+            lora_model["filename"],
+            profile_settings,
+        )
+
+        save_file(refit_dict, lora_trt_path)
+    finally:
+        if unet_memory.IS_FORGE_BACKEND:
+            unet_memory.unload_unet_from_manager()  # hand the UNet back in a clean state, even on errors
 
 
     return "## Exported Successfully \n"

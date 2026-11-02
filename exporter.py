@@ -67,8 +67,10 @@ def _forge_patched_state_dict(unet: torch.nn.Module):
         name = key[len(prefix):] if key.startswith(prefix) else key
         if name not in state_dict:
             continue
-        weight = state_dict[name].detach().to(dtype=torch.float32, copy=True)
-        state_dict[name] = forge_lora.calculate_weight(key_patches, weight, key)
+        # Merge on the CPU in fp32 and keep the result in fp16: an SDXL LoRA touches hundreds of
+        # large weights, and fp32 copies of all of them don't fit next to the UNet in VRAM.
+        weight = state_dict[name].detach().to(device="cpu", dtype=torch.float32, copy=True)
+        state_dict[name] = forge_lora.calculate_weight(key_patches, weight, key).to(torch.float16)
         merged += 1
     print(f"[TensorRT] Merged LoRA patches into {merged} UNet weights.", flush=True)
     return state_dict
