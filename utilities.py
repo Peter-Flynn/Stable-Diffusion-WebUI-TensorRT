@@ -82,59 +82,93 @@ def _atomic_write(path, data: bytes):
 
 
 class TQDMProgressMonitor(trt.IProgressMonitor):
-    def __init__(self):
+    """Build progress.
+
+    Console: one tqdm bar per phase, nested up to `max_depth`, always closed when the
+    phase finishes. UI: an optional `callback(fraction, description)` driven by the
+    top-level phase (plus the progress of its active sub-phase), so the WebUI shows a
+    single bar instead of every nested tqdm bar."""
+
+    def __init__(self, callback=None, max_depth=3):
         trt.IProgressMonitor.__init__(self)
-        self._active_phases = {}
+        self._phases = {}
         self._step_result = True
-        self.max_indent = 5
+        self.max_depth = max_depth
+        self.callback = callback
+        self._top = None
+        self._last_fraction = 0.0
+
+    def _close(self, phase_name):
+        phase = self._phases.pop(phase_name, None)
+        if phase is not None and phase["tq"] is not None:
+            phase["tq"].close()
+
+    def _set(self, phase_name, n):
+        phase = self._phases.get(phase_name)
+        if phase is None:
+            return
+        n = max(0, min(int(n), phase["total"]))  # TensorRT may overshoot; keep bars <= 100%
+        if phase["tq"] is not None and n != phase["tq"].n:
+            phase["tq"].update(n - phase["tq"].n)
+        phase["n"] = n
+        self._report()
+
+    def _report(self):
+        if self.callback is None or self._top not in self._phases:
+            return
+        top = self._phases[self._top]
+        fraction = top["n"]
+        desc = self._top
+        # Add the fractional progress and name of the deepest active phase under the top one.
+        child = next((k for k, v in self._phases.items() if v["parent"] == self._top), None)
+        if child is not None:
+            c = self._phases[child]
+            fraction += c["n"] / c["total"]
+            deepest = max(self._phases.items(), key=lambda kv: kv[1]["depth"])[0]
+            desc = f"{self._top}: {deepest}"
+        # Between sub-phases the estimate can dip; never move the UI bar backwards.
+        self._last_fraction = max(self._last_fraction, min(fraction / top["total"], 1.0))
+        try:
+            self.callback(self._last_fraction, desc)
+        except Exception:
+            pass
 
     def phase_start(self, phase_name, parent_phase, num_steps):
-        leave = False
         try:
-            if parent_phase is not None:
-                nbIndents = (
-                    self._active_phases.get(parent_phase, {}).get(
-                        "nbIndents", self.max_indent
-                    )
-                    + 1
-                )
-                if nbIndents >= self.max_indent:
-                    return
+            self._close(phase_name)  # phase names can repeat: never leak the previous bar
+            if parent_phase is None:
+                depth = 0
+                self._top = phase_name
+                self._last_fraction = 0.0
             else:
-                nbIndents = 0
-                leave = True
-            self._active_phases[phase_name] = {
-                "tq": tqdm(
-                    total=num_steps, desc=phase_name, leave=leave, position=nbIndents
-                ),
-                "nbIndents": nbIndents,
-                "parent_phase": parent_phase,
+                depth = self._phases.get(parent_phase, {}).get("depth", self.max_depth) + 1
+            tq = None
+            if depth < self.max_depth:
+                tq = tqdm(total=num_steps, desc=phase_name, leave=depth == 0, position=depth, dynamic_ncols=True)
+            self._phases[phase_name] = {
+                "tq": tq,
+                "depth": depth,
+                "parent": parent_phase,
+                "total": max(int(num_steps), 1),
+                "n": 0,
             }
+            self._report()
         except KeyboardInterrupt:
             # phase_start cannot cancel the build directly; request it from step_complete.
             self._step_result = False
 
     def phase_finish(self, phase_name):
         try:
-            if phase_name in self._active_phases:
-                tq = self._active_phases[phase_name]["tq"]
-                tq.update(tq.total - tq.n)
-
-                parent_phase = self._active_phases[phase_name].get("parent_phase", None)
-                while parent_phase is not None and parent_phase in self._active_phases:
-                    self._active_phases[parent_phase]["tq"].refresh()
-                    parent_phase = self._active_phases[parent_phase].get(
-                        "parent_phase", None
-                    )
-                del self._active_phases[phase_name]
+            if phase_name in self._phases:
+                self._set(phase_name, self._phases[phase_name]["total"])
+            self._close(phase_name)
+            self._report()
         except KeyboardInterrupt:
             self._step_result = False
 
     def step_complete(self, phase_name, step):
         try:
-            if phase_name in self._active_phases:
-                tq = self._active_phases[phase_name]["tq"]
-                tq.update(step - tq.n)
+            self._set(phase_name, step)
             return self._step_result
         except KeyboardInterrupt:
             # No need to propagate this to TensorRT; just cancel the build.
@@ -184,6 +218,7 @@ class Engine:
         timing_cache=None,
         update_output_names=None,
         optimization_level=None,
+        progress_callback=None,
     ):
         print(f"[TensorRT] Building engine for {onnx_path}: {self.engine_path}", flush=True)
         builder = trt.Builder(TRT_LOGGER)
@@ -206,7 +241,7 @@ class Engine:
             self._set_network_outputs(network, update_output_names)
 
         config = builder.create_builder_config()
-        config.progress_monitor = TQDMProgressMonitor()
+        config.progress_monitor = TQDMProgressMonitor(callback=progress_callback)
 
         if strongly_typed:
             print(

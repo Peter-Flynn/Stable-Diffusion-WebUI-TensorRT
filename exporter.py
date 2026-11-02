@@ -332,7 +332,7 @@ def _export_onnx(
     print(f"[TensorRT] ONNX model ready at: {path}", flush=True)
 
 
-def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, use_fp16: bool, optimization_level: int = None):
+def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, use_fp16: bool, optimization_level: int = None, progress_callback=None):
     print(f"[TensorRT] Starting TensorRT engine compilation...", flush=True)
     print(f"[TensorRT] ONNX Input: {onnx_path}", flush=True)
     print(f"[TensorRT] TRT Output:  {trt_path}", flush=True)
@@ -358,6 +358,7 @@ def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, 
             timing_cache=timing_cache,
             input_profile=[profile],
             optimization_level=optimization_level,
+            progress_callback=progress_callback,
         )
         e = time.time()
         print(f"[TensorRT] TensorRT engine compilation time: {(e-s):.2f}s", flush=True)

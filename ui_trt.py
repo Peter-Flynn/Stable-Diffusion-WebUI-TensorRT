@@ -61,7 +61,7 @@ def export_unet_to_trt(
     static_shapes,
     preset,
     optimization_level=3,
-    progress=gr.Progress(track_tqdm=True),
+    progress=gr.Progress(),
 ):
     try:
         sd_hijack.model_hijack.apply_optimizations("None")
@@ -195,6 +195,7 @@ def export_unet_to_trt(
                 profile=profile,
                 use_fp16=not use_fp32,
                 optimization_level=optimization_level,
+                progress_callback=lambda fraction, desc: progress(fraction, desc=desc),
             )
             if ret:
                 yield (
