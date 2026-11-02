@@ -275,13 +275,24 @@ class TrtUnet(sd_unet.SdUnet):
         self.step_idx = 0
         self._last_signature = None
         self._warned_unsupported = set()
-        self._fallback_reason = None  # set for the rest of a generation after an unrecoverable OOM
-        self._unsupported_signature = None  # input shapes no profile covers -> run PyTorch for them
+        self._fallback_reason = None  # set: the rest of this generation runs on PyTorch
+        self._torch_restored = False  # the PyTorch UNet was fully loaded by a fallback
 
     def reset_generation_state(self):
         self.step_idx = 0
         self._fallback_reason = None
-        self._unsupported_signature = None
+
+    def fall_back_to_pytorch(self, reason: str, message: str):
+        """Finish this generation exactly like an SD Unet = None generation: free the engine and
+        fully load the PyTorch UNet (no streaming). The next generation uses TensorRT again."""
+        self._fallback_reason = reason
+        self._last_signature = None
+        self.release_engine()
+        _free_cuda_cache()
+        unet_memory.restore_torch_unet()
+        self._torch_restored = True
+        _notify(message)
+        raise TrtFallback(reason)
 
     def forward(
         self,
@@ -294,10 +305,7 @@ class TrtUnet(sd_unet.SdUnet):
         if self._fallback_reason is not None:
             raise TrtFallback(self._fallback_reason)
         if self.engine is None or getattr(self.engine, "engine", None) is None:
-            # The engine was released after an OOM fallback: free the PyTorch UNet's VRAM again
-            # (as apply_unet does on activation) and reload the engine.
-            unet_memory.offload_torch_unet()
-            self.activate()
+            self.activate()  # released by a fallback in an earlier generation
 
         nvtx.range_push("forward")
 
@@ -353,17 +361,12 @@ class TrtUnet(sd_unet.SdUnet):
         # Re-check the profile whenever the input shapes change (first step, Hires. fix pass,
         # CFG 1 steps, ...), not only on the first step.
         signature = tuple((k, tuple(v.shape)) for k, v in feed_dict.items() if v is not None)
-        if signature == self._unsupported_signature:
-            nvtx.range_pop()
-            raise TrtFallback("unsupported input shapes")
         if signature != self._last_signature:
             try:
                 self._select_profile(feed_dict)
             except NoProfileError as e:
-                self._unsupported_signature = signature
                 nvtx.range_pop()
-                _notify(f"{e} Using PyTorch for these steps.")
-                raise TrtFallback(str(e))
+                self.fall_back_to_pytorch("unsupported input shapes", f"{e} Finishing this generation with PyTorch.")
             self._last_signature = signature
 
         feed_dict = self._pad_to_profile(feed_dict)
@@ -379,17 +382,12 @@ class TrtUnet(sd_unet.SdUnet):
                     print("[TensorRT] Out of GPU memory; freeing cached memory and retrying...", flush=True)
                     _free_cuda_cache()
                     continue
-                # Give the engine's memory back so PyTorch can run, and stay on PyTorch for this generation.
-                self._fallback_reason = "out of GPU memory"
-                self.engine.reset()
-                self._last_signature = None
-                _free_cuda_cache()
                 nvtx.range_pop()
-                _notify(
+                self.fall_back_to_pytorch(
+                    "out of GPU memory",
                     "Out of GPU memory running the engine; finishing this generation with PyTorch. "
-                    "A smaller engine profile or freeing VRAM avoids this."
+                    "A smaller engine profile or freeing VRAM avoids this.",
                 )
-                raise TrtFallback(self._fallback_reason)
 
         nvtx.range_pop()
         return out[:b] if out.shape[0] != b else out
@@ -462,6 +460,11 @@ class TrtUnet(sd_unet.SdUnet):
             _notify(f"Couldn't apply LoRA weights to the engine ({e}). Generating without the LoRA.")
 
     def switch_engine(self):
+        if self._fallback_reason is not None:
+            # On PyTorch for the rest of this generation: don't load an engine next to the fully
+            # loaded PyTorch UNet. The selected profile is loaded with the next generation.
+            self.loaded_config = self.configs[self.profile_idx]
+            return
         self.loaded_config = self.configs[self.profile_idx]
         engine_path = os.path.join(TRT_MODEL_DIR, self.loaded_config["filepath"])
         print(f"[TensorRT] Switching to Profile {self.profile_idx}: {engine_path}", flush=True)
@@ -480,6 +483,10 @@ class TrtUnet(sd_unet.SdUnet):
             self.engine = Engine(engine_path)
         elif getattr(self.engine, "engine", None) is None:
             self.engine.engine_path = engine_path
+        if self._torch_restored:
+            # A fallback fully loaded the PyTorch UNet; offload it before the engine takes its place.
+            unet_memory.offload_torch_unet()
+            self._torch_restored = False
         # TensorRT allocates with cudaMalloc, outside PyTorch: VRAM PyTorch has cached but isn't
         # using is unavailable to it, so return that to the driver before loading the engine.
         _free_cuda_cache()
