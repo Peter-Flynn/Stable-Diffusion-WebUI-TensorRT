@@ -20,8 +20,9 @@ Supports Stable Diffusion 1.5, 2.1, SDXL, SDXL Turbo, and LCM.
   PyTorch's allocator, so it's shared with the rest of the WebUI. ONNX export traces at a small resolution.
 - **Fewer copies per step.** Inputs that already match the engine's dtype are bound directly; outputs aren't cloned.
 - **LoRA fixes.** LoRA export works on reForge/Forge (LoRAs are applied through the ModelPatcher there), refit weights
-  match the engine's weight dtypes (required for strongly typed engines), `<lora:name>` without a weight works, LoRAs in
-  subfolders are listed, and bf16/fp8 checkpoints no longer crash the weight mapping.
+  match the engine's weight dtypes (required for strongly typed engines), `<lora:name>` without a weight works, the UNet
+  weight of `<lora:name:te:unet>` is honored, aliases from LoRA cards resolve, LoRAs in subfolders are listed, and bf16/fp8
+  checkpoints no longer crash the weight mapping. On reForge, converting a LoRA only reads the weights it changes.
 - **Non-destructive installer.** `install.py` never uninstalls or replaces your TensorRT. Set
   `TRT_EXTENSION_SKIP_INSTALL=1` to make it install nothing at all (useful for Nix or other managed environments).
 - **reForge support.** Hooks `ldm_patched`'s `UNetModel.forward`, uses an ONNX-exportable attention during export, and
@@ -32,8 +33,12 @@ Supports Stable Diffusion 1.5, 2.1, SDXL, SDXL Turbo, and LCM.
 - **Out-of-memory handling.** Builds report kernels TensorRT skipped for lack of VRAM (they make engines slower) and
   free models first. At runtime an OOM is retried once, then the generation finishes on PyTorch; inputs no engine
   profile covers also run on PyTorch instead of failing. Load errors distinguish "out of memory" from "rebuild needed".
+- **Profile selection that matches the sampler.** Prompt lengths are counted with the WebUI's own tokenizer (emphasis,
+  `BREAK`, embeddings, prompt editing), reForge's cond/uncond batching is accounted for, and the same scoring is used before
+  and during sampling, so engines aren't reloaded mid-generation.
 - Respects `SD Unet: None`, shows errors in the UI instead of swallowing them, and warns when ControlNet inputs are
-  ignored by a TensorRT engine.
+  ignored by a TensorRT engine. A LoRA that hasn't been converted, or an engine selected for another checkpoint, makes that
+  generation use PyTorch instead of producing wrong images.
 
 ---
 
@@ -79,7 +84,8 @@ pip install tensorrt onnx onnxscript onnx-graphsurgeon polygraphy --extra-index-
 
 ## Tips
 
-- **Hires. fix**: use a dynamic engine that covers both the base and the upscaled resolution.
+- **Hires. fix**: use a dynamic engine that covers both the base and the upscaled resolution. Otherwise the upscaled pass
+  uses a second engine if one covers it, or PyTorch.
 - **Resolution**: width and height should be divisible by 64.
 - **Not supported by engines**: ControlNet and other UNet patches (FreeU, attention couple, ...). Set SD Unet to `None`
   when you need them.

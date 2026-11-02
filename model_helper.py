@@ -15,39 +15,35 @@
 # limitations under the License.
 #
 
-import os
 import json
+import math
+import os
+import struct
 import tempfile
-from typing import List, Tuple
 
-import torch
 import numpy as np
 import onnx
-from onnx import shape_inference, numpy_helper
-import struct
+import onnx.helper
+import torch
+from onnx import numpy_helper, shape_inference
 
-# Compatibility patch for newer onnx versions (>= 1.17) where float32_to_bfloat16 was removed from onnx.helper
-try:
-    import onnx.helper
-    if not hasattr(onnx.helper, "float32_to_bfloat16"):
-        def _float32_to_bfloat16(fval: float, truncate: bool = False) -> int:
-            ival = int.from_bytes(struct.pack("<f", float(fval)), "little")
-            if truncate:
-                return ival >> 16
-            return (ival + 0x8000 + ((ival >> 16) & 1)) >> 16
+from modules import sd_hijack
 
-        onnx.helper.float32_to_bfloat16 = _float32_to_bfloat16
+from datastructures import ProfileSettings
 
-    if not hasattr(onnx.helper, "bfloat16_to_float32"):
-        def _bfloat16_to_float32(ival: int) -> float:
-            return struct.unpack("<f", (int(ival) << 16).to_bytes(4, "little"))[0]
+if not hasattr(onnx.helper, "float32_to_bfloat16"):  # removed in onnx 1.20; older onnx-graphsurgeon needs it
 
-        onnx.helper.bfloat16_to_float32 = _bfloat16_to_float32
-except Exception:
-    pass
+    def _float32_to_bfloat16(fval, truncate=False):
+        ival = int.from_bytes(struct.pack("<f", fval), "little")
+        if truncate:
+            return ival >> 16
+        if math.isnan(fval):
+            return 0x7FC0
+        return (ival + 0x7FFF + ((ival >> 16) & 1)) >> 16
 
-# Graph cleanup / constant folding is optional: without these packages the raw
-# ONNX graph is handed to TensorRT, which performs the same optimizations itself.
+    onnx.helper.float32_to_bfloat16 = _float32_to_bfloat16
+
+# Optional: without them the raw graph goes to TensorRT, which does the same optimizations.
 try:
     import onnx_graphsurgeon as gs
 except ImportError:
@@ -57,303 +53,121 @@ try:
 except ImportError:
     fold_constants = None
 
-from modules import sd_hijack, sd_unet
-
-from datastructures import ProfileSettings
-
 
 def infer_onnx_shapes(onnx_graph):
-    is_large = False
     try:
-        is_large = onnx_graph.ByteSize() > 2147483648
+        small = onnx_graph.ByteSize() <= 2**31
     except Exception:
-        is_large = True
-
-    if not is_large:
+        small = False
+    if small:
         return shape_inference.infer_shapes(onnx_graph)
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        onnx_orig_path = os.path.join(temp_dir, "model.onnx")
-        onnx_inferred_path = os.path.join(temp_dir, "inferred.onnx")
-        onnx.save_model(
-            onnx_graph,
-            onnx_orig_path,
-            save_as_external_data=True,
-            all_tensors_to_one_file=True,
-            convert_attribute=False,
-        )
-        onnx.shape_inference.infer_shapes_path(onnx_orig_path, onnx_inferred_path)
-        return onnx.load(onnx_inferred_path)
+    with tempfile.TemporaryDirectory() as temp_dir:  # protobuf can't hold > 2 GB
+        src, dst = os.path.join(temp_dir, "model.onnx"), os.path.join(temp_dir, "inferred.onnx")
+        onnx.save_model(onnx_graph, src, save_as_external_data=True, all_tensors_to_one_file=True, convert_attribute=False)
+        shape_inference.infer_shapes_path(src, dst)
+        return onnx.load(dst)
 
 
-class UNetModel(torch.nn.Module):
-    def __init__(
-        self, unet, embedding_dim: int, text_minlen: int = 77, is_xl: bool = False
-    ) -> None:
-        super().__init__()
+def optimize_onnx(onnx_graph):
+    if gs is None:
+        print("[TensorRT] onnx-graphsurgeon not installed; skipping ONNX graph cleanup.", flush=True)
+        return infer_onnx_shapes(onnx_graph)
+    graph = gs.import_onnx(onnx_graph)
+    graph.cleanup().toposort()
+    if fold_constants is not None:
+        graph = gs.import_onnx(fold_constants(gs.export_onnx(graph), allow_onnxruntime_shape_inference=True))
+    graph = gs.import_onnx(infer_onnx_shapes(gs.export_onnx(graph)))
+    graph.cleanup().toposort()
+    return gs.export_onnx(graph)
+
+
+class UNetModel:
+    num_xl_classes = 2816  # SDXL's "y" (pooled text embedding + size/crop conditioning)
+    dyn_axes = {
+        "sample": {0: "2B", 2: "H", 3: "W"},
+        "encoder_hidden_states": {0: "2B", 1: "77N"},
+        "timesteps": {0: "2B"},
+        "latent": {0: "2B", 2: "H", 3: "W"},
+        "y": {0: "2B"},
+    }
+
+    def __init__(self, unet, embedding_dim: int, is_xl: bool = False):
         self.unet = unet
-        self.is_xl = is_xl
-
-        self.text_minlen = text_minlen
         self.embedding_dim = embedding_dim
-        self.num_xl_classes = 2816  # Magic number for num_classes
-        self.emb_chn = 1280
-        self.in_channels = self.unet.in_channels
-
-        self.dyn_axes = {
-            "sample": {0: "2B", 2: "H", 3: "W"},
-            "encoder_hidden_states": {0: "2B", 1: "77N"},
-            "timesteps": {0: "2B"},
-            "latent": {0: "2B", 2: "H", 3: "W"},
-            "y": {0: "2B"},
-        }
+        self.is_xl = is_xl
+        self.in_channels = unet.in_channels
 
     def apply_torch_model(self):
-        def disable_checkpoint(self):
-            if getattr(self, "use_checkpoint", False) == True:
-                self.use_checkpoint = False
-            if getattr(self, "checkpoint", False) == True:
-                self.checkpoint = False
+        """Make the UNet traceable: no gradient checkpointing, no attention hijacks (A1111)."""
+
+        def disable_checkpoint(module):
+            for attr in ("use_checkpoint", "checkpoint"):
+                if getattr(module, attr, None) is True:
+                    setattr(module, attr, False)
 
         self.unet.apply(disable_checkpoint)
-        self.set_unet("None")
+        sd_hijack.model_hijack.apply_optimizations("None")
 
-    def set_unet(self, ckpt: str):
-        # TODO test if using this with TRT works
-        sd_unet.apply_unet(ckpt)
-        sd_hijack.model_hijack.apply_optimizations(ckpt)
+    def get_input_names(self):
+        return ["sample", "timesteps", "encoder_hidden_states"] + (["y"] if self.is_xl else [])
 
-    def get_input_names(self) -> List[str]:
-        names = ["sample", "timesteps", "encoder_hidden_states"]
-        if self.is_xl:
-            names.append("y")
-        return names
-
-    def get_output_names(self) -> List[str]:
+    def get_output_names(self):
         return ["latent"]
 
-    def get_dynamic_axes(self) -> dict:
-        io_names = self.get_input_names() + self.get_output_names()
-        dyn_axes = {name: self.dyn_axes[name] for name in io_names}
-        return dyn_axes
+    def get_dynamic_axes(self):
+        return {name: self.dyn_axes[name] for name in self.get_input_names() + self.get_output_names()}
 
-    def get_sample_input(
-        self,
-        batch_size: int,
-        latent_height: int,
-        latent_width: int,
-        text_len: int,
-        device: str = "cuda",
-        dtype: torch.dtype = torch.float32,
-    ) -> Tuple[torch.Tensor]:
+    def get_sample_input(self, batch_size, latent_height, latent_width, text_len, device="cuda", dtype=torch.float32):
         inputs = [
-            torch.randn(
-                batch_size,
-                self.in_channels,
-                latent_height,
-                latent_width,
-                dtype=dtype,
-                device=device,
-            ),
+            torch.randn(batch_size, self.in_channels, latent_height, latent_width, dtype=dtype, device=device),
             torch.randn(batch_size, dtype=dtype, device=device),
-            torch.randn(
-                batch_size,
-                text_len,
-                self.embedding_dim,
-                dtype=dtype,
-                device=device,
-            ),
+            torch.randn(batch_size, text_len, self.embedding_dim, dtype=dtype, device=device),
         ]
         if self.is_xl:
-            inputs.append(
-                torch.randn(batch_size, self.num_xl_classes, dtype=dtype, device=device)
-            )
+            inputs.append(torch.randn(batch_size, self.num_xl_classes, dtype=dtype, device=device))
         return tuple(inputs)
 
     def get_input_profile(self, profile: ProfileSettings) -> dict:
-        min_batch, opt_batch, max_batch = profile.get_a1111_batch_dim()
-        (
-            min_latent_height,
-            latent_height,
-            max_latent_height,
-            min_latent_width,
-            latent_width,
-            max_latent_width,
-        ) = profile.get_latent_dim()
-
-        shape_dict = {
-            "sample": [
-                (min_batch, self.unet.in_channels, min_latent_height, min_latent_width),
-                (opt_batch, self.unet.in_channels, latent_height, latent_width),
-                (max_batch, self.unet.in_channels, max_latent_height, max_latent_width),
-            ],
-            "timesteps": [(min_batch,), (opt_batch,), (max_batch,)],
-            "encoder_hidden_states": [
-                (min_batch, profile.t_min, self.embedding_dim),
-                (opt_batch, profile.t_opt, self.embedding_dim),
-                (max_batch, profile.t_max, self.embedding_dim),
-            ],
+        batch = profile.get_batch_dim()
+        h_min, h_opt, h_max, w_min, w_opt, w_max = profile.get_latent_dim()
+        shapes = {
+            "sample": [(b, self.in_channels, h, w) for b, h, w in zip(batch, (h_min, h_opt, h_max), (w_min, w_opt, w_max))],
+            "timesteps": [(b,) for b in batch],
+            "encoder_hidden_states": [(b, t, self.embedding_dim) for b, t in zip(batch, (profile.t_min, profile.t_opt, profile.t_max))],
         }
         if self.is_xl:
-            shape_dict["y"] = [
-                (min_batch, self.num_xl_classes),
-                (opt_batch, self.num_xl_classes),
-                (max_batch, self.num_xl_classes),
-            ]
+            shapes["y"] = [(b, self.num_xl_classes) for b in batch]
+        return shapes
 
-        return shape_dict
+    def export_weights_map(self, onnx_path: str, weights_map_path: str):
+        """Map UNet weight names to ONNX initializers (for LoRA refits) by matching their fp16 data.
+        Constant folding may have transposed weights, so transposes are matched too."""
+        onnx_dir = os.path.dirname(onnx_path)
+        by_hash = {}
+        for init in onnx.load(onnx_path, load_external_data=False).graph.initializer:  # read one at a time
+            data = numpy_helper.to_array(init, base_dir=onnx_dir).astype(np.float16)
+            by_hash.setdefault(hash(data.tobytes()), []).append((init.name, list(data.shape)))
 
-    # Helper utility for weights map
-    def export_weights_map(self, onnx_opt_path: str, weights_map_path: dict):
-        onnx_opt_dir = os.path.dirname(onnx_opt_path)
         state_dict = self.unet.state_dict()
-        # Initializers are read one at a time below; don't load all external data (~5 GB for SDXL).
-        onnx_opt_model = onnx.load(onnx_opt_path, load_external_data=False)
+        names, shapes = {}, {}
+        for name, weight in state_dict.items():
+            wt = weight.detach().to(torch.float16).cpu().numpy()  # through torch: numpy has no bf16/fp8
+            for transposed, data in ((False, wt), (True, wt.T)):
+                candidates = by_hash.get(hash(data.tobytes()))
+                if candidates:
+                    match = next((c for c in candidates if c[0] == name), candidates[0])  # identical tensors: prefer the name
+                    candidates.remove(match)
+                    names[name], shapes[name] = match[0], (match[1], transposed)
+                    break
 
-        # Create initializer data hashes
-        def init_hash_map(onnx_opt_model):
-            initializer_hash_mapping = {}
-            for initializer in onnx_opt_model.graph.initializer:
-                initializer_data = numpy_helper.to_array(
-                    initializer, base_dir=onnx_opt_dir
-                ).astype(np.float16)
-                initializer_hash = hash(initializer_data.data.tobytes())
-                initializer_hash_mapping[initializer.name] = (
-                    initializer_hash,
-                    initializer_data.shape,
-                )
-            return initializer_hash_mapping
-
-        initializer_hash_mapping = init_hash_map(onnx_opt_model)
-
-        weights_name_mapping = {}
-        weights_shape_mapping = {}
-        # set to keep track of initializers already added to the name_mapping dict
-        initializers_mapped = set()
-        for wt_name, wt in state_dict.items():
-            # get weight hash
-            # Go through torch for the fp16 cast: numpy has no bf16/fp8 dtypes.
-            wt = wt.detach().to(torch.float16).cpu().numpy()
-            wt_hash = hash(wt.data.tobytes())
-            wt_t_hash = hash(np.transpose(wt).data.tobytes())
-
-            for initializer_name, (
-                initializer_hash,
-                initializer_shape,
-            ) in initializer_hash_mapping.items():
-                # Due to constant folding, some weights are transposed during export
-                # To account for the transpose op, we compare the initializer hash to the
-                # hash for the weight and its transpose
-                if wt_hash == initializer_hash or wt_t_hash == initializer_hash:
-                    # The assert below ensures there is a 1:1 mapping between
-                    # PyTorch and ONNX weight names. It can be removed in cases where 1:many
-                    # mapping is found and name_mapping[wt_name] = list()
-                    assert initializer_name not in initializers_mapped
-                    weights_name_mapping[wt_name] = initializer_name
-                    initializers_mapped.add(initializer_name)
-                    is_transpose = False if wt_hash == initializer_hash else True
-                    weights_shape_mapping[wt_name] = (
-                        initializer_shape,
-                        is_transpose,
-                    )
-
-        unmatched = [n for n in state_dict if n not in weights_name_mapping]
-        print(
-            f"[TensorRT] UNet: {len(weights_name_mapping)} of {len(state_dict)} weights matched ONNX initializers",
-            flush=True,
-        )
+        unmatched = [n for n in state_dict if n not in names]
+        print(f"[TensorRT] UNet: {len(names)} of {len(state_dict)} weights matched ONNX initializers", flush=True)
         if len(unmatched) > 0.02 * len(state_dict):
             raise RuntimeError(
                 f"{len(unmatched)} UNet weights (e.g. {unmatched[0]}) don't match the exported ONNX model, so "
                 "LoRAs couldn't be applied to them. The ONNX model was probably exported while a LoRA was "
-                "active, or from a different version of this checkpoint. Delete "
-                f"{os.path.basename(onnx_opt_path)} (models/Unet-onnx) and re-export the engine, then convert "
-                "the LoRA again."
+                f"active, or from a different version of this checkpoint. Delete {os.path.basename(onnx_path)} "
+                "(models/Unet-onnx) and re-export the engine, then convert the LoRA again."
             )
-
-        assert weights_name_mapping.keys() == weights_shape_mapping.keys()
-        with open(weights_map_path, "w") as fp:
-            json.dump([weights_name_mapping, weights_shape_mapping], fp)
-
-    @staticmethod
-    def optimize(name, onnx_graph, verbose=False):
-        if gs is None:
-            print("[TensorRT] onnx-graphsurgeon not installed; skipping ONNX graph cleanup.", flush=True)
-            return infer_onnx_shapes(onnx_graph)
-        opt = Optimizer(onnx_graph, verbose=verbose)
-        opt.info(name + ": original")
-        opt.cleanup()
-        opt.info(name + ": cleanup")
-        if fold_constants is not None:
-            opt.fold_constants()
-            opt.info(name + ": fold constants")
-        opt.infer_shapes()
-        opt.info(name + ": shape inference")
-        onnx_opt_graph = opt.cleanup(return_onnx=True)
-        opt.info(name + ": finished")
-        return onnx_opt_graph
-
-
-class Optimizer:
-    def __init__(self, onnx_graph, verbose=False):
-        self.graph = gs.import_onnx(onnx_graph)
-        self.verbose = verbose
-
-    def info(self, prefix):
-        if self.verbose:
-            print(
-                f"{prefix} .. {len(self.graph.nodes)} nodes, {len(self.graph.tensors().keys())} tensors, {len(self.graph.inputs)} inputs, {len(self.graph.outputs)} outputs"
-            )
-
-    def cleanup(self, return_onnx=False):
-        self.graph.cleanup().toposort()
-        if return_onnx:
-            return gs.export_onnx(self.graph)
-
-    def select_outputs(self, keep, names=None):
-        self.graph.outputs = [self.graph.outputs[o] for o in keep]
-        if names:
-            for i, name in enumerate(names):
-                self.graph.outputs[i].name = name
-
-    def fold_constants(self, return_onnx=False):
-        onnx_graph = fold_constants(
-            gs.export_onnx(self.graph), allow_onnxruntime_shape_inference=True
-        )
-        self.graph = gs.import_onnx(onnx_graph)
-        if return_onnx:
-            return onnx_graph
-
-    def infer_shapes(self, return_onnx=False):
-        onnx_graph = infer_onnx_shapes(gs.export_onnx(self.graph))
-        self.graph = gs.import_onnx(onnx_graph)
-        if return_onnx:
-            return onnx_graph
-
-    def clip_add_hidden_states(self, return_onnx=False):
-        hidden_layers = -1
-        onnx_graph = gs.export_onnx(self.graph)
-        for i in range(len(onnx_graph.graph.node)):
-            for j in range(len(onnx_graph.graph.node[i].output)):
-                name = onnx_graph.graph.node[i].output[j]
-                if "layers" in name:
-                    hidden_layers = max(
-                        int(name.split(".")[1].split("/")[0]), hidden_layers
-                    )
-        for i in range(len(onnx_graph.graph.node)):
-            for j in range(len(onnx_graph.graph.node[i].output)):
-                if onnx_graph.graph.node[i].output[
-                    j
-                ] == "/text_model/encoder/layers.{}/Add_1_output_0".format(
-                    hidden_layers - 1
-                ):
-                    onnx_graph.graph.node[i].output[j] = "hidden_states"
-            for j in range(len(onnx_graph.graph.node[i].input)):
-                if onnx_graph.graph.node[i].input[
-                    j
-                ] == "/text_model/encoder/layers.{}/Add_1_output_0".format(
-                    hidden_layers - 1
-                ):
-                    onnx_graph.graph.node[i].input[j] = "hidden_states"
-        if return_onnx:
-            return onnx_graph
+        with open(weights_map_path, "w") as f:
+            json.dump([names, shapes], f)
