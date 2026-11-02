@@ -36,10 +36,26 @@ def get_cc():
 cc_major, cc_minor = get_cc()
 
 
+def installed_trt_version() -> str:
+    try:
+        import tensorrt
+
+        return tensorrt.__version__
+    except Exception:
+        return ""
+
+
+def same_trt_release(a: str, b: str) -> bool:
+    """Engines only load on the TensorRT major.minor release they were built with."""
+    return a.split(".")[:2] == b.split(".")[:2]
+
+
 class ModelManager:
     def __init__(self, model_file=MODEL_FILE) -> None:
         self.all_models = {}
         self.model_file = model_file
+        self.trt_version = installed_trt_version()
+        self._reported_incompatible = set()
         self.refresh_cc()
         if not os.path.exists(model_file):
             warning("Model file does not exist. Creating new one.")
@@ -131,7 +147,8 @@ class ModelManager:
         lora,
     ):
         config = ModelConfig(
-            profile, static_shapes, fp32, inpaint, refit, lora, vram, unet_hidden_dim
+            profile, static_shapes, fp32, inpaint, refit, lora, vram, unet_hidden_dim,
+            trt_version=self.trt_version,
         )
         trt_name, trt_path = self.get_trt_path(
             model_name, model_hash, profile, static_shapes
@@ -143,6 +160,10 @@ class ModelManager:
 
         if base_model_name not in self.all_models[self.cc]:
             self.all_models[self.cc][base_model_name] = []
+        # A rebuild (Force Rebuild / new TensorRT version) overwrites the same file: replace its entry.
+        self.all_models[self.cc][base_model_name] = [
+            m for m in self.all_models[self.cc][base_model_name] if m["filepath"] != trt_name
+        ]
         self.all_models[self.cc][base_model_name].append(
             {
                 "filepath": trt_name,
@@ -194,9 +215,54 @@ class ModelManager:
         return out
 
     def available_models(self):
+        """Engines for this GPU that the installed TensorRT can load. Engines recorded as
+        built with another TensorRT release are hidden (legacy entries without a version
+        are kept; loading them reports a clear error if they're incompatible)."""
         self.refresh_cc()
-        available = self.all_models.get(self.cc, {})
+        available = {}
+        for base_model, models in self.all_models.get(self.cc, {}).items():
+            usable = []
+            for m in models:
+                built_with = getattr(m["config"], "trt_version", "")
+                if built_with and self.trt_version and not same_trt_release(built_with, self.trt_version):
+                    if m["filepath"] not in self._reported_incompatible:
+                        self._reported_incompatible.add(m["filepath"])
+                        print(
+                            f"[TensorRT] Ignoring {m['filepath']}: built with TensorRT {built_with}, "
+                            f"installed is {self.trt_version}. Rebuild it from the TensorRT tab.",
+                            flush=True,
+                        )
+                    continue
+                usable.append(m)
+            if usable:
+                available[base_model] = usable
         return available
+
+    def all_engines(self):
+        """(cc, base_model, entry) for every recorded engine, for the management UI."""
+        for cc, base_models in self.all_models.items():
+            for base_model, models in base_models.items():
+                for m in models:
+                    yield cc, base_model, m
+
+    def delete_engine(self, filepath: str) -> bool:
+        """Delete an engine file and its model.json entry."""
+        found = False
+        for cc, base_models in self.all_models.items():
+            for base_model in list(base_models):
+                kept = [m for m in base_models[base_model] if m["filepath"] != filepath]
+                if len(kept) != len(base_models[base_model]):
+                    found = True
+                    if kept:
+                        base_models[base_model] = kept
+                    else:
+                        base_models.pop(base_model)
+        path = os.path.join(TRT_MODEL_DIR, filepath)
+        if os.path.basename(filepath) == filepath and os.path.isfile(path):
+            os.remove(path)
+            found = True
+        self.write_json()
+        return found
 
     def available_loras(self):
         available = {}

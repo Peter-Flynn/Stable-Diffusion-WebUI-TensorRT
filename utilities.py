@@ -183,6 +183,7 @@ class Engine:
         enable_all_tactics=False,  # kept for API compatibility (Polygraphy-only option)
         timing_cache=None,
         update_output_names=None,
+        optimization_level=None,
     ):
         print(f"[TensorRT] Building engine for {onnx_path}: {self.engine_path}", flush=True)
         builder = trt.Builder(TRT_LOGGER)
@@ -215,6 +216,10 @@ class Engine:
             )
         elif fp16:
             config.set_flag(trt.BuilderFlag.FP16)
+
+        if optimization_level is not None and hasattr(config, "builder_optimization_level"):
+            # 0-5, TensorRT default 3. Higher searches more tactics: slower builds, sometimes faster engines.
+            config.builder_optimization_level = int(optimization_level)
 
         if enable_refit:
             refit_flag = getattr(trt.BuilderFlag, "REFIT", None)
