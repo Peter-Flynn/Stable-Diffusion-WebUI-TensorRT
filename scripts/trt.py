@@ -173,6 +173,35 @@ def get_max_prompt_token_count(p) -> (int, dict):
     return final_tokens, info
 
 
+class MissingTrtLora(Exception):
+    def __init__(self, names):
+        super().__init__(f"LoRA not converted for TensorRT: {', '.join(names)}")
+        self.names = names
+
+
+def resolve_trt_lora(tag_name: str, available: dict):
+    """Path of the converted .lora for a prompt tag. Tags may use the file name or the alias
+    from the LoRA's metadata (reForge's LoRA cards insert the alias by default), so resolve them
+    through the LoRA extension like the WebUI does. Converted files are named after the file."""
+    if tag_name in available:
+        return available[tag_name]
+    try:
+        from exporter import _import_lora_networks
+
+        networks = _import_lora_networks()
+        entry = networks.available_network_aliases.get(tag_name)
+        if entry is None and not networks.available_network_aliases:
+            networks.list_available_networks()
+            entry = networks.available_network_aliases.get(tag_name)
+        if entry is not None:
+            for key in (entry.name, os.path.splitext(os.path.basename(entry.filename))[0]):
+                if key in available:
+                    return available[key]
+    except Exception as e:
+        print(f"[TensorRT] Could not resolve LoRA alias '{tag_name}': {e}", flush=True)
+    return None
+
+
 class NoProfileError(RuntimeError):
     pass
 
@@ -735,6 +764,7 @@ class TensorRTScript(scripts.Script):
         # Get pathes
         print("[TensorRT] Applying LoRAs: " + str(loras))
         available = modelmanager.available_loras()
+        missing = []
         for lora in loras:
             # <lora:name> or <lora:name:scale> (extra fields after the scale are ignored)
             lora_parts = lora.split(":")[1:]
@@ -742,14 +772,16 @@ class TensorRTScript(scripts.Script):
                 raise ValueError(f"Invalid LoRA tag: <{lora}>")
             lora_name = lora_parts[0]
             lora_scale = float(lora_parts[1]) if len(lora_parts) > 1 and lora_parts[1] else 1.0
+            path = resolve_trt_lora(lora_name, available)
+            if path is None:
+                missing.append(lora_name)
+                continue
             lora_scales.append(lora_scale)
-            if lora_name not in available:
-                raise Exception(
-                    f"Please export the LoRA checkpoint {lora_name} first from the TensorRT LoRA tab"
-                )
-            lora_pathes.append(
-                available[lora_name]
-            )
+            lora_pathes.append(path)
+
+        if missing:
+            self.lora_hash = ""  # retry next time (e.g. after converting the LoRA)
+            raise MissingTrtLora(missing)
 
         # Merge lora refit dicts
         base_name, base_path = modelmanager.get_onnx_path(p.sd_model_name)
@@ -841,6 +873,13 @@ class TensorRTScript(scripts.Script):
         try:
             if not self.torch_unet:
                 self.get_loras(p)
+        except MissingTrtLora as e:
+            # PyTorch handles LoRAs natively: use it for this generation instead of failing.
+            _notify(
+                f"LoRA {', '.join(e.names)} hasn't been converted for TensorRT (TensorRT tab -> TensorRT LoRA); "
+                "using PyTorch for this generation."
+            )
+            self.torch_unet = True
         except Exception as e:
             raise gr.Error(str(e))
 
@@ -868,7 +907,7 @@ class TensorRTScript(scripts.Script):
             sd_unet.current_unet.deactivate()
 
         if self.torch_unet:
-            gr.Warning("Enabling PyTorch fallback as no engine was found.")
+            print("[TensorRT] Using PyTorch for this generation.", flush=True)
             sd_unet.current_unet = None
             sd_unet.current_unet_option = sd_unet_option
             unet_memory.restore_torch_unet()
