@@ -1,400 +1,219 @@
-import gc
-import os
-import sys
-import math
-import time
-import shutil
+import importlib
+import inspect
 import json
+import math
+import os
+import shutil
+import sys
+import time
 from pathlib import Path
-from logging import info, error
-from collections import OrderedDict
-from typing import List, Tuple
 
-import torch
-import torch.nn.functional as F
 import numpy as np
 import onnx
+import torch
+import torch.nn.functional as F
 from onnx import numpy_helper
 from onnx.external_data_helper import uses_external_data
 
+from modules import devices, paths_internal, shared
 
-def check_model_uses_external_data(model) -> bool:
-    return any(uses_external_data(init) for init in model.graph.initializer)
-
-
-from modules import shared
-
-from utilities import Engine
-from datastructures import ProfileSettings
-from model_helper import UNetModel
 import unet_memory
+from datastructures import ProfileSettings
+from model_helper import UNetModel, optimize_onnx
+from utilities import Engine
+
+TRACE_RESOLUTION = 512  # the graph's spatial axes are dynamic; tracing small saves VRAM
 
 
-def _import_lora_networks():
+def import_lora_networks():
     try:
-        import networks  # importable once the built-in Lora extension is loaded
+        import networks
 
         return networks
     except ImportError:
         pass
-    import importlib
-
-    sys.path.append(os.path.join("extensions-builtin", "Lora"))
+    path = os.path.join(paths_internal.script_path, "extensions-builtin", "Lora")
+    if path not in sys.path:
+        sys.path.append(path)
     try:
         return importlib.import_module("networks")
     except Exception as e:
         raise RuntimeError(f"The built-in Lora extension could not be imported: {e}")
 
 
-def _forge_patched_state_dict(unet: torch.nn.Module):
-    """reForge/Forge attach LoRAs to the UNet's ModelPatcher instead of merging them into
-    the torch weights, so the module's state_dict() never changes. Compute the merged
-    weights for the patched keys without modifying the live model. Returns None on A1111."""
-    try:
-        import ldm_patched.modules.lora as forge_lora
+def _forge_merged_weights(unet: torch.nn.Module) -> dict:
+    """reForge keeps LoRAs as patches on the UNet's ModelPatcher, so the module's weights never
+    change: merge the patched ones on the CPU without touching the live model."""
+    import ldm_patched.modules.lora as forge_lora
 
-        patcher = shared.sd_model.forge_objects.unet
-        patches = patcher.patches
-    except Exception:
-        return None
-    if not patches:
-        return None
-
-    state_dict = dict(unet.state_dict())
-    prefix = "diffusion_model."
-    merged = 0
+    sd_model = shared.sd_model
+    patches = getattr(sd_model, "forge_objects_after_applying_lora", sd_model.forge_objects).unet.patches
+    state_dict = unet.state_dict()
+    merged = {}
     for key, key_patches in patches.items():
-        name = key[len(prefix):] if key.startswith(prefix) else key
-        if name not in state_dict:
-            continue
-        # Merge on the CPU in fp32 and keep the result in fp16: an SDXL LoRA touches hundreds of
-        # large weights, and fp32 copies of all of them don't fit next to the UNet in VRAM.
-        weight = state_dict[name].detach().to(device="cpu", dtype=torch.float32, copy=True)
-        state_dict[name] = forge_lora.calculate_weight(key_patches, weight, key).to(torch.float16)
-        merged += 1
-    print(f"[TensorRT] Merged LoRA patches into {merged} UNet weights.", flush=True)
-    return state_dict
+        name = key.removeprefix("diffusion_model.")
+        if name in state_dict:
+            # fp32 math, fp16 result on the CPU: fp32 copies of an SDXL LoRA's weights don't fit in VRAM
+            weight = state_dict[name].detach().to(device="cpu", dtype=torch.float32, copy=True)
+            merged[name] = forge_lora.calculate_weight(key_patches, weight, key).to(torch.float16)
+    print(f"[TensorRT] Merged LoRA patches into {len(merged)} UNet weights.", flush=True)
+    return merged
 
 
-def apply_lora(model: torch.nn.Module, lora_path: str, inputs: Tuple[torch.Tensor]) -> dict:
-    """Load a LoRA through the WebUI and return the UNet state dict with the LoRA merged in."""
-    networks = _import_lora_networks()
-    lora_name = os.path.splitext(os.path.basename(lora_path))[0]
-
-    if not unet_memory.IS_FORGE_BACKEND:
-        model.forward(*inputs)  # A1111 applies LoRAs to the modules during forward
-    networks.load_networks([lora_name], [1.0], [1.0], [None])
-
-    state_dict = _forge_patched_state_dict(model)
-    if state_dict is not None:
-        # Undo the LoRA selection so it doesn't leak into the next PyTorch generation.
+def lora_state_dict(modelobj: UNetModel, lora_name: str) -> dict:
+    """UNet weights with the LoRA merged in: the changed ones on reForge, all of them on A1111."""
+    networks = import_lora_networks()
+    if unet_memory.IS_FORGE_BACKEND:
+        networks.load_networks([lora_name], [1.0], [1.0], [None])
         try:
-            networks.load_networks([], [], [], [])
-        except Exception:
-            pass
-        return state_dict
-
-    # A1111: the LoRA is merged into the module weights during forward.
-    model.forward(*inputs)
-    return model.state_dict()
-
-
-def get_refit_weights(
-    state_dict: dict, onnx_opt_path: str, weight_name_mapping: dict, weight_shape_mapping: dict
-) -> dict:
-    """fp16 deltas (LoRA-merged weight - ONNX initializer) for the weights that changed."""
-    refit_weights = OrderedDict()
-    onnx_opt_dir = os.path.dirname(onnx_opt_path)
-    # Read initializers one at a time instead of loading the whole model into RAM.
-    onnx_opt_model = onnx.load(onnx_opt_path, load_external_data=False)
-    initializer_to_torch = {v: k for k, v in weight_name_mapping.items()}
-
-    for initializer in onnx_opt_model.graph.initializer:
-        torch_name = initializer_to_torch.get(initializer.name)
-        if torch_name is None:
-            continue
-        initializer_data = numpy_helper.to_array(initializer, base_dir=onnx_opt_dir).astype(np.float16)
-
-        wt = state_dict[torch_name].detach()
-        initializer_shape, is_transpose = weight_shape_mapping[torch_name]
-        wt = torch.transpose(wt, 0, 1) if is_transpose else torch.reshape(wt, initializer_shape)
-        wt = wt.to(device="cpu", dtype=torch.float16)
-
-        base = torch.from_numpy(initializer_data)
-        if not torch.equal(wt, base):
-            refit_weights[initializer.name] = (wt - base).contiguous()  # on the CPU, not accumulating in VRAM
-
-    return refit_weights
-
-
-def export_lora(
-    modelobj: UNetModel,
-    onnx_path: str,
-    weights_map_path: str,
-    lora_name: str,
-    profile: ProfileSettings,
-) -> dict:
-    info("Exporting LoRA weights...")
-    inputs = modelobj.get_sample_input(
-        2,
-        min(profile.h_opt, TRACE_RESOLUTION) // 8,
-        min(profile.w_opt, TRACE_RESOLUTION) // 8,
-        profile.t_opt,
-    )
-
-    with open(weights_map_path, "r") as fp_wts:
-        print(f"[I] Loading weights map: {weights_map_path} ")
-        [weights_name_mapping, weights_shape_mapping] = json.load(fp_wts)
-
+            return _forge_merged_weights(modelobj.unet)
+        finally:
+            networks.load_networks([], [], [], [])  # don't leave it selected for the next generation
+    inputs = modelobj.get_sample_input(2, TRACE_RESOLUTION // 8, TRACE_RESOLUTION // 8, 77)
     with torch.inference_mode(), torch.autocast("cuda"):
-        state_dict = apply_lora(
-            modelobj.unet, os.path.splitext(lora_name)[0], inputs
-        )
-
-        refit_dict = get_refit_weights(
-            state_dict,
-            onnx_path,
-            weights_name_mapping,
-            weights_shape_mapping,
-        )
-
-    return refit_dict
+        modelobj.unet.forward(*inputs)
+        networks.load_networks([lora_name], [1.0], [1.0], [None])
+        modelobj.unet.forward(*inputs)  # A1111 merges LoRAs into the weights during forward
+    return modelobj.unet.state_dict()
 
 
-def _math_scaled_dot_product_attention(
-    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
-):
-    scale_factor = 1.0 / math.sqrt(query.size(-1)) if scale is None else scale
-    scores = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
+def export_lora(modelobj: UNetModel, onnx_path: str, weights_map_path: str, lora_name: str) -> dict:
+    """fp16 deltas (merged weight - base) for the ONNX initializers the LoRA changes."""
+    with open(weights_map_path) as f:
+        names, shapes = json.load(f)
+    state_dict = lora_state_dict(modelobj, lora_name)
+    to_torch = {v: k for k, v in names.items()}
+    onnx_dir = os.path.dirname(onnx_path)
+    deltas = {}
+    with torch.inference_mode():
+        for init in onnx.load(onnx_path, load_external_data=False).graph.initializer:  # read one at a time
+            name = to_torch.get(init.name)
+            if name not in state_dict:
+                continue
+            shape, transposed = shapes[name]
+            wt = state_dict[name].detach()
+            wt = (wt.permute(*range(wt.dim() - 1, -1, -1)) if transposed else wt.reshape(shape)).to(device="cpu", dtype=torch.float16)
+            base = torch.from_numpy(numpy_helper.to_array(init, base_dir=onnx_dir).astype(np.float16))
+            if not torch.equal(wt, base):
+                deltas[init.name] = (wt - base).contiguous()
+    return deltas
+
+
+def _math_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kwargs):
+    scores = torch.matmul(query, key.transpose(-2, -1)) * (1.0 / math.sqrt(query.size(-1)) if scale is None else scale)
     if is_causal:
-        L, S = query.size(-2), key.size(-2)
-        mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
+        mask = torch.ones(query.size(-2), key.size(-2), dtype=torch.bool, device=query.device).tril()
         scores = scores.masked_fill(~mask, float("-inf"))
     if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            scores = scores.masked_fill(~attn_mask, float("-inf"))
-        else:
-            scores = scores + attn_mask
-    attn_weights = torch.softmax(scores, dim=-1)
-    return torch.matmul(attn_weights, value)
-
-
-TRACE_RESOLUTION = 512
+        scores = scores.masked_fill(~attn_mask, float("-inf")) if attn_mask.dtype == torch.bool else scores + attn_mask
+    return torch.matmul(torch.softmax(scores, dim=-1), value)
 
 
 def swap_sdpa(func):
+    """Trace attention as matmul + softmax, which exports to ONNX and which TensorRT fuses: the math
+    version of PyTorch's fused SDPA, and reForge's PyTorch attention instead of xformers, sage, ..."""
+
     def wrapper(*args, **kwargs):
-        old_sdpa = getattr(F, "scaled_dot_product_attention", None)
-        # Instead of deleting scaled_dot_product_attention (which causes AttributeError in reForge/ldm_patched),
-        # replace it with a pure-math implementation that is 100% exportable to ONNX across all backends.
+        swaps = [(F, "scaled_dot_product_attention", _math_sdpa)]
         try:
-            setattr(F, "scaled_dot_product_attention", _math_scaled_dot_product_attention)
+            import ldm_patched.ldm.modules.attention as attention
+
+            swaps += [(attention, name, attention.attention_pytorch) for name in ("optimized_attention", "optimized_attention_masked")]
         except Exception:
             pass
+        originals = [(owner, name, getattr(owner, name)) for owner, name, _ in swaps]
+        for owner, name, replacement in swaps:
+            setattr(owner, name, replacement)
         try:
-            ret = func(*args, **kwargs)
+            return func(*args, **kwargs)
         finally:
-            if old_sdpa is not None:
-                try:
-                    setattr(F, "scaled_dot_product_attention", old_sdpa)
-                except Exception:
-                    pass
-        return ret
+            for owner, name, original in originals:
+                setattr(owner, name, original)
 
     return wrapper
 
 
 @swap_sdpa
-def export_onnx(
-    onnx_path: str,
-    modelobj: UNetModel,
-    profile: ProfileSettings,
-    opset: int = 17,
-    diable_optimizations: bool = False,
-):
-    print(f"[TensorRT] Preparing weights for ONNX export...", flush=True)
-    # The exported graph has dynamic batch/height/width/token axes, so the trace
-    # resolution doesn't affect the engine. Tracing small keeps VRAM use low.
+def export_onnx(onnx_path: str, modelobj: UNetModel, profile: ProfileSettings, disable_optimizations: bool = False):
     inputs = modelobj.get_sample_input(
-        2,
-        min(profile.h_opt, TRACE_RESOLUTION) // 8,
-        min(profile.w_opt, TRACE_RESOLUTION) // 8,
-        profile.t_opt,
+        2, min(profile.h_opt, TRACE_RESOLUTION) // 8, min(profile.w_opt, TRACE_RESOLUTION) // 8, profile.t_opt
     )
-
-    if not os.path.exists(onnx_path):
-        _export_onnx(
-            modelobj.unet,
-            inputs,
-            Path(onnx_path),
-            opset,
-            modelobj.get_input_names(),
-            modelobj.get_output_names(),
-            modelobj.get_dynamic_axes(),
-            modelobj.optimize if not diable_optimizations else None,
-        )
-    else:
-        print(f"[TensorRT] Found existing ONNX model: {onnx_path} (skipping re-export)", flush=True)
-
-
-def _export_onnx(
-    model: torch.nn.Module, inputs: Tuple[torch.Tensor], path: str, opset: int, in_names: List[str], out_names: List[str], dyn_axes: dict, optimizer=None
-):
-    tmp_dir = os.path.abspath("onnx_tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-    tmp_path = os.path.join(tmp_dir, "model.onnx")
-    # Ensure all model parameters and buffers are placed on the input device
-    target_device = inputs[0].device if len(inputs) > 0 else torch.device("cuda")
-    try:
-        model = model.to(target_device)
-        for p in model.parameters():
-            if p.device != target_device:
-                p.data = p.data.to(target_device)
-        for b in model.buffers():
-            if b.device != target_device:
-                b.data = b.data.to(target_device)
-    except Exception as e:
-        print(f"[TensorRT] Info: Model parameter device verification: {e}", flush=True)
-
-    export_kwargs = {
-        "export_params": True,
-        "opset_version": max(opset, 17),
-        # PyTorch's constant folding runs on the GPU and can duplicate weight tensors, which
-        # doesn't fit for SDXL on 8-12 GB cards. TensorRT folds constants itself at build time.
-        "do_constant_folding": optimizer is not None,
-        "input_names": in_names,
-        "output_names": out_names,
-        "dynamic_axes": dyn_axes,
-    }
-
-    # In PyTorch >= 2.2 / 2.4, explicitly set dynamo=False to use TorchScript tracer instead of TorchDynamo/FakeTensor
-    import inspect
-    sig = inspect.signature(torch.onnx.export)
-    if "dynamo" in sig.parameters:
-        export_kwargs["dynamo"] = False
-
-    try:
-        print(f"[TensorRT] Exporting PyTorch graph to ONNX (working file: {tmp_path})...", flush=True)
-        print(f"[TensorRT] This may take 1–3 minutes. Please wait...", flush=True)
-        with torch.inference_mode(), torch.autocast("cuda"):
-            torch.onnx.export(
-                model,
-                inputs,
-                tmp_path,
-                **export_kwargs,
-            )
-        print(f"[TensorRT] ONNX graph exported successfully!", flush=True)
-    except Exception as e:
-        print(f"[TensorRT ERROR] ONNX export failed: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        if os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise RuntimeError(f"Error during torch.onnx.export: {e}")
-
-    print(f"[TensorRT] Validating and processing ONNX structure...", flush=True)
-    os.makedirs(path.parent, exist_ok=True)
-    # Write into a staging folder next to the destination and move the files into place at the
-    # end (external data first, the .onnx last). An interrupted export then never leaves a
-    # partial .onnx behind that later exports would pick up as "existing".
+    optimizer = None if disable_optimizations else optimize_onnx
+    path = Path(onnx_path)
+    tmp_dir = path.parent / f".{path.name}.trace"
     stage_dir = path.parent / f".{path.name}.partial"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
     shutil.rmtree(stage_dir, ignore_errors=True)
-    stage_dir.mkdir(parents=True)
-    staged = stage_dir / path.name
+    tmp_dir.mkdir(parents=True)
+    stage_dir.mkdir()
+    tmp_path, staged = tmp_dir / "model.onnx", stage_dir / path.name
+    kwargs = {
+        "opset_version": 17,
+        # PyTorch's constant folding runs on the GPU and can duplicate weights, which doesn't fit for
+        # SDXL on 8-12 GB cards; TensorRT folds constants itself.
+        "do_constant_folding": optimizer is not None,
+        "input_names": modelobj.get_input_names(),
+        "output_names": modelobj.get_output_names(),
+        "dynamic_axes": modelobj.get_dynamic_axes(),
+    }
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        kwargs["dynamo"] = False  # the TorchScript exporter: the dynamo one can't trace these UNets
     try:
-        onnx_model = onnx.load(tmp_path, load_external_data=False)
-        model_uses_external_data = check_model_uses_external_data(onnx_model)
-        if model_uses_external_data:
-            print(f"[TensorRT] Model exceeds 2GB (using external weight data). Saving...", flush=True)
-            onnx_model = onnx.load(tmp_path, load_external_data=True)
+        print("[TensorRT] Exporting the UNet to ONNX (1-3 minutes)...", flush=True)
+        model = modelobj.unet.to(inputs[0].device)
+        with torch.inference_mode(), torch.autocast("cuda"):
+            torch.onnx.export(model, inputs, str(tmp_path), **kwargs)
 
+        onnx_model = onnx.load(str(tmp_path), load_external_data=False)
+        external = any(uses_external_data(t) for t in onnx_model.graph.initializer)
+        if external:  # > 2 GB: exported as one file per tensor, saved as one data file
+            onnx_model = onnx.load(str(tmp_path))
         if optimizer is not None:
-            print(f"[TensorRT] Optimizing ONNX nodes (GraphSurgeon)...", flush=True)
-            onnx_model = optimizer("unet", onnx_model)
-
-        if model_uses_external_data:
-            onnx.save(
-                onnx_model,
-                str(staged),
-                save_as_external_data=True,
-                all_tensors_to_one_file=True,
-                location=path.name + "_data",
-                size_threshold=1024,
-            )
+            onnx_model = optimizer(onnx_model)
+        if external:
+            onnx.save(onnx_model, str(staged), save_as_external_data=True, all_tensors_to_one_file=True, location=path.name + "_data", size_threshold=1024)
         elif optimizer is not None:
             onnx.save(onnx_model, str(staged))
         else:
-            shutil.move(tmp_path, str(staged))
+            shutil.move(str(tmp_path), str(staged))
         del onnx_model
-
+        # Move into place with the .onnx last: an interrupted export never leaves a partial model
+        # that later exports would take as existing.
         for f in sorted(stage_dir.iterdir(), key=lambda f: f.name == path.name):
             os.replace(f, path.parent / f.name)
-    except Exception as e:
-        print(f"[TensorRT ERROR] Saving the ONNX model failed: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        raise RuntimeError(f"Error while saving the ONNX model: {e}")
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
         shutil.rmtree(tmp_dir, ignore_errors=True)
-    print(f"[TensorRT] ONNX model ready at: {path}", flush=True)
+    print(f"[TensorRT] ONNX model saved: {path}", flush=True)
 
 
-def free_gpu_memory():
-    """Release as much VRAM as possible before a TensorRT build: unload models held by
-    reForge/Forge's model manager (they're reloaded on the next generation) and empty
-    PyTorch's cache. TensorRT skips kernels that don't fit, so free memory = faster engines."""
+def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, use_fp16: bool, optimization_level=None, progress_callback=None) -> bool:
+    model = shared.sd_model
+    # A1111: everything off the GPU for the build. reForge: unloaded through its model manager below,
+    # since moving models behind its back desyncs it.
+    move = not unet_memory.IS_FORGE_BACKEND and model is not None and not getattr(model, "lowvram", False)
+    if move:
+        model.cpu()
     unet_memory.free_vram_for_export()
     unet_memory.report_free_vram("for the build")
-
-
-def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, use_fp16: bool, optimization_level: int = None, progress_callback=None):
-    print(f"[TensorRT] Starting TensorRT engine compilation...", flush=True)
-    print(f"[TensorRT] ONNX Input: {onnx_path}", flush=True)
-    print(f"[TensorRT] TRT Output:  {trt_path}", flush=True)
-    print(f"[TensorRT] Timing Cache: {timing_cache}", flush=True)
-    engine = Engine(trt_path)
-
-    model = None
-    # reForge/Forge: free_gpu_memory() unloads everything through the model manager instead;
-    # moving the model by hand would desync the manager (device mismatch errors later).
-    if not unet_memory.IS_FORGE_BACKEND and getattr(shared, "sd_model", None) is not None:
-        try:
-            print(f"[TensorRT] Freeing VRAM: moving base model to RAM...", flush=True)
-            model = shared.sd_model.cpu()
-        except Exception as e:
-            print(f"[TensorRT] Warning: failed to move model to CPU: {e}", flush=True)
-    free_gpu_memory()
-
     try:
-        s = time.time()
-        ret = engine.build(
+        start = time.time()
+        engine = Engine(trt_path)
+        ok = engine.build(
             onnx_path,
             use_fp16,
-            enable_refit=True,
-            enable_preview=True,
+            [profile],
+            refit=True,
             timing_cache=timing_cache,
-            input_profile=[profile],
             optimization_level=optimization_level,
             progress_callback=progress_callback,
         )
-        e = time.time()
-        print(f"[TensorRT] TensorRT engine compilation time: {(e-s):.2f}s", flush=True)
-        if getattr(engine, "build_memory_messages", 0):
-            try:
-                import gradio as gr
+        print(f"[TensorRT] Engine build took {time.time() - start:.0f}s", flush=True)
+        if engine.build_memory_messages:
+            import gradio as gr
 
-                gr.Warning(
-                    "TensorRT skipped some kernels for lack of GPU memory; the engine may be slower. "
-                    "See the console for details."
-                )
-            except Exception:
-                pass
-        return ret
+            gr.Warning("TensorRT skipped some kernels for lack of GPU memory; the engine may be slower. See the console.")
+        return ok
     finally:
-        if model is not None:
-            try:
-                print(f"[TensorRT] Restoring model to GPU memory...", flush=True)
-                shared.sd_model = model.cuda()
-            except Exception as e:
-                print(f"[TensorRT] Warning: failed to restore model to GPU: {e}", flush=True)
+        if move:
+            model.to(devices.device)
