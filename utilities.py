@@ -19,6 +19,7 @@
 # Supports TensorRT 10.x (weakly typed FP16 builds) and TensorRT 11+ (strongly typed
 # builds, where BuilderFlag.FP16 no longer exists and precision comes from the ONNX graph).
 
+import mmap
 import os
 from collections import OrderedDict
 from logging import error, warning
@@ -115,10 +116,11 @@ def trt_to_torch_dtype(dtype):
         raise TypeError(f"Unsupported TensorRT dtype: {dtype}")
 
 
-def _atomic_write(path, data: bytes):
+def _atomic_write(path, data):
+    """Write any buffer (bytes, IHostMemory, ...) without an extra in-memory copy."""
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "wb") as f:
-        f.write(data)
+        f.write(memoryview(data))
     os.replace(tmp_path, path)
 
 
@@ -349,7 +351,7 @@ class Engine:
 
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.engine_path)), exist_ok=True)
-            _atomic_write(self.engine_path, bytes(serialized))
+            _atomic_write(self.engine_path, serialized)  # no bytes() copy: SDXL engines are ~5 GB
         except Exception as e:
             error(f"Failed to save engine: {e}")
             return 1
@@ -385,13 +387,14 @@ class Engine:
 
     def load(self):
         print(f"[TensorRT] Loading engine: {self.engine_path}", flush=True)
-        with open(self.engine_path, "rb") as f:
-            data = f.read()
         if self.runtime is None:
             self.runtime = trt.Runtime(TRT_LOGGER)
         TRT_LOGGER.begin()
         try:
-            self.engine = self.runtime.deserialize_cuda_engine(data)
+            # Memory-map the plan instead of reading it into a Python bytes object, which would
+            # cost an extra engine-sized chunk of RAM (~5 GB for SDXL) during every load.
+            with open(self.engine_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                self.engine = self.runtime.deserialize_cuda_engine(data)
         except Exception as e:
             TRT_LOGGER.errors.append(str(e))
             self.engine = None
@@ -487,10 +490,21 @@ class Engine:
             size = int(getattr(self.engine, "device_memory_size_v2", 0) or self.engine.device_memory_size)
         size = max(size, 1)
 
-        if self._device_memory is None or self._device_memory.numel() < size:
+        current = 0 if self._device_memory is None else self._device_memory.numel()
+        # Grow when needed; also shrink when far too big (e.g. after a large Hires. fix pass),
+        # so the peak isn't held for the rest of the session.
+        if current < size or current > 2 * size:
             self._device_memory = None  # release the old block first
             self._device_memory = torch.empty(size, dtype=torch.uint8, device="cuda")
         self.context.set_device_memory(self._device_memory.data_ptr(), self._device_memory.numel())
+
+    def release_activation_memory(self):
+        """Give the activation memory and staging buffers back to PyTorch between sampling runs
+        (e.g. for the VAE decode). They're re-allocated on the next inference."""
+        if self._user_managed_memory:
+            self._device_memory = None
+            self._input_shapes = {}  # forces set_input_shape + set_device_memory before the next run
+        self.tensors = OrderedDict()
 
     def allocate_buffers(self, shape_dict=None, device="cuda"):
         """Kept for API compatibility: sets input shapes. Buffers are handled in infer()."""

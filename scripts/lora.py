@@ -23,25 +23,18 @@ def merge_loras(loras: List[str], scales: List[str]) -> dict:
 
 
 def apply_loras(base_path: str, loras: List[str], scales: List[str]) -> dict:
+    """Full refit weights (base + LoRA deltas) for every weight the LoRAs touch."""
     refit_dict = merge_loras(loras, scales)
-    base = onnx.load(base_path)
+    # Don't pull the whole model (~5 GB for SDXL) into RAM: read only the initializers we need.
+    base = onnx.load(base_path, load_external_data=False)
     onnx_opt_dir = os.path.dirname(base_path)
-
-    def convert_int64(arr):
-        if len(arr.shape) == 0:
-            return np.array([np.int32(arr)])
-        return arr
 
     for initializer in base.graph.initializer:
         if initializer.name not in refit_dict:
             continue
-
         wt = refit_dict[initializer.name]
-        initializer_data = numpy_helper.to_array(
-            initializer, base_dir=onnx_opt_dir
-        ).astype(np.float16)
-        delta = torch.from_numpy(initializer_data).to(wt.device).float() + wt
-
-        refit_dict[initializer.name] = delta.contiguous()
+        initializer_data = numpy_helper.to_array(initializer, base_dir=onnx_opt_dir).astype(np.float16)
+        # fp16 halves the RAM held for the refit; the engine converts to its own weight dtype anyway.
+        refit_dict[initializer.name] = (torch.from_numpy(initializer_data).float() + wt).half().contiguous()
 
     return refit_dict

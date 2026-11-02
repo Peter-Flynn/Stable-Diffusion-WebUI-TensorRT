@@ -81,7 +81,8 @@ def apply_lora(model: torch.nn.Module, lora_path: str, inputs: Tuple[torch.Tenso
     networks = _import_lora_networks()
     lora_name = os.path.splitext(os.path.basename(lora_path))[0]
 
-    model.forward(*inputs)
+    if not unet_memory.IS_FORGE_BACKEND:
+        model.forward(*inputs)  # A1111 applies LoRAs to the modules during forward
     networks.load_networks([lora_name], [1.0], [1.0], [None])
 
     state_dict = _forge_patched_state_dict(model)
@@ -101,36 +102,27 @@ def apply_lora(model: torch.nn.Module, lora_path: str, inputs: Tuple[torch.Tenso
 def get_refit_weights(
     state_dict: dict, onnx_opt_path: str, weight_name_mapping: dict, weight_shape_mapping: dict
 ) -> dict:
+    """fp16 deltas (LoRA-merged weight - ONNX initializer) for the weights that changed."""
     refit_weights = OrderedDict()
     onnx_opt_dir = os.path.dirname(onnx_opt_path)
-    onnx_opt_model = onnx.load(onnx_opt_path)
-    # Create initializer data hashes
-    initializer_hash_mapping = {}
-    onnx_data_mapping = {}
+    # Read initializers one at a time instead of loading the whole model into RAM.
+    onnx_opt_model = onnx.load(onnx_opt_path, load_external_data=False)
+    initializer_to_torch = {v: k for k, v in weight_name_mapping.items()}
+
     for initializer in onnx_opt_model.graph.initializer:
-        initializer_data = numpy_helper.to_array(
-            initializer, base_dir=onnx_opt_dir
-        ).astype(np.float16)
-        initializer_hash = hash(initializer_data.data.tobytes())
-        initializer_hash_mapping[initializer.name] = initializer_hash
-        onnx_data_mapping[initializer.name] = initializer_data
+        torch_name = initializer_to_torch.get(initializer.name)
+        if torch_name is None:
+            continue
+        initializer_data = numpy_helper.to_array(initializer, base_dir=onnx_opt_dir).astype(np.float16)
 
-    for torch_name, initializer_name in weight_name_mapping.items():
-        initializer_hash = initializer_hash_mapping[initializer_name]
-        wt = state_dict[torch_name]
-
-        # get shape transform info
+        wt = state_dict[torch_name].detach()
         initializer_shape, is_transpose = weight_shape_mapping[torch_name]
-        if is_transpose:
-            wt = torch.transpose(wt, 0, 1)
-        else:
-            wt = torch.reshape(wt, initializer_shape)
+        wt = torch.transpose(wt, 0, 1) if is_transpose else torch.reshape(wt, initializer_shape)
+        wt = wt.to(device="cpu", dtype=torch.float16)
 
-        # include weight if hashes differ
-        wt_hash = hash(wt.detach().to(torch.float16).cpu().numpy().data.tobytes())
-        if initializer_hash != wt_hash:
-            delta = wt.to(torch.float16) - torch.tensor(onnx_data_mapping[initializer_name]).to(wt.device)
-            refit_weights[initializer_name] = delta.contiguous()
+        base = torch.from_numpy(initializer_data)
+        if not torch.equal(wt, base):
+            refit_weights[initializer.name] = (wt - base).contiguous()  # on the CPU, not accumulating in VRAM
 
     return refit_weights
 
@@ -302,38 +294,48 @@ def _export_onnx(
 
     print(f"[TensorRT] Validating and processing ONNX structure...", flush=True)
     os.makedirs(path.parent, exist_ok=True)
-    onnx_model = onnx.load(tmp_path, load_external_data=False)
-    model_uses_external_data = check_model_uses_external_data(onnx_model)
+    # Write into a staging folder next to the destination and move the files into place at the
+    # end (external data first, the .onnx last). An interrupted export then never leaves a
+    # partial .onnx behind that later exports would pick up as "existing".
+    stage_dir = path.parent / f".{path.name}.partial"
+    shutil.rmtree(stage_dir, ignore_errors=True)
+    stage_dir.mkdir(parents=True)
+    staged = stage_dir / path.name
+    try:
+        onnx_model = onnx.load(tmp_path, load_external_data=False)
+        model_uses_external_data = check_model_uses_external_data(onnx_model)
+        if model_uses_external_data:
+            print(f"[TensorRT] Model exceeds 2GB (using external weight data). Saving...", flush=True)
+            onnx_model = onnx.load(tmp_path, load_external_data=True)
 
-    if model_uses_external_data:
-        print(f"[TensorRT] Model exceeds 2GB (using external weight data). Saving...", flush=True)
-        onnx_model = onnx.load(tmp_path, load_external_data=True)
-        onnx.save(
-            onnx_model,
-            str(path),
-            save_as_external_data=True,
-            all_tensors_to_one_file=True,
-            location=path.name + "_data",
-            size_threshold=1024,
-        )
-
-    if optimizer is not None:
-        try:
+        if optimizer is not None:
             print(f"[TensorRT] Optimizing ONNX nodes (GraphSurgeon)...", flush=True)
-            onnx_opt_graph = optimizer("unet", onnx_model)
-            onnx.save(onnx_opt_graph, path)
-        except Exception as e:
-            print(f"[TensorRT ERROR] ONNX optimization failed: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-            if os.path.exists(tmp_dir):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise RuntimeError(f"Error during ONNX graph optimization: {e}")
+            onnx_model = optimizer("unet", onnx_model)
 
-    if not model_uses_external_data and optimizer is None:
-        shutil.move(tmp_path, str(path))
+        if model_uses_external_data:
+            onnx.save(
+                onnx_model,
+                str(staged),
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location=path.name + "_data",
+                size_threshold=1024,
+            )
+        elif optimizer is not None:
+            onnx.save(onnx_model, str(staged))
+        else:
+            shutil.move(tmp_path, str(staged))
+        del onnx_model
 
-    if os.path.exists(tmp_dir):
+        for f in sorted(stage_dir.iterdir(), key=lambda f: f.name == path.name):
+            os.replace(f, path.parent / f.name)
+    except Exception as e:
+        print(f"[TensorRT ERROR] Saving the ONNX model failed: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        raise RuntimeError(f"Error while saving the ONNX model: {e}")
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
         shutil.rmtree(tmp_dir, ignore_errors=True)
     print(f"[TensorRT] ONNX model ready at: {path}", flush=True)
 

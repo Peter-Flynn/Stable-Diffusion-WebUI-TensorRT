@@ -240,6 +240,7 @@ class TrtUnet(sd_unet.SdUnet):
         self.is_auto = True
 
         self.refitted_keys = set()
+        self._refit_dict = {}  # active LoRA weights, re-applied whenever an engine is (re)loaded
 
         self.engine = None
         self.step_idx = 0
@@ -412,13 +413,24 @@ class TrtUnet(sd_unet.SdUnet):
         return feed_dict
 
     def apply_loras(self, refit_dict: dict):
-        if not self.refitted_keys.issubset(set(refit_dict.keys())):
-            # Need to ensure that weights that have been modified before and are not present anymore are reset.
-            self.refitted_keys = set()
+        self._refit_dict = refit_dict or {}
+        if not self.refitted_keys.issubset(set(self._refit_dict.keys())):
+            # Weights refitted before but not part of this LoRA set: reload the engine to reset them.
+            # (switch_engine re-applies self._refit_dict after loading.)
             self.switch_engine()
+            return
+        self._refit_current_engine()
 
-        self.engine.refit_from_dict(refit_dict, is_fp16=True)
-        self.refitted_keys = set(refit_dict.keys())
+    def _refit_current_engine(self):
+        if not self._refit_dict:
+            self.refitted_keys = set()
+            return
+        try:
+            self.engine.refit_from_dict(self._refit_dict, is_fp16=True)
+            self.refitted_keys = set(self._refit_dict.keys())
+        except Exception as e:
+            self.refitted_keys = set()
+            _notify(f"Couldn't apply LoRA weights to the engine ({e}). Generating without the LoRA.")
 
     def switch_engine(self):
         self.loaded_config = self.configs[self.profile_idx]
@@ -442,6 +454,14 @@ class TrtUnet(sd_unet.SdUnet):
         self.engine.load()
         print(f"[TensorRT] Loaded Profile {self.profile_idx}:\n{self.engine}", flush=True)
         self.engine.activate()
+        # A freshly loaded engine has the base weights: re-apply the active LoRAs, otherwise any
+        # profile switch (step-1 check, Hires. fix, reload after a fallback) silently drops them.
+        self.refitted_keys = set()
+        self._refit_current_engine()
+
+    def release_activation_memory(self):
+        if self.engine is not None and getattr(self.engine, "engine", None) is not None:
+            self.engine.release_activation_memory()
 
     def deactivate(self):
         if self.engine is not None:
@@ -458,13 +478,19 @@ def _trt_active() -> bool:
     return isinstance(unet, TrtUnet) and unet._fallback_reason is None
 
 
+def _release_activation_memory():
+    unet = sd_unet.current_unet
+    if isinstance(unet, TrtUnet):
+        unet.release_activation_memory()
+
+
 def patch_unet_forward():
     """
     Hooks UNetModel.forward in ldm_patched, ldm, and sgm to redirect to sd_unet.current_unet when active.
     This is required for Stable Diffusion WebUI reForge (and Forge), which uses ldm_patched as its
     execution backend and does not have the classic A1111 sd_hijack unet forward patch enabled.
     """
-    unet_memory.install_sampling_hook(_trt_active)
+    unet_memory.install_sampling_hook(_trt_active, on_sampling_done=_release_activation_memory)
 
     targets = [
         ("ldm_patched.ldm.modules.diffusionmodules.openaimodel", "UNetModel"),
@@ -877,6 +903,11 @@ class TensorRTScript(scripts.Script):
             print(f"[TensorRT] process_batch: switching to Profile {self.idx}", flush=True)
             sd_unet.current_unet.profile_idx = self.idx
             sd_unet.current_unet.switch_engine()
+
+    def post_sample(self, p, ps, *args):
+        # Free the engine's activation memory before the VAE decode (reForge also does this
+        # after every sampler run via the sampling_cleanup hook).
+        _release_activation_memory()
 
     def before_hr(self, p, *args):
         if (
