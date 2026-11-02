@@ -129,7 +129,7 @@ def export_unet_to_trt(
 
             if hasattr(shared, "sd_model") and shared.sd_model is not None:
                 if hasattr(shared.sd_model, "forge_objects"):
-                    unet_patcher = shared.sd_model.forge_objects.get("unet", None)
+                    unet_patcher = getattr(shared.sd_model.forge_objects, "unet", None)
                     if unet_patcher is not None:
                         model_management.load_models_gpu([unet_patcher], force_full_load=True)
                         if hasattr(unet_patcher, "load"):

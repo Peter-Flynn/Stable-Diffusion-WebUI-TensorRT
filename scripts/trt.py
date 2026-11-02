@@ -95,14 +95,15 @@ def count_clip_tokens(text: str) -> int:
                     chunks = max(1, (tok_len + 74) // 75)
                     return chunks * 77
             if getattr(shared, "sd_model", None) is not None and hasattr(shared.sd_model, "forge_objects"):
-                clip = shared.sd_model.forge_objects.get("clip", None)
+                # ForgeSD is a plain object (.unet/.clip/.vae), not a dict.
+                clip = getattr(shared.sd_model.forge_objects, "clip", None)
                 if clip is not None:
                     tok = getattr(clip, "tokenizer", None)
                     if tok is not None and hasattr(tok, "tokenize_with_weights"):
+                        # {clip_name: [chunk, ...]}, each chunk being one 77-token window
                         tokens = tok.tokenize_with_weights(text)
-                        max_len = max([len(v) for v in tokens.values()]) if tokens else 0
-                        if max_len > 0:
-                            chunks = max(1, (max_len + 74) // 75)
+                        chunks = max([len(v) for v in tokens.values()]) if tokens else 0
+                        if chunks > 0:
                             return chunks * 77
     except Exception:
         pass
