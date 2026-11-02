@@ -451,6 +451,9 @@ class TrtUnet(sd_unet.SdUnet):
             self.engine = Engine(engine_path)
         elif getattr(self.engine, "engine", None) is None:
             self.engine.engine_path = engine_path
+        # TensorRT allocates with cudaMalloc, outside PyTorch: VRAM PyTorch has cached but isn't
+        # using is unavailable to it, so return that to the driver before loading the engine.
+        _free_cuda_cache()
         self.engine.load()
         print(f"[TensorRT] Loaded Profile {self.profile_idx}:\n{self.engine}", flush=True)
         self.engine.activate()
@@ -491,6 +494,7 @@ def patch_unet_forward():
     execution backend and does not have the classic A1111 sd_hijack unet forward patch enabled.
     """
     unet_memory.install_sampling_hook(_trt_active, on_sampling_done=_release_activation_memory)
+    unet_memory.install_text_encoder_hook()
 
     targets = [
         ("ldm_patched.ldm.modules.diffusionmodules.openaimodel", "UNetModel"),
