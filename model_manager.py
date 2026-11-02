@@ -95,7 +95,8 @@ class ModelManager:
         return trt_filename, trt_path
 
     def get_weights_map_path(self, model_name: str):
-        return os.path.join(TRT_MODEL_DIR, f"{model_name}_weights_map.json")
+        # v2: maps written before LoRA-free tracing / validation may be incomplete; regenerate them.
+        return os.path.join(TRT_MODEL_DIR, f"{model_name}_weights_map_v2.json")
 
     def update(self):
         trt_engines = [

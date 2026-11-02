@@ -256,14 +256,19 @@ class UNetModel(torch.nn.Module):
                         is_transpose,
                     )
 
-            # Sanity check: Were any weights not matched
-            if wt_name not in weights_name_mapping:
-                print(
-                    f"[I] PyTorch weight {wt_name} not matched with any ONNX initializer"
-                )
+        unmatched = [n for n in state_dict if n not in weights_name_mapping]
         print(
-            f"[I] UNet: {len(weights_name_mapping.keys())} PyTorch weights were matched with ONNX initializers"
+            f"[TensorRT] UNet: {len(weights_name_mapping)} of {len(state_dict)} weights matched ONNX initializers",
+            flush=True,
         )
+        if len(unmatched) > 0.02 * len(state_dict):
+            raise RuntimeError(
+                f"{len(unmatched)} UNet weights (e.g. {unmatched[0]}) don't match the exported ONNX model, so "
+                "LoRAs couldn't be applied to them. The ONNX model was probably exported while a LoRA was "
+                "active, or from a different version of this checkpoint. Delete "
+                f"{os.path.basename(onnx_opt_path)} (models/Unet-onnx) and re-export the engine, then convert "
+                "the LoRA again."
+            )
 
         assert weights_name_mapping.keys() == weights_shape_mapping.keys()
         with open(weights_map_path, "w") as fp:
