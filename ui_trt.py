@@ -61,7 +61,7 @@ def export_unet_to_trt(
     static_shapes,
     preset,
     optimization_level=3,
-    progress=gr.Progress(track_tqdm=True),
+    progress=gr.Progress(),
 ):
     try:
         sd_hijack.model_hijack.apply_optimizations("None")
@@ -129,7 +129,7 @@ def export_unet_to_trt(
 
             if hasattr(shared, "sd_model") and shared.sd_model is not None:
                 if hasattr(shared.sd_model, "forge_objects"):
-                    unet_patcher = shared.sd_model.forge_objects.get("unet", None)
+                    unet_patcher = getattr(shared.sd_model.forge_objects, "unet", None)
                     if unet_patcher is not None:
                         model_management.load_models_gpu([unet_patcher], force_full_load=True)
                         if hasattr(unet_patcher, "load"):
@@ -195,6 +195,7 @@ def export_unet_to_trt(
                 profile=profile,
                 use_fp16=not use_fp32,
                 optimization_level=optimization_level,
+                progress_callback=lambda fraction, desc: progress(fraction, desc=desc),
             )
             if ret:
                 yield (
