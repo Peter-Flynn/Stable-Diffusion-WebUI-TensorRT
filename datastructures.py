@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass
 from enum import Enum
 from json import JSONEncoder
@@ -57,6 +58,13 @@ class ModelConfig:
     lora: bool
     vram: int
     unet_hidden_dim: int = 4
+    trt_version: str = ""  # TensorRT version the engine was built with ("" = unknown / legacy)
+
+    def min_batch(self) -> int:
+        return self.profile["sample"][0][0]
+
+    def min_tokens(self) -> int:
+        return self.profile["encoder_hidden_states"][0][1]
 
     def is_compatible_from_dict(self, feed_dict: dict):
         distance = 0.0
@@ -64,7 +72,16 @@ class ModelConfig:
             if k not in self.profile:
                 continue
             _min, _opt, _max = self.profile[k]
-            v_tensor = torch.Tensor(list(v.shape)) if hasattr(v, "shape") else torch.Tensor(list(v))
+            v_shape = list(v.shape) if hasattr(v, "shape") else list(v)
+            # Inputs below the profile minimum can be padded by repetition (see TrtUnet.forward):
+            # the batch always, the token axis when the minimum is a multiple of it.
+            if v_shape and v_shape[0] < _min[0]:
+                v_shape[0] = _min[0]
+                distance += 500.0
+            if k == "encoder_hidden_states" and v_shape[1] < _min[1] and _min[1] % v_shape[1] == 0:
+                v_shape[1] = _min[1]
+                distance += 500.0
+            v_tensor = torch.Tensor(v_shape)
             r_min = torch.Tensor(_max) - v_tensor
             r_opt = (torch.Tensor(_opt) - v_tensor).abs()
             r_max = v_tensor - torch.Tensor(_min)
@@ -221,17 +238,12 @@ class ProfileSettings:
         )
 
     def get_a1111_batch_dim(self):
-        static_batch = self.bs_min == self.bs_max == self.bs_opt
-        if self.t_max <= 77:
-            return (self.bs_min * 2, self.bs_opt * 2, self.bs_max * 2)
-        elif self.t_max > 77 and static_batch:
-            return (self.bs_opt, self.bs_opt, self.bs_opt)
-        elif self.t_max > 77 and not static_batch:
-            if self.t_opt > 77:
-                return (self.bs_min, self.bs_opt, self.bs_max * 2)
-            return (self.bs_min, self.bs_opt * 2, self.bs_max * 2)
-        else:
-            raise Exception("Uncovered case in get_batch_dim")
+        # Cond and uncond are normally denoised together (batch 2B). A batch of B happens
+        # with CFG 1 (reForge skips the uncond pass) or when cond/uncond run separately;
+        # dynamic engines cover it natively, static ones get padded at runtime.
+        if self.static_shape or self.bs_min == self.bs_max == self.bs_opt and self.h_min == self.h_max and self.w_min == self.w_max:
+            return (self.bs_opt * 2, self.bs_opt * 2, self.bs_opt * 2)
+        return (self.bs_min, self.bs_opt * 2, self.bs_max * 2)
 
 
 class ProfilePrests:
@@ -284,6 +296,5 @@ class ProfilePrests:
         return list(self.profile_presets.keys()) + ["Default"]
 
     def get_default(self, is_xl: bool):
-        if is_xl:
-            return self.default_xl
-        return self.default
+        # Return a copy: callers mutate the settings (token_to_dim).
+        return copy.copy(self.default_xl if is_xl else self.default)
