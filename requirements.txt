@@ -1,3 +1,5 @@
+tensorrt>=10.0
 onnx
 onnxscript
-optimum
+onnx-graphsurgeon
+polygraphy
