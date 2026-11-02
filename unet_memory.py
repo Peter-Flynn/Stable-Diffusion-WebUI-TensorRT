@@ -10,6 +10,7 @@ active we make reForge's `sampling_prepare` load the UNet in NO_VRAM mode: weigh
 system RAM but are streamed per layer if PyTorch needs them (e.g. a TensorRT fallback).
 """
 
+import gc
 import importlib.util
 import sys
 
@@ -143,3 +144,29 @@ def install_sampling_hook(is_trt_active):
             setattr(module, "sampling_prepare", sampling_prepare)
     _sampling_hook_installed = True
     print("[TensorRT] Hooked reForge sampling_prepare (UNet weights stay off the GPU while TensorRT is active).", flush=True)
+
+
+def report_free_vram(label: str):
+    try:
+        free, total = torch.cuda.mem_get_info()
+        print(f"[TensorRT] Free GPU memory {label}: {free / 2**30:.2f} / {total / 2**30:.2f} GiB", flush=True)
+    except Exception:
+        pass
+
+
+def free_vram_for_export():
+    """Clear VRAM before ONNX tracing or an engine build: release an active TensorRT engine
+    (it holds VRAM outside PyTorch) and unload every model reForge/Forge's manager holds.
+    Everything is reloaded on demand by the next generation."""
+    from modules import sd_unet
+
+    if sd_unet.current_unet is not None:
+        try:
+            sd_unet.current_unet.deactivate()
+        except Exception as e:
+            print(f"[TensorRT] Could not deactivate the current UNet: {e}", flush=True)
+        sd_unet.current_unet = None
+        sd_unet.current_unet_option = None  # makes the WebUI re-activate it on the next generation
+    free_all_models()
+    gc.collect()
+    torch.cuda.empty_cache()
