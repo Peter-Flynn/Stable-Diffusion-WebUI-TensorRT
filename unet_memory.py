@@ -106,7 +106,15 @@ def free_all_models():
         return False
 
 
-def install_sampling_hook(is_trt_active):
+def _rebind(owner, name, original, replacement):
+    """Replace a function, including in modules that did `from ... import name`."""
+    setattr(owner, name, replacement)
+    for module in list(sys.modules.values()):
+        if module is not None and getattr(module, name, None) is original:
+            setattr(module, name, replacement)
+
+
+def install_sampling_hook(is_trt_active, on_sampling_done=None):
     """reForge: while TensorRT is active, keep sampling_prepare from loading the UNet weights
     into VRAM (load them in NO_VRAM mode instead), so the UNet isn't held twice."""
     global _sampling_hook_installed
@@ -137,11 +145,20 @@ def install_sampling_hook(is_trt_active):
             mm.vram_state = previous
 
     sampling_prepare._trt_wrapped = True
-    forge_sampler.sampling_prepare = sampling_prepare
-    # Modules that did `from modules_forge.forge_sampler import sampling_prepare` hold their own reference.
-    for name, module in list(sys.modules.items()):
-        if module is not None and getattr(module, "sampling_prepare", None) is original:
-            setattr(module, "sampling_prepare", sampling_prepare)
+    _rebind(forge_sampler, "sampling_prepare", original, sampling_prepare)
+
+    # After every sampler run (base pass, Hires. fix pass, img2img), before the VAE decode.
+    original_cleanup = getattr(forge_sampler, "sampling_cleanup", None)
+    if on_sampling_done is not None and original_cleanup is not None:
+
+        def sampling_cleanup(unet, *args, **kwargs):
+            try:
+                on_sampling_done()
+            except Exception as e:
+                print(f"[TensorRT] Could not release activation memory: {e}", flush=True)
+            return original_cleanup(unet, *args, **kwargs)
+
+        _rebind(forge_sampler, "sampling_cleanup", original_cleanup, sampling_cleanup)
     _sampling_hook_installed = True
     print("[TensorRT] Hooked reForge sampling_prepare (UNet weights stay off the GPU while TensorRT is active).", flush=True)
 
