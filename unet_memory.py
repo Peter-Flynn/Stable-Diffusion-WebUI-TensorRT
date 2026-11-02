@@ -189,11 +189,18 @@ def free_vram_for_export():
     torch.cuda.empty_cache()
 
 
+def _load_text_encoder_fully(patcher):
+    """Load the text encoder completely. reForge may otherwise load it partially when VRAM is
+    tight, and partial loads leave bare parameters such as CLIP-G's `text_projection` on the CPU:
+    forge_clip.CLIP_SD_XL_G then computes the pooled output on the CPU while the SDXL size
+    embeddings are on the GPU ("Expected all tensors to be on the same device ... wrapper_CUDA_cat").
+    The text encoder is small (~1.6 GB for SDXL); the manager evicts other models to fit it."""
+    _model_management().load_models_gpu([patcher], force_full_load=True)
+
+
 def ensure_text_encoder_loaded():
-    """reForge creates SDXL size-conditioning tensors on the text encoder's *current* device
-    (sd_models_xl.get_learned_conditioning) while the text embeddings are computed on the GPU.
-    If the text encoder was unloaded (e.g. by our export/build cleanup), that mismatches
-    ("Expected all tensors to be on the same device ... wrapper_CUDA_cat"). Load it first."""
+    """Load the text encoder before conditioning if it's on the CPU (e.g. after our export/build
+    cleanup unloaded it): reForge builds SDXL size conditioning on its *current* device."""
     if not IS_FORGE_BACKEND or not torch.cuda.is_available():
         return
     try:
@@ -201,6 +208,41 @@ def ensure_text_encoder_loaded():
         patcher = getattr(clip, "patcher", None)
         device = getattr(getattr(patcher, "model", None), "device", None)
         if patcher is not None and device is not None and torch.device(device).type == "cpu":
-            _model_management().load_model_gpu(patcher)
+            _load_text_encoder_fully(patcher)
     except Exception as e:
         print(f"[TensorRT] Could not load the text encoder: {e}", flush=True)
+
+
+_text_encoder_hook_installed = False
+
+
+def install_text_encoder_hook():
+    """reForge: make move_clip_to_gpu() (called before every SDXL/SD1 text encode, including with
+    LoRA-patched text encoders) load the text encoder fully instead of possibly partially."""
+    global _text_encoder_hook_installed
+    if _text_encoder_hook_installed or not IS_FORGE_BACKEND:
+        return
+    try:
+        import modules_forge.forge_clip as forge_clip
+        from modules import sd_models
+    except Exception:
+        return
+    original = forge_clip.move_clip_to_gpu
+    if getattr(original, "_trt_wrapped", False):
+        _text_encoder_hook_installed = True
+        return
+
+    def move_clip_to_gpu(*args, **kwargs):
+        sd_model = getattr(sd_models.model_data, "sd_model", None)
+        patcher = getattr(getattr(getattr(sd_model, "forge_objects", None), "clip", None), "patcher", None)
+        if patcher is None:
+            return original(*args, **kwargs)
+        try:
+            _load_text_encoder_fully(patcher)
+        except Exception as e:
+            print(f"[TensorRT] Full text encoder load failed ({e}); using reForge's default.", flush=True)
+            return original(*args, **kwargs)
+
+    move_clip_to_gpu._trt_wrapped = True
+    _rebind(forge_clip, "move_clip_to_gpu", original, move_clip_to_gpu)
+    _text_encoder_hook_installed = True
