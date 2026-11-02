@@ -265,7 +265,9 @@ def _export_onnx(
     export_kwargs = {
         "export_params": True,
         "opset_version": max(opset, 17),
-        "do_constant_folding": True,
+        # PyTorch's constant folding runs on the GPU and can duplicate weight tensors, which
+        # doesn't fit for SDXL on 8-12 GB cards. TensorRT folds constants itself at build time.
+        "do_constant_folding": optimizer is not None,
         "input_names": in_names,
         "output_names": out_names,
         "dynamic_axes": dyn_axes,
@@ -338,14 +340,8 @@ def free_gpu_memory():
     """Release as much VRAM as possible before a TensorRT build: unload models held by
     reForge/Forge's model manager (they're reloaded on the next generation) and empty
     PyTorch's cache. TensorRT skips kernels that don't fit, so free memory = faster engines."""
-    unet_memory.free_all_models()
-    gc.collect()
-    torch.cuda.empty_cache()
-    try:
-        free, total = torch.cuda.mem_get_info()
-        print(f"[TensorRT] Free GPU memory for the build: {free / 2**30:.1f} / {total / 2**30:.1f} GiB", flush=True)
-    except Exception:
-        pass
+    unet_memory.free_vram_for_export()
+    unet_memory.report_free_vram("for the build")
 
 
 def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, use_fp16: bool, optimization_level: int = None, progress_callback=None):

@@ -26,6 +26,24 @@ profile_presets = ProfilePrests()
 logging.basicConfig(level=logging.INFO)
 
 
+def load_unet_for_tracing(purpose: str):
+    """Clear VRAM, then put only the UNet on the GPU (fully, via the model manager on reForge)."""
+    unet_memory.free_vram_for_export()
+    try:
+        if unet_memory.IS_FORGE_BACKEND:
+            import ldm_patched.modules.model_management as model_management
+
+            unet_patcher = getattr(shared.sd_model.forge_objects, "unet", None)
+            if unet_patcher is not None:
+                model_management.load_models_gpu([unet_patcher], force_full_load=True)
+        else:
+            target_device = devices.device if hasattr(devices, "device") else torch.device("cuda")
+            shared.sd_model.model.diffusion_model.to(target_device)
+    except Exception as e:
+        print(f"[TensorRT] Could not load the UNet onto the GPU: {e}", flush=True)
+    unet_memory.report_free_vram(f"after loading the UNet {purpose}")
+
+
 def get_context_dim():
     if hasattr(shared, "sd_model") and shared.sd_model is not None:
         if getattr(shared.sd_model, "is_sd1", False):
@@ -113,45 +131,9 @@ def export_unet_to_trt(
         diable_optimizations = is_xl
         embedding_dim = get_context_dim()
 
-        # reForge / Forge / ComfyUI model loader: ensure all weights are loaded on GPU before tracing
-        try:
-            import ldm_patched.modules.model_management as model_management
-            if hasattr(model_management, "LoadedModel"):
-                orig_del = getattr(model_management.LoadedModel, "__del__", None)
-                if orig_del and not getattr(model_management.LoadedModel, "_del_patched", False):
-                    def safe_del(self):
-                        if getattr(self, "_patcher_finalizer", None) is not None:
-                            try:
-                                self._patcher_finalizer.detach()
-                            except Exception:
-                                pass
-                    model_management.LoadedModel.__del__ = safe_del
-                    model_management.LoadedModel._del_patched = True
-
-            if hasattr(shared, "sd_model") and shared.sd_model is not None:
-                if hasattr(shared.sd_model, "forge_objects"):
-                    unet_patcher = getattr(shared.sd_model.forge_objects, "unet", None)
-                    if unet_patcher is not None:
-                        model_management.load_models_gpu([unet_patcher], force_full_load=True)
-                        if hasattr(unet_patcher, "load"):
-                            unet_patcher.load()
-        except Exception as e:
-            print(f"[TensorRT] Info: reForge model loader: {e}", flush=True)
-
-        try:
-            target_device = devices.device if hasattr(devices, "device") else torch.device("cuda")
-            # A1111 only: on reForge/Forge the model manager loaded the UNet above, and moving
-            # weights behind its back desyncs it (device mismatch errors in later generations).
-            if not unet_memory.IS_FORGE_BACKEND and getattr(shared, "sd_model", None) is not None:
-                shared.sd_model.model.diffusion_model.to(target_device)
-                for param in shared.sd_model.model.diffusion_model.parameters():
-                    if param.device != target_device:
-                        param.data = param.data.to(target_device)
-                for buf in shared.sd_model.model.diffusion_model.buffers():
-                    if buf.device != target_device:
-                        buf.data = buf.data.to(target_device)
-        except Exception as e:
-            print(f"[TensorRT] Info: synchronizing weights to GPU: {e}", flush=True)
+        # The UNet weights are only needed on the GPU to trace the ONNX graph.
+        if not os.path.exists(onnx_path):
+            load_unet_for_tracing("for ONNX export")
 
         modelobj = UNetModel(
             shared.sd_model.model.diffusion_model,
@@ -288,6 +270,7 @@ def export_lora_to_trt(lora_name, force_export):
         return f"## Please export the base model ({model_name}) first."
 
     embedding_dim = get_context_dim()
+    load_unet_for_tracing("for LoRA export")
 
     modelobj = UNetModel(
         shared.sd_model.model.diffusion_model,
@@ -320,6 +303,8 @@ def export_lora_to_trt(lora_name, force_export):
     )
 
     save_file(refit_dict, lora_trt_path)
+    if unet_memory.IS_FORGE_BACKEND:
+        unet_memory.unload_unet_from_manager()  # hand the UNet back in a clean state
 
 
     return "## Exported Successfully \n"
