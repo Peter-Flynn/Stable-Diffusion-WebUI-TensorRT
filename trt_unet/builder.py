@@ -3,6 +3,7 @@ driver when it ends. Run by export.py; reports progress and its result on stdout
 
 import json
 import os
+from collections import Counter
 import sys
 import threading
 import time
@@ -125,11 +126,11 @@ class NoEngine(RuntimeError):
     pass
 
 
-def _null_placeholders(network, names) -> set:
+def _null_placeholders(network, names, sizes) -> set:
     """Swaps the parsed UNet weights (export.py's placeholders, told apart by the index they start with)
     for TensorRT's null placeholders: a type and a size without data, which the builder doesn't keep or
-    convert. They're implicitly refittable. Returns the names swapped."""
-    swapped = set()
+    convert. They're implicitly refittable. Returns the names swapped, and logs what it found."""
+    swapped, slots_seen, samples, problems = set(), Counter(), [], Counter()
     for i in range(network.num_layers):
         layer = network.get_layer(i)
         if layer.type == trt.LayerType.CONSTANT:
@@ -139,20 +140,32 @@ def _null_placeholders(network, names) -> set:
         else:
             continue
         for slot in slots:
-            weights = getattr(layer, slot)
-            if weights.dtype != trt.DataType.HALF or weights.size < 3:
+            try:
+                weights = getattr(layer, slot)
+                slots_seen[f"{layer.type.name.lower()}.{slot} {weights.dtype.name}"] += 1
+                if weights.dtype != trt.DataType.HALF or weights.size < 3:
+                    continue
+                head = weights.numpy()[:3]
+            except Exception as e:
+                problems[f"{layer.type.name.lower()}.{slot}: {type(e).__name__}: {e}"] += 1
                 continue
-            head = weights.numpy()[:3]
+            if len(samples) < 4:
+                samples.append(f"{weights.size} values from {[float(v) for v in head]}")
             if head[0] != PLACEHOLDER_MARK:
                 continue  # not one of ours, or the parser changed it (e.g. transposed): stays as it is
             index = int(head[1]) * 2048 + int(head[2])
-            if index >= len(names) or names[index] in swapped:
-                continue
+            if index >= len(names) or names[index] in swapped or weights.size != sizes[index]:
+                continue  # e.g. a weight the parser rearranged that happens to start like a placeholder
             setattr(layer, slot, trt.Weights(weights.dtype, 0, weights.size))
             # TensorRT's own descriptor of the placeholder carries the name
             if not network.set_weights_name(getattr(layer, slot), names[index]):
                 raise RuntimeError(f"TensorRT didn't take the name of the null placeholder for {names[index]}")
             swapped.add(names[index])
+    log(
+        f"Null placeholders: {len(swapped)} of {len(names)} weights. Parsed network: {network.num_layers} layers; "
+        f"weights {dict(slots_seen) or 'none'}; FP16 ones start with {samples or 'nothing'}"
+        + (f"; couldn't read {dict(problems)}" if problems else "")
+    )
     return swapped
 
 
@@ -173,9 +186,7 @@ def build(job, logger, progress, strip=True, null=False):
     if not parsed:
         raise RuntimeError("TensorRT could not parse the ONNX model: " + "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
 
-    swapped = _null_placeholders(network, job["placeholders"]) if null and strip else set()
-    if swapped:
-        log(f"Building with null placeholders for {len(swapped)} of {len(job['weights'])} weights")
+    swapped = _null_placeholders(network, job["placeholders"], job["placeholder_sizes"]) if null and strip else set()
     unmarked = [name for name in job["weights"] if name not in swapped and not network.mark_weights_refittable(name)]
     if unmarked:
         raise RuntimeError(f"{len(unmarked)} UNet weights aren't in the TensorRT network (e.g. {unmarked[0]})")

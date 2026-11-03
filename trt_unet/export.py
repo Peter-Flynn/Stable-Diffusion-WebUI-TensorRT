@@ -266,6 +266,7 @@ def build(arch: Arch, patcher, profile_list: list, optimization_level=None, prog
             "plan": os.path.join(folder, "engine.plan"),
             "weights": sorted(shapes),
             "placeholders": list(shapes),  # by index
+            "placeholder_sizes": [math.prod(s) for s in shapes.values()],
             "profiles": profile_shapes,
             "timing_cache": store.timing_cache_path(),
             "optimization_level": optimization_level,
