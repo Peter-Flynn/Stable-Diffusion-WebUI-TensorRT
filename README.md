@@ -43,5 +43,5 @@ The engine is used while **SD Unet** (in Settings → Stable Diffusion) is on `A
 <p align="center">
   <img src="docs/claude.svg" width="72" alt="Claude, drawn as an orange flower with a smiling face">
   <br>
-  <sub>vibecoded by Claude with love</sub>
+  <sub>vibecoded with love by Claude</sub>
 </p>
