@@ -4,6 +4,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -17,10 +18,10 @@ from onnx.external_data_helper import uses_external_data
 
 from modules import devices, paths_internal, shared
 
+import engine_builder
 import unet_memory
 from datastructures import ProfileSettings
 from model_helper import UNetModel, optimize_onnx
-from utilities import Engine
 
 TRACE_RESOLUTION = 512  # the graph's spatial axes are dynamic; tracing small saves VRAM
 
@@ -187,6 +188,63 @@ def export_onnx(onnx_path: str, modelobj: UNetModel, profile: ProfileSettings, d
     print(f"[TensorRT] ONNX model saved: {path}", flush=True)
 
 
+def _builder_env() -> dict:
+    """The builder process's environment: unbuffered UTF-8 output, and the WebUI's GPU as its only
+    visible device (TensorRT builds on the current device, which a new process doesn't share)."""
+    env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+    try:
+        device = torch.device(devices.device)
+        if device.type != "cuda":
+            return env
+        index = device.index if device.index is not None else torch.cuda.current_device()
+    except Exception:
+        return env
+    visible = [d.strip() for d in env.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip()]
+    if not visible:
+        env["CUDA_VISIBLE_DEVICES"] = str(index)
+    elif index < len(visible):
+        env["CUDA_VISIBLE_DEVICES"] = visible[index]
+    return env
+
+
+def _run_builder(job: dict, progress_callback=None):
+    """Build in engine_builder's own process, so the builder's VRAM goes back to the driver when it
+    exits. Returns (success, number of memory allocation failures)."""
+    cmd = [sys.executable, "-u", os.path.abspath(engine_builder.__file__), json.dumps(job)]
+    result = {}
+    # stdin stays open until the builder exits: if the WebUI dies, the builder sees EOF and stops.
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=_builder_env(), text=True, encoding="utf-8", errors="replace", bufsize=1
+    )
+    try:
+        for line in proc.stdout:
+            kind, payload = engine_builder.parse_message(line)
+            if kind == "progress":
+                if progress_callback is not None:
+                    try:
+                        progress_callback(payload["fraction"], payload["desc"])
+                    except Exception:
+                        pass
+            elif kind == "result":
+                result = payload
+            else:
+                sys.stdout.write(payload)
+                sys.stdout.flush()
+        code = proc.wait()
+    finally:
+        if proc.poll() is None:  # interrupted while building
+            proc.kill()
+            proc.wait()
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except Exception:
+                pass
+    if code != 0 and not result:
+        print(f"[TensorRT] The engine builder exited unexpectedly (code {code}).", flush=True)
+    return bool(result.get("ok")) and code == 0, int(result.get("memory_messages", 0))
+
+
 def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, use_fp16: bool, optimization_level=None, progress_callback=None) -> bool:
     model = shared.sd_model
     # A1111: everything off the GPU for the build. reForge: unloaded through its model manager below,
@@ -196,20 +254,21 @@ def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, 
         model.cpu()
     unet_memory.free_vram_for_export()
     unet_memory.report_free_vram("for the build")
+    job = {
+        "engine_path": trt_path,
+        "onnx_path": onnx_path,
+        "fp16": use_fp16,
+        "profiles": [profile],
+        "refit": True,
+        "timing_cache": timing_cache,
+        "optimization_level": optimization_level,
+    }
     try:
         start = time.time()
-        engine = Engine(trt_path)
-        ok = engine.build(
-            onnx_path,
-            use_fp16,
-            [profile],
-            refit=True,
-            timing_cache=timing_cache,
-            optimization_level=optimization_level,
-            progress_callback=progress_callback,
-        )
+        ok, memory_messages = _run_builder(job, progress_callback)
         print(f"[TensorRT] Engine build took {time.time() - start:.0f}s", flush=True)
-        if engine.build_memory_messages:
+        unet_memory.report_free_vram("after the build")
+        if memory_messages:
             import gradio as gr
 
             gr.Warning("TensorRT skipped some kernels for lack of GPU memory; the engine may be slower. See the console.")
