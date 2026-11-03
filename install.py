@@ -4,7 +4,7 @@ from importlib import metadata
 
 import launch
 
-MIN_TRT_VERSION = (10, 0)
+MIN_TRT = (10, 1)
 NVIDIA_INDEX = "--extra-index-url https://pypi.nvidia.com"
 
 
@@ -21,25 +21,18 @@ def installed_tensorrt():
 
 def install():
     if os.environ.get("TRT_EXTENSION_SKIP_INSTALL", "").lower() in ("1", "true", "yes"):
-        print("[TensorRT Extension] TRT_EXTENSION_SKIP_INSTALL is set; not installing anything.")
         return
-
-    trt_pkg, trt_ver = installed_tensorrt()
-    if trt_pkg is None:
-        print("[TensorRT Extension] TensorRT is not installed. Installing the latest release...")
+    name, version = installed_tensorrt()
+    if name is None:
+        print("[TensorRT] Installing TensorRT...")
         launch.run_pip(f"install tensorrt {NVIDIA_INDEX}", "tensorrt", live=True)
-    elif tuple(map(int, re.findall(r"\d+", trt_ver)[:2])) < MIN_TRT_VERSION:
-        print(
-            f"[TensorRT Extension] Warning: {trt_pkg}=={trt_ver} is older than {'.'.join(map(str, MIN_TRT_VERSION))} and "
-            f"isn't supported. Please upgrade it (pip install -U tensorrt {NVIDIA_INDEX})."
-        )
-
-    for pkg in ("onnx", "onnxscript"):
-        if not launch.is_installed(pkg):
-            launch.run_pip(f"install {pkg}", pkg, live=True)
+    elif tuple(map(int, re.findall(r"\d+", version)[:2])) < MIN_TRT:
+        print(f"[TensorRT] {name} {version} is too old; this extension needs TensorRT {'.'.join(map(str, MIN_TRT))} or later (pip install -U tensorrt {NVIDIA_INDEX}).")
+    if not launch.is_installed("onnx"):
+        launch.run_pip("install onnx", "onnx", live=True)
 
 
 try:
     install()
 except Exception as e:
-    print(f"[TensorRT Extension] Dependency installation failed: {e}")
+    print(f"[TensorRT] Installing dependencies failed: {e}")
