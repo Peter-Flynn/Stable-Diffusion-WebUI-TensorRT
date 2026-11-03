@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 330" width="880" height="330" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<defs><marker id="h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#6e7681"/></marker></defs>
+<rect x="0" y="1" width="428" height="328" rx="12" fill="#161b22" stroke="#30363d"/>
+<text x="24" y="38" font-size="17" font-weight="600" fill="#e6edf3">NVIDIA's extension</text>
+<text x="24" y="306" font-size="14" fill="#8b949e">An engine per checkpoint, with its weights inside</text>
+<rect x="24" y="62" width="130" height="42" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+<text x="89.0" y="88.0" font-size="14" text-anchor="middle" fill="#e6edf3">Illustrious</text>
+<path d="M156 83 C191.0 83 191.0 83 226 83" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#h)"/>
+<rect x="228" y="62" width="176" height="42" rx="8" fill="#1c2a0c" stroke="#76b900" stroke-width="1.5"/>
+<text x="316.0" y="80.0" font-size="14" text-anchor="middle" fill="#e6edf3">Engine</text>
+<text x="316.0" y="98.0" font-size="12" text-anchor="middle" fill="#8b949e">weights inside, GBs</text>
+<rect x="24" y="120" width="130" height="42" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+<text x="89.0" y="146.0" font-size="14" text-anchor="middle" fill="#e6edf3">NoobAI</text>
+<path d="M156 141 C191.0 141 191.0 141 226 141" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#h)"/>
+<rect x="228" y="120" width="176" height="42" rx="8" fill="#1c2a0c" stroke="#76b900" stroke-width="1.5"/>
+<text x="316.0" y="138.0" font-size="14" text-anchor="middle" fill="#e6edf3">Engine</text>
+<text x="316.0" y="156.0" font-size="12" text-anchor="middle" fill="#8b949e">weights inside, GBs</text>
+<rect x="24" y="178" width="130" height="42" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+<text x="89.0" y="204.0" font-size="14" text-anchor="middle" fill="#e6edf3">Pony</text>
+<path d="M156 199 C191.0 199 191.0 199 226 199" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#h)"/>
+<rect x="228" y="178" width="176" height="42" rx="8" fill="#1c2a0c" stroke="#76b900" stroke-width="1.5"/>
+<text x="316.0" y="196.0" font-size="14" text-anchor="middle" fill="#e6edf3">Engine</text>
+<text x="316.0" y="214.0" font-size="12" text-anchor="middle" fill="#8b949e">weights inside, GBs</text>
+<rect x="24" y="238" width="130" height="42" rx="8" fill="#272115" stroke="#bb8009" stroke-width="1.5"/>
+<text x="89.0" y="264.0" font-size="14" text-anchor="middle" fill="#e6edf3">LoRA</text>
+<path d="M156 259 C191.0 259 191.0 259 226 259" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#h)"/>
+<rect x="228" y="238" width="176" height="42" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+<text x="316.0" y="256.0" font-size="14" text-anchor="middle" fill="#e6edf3">Converted LoRA</text>
+<text x="316.0" y="274.0" font-size="12" text-anchor="middle" fill="#8b949e">an export per LoRA</text>
+<rect x="452" y="1" width="428" height="328" rx="12" fill="#161b22" stroke="#30363d"/>
+<text x="476" y="38" font-size="17" font-weight="600" fill="#e6edf3">This fork</text>
+<text x="476" y="306" font-size="14" fill="#8b949e">One engine per architecture, weights from what's loaded</text>
+<rect x="476" y="62" width="130" height="42" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+<text x="541.0" y="88.0" font-size="14" text-anchor="middle" fill="#e6edf3">Illustrious</text>
+<path d="M608 83 C651.0 83 651.0 166 694 166" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#h)"/>
+<rect x="476" y="120" width="130" height="42" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+<text x="541.0" y="146.0" font-size="14" text-anchor="middle" fill="#e6edf3">NoobAI</text>
+<path d="M608 141 C651.0 141 651.0 166 694 166" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#h)"/>
+<rect x="476" y="178" width="130" height="42" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+<text x="541.0" y="204.0" font-size="14" text-anchor="middle" fill="#e6edf3">Pony</text>
+<path d="M608 199 C651.0 199 651.0 166 694 166" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#h)"/>
+<rect x="476" y="238" width="130" height="42" rx="8" fill="#272115" stroke="#bb8009" stroke-width="1.5"/>
+<text x="541.0" y="256.0" font-size="14" text-anchor="middle" fill="#e6edf3">LoRAs</text>
+<text x="541.0" y="274.0" font-size="12" text-anchor="middle" fill="#8b949e">as usual</text>
+<path d="M608 259 C651.0 259 651.0 186 694 186" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#h)"/>
+<rect x="696" y="120" width="160" height="112" rx="8" fill="#1c2a0c" stroke="#76b900" stroke-width="1.5"/>
+<text x="776.0" y="181.0" font-size="14" text-anchor="middle" fill="#e6edf3"></text>
+<text x="776" y="168" font-size="16" font-weight="600" text-anchor="middle" fill="#e6edf3">SDXL engine</text>
+<text x="776" y="196" font-size="12" text-anchor="middle" fill="#8b949e">no weights inside;</text>
+<text x="776" y="212" font-size="12" text-anchor="middle" fill="#8b949e">gets them at load</text>
+</svg>
