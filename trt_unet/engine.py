@@ -125,20 +125,26 @@ class Engine:
         if not ok:
             raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
 
-    def _prepare(self, profile: int, shapes: dict, stream: int):
+    def _set_shapes(self, profile: int, shapes: dict, stream: int):
+        """Selects the profile and input shapes on the context. What's recorded is only what TensorRT
+        accepted, so a failure here makes the next call set everything again."""
         self._context()
         if profile != self.profile:
+            self.profile, self.shapes, self.memory_bound = None, {}, False
             if not self.context.set_optimization_profile_async(profile, stream):
                 raise RuntimeError(f"Could not select optimization profile {profile}")
-            self.profile, self.shapes, self.memory_bound = profile, {}, False
-        changed = False
+            self.profile = profile
         for name, shape in shapes.items():
             if self.shapes.get(name) != shape:
+                self.shapes.pop(name, None)
+                self.memory_bound = False
                 if not self.context.set_input_shape(name, shape):
                     raise RuntimeError(f"Input {name} {shape} is outside profile {profile}")
                 self.shapes[name] = shape
-                changed = True
-        if changed or not self.memory_bound:
+
+    def _prepare(self, profile: int, shapes: dict, stream: int):
+        self._set_shapes(profile, shapes, stream)
+        if not self.memory_bound:
             size = self.activation_bytes()
             if self.memory is None or self.memory.numel() < size or self.memory.numel() > 2 * size:
                 self.memory = None
@@ -152,14 +158,7 @@ class Engine:
         return size if size > 0 else int(self.engine.get_device_memory_size_for_profile_v2(self.profile))
 
     def estimate_activation_bytes(self, profile: int, shapes: dict, stream: int) -> int:
-        self._context()
-        if profile != self.profile:
-            self.context.set_optimization_profile_async(profile, stream)
-            self.profile, self.shapes, self.memory_bound = profile, {}, False
-        for name, shape in shapes.items():
-            self.context.set_input_shape(name, shape)
-            self.shapes[name] = shape
-        self.memory_bound = False
+        self._set_shapes(profile, shapes, stream)
         return self.activation_bytes()
 
     def infer(self, feed: dict, profile: int, stream: int) -> dict:
