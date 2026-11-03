@@ -1,44 +1,39 @@
 # TensorRT for reForge
 
-Runs the Stable Diffusion UNet of [stable-diffusion-webui-reForge](https://github.com/Panchovix/stable-diffusion-webui-reForge)
-on NVIDIA TensorRT engines. Supports SD 1.x, SD 2.x and SDXL-architecture checkpoints (including Pony, Illustrious,
-NoobAI and other fine-tunes, v-prediction ones too) on RTX 2080 Ti and newer GPUs.
+A fork of [NVIDIA's TensorRT extension](https://github.com/NVIDIA/Stable-Diffusion-WebUI-TensorRT), rewritten for
+[reForge](https://github.com/Panchovix/stable-diffusion-webui-reForge). It runs SD 1.x, SD 2.x and SDXL models on
+TensorRT, fine-tunes like Pony, Illustrious and NoobAI included, on an RTX 2080 Ti or newer.
 
-## How it works
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/engines-dark.svg">
+    <img alt="NVIDIA's extension builds an engine for each checkpoint and converts each LoRA. This fork builds one engine for each architecture and loads the weights of whatever checkpoint and LoRAs are in use." src="docs/engines-light.svg" width="880">
+  </picture>
+</p>
 
-- **Engines are compiled per architecture, not per checkpoint.** An engine is built without weights; the loaded
-  checkpoint's weights are put into it when it loads. One SDXL engine runs every SDXL checkpoint, so switching
-  checkpoints doesn't need a new export, and engine files are megabytes instead of gigabytes.
-- **LoRAs just work.** The engine gets exactly the weights reForge would use for PyTorch, LoRAs (and any other weight
-  patch reForge supports) included. When the LoRAs change, only the weights they touch are updated. There is no
-  conversion step.
-- **One engine, several profiles.** A profile is a size range, batch range and prompt length range. The default is
-  every base resolution plus Hires. fix up to 2x of them, with prompts of up to 750 tokens; the engine switches between
-  profiles instantly, with one copy of the weights in VRAM. CFG 1 (Lightning, DMD2, Turbo) runs at half the batch
-  instead of padding.
-- **reForge manages its memory.** The engine is a model of reForge's model manager, which loads it, makes room for
-  it and unloads it when another model needs the VRAM, like the text encoder or VAE. While a pass runs on the
-  engine, the PyTorch UNet stays in RAM.
-- **Anything the engine can't run uses PyTorch:** sizes no profile covers, ControlNet, UNet patches (FreeU,
-  attention couple, ...), or an engine that fails to load or runs out of VRAM. You get a notice; the image is the
-  same as without TensorRT.
+## How it differs
 
-## Requirements
+|                    | NVIDIA's extension                       | This fork                                        |
+| ------------------ | ---------------------------------------- | ------------------------------------------------ |
+| WebUI              | Automatic1111                            | reForge                                          |
+| Engines            | One per checkpoint, GBs each             | One per architecture, with no weights inside     |
+| New checkpoint     | Build a new engine                       | Nothing to do                                    |
+| LoRAs              | Convert each one first                   | Work as usual                                    |
+| Hires. fix         | Build an engine that covers both sizes   | Covered by the default engine                    |
 
-- reForge, with an NVIDIA RTX 2080 Ti or newer and a recent driver.
-- TensorRT 11 or later, any CUDA build of it. The extension installs or updates TensorRT if it's missing or older,
-  and `onnx`. Set `TRT_EXTENSION_SKIP_INSTALL=1` to install nothing.
+Anything the engine can't run, like ControlNet, UNet patches such as FreeU, or a size it wasn't built for, runs on
+PyTorch instead, with a notice.
 
 ## Use
 
-1. Load a checkpoint and open the **TensorRT** tab. It shows the checkpoint's architecture.
-2. Click **Build engine**. The default profiles cover every base resolution and Hires. fix up to 2x of them; to
-   change them (e.g. batch sizes above 1), open **Edit profiles** first and use a preset or your own sizes. The
-   first build takes several minutes; later ones reuse the timing cache.
-3. Keep **SD Unet** (Settings → Stable Diffusion, or add `sd_unet` to the Quicksettings list) on `Automatic`, its
-   default: every checkpoint of that architecture now uses the engine. `None` uses PyTorch. The tab says if the
-   setting keeps the engine from being used.
+1. Install from **Extensions → Install from URL** with this repo's URL. TensorRT 11 or later is installed on the
+   next launch (set `TRT_EXTENSION_SKIP_INSTALL=1` to skip that).
+2. Load a checkpoint, open the **TensorRT** tab and click **Build engine**. The first build takes a few minutes.
+3. Generate. Every checkpoint with the same architecture now uses the engine.
 
-Engines only load with the TensorRT version and GPU they were built with; after upgrading TensorRT, build again
-(the tab keeps the old engine's profiles).
-Engines live in `models/Unet-trt/<architecture>/`.
+The engine is used while **SD Unet** (in Settings → Stable Diffusion) is on `Automatic`, the default. Set it to
+`None` to use PyTorch.
+
+> [!NOTE]
+> An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build it again;
+> the tab keeps its profiles.
