@@ -160,18 +160,20 @@ def _legacy_outputs():
     return gr.update(value=text, visible=True), gr.update(visible=True)
 
 
-def refresh(reset_draft=True, draft=None):
+def refresh(draft=None, draft_arch=None):
+    """Everything on the tab, for the loaded checkpoint. Profiles being edited stay unless the architecture changed."""
     sd_model, _, arch, record = _current()
     form = [gr.update()] * (len(FIELDS) * 3)
-    if arch is not None and (reset_draft or draft is None):
+    if arch is not None and (draft is None or draft_arch != arch.id):
         source = record or _stale(arch)
         draft = [p.to_dict() for p in (source.profiles if source else default_profiles(arch.adm_channels))]
         form = [v for f in FIELDS for v in getattr(default_profiles(arch.adm_channels)[0], f)]
-    elif draft is None:
+    elif arch is None:
         draft = []
     engines = list(_engine_choices())
     return (
         _status(sd_model, arch, record),
+        arch.id if arch else None,
         draft,
         *_draft_outputs(draft, record),
         *form,
@@ -243,12 +245,28 @@ def remove_profile(draft, choice):
     return (draft, *_draft_outputs(draft, _current()[3]), "")
 
 
-def build(draft, optimization_level, progress=gr.Progress()):
+def _outcome(arch, result) -> str:
+    if result["ok"]:
+        message = f"### Engine built\nEvery {arch.family} checkpoint runs on it with `SD Unet` set to `Automatic`."
+        if result.get("stripped") is False:
+            message += " (TensorRT couldn't leave the weights out of it, so its file is as large as the UNet.)"
+    elif result.get("error") == "cancelled":
+        message = "### Build cancelled\nThe existing engine, if any, is unchanged."
+    else:
+        message = f"### The build failed\n`{result.get('error')}`\n\nThe console has the details. The existing engine, if any, is unchanged."
+    if result.get("memory_warnings"):
+        message += (
+            f"\n\nTensorRT skipped {result['memory_warnings']} kernels that need more VRAM than is free at a profile's largest sizes, "
+            "so those sizes may run a little slower. Narrower profiles avoid this."
+        )
+    return message
+
+
+def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
     from modules.call_queue import queue_lock
 
     from . import export
 
-    message = ""
     export.CANCEL.clear()
     BUILDING.set()
     try:
@@ -256,30 +274,21 @@ def build(draft, optimization_level, progress=gr.Progress()):
             _, patcher, arch, _ = _current()
             if arch is None:
                 raise RuntimeError("Load a checkpoint TensorRT engines can run first.")
-            if not draft:
+            if arch.id != draft_arch:  # the checkpoint changed since the tab showed these profiles
+                message, draft = "### Nothing built\nThe loaded checkpoint has another architecture now. Check its profiles, then build.", None
+            elif not draft:
                 raise RuntimeError("Add at least one profile.")
-            _refresh_unet_list()
-            result = export.build(arch, patcher, [Profile.from_dict(d) for d in draft], int(optimization_level), lambda f, t: progress(f, desc=t))
-            _refresh_unet_list()
-        if result["ok"]:
-            message = f"### Engine built\nEvery {arch.family} checkpoint runs on it with `SD Unet` set to `Automatic`."
-            if result.get("stripped") is False:
-                message += " (TensorRT couldn't leave the weights out of it, so its file is as large as the UNet.)"
-        elif result.get("error") == "cancelled":
-            message = "### Build cancelled\nThe existing engine, if any, is unchanged."
-        else:
-            message = f"### The build failed\n`{result.get('error')}`\n\nThe console has the details. The existing engine, if any, is unchanged."
-        if result.get("memory_warnings"):
-            message += (
-                f"\n\nTensorRT skipped {result['memory_warnings']} kernels that need more VRAM than is free at a profile's largest sizes, "
-                "so those sizes may run a little slower. Narrower profiles avoid this."
-            )
+            else:
+                _refresh_unet_list()
+                result = export.build(arch, patcher, [Profile.from_dict(d) for d in draft], int(optimization_level), lambda f, t: progress(f, desc=t))
+                _refresh_unet_list()
+                message = _outcome(arch, result)
     except Exception as e:
         traceback.print_exc()
         message = f"### The build failed\n`{e}`"
     finally:
         BUILDING.clear()
-    return (message, *refresh(reset_draft=False, draft=draft))
+    return (message, *refresh(draft, draft_arch))
 
 
 def _build_started():
@@ -293,7 +302,7 @@ def cancel_build():
     common.log("Cancelling the engine build...")
 
 
-def delete_engine(choice, draft):
+def delete_engine(choice, draft, draft_arch):
     from modules.call_queue import queue_lock
 
     record = _engine_choices().get(choice) if choice else None
@@ -303,17 +312,17 @@ def delete_engine(choice, draft):
             store.delete(record)
             sd_unet.list_unets()
         common.log(f"Deleted {record.plan}")
-    return refresh(reset_draft=False, draft=draft)
+    return refresh(draft, draft_arch)
 
 
-def delete_legacy(draft, confirmed):
+def delete_legacy(draft, draft_arch, confirmed):
     from modules.call_queue import queue_lock
 
     if confirmed == "yes":
         with queue_lock:
             freed = store.remove_legacy_files()
         common.log(f"Deleted files from earlier versions of the extension ({common.gib(freed)})")
-    return refresh(reset_draft=False, draft=draft)
+    return refresh(draft, draft_arch)
 
 
 def on_ui_tabs():
@@ -323,7 +332,7 @@ def on_ui_tabs():
         with gr.Row(equal_height=False):
             status = gr.Markdown(elem_id="trt_status")
             refresh_button = ToolButton(value=refresh_symbol, elem_id="trt_refresh")
-        draft = gr.State([])
+        draft, draft_arch = gr.State([]), gr.State(None)
         with gr.Row(equal_height=False):
             with gr.Column(scale=3, variant="panel"):
                 gr.Markdown("### Profiles")
@@ -353,36 +362,35 @@ def on_ui_tabs():
             with gr.Column(scale=2, variant="panel"):
                 gr.Markdown("### Engines")
                 engines = gr.Markdown(elem_id="trt_engines")
-                with gr.Row():
-                    engine_choice = gr.Dropdown(label="Engine", choices=[], visible=False, elem_id="trt_engine_choice")
-                    delete_button = gr.Button("Delete engine", variant="stop", visible=False, elem_id="trt_delete")
+                engine_choice = gr.Dropdown(label="Engine", choices=[], visible=False, elem_id="trt_engine_choice")
+                delete_button = gr.Button("Delete engine", variant="stop", size="sm", visible=False, elem_id="trt_delete")
                 legacy = gr.Markdown(visible=False, elem_id="trt_legacy_text")
-                legacy_button = gr.Button("Delete these files", visible=False, elem_id="trt_legacy")
+                legacy_button = gr.Button("Delete these files", variant="stop", size="sm", visible=False, elem_id="trt_legacy")
                 legacy_confirm = gr.Textbox(visible=False)
                 with gr.Accordion("How it works", open=False):
                     gr.Markdown(HELP)
 
         draft_outputs = [draft, table, selector, build_button]
-        outputs = [status, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, legacy, legacy_button, cancel_button]
+        outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, legacy, legacy_button, cancel_button]
         # In the browser; the preset menu empties again so the same preset can be picked twice.
         preset.change(
             None, [preset], [*numbers, preset],
             **{JS: f"(name, ...current) => [...(({json.dumps(presets)})[name] || current.slice(0, {len(numbers)})), null]"},
         )
-        refresh_button.click(refresh, None, outputs)
+        refresh_button.click(refresh, [draft, draft_arch], outputs)  # also clicked when the tab opens (javascript/tensorrt.js)
         tab.load(refresh, None, outputs)
         selector.change(select_profile, [draft, selector], [*numbers, save_button, remove_button])
         add_button.click(add_profile, [draft, *numbers], [*draft_outputs, note])
         save_button.click(save_profile, [draft, selector, *numbers], [*draft_outputs, note])
         remove_button.click(remove_profile, [draft, selector], [*draft_outputs, note])
-        build_button.click(_build_started, None, [build_button, cancel_button, result], queue=False).then(build, [draft, level], [result, *outputs])
+        build_button.click(_build_started, None, [build_button, cancel_button, result], queue=False).then(build, [draft, draft_arch, level], [result, *outputs])
         cancel_button.click(cancel_build, None, None, queue=False)
         delete_button.click(
-            delete_engine, [engine_choice, draft], outputs,
-            **{JS: "(choice, draft) => [choice && confirm('Delete the engine ' + choice + '? Building it again takes a while.') ? choice : null, draft]"},
+            delete_engine, [engine_choice, draft, draft_arch], outputs,
+            **{JS: "(choice, ...rest) => [choice && confirm('Delete the engine ' + choice + '? Building it again takes a while.') ? choice : null, ...rest.slice(0, 2)]"},
         )
         legacy_button.click(
-            delete_legacy, [draft, legacy_confirm], outputs,
-            **{JS: "(draft, _) => [draft, confirm('Delete the files from earlier versions of the extension?') ? 'yes' : '']"},
+            delete_legacy, [draft, draft_arch, legacy_confirm], outputs,
+            **{JS: "(draft, draft_arch) => [draft, draft_arch, confirm('Delete the files from earlier versions of the extension?') ? 'yes' : '']"},
         )
     return [(tab, "TensorRT", "tensorrt")]
