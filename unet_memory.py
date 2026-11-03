@@ -4,6 +4,7 @@ loses track of them); the manager can't see TensorRT's memory, so room is made f
 and engines make way for its models. "Reload UI" doesn't re-import this module: the hooks call
 the current script through `callbacks`."""
 
+import functools
 import gc
 import importlib.util
 import sys
@@ -39,6 +40,19 @@ def forge_model_management():
     return model_management
 
 
+def in_inference_mode(fn):
+    """For calls that move reForge's weights. Its generations run in inference mode, so a LoRA's
+    unpatch leaves inference-tensor weights; moved outside it, they break ("Inference tensors do not
+    track version counter")."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with torch.inference_mode():
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 def _unet_patcher():
     return getattr(getattr(getattr(shared, "sd_model", None), "forge_objects", None), "unet", None)
 
@@ -56,6 +70,7 @@ def report_free_vram(label: str):
         pass
 
 
+@in_inference_mode
 def unload_unet_from_manager():
     patcher = _unet_patcher()
     if patcher is None:
@@ -97,13 +112,14 @@ def restore_torch_unet(input_shape=None):
                 return
             estimate = patcher.model_options.get("memory_peak_estimation_modifier", patcher.memory_required)
             required = estimate(list(input_shape)) + getattr(patcher, "extra_preserved_memory_during_sampling", 0)
-            forge_model_management().load_models_gpu([patcher], memory_required=required)
+            in_inference_mode(forge_model_management().load_models_gpu)([patcher], memory_required=required)
         elif not getattr(shared.sd_model, "lowvram", False):
             shared.sd_model.model.diffusion_model.to(devices.device)
     except Exception as e:
         print(f"[TensorRT] Could not restore the PyTorch UNet: {e}", flush=True)
 
 
+@in_inference_mode
 def make_room(size: int):
     """Has the manager unload models until `size` bytes are free (reloaded on demand). Never the
     UNet: it holds no VRAM while TensorRT runs, and unloading it drops its patches mid-sampling."""
@@ -152,6 +168,7 @@ def vram_available_for(models) -> int:
     return available
 
 
+@in_inference_mode
 def free_all_models():
     if not IS_FORGE_BACKEND:
         return

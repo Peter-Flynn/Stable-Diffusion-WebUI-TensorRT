@@ -19,6 +19,7 @@ from model_helper import UNetModel
 from model_manager import TRT_MODEL_DIR, modelmanager
 
 profile_presets = ProfilePresets()
+JS = "js" if int(gr.__version__.split(".")[0]) >= 4 else "_js"
 LEVELS = (("min", "Min"), ("opt", "Optimal"), ("max", "Max"))
 SLIDER_GROUPS = (  # column elem_id, label, (minimum, maximum, step), ProfileSettings prefix, slider elem_id
     ("trt_batch", "{} batch-size", (1, 16, 1), "bs", "trt_{}_batch"),
@@ -38,7 +39,8 @@ def load_unet_for_tracing():
         if unet_memory.IS_FORGE_BACKEND:
             # Not forge_objects.unet: loading it would merge the last generation's LoRA into the weights.
             original = getattr(shared.sd_model, "forge_objects_original", shared.sd_model.forge_objects)
-            unet_memory.forge_model_management().load_models_gpu([original.unet], force_full_load=True)
+            load = unet_memory.in_inference_mode(unet_memory.forge_model_management().load_models_gpu)
+            load([original.unet], force_full_load=True)
         else:
             shared.sd_model.model.diffusion_model.to(devices.device)
     except Exception as e:
@@ -272,14 +274,24 @@ def on_ui_tabs():
                         button_export_unet = gr.Button(value="Export Engine", variant="primary", elem_id="trt_export_unet", visible=False)
                         button_export_default_unet = gr.Button(value="Export Default Engine", variant="primary", elem_id="trt_export_default_unet")
 
-                        version.change(profile_presets.get_settings_from_version, version, profile_sliders + [static_shapes])
+                        # Presets are constants: applied in the browser, without a round trip through the queue.
+                        presets = {v: list(profile_presets.get_settings_from_version(v)) for v in profile_presets.get_choices()}
                         version.change(
-                            lambda v: (gr.update(visible=v != "Default"), gr.update(visible=v == "Default"), gr.update(visible=v != "Default")),
+                            None,
                             version,
-                            [button_export_unet, button_export_default_unet, advanced_settings],
+                            profile_sliders + [static_shapes, button_export_unet, button_export_default_unet, advanced_settings],
+                            **{JS: f"""(v) => {{
+                                const custom = v !== "Default", show = (visible) => ({{__type__: "update", visible}});
+                                return [...{json.dumps(presets)}[v], show(custom), show(!custom), show(custom)];
+                            }}"""},
                         )
                         min_max_sliders = [s for i, s in enumerate(profile_sliders) if i % 3 != 1]
-                        static_shapes.change(lambda static: [gr.update(visible=not static)] * len(min_max_sliders), static_shapes, min_max_sliders)
+                        static_shapes.change(
+                            None,
+                            static_shapes,
+                            min_max_sliders,
+                            **{JS: f"(s) => Array({len(min_max_sliders)}).fill({{__type__: 'update', visible: !s}})"},
+                        )
 
                     with gr.Tab(label="TensorRT LoRA"):
                         gr.Markdown("# Apply LoRA checkpoint to TensorRT model")
