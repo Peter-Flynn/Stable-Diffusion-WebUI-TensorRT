@@ -65,6 +65,8 @@ class Engine:
         self._input_shapes = {}
         self._device_memory = None
         self._user_managed_memory = False
+        self.activation_bytes = 0
+        self.before_allocate = None  # (size) before activation memory is allocated
 
     def __del__(self):
         try:
@@ -84,7 +86,6 @@ class Engine:
             self.runtime = trt.Runtime(TRT_LOGGER)
         TRT_LOGGER.begin()
         try:
-            # mmap instead of reading into bytes: saves an engine-sized chunk of RAM per load.
             with open(self.engine_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
                 self.engine = self.runtime.deserialize_cuda_engine(data)
         except Exception as e:
@@ -114,8 +115,7 @@ class Engine:
         return f"{message}\nTensorRT said: {details}" if details else message
 
     def activate(self):
-        """Create the execution context. Its activation memory comes from PyTorch's allocator, sized
-        for the shapes in use rather than the profile maximum, so it's shared with the WebUI."""
+        """Activation memory comes from PyTorch's allocator, so the WebUI sees and reuses it."""
         self.context = None
         self._user_managed_memory = False
         self._device_memory = None
@@ -156,18 +156,17 @@ class Engine:
                 size = int(self.context.update_device_memory_size_for_shapes())
             except Exception:
                 size = 0
-        if size <= 0:
-            size = int(getattr(self.engine, "device_memory_size_v2", 0) or self.engine.device_memory_size)
-        size = max(size, 1)
+        size = max(size if size > 0 else self.max_activation_bytes(), 1)
+        self.activation_bytes = size
         current = 0 if self._device_memory is None else self._device_memory.numel()
-        # Shrink too, so one large pass (e.g. Hires. fix) doesn't pin its peak.
         if current < size or current > 2 * size:
             self._device_memory = None
+            if self.before_allocate is not None:
+                self.before_allocate(size)
             self._device_memory = torch.empty(size, dtype=torch.uint8, device="cuda")
         self.context.set_device_memory(self._device_memory.data_ptr(), self._device_memory.numel())
 
     def max_activation_bytes(self) -> int:
-        """Upper bound of the activation memory an inference allocates (the profile maximum)."""
         if self.engine is None:
             return 0
         for attr in ("device_memory_size_v2", "device_memory_size"):
@@ -179,17 +178,17 @@ class Engine:
                 return size
         return 0
 
+    def needed_activation_bytes(self) -> int:
+        """What the last inference needed, else the profile maximum."""
+        return self.activation_bytes or self.max_activation_bytes()
+
     def release_activation_memory(self):
-        """Return activation memory and staging buffers to PyTorch (e.g. for the VAE decode);
-        they're reallocated on the next inference."""
         if self._user_managed_memory:
             self._device_memory = None
-            self._input_shapes = {}  # forces set_input_shape + set_device_memory next time
+            self._input_shapes = {}
         self._staging = {}
 
     def infer(self, feed_dict, stream):
-        """Run on `stream`; returns freshly allocated outputs. Inputs already on the GPU in the
-        engine's dtype are bound directly, others are copied into staging buffers."""
         self._set_input_shapes(feed_dict)
         outputs = {}
         for name, is_input, dtype in self.io_tensors:
@@ -209,14 +208,17 @@ class Engine:
         return outputs
 
     def refit(self, weights: dict):
-        """Refit weights, each converted to the dtype the engine expects for it."""
         refitter = trt.Refitter(self.engine, TRT_LOGGER)
         refittable = set(refitter.get_all_weights())
-        keep_alive = []  # buffers must stay valid until refit_cuda_engine()
-        skipped = 0
+        missing = [name for name in weights if name not in refittable]
+        if len(missing) > 0.02 * len(weights):
+            raise RuntimeError(
+                f"{len(missing)} of {len(weights)} LoRA weights (e.g. {missing[0]}) aren't in this engine, which was "
+                "built from another ONNX export. Rebuild the engine, or convert the LoRA again."
+            )
+        keep_alive = []  # valid until refit_cuda_engine() returns
         for name, wt in weights.items():
             if name not in refittable:
-                skipped += 1
                 continue
             proto = refitter.get_weights_prototype(name)
             t = wt.detach().to(dtype=_torch_dtype(proto.dtype)).contiguous()
@@ -226,13 +228,12 @@ class Engine:
             location = trt.TensorLocation.DEVICE if t.is_cuda else trt.TensorLocation.HOST
             if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), location):
                 raise RuntimeError(f"TensorRT rejected refit weight '{name}'.")
-        if skipped:
-            _log(f"{skipped} LoRA weights aren't refittable in this engine and were skipped.")
+        if missing:
+            _log(f"{len(missing)} LoRA weights aren't refittable in this engine and were skipped.")
         try:
             ok = refitter.refit_cuda_engine()
         finally:
-            # A refit caches resources for the engine that stay allocated (outside PyTorch, where the
-            # WebUI can't reclaim them) for as long as the engine lives, unless released.
+            # Else what the refit cached stays allocated as long as the engine lives.
             release = getattr(refitter, "release_refit_resources", None)
             if release is not None:
                 try:

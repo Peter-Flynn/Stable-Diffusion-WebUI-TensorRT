@@ -14,16 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""Builds TensorRT engines, in a process of its own.
-
-The builder keeps device memory after a build, which the WebUI's model manager then sees as
-used and can't reclaim, so every model it loads afterwards only partially fits. Run as a
-script, the build gets its own process: all of its memory goes back to the driver when it
-exits. exporter.export_trt starts it; it reports progress and its result on stdout.
-
-Doesn't import torch or the WebUI: the TensorRT logger here is shared with the runtime
-(utilities.py), and the script must start quickly.
-"""
+"""Builds TensorRT engines. Run as a script by exporter.export_trt, so the VRAM the builder keeps
+goes back to the driver when the build ends; progress and the result are reported on stdout.
+Doesn't import torch or the WebUI."""
 
 import json
 import os
@@ -34,13 +27,11 @@ import time
 import tensorrt as trt
 from tqdm import tqdm
 
-# TensorRT 11 removed the weakly typed precision flags: networks are strongly typed and take their
-# precision from the ONNX graph (exported under autocast).
+# TensorRT 11 only builds strongly typed networks: precision comes from the ONNX graph.
 STRONGLY_TYPED = not hasattr(trt.BuilderFlag, "FP16")
 
 _MEMORY_HINTS = ("insufficient memory", "memory is insufficient", "could not be allocated", "out of memory")
 
-# Lines the builder process writes for its parent; everything else on stdout is console output.
 PROGRESS_PREFIX = "@@trt-progress "
 RESULT_PREFIX = "@@trt-result "
 
@@ -50,8 +41,8 @@ def _log(message):
 
 
 class TRTLogger(trt.ILogger):
-    """Prints errors (and build warnings once each), keeps the current operation's errors for
-    exception messages, and counts out-of-memory messages, which TensorRT only reports quietly."""
+    """Prints errors and (once each) build warnings, keeps errors for exception messages, and
+    counts out-of-memory messages, which TensorRT only reports as warnings."""
 
     def __init__(self):
         trt.ILogger.__init__(self)
@@ -88,13 +79,13 @@ def atomic_write(path, data):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "wb") as f:
-        f.write(memoryview(data))  # no copy: SDXL engines are ~5 GB
+        f.write(memoryview(data))
     os.replace(tmp_path, path)
 
 
 class ProgressMonitor(trt.IProgressMonitor):
-    """Console: one tqdm bar per build phase, nested up to `max_depth`. UI: `callback(fraction,
-    description)` driven by the top-level phase and its active sub-phase."""
+    """tqdm bars per build phase (up to `max_depth` deep), and `callback(fraction, description)`
+    for the top-level phase and its active sub-phase."""
 
     def __init__(self, callback=None, max_depth=3):
         trt.IProgressMonitor.__init__(self)
@@ -114,7 +105,7 @@ class ProgressMonitor(trt.IProgressMonitor):
         phase = self._phases.get(name)
         if phase is None:
             return
-        n = max(0, min(int(n), phase["total"]))  # TensorRT may overshoot
+        n = max(0, min(int(n), phase["total"]))
         if phase["tq"] is not None:
             phase["tq"].update(n - phase["tq"].n)
         phase["n"] = n
@@ -129,7 +120,6 @@ class ProgressMonitor(trt.IProgressMonitor):
         if child is not None:
             fraction += child["n"] / child["total"]
             desc = f"{self._top}: {max(self._phases.items(), key=lambda kv: kv[1]['depth'])[0]}"
-        # The estimate dips between sub-phases; never move the bar backwards.
         self._fraction = max(self._fraction, min(fraction / top["total"], 1.0))
         try:
             self.callback(self._fraction, desc)
@@ -138,7 +128,7 @@ class ProgressMonitor(trt.IProgressMonitor):
 
     def phase_start(self, phase_name, parent_phase, num_steps):
         try:
-            self._close(phase_name)  # phase names repeat
+            self._close(phase_name)
             if parent_phase is None:
                 depth, self._top, self._fraction = 0, phase_name, 0.0
             else:
@@ -149,7 +139,7 @@ class ProgressMonitor(trt.IProgressMonitor):
             self._phases[phase_name] = {"tq": tq, "depth": depth, "parent": parent_phase, "total": max(int(num_steps), 1), "n": 0}
             self._report()
         except KeyboardInterrupt:
-            self._cancel = True  # only step_complete can cancel the build
+            self._cancel = True
 
     def phase_finish(self, phase_name):
         try:
@@ -167,8 +157,12 @@ class ProgressMonitor(trt.IProgressMonitor):
             return False
 
 
+def _is_dynamic(input_profiles) -> bool:
+    return any(tuple(lo) != tuple(hi) for shapes in input_profiles for lo, _, hi in shapes.values())
+
+
 def build_engine(engine_path, onnx_path, fp16, input_profiles, refit=True, timing_cache=None, optimization_level=None, progress_callback=None):
-    """Build and save an engine. Returns (success, number of memory allocation failures)."""
+    """Builds and saves an engine. Returns (success, number of memory allocation failures)."""
     print(f"[TensorRT] Building {engine_path}", flush=True)
     TRT_LOGGER.begin(print_warnings=True)
     builder = trt.Builder(TRT_LOGGER)
@@ -189,6 +183,9 @@ def build_engine(engine_path, onnx_path, fp16, input_profiles, refit=True, timin
         config.set_flag(trt.BuilderFlag.FP16)
     if optimization_level is not None:
         config.builder_optimization_level = int(optimization_level)
+    resize = getattr(getattr(trt, "PreviewFeature", None), "RUNTIME_ACTIVATION_RESIZE_10_10", None)
+    if resize is not None and _is_dynamic(input_profiles):
+        config.set_preview_feature(resize, True)  # activation memory sized for the shapes in use
     if refit:
         if hasattr(trt.BuilderFlag, "REFIT"):
             config.set_flag(trt.BuilderFlag.REFIT)
@@ -242,12 +239,8 @@ def build_engine(engine_path, onnx_path, fp16, input_profiles, refit=True, timin
     return True, memory_messages
 
 
-# --- The builder process: started by exporter.export_trt with the job as a JSON argument ---
-
-
 def parse_message(line: str):
-    """(kind, payload) for a line the builder process wrote: ("progress", {...}), ("result",
-    {...}), or ("output", line) for console output."""
+    """("progress" | "result", payload) for protocol lines, ("output", line) for the rest."""
     for kind, prefix in (("progress", PROGRESS_PREFIX), ("result", RESULT_PREFIX)):
         if line.startswith(prefix):
             try:
@@ -276,8 +269,7 @@ def _progress_sender(min_interval=0.5):
 
 
 def _exit_with_parent():
-    """The parent keeps our stdin open until we exit: end of input means it's gone, and a build
-    nobody waits for would only hold the GPU."""
+    """The parent holds our stdin open until we exit: EOF means it's gone."""
 
     def watch():
         try:
