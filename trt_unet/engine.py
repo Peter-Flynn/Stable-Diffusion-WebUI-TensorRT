@@ -3,12 +3,19 @@ one execution context, and activation memory from PyTorch's allocator sized for 
 
 import ctypes
 import os
+import time
 from collections import deque
 
 import tensorrt as trt
 import torch
 
-from .common import gib
+from .common import gib, log
+
+# Refitting prepares the weights for the GPU on the CPU, by default on one thread. Weights come straight
+# from PyTorch's FP16 tensors, and the engine's first output is checked for NaN/Inf, so TensorRT's own
+# pass over every weight is skipped.
+REFITTER_SETTINGS = {"max_threads": os.cpu_count() or 1, "weights_validation": False}
+_unsettable = set()
 
 
 _DTYPES = {
@@ -102,7 +109,9 @@ class Engine:
     def loaded(self) -> bool:
         return self.engine is not None
 
-    def load(self):
+    def load(self) -> float:
+        """Returns the seconds it took."""
+        start = time.perf_counter()
         LOGGER.clear()
         with open(self.plan_path, "rb") as f:
             plan = f.read()
@@ -127,6 +136,7 @@ class Engine:
         self.weight_names = list(trt.Refitter(self.engine, LOGGER).get_all_weights())
         self.context = None  # created once the weights are in
         self._reset_context_state()
+        return time.perf_counter() - start
 
     def _context(self):
         if self.context is None:
@@ -144,32 +154,47 @@ class Engine:
         self.engine = None
         self._reset_context_state()
 
-    def refit(self, names, tensor_for):
-        """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name)`."""
+    def refit(self, names, tensor_for) -> dict:
+        """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name)`. Returns the
+        seconds spent getting the weights ("weights") and in TensorRT ("tensorrt")."""
         refitter = trt.Refitter(self.engine, LOGGER)
-        keep = []
+        for setting, value in REFITTER_SETTINGS.items():
+            try:
+                setattr(refitter, setting, value)
+            except (AttributeError, TypeError) as e:  # the Python API reference doesn't say they're settable
+                if setting not in _unsettable:
+                    _unsettable.add(setting)
+                    log(f"Could not set the refitter's {setting}: {e}")
+        keep, seconds = [], {"weights": 0.0, "tensorrt": 0.0}
 
         def put(name):
+            start = time.perf_counter()
             proto = refitter.get_weights_prototype(name)
             t = tensor_for(name).to(dtype=torch_dtype(proto.dtype)).contiguous()
             if t.numel() != proto.size:
                 raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
             keep.append(t)
             location = trt.TensorLocation.DEVICE if t.is_cuda else trt.TensorLocation.HOST
+            given = time.perf_counter()
+            seconds["weights"] += given - start
             if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), location):
                 raise RuntimeError(f"TensorRT rejected weight {name}")
+            seconds["tensorrt"] += time.perf_counter() - given
 
         LOGGER.clear()
         for name in names:
             put(name)
         for name in refitter.get_missing_weights():
             put(name)
+        start = time.perf_counter()
         try:
             ok = refitter.refit_cuda_engine()
         finally:
             refitter.release_refit_resources()  # else the refit's scratch memory stays allocated as long as the engine
+        seconds["tensorrt"] += time.perf_counter() - start
         if not ok:
             raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
+        return seconds
 
     def _set_shapes(self, profile: int, shapes: dict, stream: int):
         """Selects the profile and input shapes on the context. What's recorded is only what TensorRT
