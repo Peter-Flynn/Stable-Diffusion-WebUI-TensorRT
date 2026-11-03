@@ -301,6 +301,31 @@ def delete_engine(choice, draft, draft_arch):
     return refresh(draft, draft_arch)
 
 
+_sd_unet = {"dropdowns": [], "sync": None}  # SD Unet's dropdown (Settings or Quicksettings) and the tab's sync button
+
+
+def _sd_unet_update():
+    from modules import shared_items
+
+    return gr.update(choices=shared_items.sd_unet_items(), value=shared.opts.sd_unet)
+
+
+def _connect(dropdown):
+    _sd_unet["sync"].click(_sd_unet_update, None, dropdown, queue=False)
+
+
+def on_before_ui():
+    _sd_unet.update(dropdowns=[], sync=None)
+
+
+def on_after_component(component, **kwargs):
+    """reForge makes SD Unet's dropdown in Settings before the extension tabs, or in Quicksettings after them."""
+    if kwargs.get("elem_id") == "setting_sd_unet":
+        _sd_unet["dropdowns"].append(component)
+        if _sd_unet["sync"] is not None:
+            _connect(component)
+
+
 def on_ui_tabs():
     presets = _preset_values()
     first = [v for f in FIELDS for v in getattr(default_profiles(2816)[0], f)]
@@ -342,9 +367,12 @@ def on_ui_tabs():
                 delete_button = gr.Button("Delete engine", variant="stop", size="sm", visible=False, elem_id="trt_delete")
                 with gr.Accordion("How it works", open=False):
                     gr.Markdown(HELP)
+        _sd_unet["sync"] = gr.Button(visible=False, elem_id="trt_sd_unet_sync")
+        for dropdown in _sd_unet["dropdowns"]:
+            _connect(dropdown)
 
-        # reForge fills in SD Unet's choices (Settings, Quicksettings) when the page loads: press their refresh buttons.
-        refresh_sd_unet = {JS: "() => { gradioApp().querySelectorAll('#refresh_sd_unet').forEach(button => button.click()); }"}
+        # SD Unet's dropdown shows the engines (and the setting) of when the page loaded: update it.
+        refresh_sd_unet = {JS: "() => { gradioApp().getElementById('trt_sd_unet_sync')?.click(); }"}
         draft_outputs = [draft, table, selector, build_button]
         outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, cancel_button]
         # In the browser; the preset menu empties again so the same preset can be picked twice.
