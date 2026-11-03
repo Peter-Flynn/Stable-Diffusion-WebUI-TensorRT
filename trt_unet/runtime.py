@@ -118,8 +118,9 @@ class TrtModel:
         patched ones when LoRAs change."""
         engine, weights = self.engine, self.weights
         weights.refresh()
-        wanted = {name: weights.signature(name) for name in engine.weight_names}
-        changed = [name for name in engine.weight_names if self.applied.get(name) != wanted[name]]
+        # The UNet's weights; anything else refittable keeps what the plan holds.
+        wanted = {name: weights.signature(name) for name in engine.weight_names if weights.has(name)}
+        changed = [name for name in wanted if self.applied.get(name) != wanted[name]]
         if not changed:
             return
         start = time.time()
@@ -222,6 +223,8 @@ def _selected_record():
 def _unsupported(patcher) -> str:
     if getattr(patcher, "controlnet_linked_list", None) is not None:
         return "ControlNet"
+    if getattr(patcher, "extra_concat_condition", None) is not None:
+        return "extra input channels (inpainting add-ons)"
     options = patcher.model_options.get("transformer_options", {})
     kinds = sorted({k for group in ("patches", "patches_replace") for k, v in options.get(group, {}).items() if v})
     if options.get("wrappers", {}).get("diffusion_model"):
@@ -281,7 +284,9 @@ class Pass:
     def __init__(self, model: TrtModel, patcher, x):
         self.model, self.patcher = model, patcher
         self.module = patcher.model.diffusion_model
-        self.shapes, self.takes_y = model.record.shapes, bool(model.record.arch.adm_channels)
+        arch = model.record.arch
+        self.shapes, self.takes_y = model.record.shapes, bool(arch.adm_channels)
+        self.channels, self.context_dim = arch.in_channels, arch.context_dim
         self.shape = (x.shape[0] * 2, *x.shape[1:])
         self.fallback = None
         self.checked = False
@@ -327,7 +332,9 @@ class Pass:
         raise Fallback(reason)
 
     def run(self, x, timesteps, context, y):
-        b, _, h, w = x.shape
+        b, c, h, w = x.shape
+        if c != self.channels or context.shape[2] != self.context_dim:
+            self.fall_back(f"The UNet got {c} input channels and {context.shape[2]}-wide prompts, the engine takes {self.channels} and {self.context_dim}")
         choice = profiles.select(self.shapes, b, h, w, context.shape[1])
         if choice is None:
             tokens = context.shape[1] // profiles.CONTEXT_PER_CHUNK * profiles.TOKENS_PER_CHUNK
@@ -351,13 +358,13 @@ class Pass:
                 common.mm().load_models_gpu([self.model])
         stream = torch.cuda.current_stream().cuda_stream
         try:
-            out = self.model.engine.infer(feed, index, stream)["latent"]
+            out = self._infer(feed, index, stream)
         except torch.cuda.OutOfMemoryError:
             self.model.engine.release_activations()
             common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
             common.mm().soft_empty_cache(force=True)
             try:
-                out = self.model.engine.infer(feed, index, stream)["latent"]
+                out = self._infer(feed, index, stream)
             except torch.cuda.OutOfMemoryError:
                 self.fall_back("Out of VRAM running the engine")
         if not self.checked:
@@ -365,6 +372,15 @@ class Pass:
             if not torch.isfinite(out).all():
                 self.fall_back("The engine produced NaN/Inf values")
         return out[:b].to(x.dtype)
+
+    def _infer(self, feed, index, stream):
+        try:
+            return self.model.engine.infer(feed, index, stream)["latent"]
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except Exception as e:
+            traceback.print_exc()
+            self.fall_back(f"The engine failed ({e})")
 
 
 def _engine_record(patcher, x):

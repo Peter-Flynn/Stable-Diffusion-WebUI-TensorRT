@@ -33,6 +33,9 @@ class EffectiveWeights:
         self.params = self.module.state_dict(keep_vars=True)
         self.backup = getattr(self.patcher, "backup", {}) or {}
 
+    def has(self, name: str) -> bool:
+        return name in self.params or PREFIX + name in self.backup
+
     def base(self, name: str) -> torch.Tensor:
         """The unpatched weight (reForge keeps the original of one it patched in place). `.data` reads it
         even if moving it outside inference mode broke its version counter."""

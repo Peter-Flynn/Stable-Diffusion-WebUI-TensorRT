@@ -148,6 +148,7 @@ def build(draft, optimization_level, progress=gr.Progress()):
     from . import export
 
     message = ""
+    export.CANCEL.clear()
     try:
         with queue_lock:
             _, patcher, arch, _ = _current()
@@ -160,6 +161,8 @@ def build(draft, optimization_level, progress=gr.Progress()):
             _refresh_unet_list()
         if result["ok"]:
             message = f"### Built the {arch.label} engine\n{result['record'].describe()}."
+        elif result.get("error") == "cancelled":
+            message = "### Build cancelled"
         else:
             message = f"### The build failed\n`{result.get('error')}`\n\nThe console has the details."
         if result.get("memory_warnings"):
@@ -171,6 +174,13 @@ def build(draft, optimization_level, progress=gr.Progress()):
         traceback.print_exc()
         message = f"### The build failed\n`{e}`"
     return (message, *refresh(reset_draft=False, draft=draft))
+
+
+def cancel_build():
+    from . import export
+
+    export.CANCEL.set()
+    common.log("Cancelling the engine build...")
 
 
 def delete_engine(choice, draft):
@@ -221,7 +231,9 @@ def on_ui_tabs():
                     add_button = gr.Button("Add profile", elem_id="trt_add")
                 with gr.Accordion("Advanced", open=False):
                     level = gr.Slider(0, 5, value=3, step=1, label="Builder optimization level", info="Higher searches more kernels: much slower builds, sometimes slightly faster engines.")
-                build_button = gr.Button("Build engine", variant="primary", elem_id="trt_build")
+                with gr.Row():
+                    build_button = gr.Button("Build engine", variant="primary", elem_id="trt_build")
+                    cancel_button = gr.Button("Cancel build", elem_id="trt_cancel")
                 result = gr.Markdown(elem_id="trt_result")
             with gr.Column(variant="panel"):
                 gr.Markdown("### Engines")
@@ -240,6 +252,7 @@ def on_ui_tabs():
         add_button.click(add_profile, [draft, *numbers], [draft, table, remove_index, note])
         remove_button.click(remove_profile, [draft, remove_index], [draft, table, remove_index])
         build_button.click(build, [draft, level], [result, *outputs])
+        cancel_button.click(cancel_build, None, None)
         delete_button.click(delete_engine, [engine_choice, draft], outputs)
         legacy_button.click(delete_legacy, draft, outputs)
     return [(tab, "TensorRT", "tensorrt")]

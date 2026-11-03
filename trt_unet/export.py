@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 import torch
@@ -20,6 +21,7 @@ from .arch import Arch, unet_config
 from .common import log
 
 INPUTS = ("sample", "timesteps", "encoder_hidden_states", "y")
+CANCEL = threading.Event()
 DYNAMIC_AXES = {
     "sample": {0: "batch", 2: "height", 3: "width"},
     "timesteps": {0: "batch"},
@@ -187,6 +189,14 @@ def run_builder(job_path: str, progress=None) -> dict:
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=_builder_env(), text=True, encoding="utf-8", errors="replace", bufsize=1,
     )
     result = {}
+
+    def cancel_watch():
+        while proc.poll() is None:
+            if CANCEL.wait(0.5):
+                proc.kill()
+                return
+
+    threading.Thread(target=cancel_watch, daemon=True).start()
     try:
         for line in proc.stdout:
             if line.startswith(builder.PROGRESS):
@@ -208,7 +218,9 @@ def run_builder(job_path: str, progress=None) -> dict:
         for stream in (proc.stdin, proc.stdout):
             with contextlib.suppress(Exception):
                 stream.close()
-    if not result:
+    if CANCEL.is_set():
+        result = {"ok": False, "error": "cancelled"}
+    elif not result:
         result = {"ok": False, "error": f"the builder exited unexpectedly (code {code})"}
     result["ok"] = bool(result.get("ok")) and code == 0
     return result
@@ -230,6 +242,8 @@ def build(arch: Arch, patcher, profile_list: list, optimization_level=None, prog
             progress(0.0, "Exporting the UNet graph")
         start = time.time()
         shapes = export_onnx(arch, patcher, folder)
+        if CANCEL.is_set():
+            return {"ok": False, "error": "cancelled"}
         profile_shapes = [p.unet_shapes(arch.in_channels, arch.context_dim, arch.adm_channels) for p in profile_list]
         job = {
             "onnx": os.path.join(folder, "unet.onnx"),

@@ -124,7 +124,11 @@ def _flag(enum, name):
     return getattr(enum, name, None)
 
 
-def build(job, logger, progress):
+class NoEngine(RuntimeError):
+    pass
+
+
+def build(job, logger, progress, strip=True):
     builder = trt.Builder(logger)
     typed = _flag(trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED")
     network = builder.create_network(0 if typed is None else 1 << int(typed))  # precision comes from the FP16 graph
@@ -139,8 +143,9 @@ def build(job, logger, progress):
         raise RuntimeError(f"{len(unmarked)} UNet weights aren't in the TensorRT network (e.g. {unmarked[0]})")
 
     config = builder.create_builder_config()
-    config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)  # only the UNet's weights: they're stripped and come from the checkpoint
-    config.set_flag(trt.BuilderFlag.STRIP_PLAN)
+    config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)  # only the UNet's weights: they come from the checkpoint
+    if strip:
+        config.set_flag(trt.BuilderFlag.STRIP_PLAN)
     if job.get("optimization_level") is not None:
         config.builder_optimization_level = int(job["optimization_level"])
     resize = _flag(getattr(trt, "PreviewFeature", None), "RUNTIME_ACTIVATION_RESIZE_10_10")
@@ -168,7 +173,7 @@ def build(job, logger, progress):
 
     plan = builder.build_serialized_network(network, config)
     if plan is None:
-        raise RuntimeError("TensorRT returned no engine" + (f": {logger.errors[-1]}" if logger.errors else ""))
+        raise NoEngine("TensorRT returned no engine" + (f": {logger.errors[-1]}" if logger.errors else ""))
     with open(job["plan"], "wb") as f:
         f.write(memoryview(plan))
     if cache_path:
@@ -199,7 +204,17 @@ def main(job_path):
     result = {"ok": False, "error": None}
     try:
         log(f"Building with TensorRT {trt.__version__}")
-        build(job, logger, Progress(_progress_sender()))
+        try:
+            build(job, logger, Progress(_progress_sender()))
+            result["stripped"] = True
+        except NoEngine:
+            if not any(w in " ".join(logger.errors).lower() for w in ("refit", "strip", "weight")):
+                raise
+            # Without stripping, the plan holds placeholder weights (GBs) but runs the same way.
+            log("Building a weight-stripped engine failed; building one that stores placeholder weights instead.")
+            logger.errors.clear()
+            build(job, logger, Progress(_progress_sender()), strip=False)
+            result["stripped"] = False
         result["ok"] = True
     except Exception as e:
         result["error"] = str(e)
