@@ -58,10 +58,10 @@ class Profile:
         return f"{size}, batch {span(self.batch)}, {span(self.tokens)} tokens{' (fixed size)' if self.fixed_size else ''}"
 
     def unet_shapes(self, in_channels: int, context_dim: int, adm_channels: int) -> dict:
-        """{input: [min, opt, max] shapes}. The UNet batch holds cond and uncond (2 per image); dynamic
-        batches also take one per image (CFG 1), static ones are padded to it."""
+        """{input: [min, opt, max] shapes}. The UNet batch holds cond and uncond (2 per image), or one
+        per image at CFG 1 (Lightning/DMD2/Turbo), which a batch fixed at 2 would pad to double the work."""
         lo, opt, hi = self.batch
-        batch = (2 * lo,) * 3 if lo == hi else (lo, 2 * opt, 2 * hi)
+        batch = (lo, 2 * opt, 2 * hi)
         shapes = {
             "sample": [[b, in_channels, h // 8, w // 8] for b, h, w in zip(batch, self.height, self.width)],
             "timesteps": [[b] for b in batch],
@@ -105,28 +105,27 @@ def covers_size(profile_shapes: list, height: int, width: int, batch: int = 1) -
     )
 
 
-def _p(w, h, batch=(1, 1, 1), tokens=(75, 75, 300)):
-    """Prompt lengths are a range by default: they barely affect speed, and reForge pads the prompt and
-    negative prompt to a common length (up to 4x the shorter one)."""
+def _p(w, h, batch=(1, 1, 1), tokens=(75, 300, 750)):
+    """Prompts of up to 750 tokens, tuned for 300: a prompt length range barely affects speed."""
     return Profile(w if isinstance(w, tuple) else (w,) * 3, h if isinstance(h, tuple) else (h,) * 3, batch, tokens)
 
 
 PRESETS = {
     "xl": {
+        "640-1536 (every SDXL resolution)": _p((640, 1024, 1536), (640, 1024, 1536)),
         "1024x1024": _p(1024, 1024),
         "832x1216": _p(832, 1216),
         "1216x832": _p(1216, 832),
-        "768-1344 (any SDXL aspect ratio)": _p((768, 1024, 1344), (768, 1024, 1344)),
-        "1536x1536 (Hires. fix 1.5x of 1024)": _p(1536, 1536),
-        "1024-2048 (Hires. fix up to 2x)": _p((1024, 1536, 2048), (1024, 1536, 2048)),
+        "1024-3072 (Hires. fix: 2x of every SDXL resolution)": _p((1024, 1536, 3072), (1024, 1536, 3072)),
+        "640-1536, batch 1-4": _p((640, 1024, 1536), (640, 1024, 1536), (1, 1, 4)),
     },
     "sd": {
+        "512-768 (every SD 1.5 resolution)": _p((512, 512, 768), (512, 512, 768)),
         "512x512": _p(512, 512),
         "512x768": _p(512, 768),
         "768x512": _p(768, 512),
+        "768-1536 (Hires. fix: 2x of every SD 1.5 resolution)": _p((768, 1024, 1536), (768, 1024, 1536)),
         "512-768, batch 1-4": _p((512, 512, 768), (512, 512, 768), (1, 1, 4)),
-        "768x768": _p(768, 768),
-        "1024x1024 (Hires. fix 2x of 512)": _p(1024, 1024),
     },
 }
 
@@ -136,4 +135,5 @@ def presets_for(adm_channels: int) -> dict:
 
 
 def default_profiles(adm_channels: int) -> list:
-    return [next(iter(presets_for(adm_channels).values()))]
+    """Every base resolution, and Hires. fix up to 2x of them: what most generations need."""
+    return [p for name, p in presets_for(adm_channels).items() if "every" in name]

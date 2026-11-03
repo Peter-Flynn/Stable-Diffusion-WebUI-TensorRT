@@ -12,8 +12,10 @@ NoobAI and other fine-tunes, v-prediction ones too) on RTX 2080 Ti and newer GPU
 - **LoRAs just work.** The engine gets exactly the weights reForge would use for PyTorch, LoRAs (and any other weight
   patch reForge supports) included. When the LoRAs change, only the weights they touch are updated. There is no
   conversion step.
-- **One engine, several profiles.** A profile is a size range, batch range and prompt length range. Put your base size
-  and your Hires. fix size in one engine: it switches between them instantly, with one copy of the weights in VRAM.
+- **One engine, several profiles.** A profile is a size range, batch range and prompt length range. The default is
+  every base resolution plus Hires. fix up to 2x of them, with prompts of up to 750 tokens; the engine switches between
+  profiles instantly, with one copy of the weights in VRAM. CFG 1 (Lightning, DMD2, Turbo) runs at half the batch
+  instead of padding.
 - **reForge manages its memory.** The engine is a model of reForge's model manager, which loads it, makes room for
   it and unloads it when another model needs the VRAM, like the text encoder or VAE. While a pass runs on the
   engine, the PyTorch UNet stays in RAM.

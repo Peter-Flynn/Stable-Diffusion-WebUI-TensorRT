@@ -5,6 +5,7 @@ another model needs the VRAM and loads it back for sampling, like any other mode
 runs on the engine, the PyTorch UNet stays in RAM (its patches still apply, it just isn't loaded)."""
 
 import contextlib
+import math
 import sys
 import time
 import traceback
@@ -210,6 +211,8 @@ def _unsupported(patcher) -> str:
         kinds.append("UNet wrappers")
     if any(k.startswith("diffusion_model.") for k in getattr(patcher, "object_patches", {})):
         kinds.append("replaced UNet modules")
+    if getattr(patcher, "hook_patches", None):
+        kinds.append("scheduled weights")
     return f"UNet patches ({', '.join(kinds)})" if kinds else ""
 
 
@@ -266,32 +269,43 @@ class Pass:
         self.fallback = None
         self.checked = False
         self._hint_batching()
+        # Other loads mid-pass (e.g. a live preview's decoder) unload other models first: unloading the
+        # engine would mean reloading it on the next step, the UNet would lose its patches.
+        self._keep = _keeping(model, patcher)
+        self._keep.__enter__()
+
+    def _restore(self):
+        self.patcher.model.__dict__.pop("memory_required", None)
+        if self._keep is not None:
+            self._keep, keep = None, self._keep
+            keep.__exit__(None, None, None)
+        if self.model.loaded:
+            self.model.engine.release_activations()
 
     def _hint_batching(self):
-        """reForge splits cond and uncond into separate UNet calls when it thinks the PyTorch UNet's
-        activations won't fit. The engine's activations are already allocated, and a static profile would
-        pad a split call back to full size: batch whatever a profile takes."""
+        """reForge decides how many conds (cond and uncond) to batch into one UNet call by the PyTorch
+        UNet's memory estimate. With the engine's activations already allocated, batch whatever a profile
+        runs: the whole batch, and prompts padded to the length reForge would pad them to (their least
+        common multiple). Batches no profile runs are split, so each prompt runs at its own length."""
         shapes = self.model.record.shapes
 
         def memory_required(input_shape, cond_shapes={}):
             b, _, h, w = input_shape[:4]
-            return 0 if profiles.covers_size(shapes, h, w, b) else float("inf")
+            lengths = [s[1] for s in cond_shapes.get("c_crossattn", ()) if len(s) > 1]
+            context = math.lcm(*lengths) if lengths else profiles.CONTEXT_PER_CHUNK
+            return 0 if profiles.select(shapes, b, h, w, context) is not None else float("inf")
 
         self.patcher.model.memory_required = memory_required
 
     def end(self):
         """Undoes what the pass changed; the engine stays loaded for the next one."""
-        self.patcher.model.__dict__.pop("memory_required", None)
-        if self.model.loaded:
-            self.model.engine.release_activations()
+        self._restore()
         self.model.weights = None  # don't keep this checkpoint alive
 
     def fall_back(self, reason: str):
         self.fallback = reason
         notify(f"{reason}; finishing this pass with PyTorch.")
-        self.patcher.model.__dict__.pop("memory_required", None)
-        if self.model.loaded:
-            self.model.engine.release_activations()
+        self._restore()  # PyTorch's UNet may need the engine's VRAM
         _load_torch_unet(self.patcher, self.shape)
         raise Fallback(reason)
 
@@ -349,9 +363,9 @@ def _engine_record(patcher, x):
     if reason:
         notify(f"TensorRT engines can't apply {reason}; using PyTorch.")
         return None
-    _, _, h, w = x.shape
-    if not profiles.covers_size(record.shapes, h, w):
-        notify(f"No profile of the {arch.label} engine covers {w * 8}x{h * 8}; using PyTorch for this pass. Add one in the TensorRT tab.")
+    b, _, h, w = x.shape
+    if not profiles.covers_size(record.shapes, h, w, b):
+        notify(f"No profile of the {arch.label} engine covers {w * 8}x{h * 8} at batch size {b}; using PyTorch for this pass. Add one in the TensorRT tab.")
         return None
     return record
 

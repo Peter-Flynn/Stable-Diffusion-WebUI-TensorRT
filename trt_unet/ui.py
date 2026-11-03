@@ -160,8 +160,8 @@ def build(draft, optimization_level, progress=gr.Progress()):
             message = f"### The build failed\n`{result.get('error')}`\n\nThe console has the details."
         if result.get("memory_warnings"):
             message += (
-                f"\n\nTensorRT skipped {result['memory_warnings']} kernels for lack of VRAM, so the engine may be slower than it could be "
-                "(close other GPU programs, or use fewer or smaller profiles, and rebuild)."
+                f"\n\nTensorRT skipped {result['memory_warnings']} kernels that need more VRAM than is free at a profile's largest sizes, "
+                "so those sizes may run a little slower. Narrower profiles avoid this."
             )
     except Exception as e:
         traceback.print_exc()
