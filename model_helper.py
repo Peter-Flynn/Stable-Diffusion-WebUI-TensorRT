@@ -88,6 +88,7 @@ class UNetModel:
             shapes["y"] = [(b, self.num_xl_classes) for b in batch]
         return shapes
 
+    @torch.inference_mode()
     def export_weights_map(self, onnx_path: str, weights_map_path: str):
         """Maps UNet weight names to ONNX initializers by their fp16 data (transposed ones too)."""
         onnx_dir = os.path.dirname(onnx_path)

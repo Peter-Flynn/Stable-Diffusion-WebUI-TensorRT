@@ -42,6 +42,7 @@ def import_lora_networks():
         raise RuntimeError(f"The built-in Lora extension could not be imported: {e}")
 
 
+@unet_memory.in_inference_mode
 def _forge_merged_weights(unet: torch.nn.Module) -> dict:
     """reForge keeps LoRAs as patches on the ModelPatcher: merge the patched weights on the CPU."""
     import ldm_patched.modules.lora as forge_lora
