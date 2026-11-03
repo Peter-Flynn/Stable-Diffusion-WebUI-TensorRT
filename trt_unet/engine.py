@@ -1,8 +1,12 @@
 """A deserialized TensorRT engine: weights refitted from PyTorch tensors, several optimization profiles in
 one execution context, and activation memory from PyTorch's allocator sized for the shapes in use."""
 
+from collections import deque
+
 import tensorrt as trt
 import torch
+
+from .common import gib
 
 
 _DTYPES = {
@@ -13,7 +17,6 @@ _DTYPES = {
     trt.DataType.INT64: torch.int64,
     trt.DataType.BOOL: torch.bool,
 }
-_MEMORY_HINTS = ("memory", "alloc")
 DEVICE = "cuda"
 
 
@@ -24,11 +27,21 @@ def torch_dtype(dtype):
 
 
 class Logger(trt.ILogger):
+    """Prints TensorRT's errors; keeps everything but its verbose messages to explain a failure."""
+
     def __init__(self):
         trt.ILogger.__init__(self)
         self.errors = []
+        self.messages = deque(maxlen=50)
+
+    def clear(self):
+        self.errors.clear()
+        self.messages.clear()
 
     def log(self, severity, msg):
+        if severity == trt.ILogger.Severity.VERBOSE:
+            return
+        self.messages.append(f"{severity.name}: {msg}")
         if int(severity) <= int(trt.ILogger.Severity.ERROR):
             self.errors.append(msg)
             print(f"[TensorRT] ERROR: {msg}", flush=True)
@@ -62,17 +75,18 @@ class Engine:
         return self.engine is not None
 
     def load(self):
-        LOGGER.errors.clear()
+        LOGGER.clear()
         with open(self.plan_path, "rb") as f:
             plan = f.read()
         self.engine = runtime().deserialize_cuda_engine(plan)
         if self.engine is None:
-            details = "; ".join(LOGGER.errors[-3:])
-            raise RuntimeError(
-                f"TensorRT {trt.__version__} could not load {self.plan_path}"
-                + (f": {details}" if details else "")
-                + (". There may not be enough free VRAM." if any(h in details.lower() for h in _MEMORY_HINTS) else ". Rebuild the engine.")
-            )
+            said = " | ".join(LOGGER.messages) or "nothing"
+            try:
+                free, total = torch.cuda.mem_get_info()
+                vram = f"{gib(free)} of {gib(total)} VRAM free"
+            except Exception as e:
+                vram = f"free VRAM unknown ({e})"
+            raise RuntimeError(f"TensorRT {trt.__version__} could not load {self.plan_path} ({len(plan)} bytes; {vram}). TensorRT said: {said}")
         self.io = []
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
@@ -113,7 +127,7 @@ class Engine:
             if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), location):
                 raise RuntimeError(f"TensorRT rejected weight {name}")
 
-        LOGGER.errors.clear()
+        LOGGER.clear()
         for name in names:
             put(name)
         for name in refitter.get_missing_weights():
