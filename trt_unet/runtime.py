@@ -90,17 +90,20 @@ class TrtModel:
             self.weights = EffectiveWeights(patcher)
         start, free, reserved = time.time(), torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
         engine = self._engine()
-        engine.load()
+        plan_seconds = engine.load()
         try:
             self.applied = {}
-            self.sync()
+            refit = self.sync(quiet=True)
         except Exception:
             engine.unload()
             raise
         # TensorRT's own allocations, not what PyTorch cached meanwhile (e.g. computing LoRA weights)
         used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
         self.measured = max(self.measured, used)
-        log(f"Loaded the {self.record.arch.label} engine ({common.gib(self.model_size())}) in {time.time() - start:.1f}s")
+        log(
+            f"Loaded the {self.record.arch.label} engine ({common.gib(self.model_size())}) in {time.time() - start:.1f}s: "
+            f"plan {plan_seconds:.1f}s, " + (_refit_times(refit) if refit else "no weights to refit")
+        )
         return self.model_size()
 
     def partially_unload(self, device, memory_to_free=0):
@@ -112,23 +115,30 @@ class TrtModel:
             self.applied = {}
         return self.model
 
-    def sync(self):
+    def sync(self, quiet=False):
         """Refits the weights whose source changed: all of them for a new engine or checkpoint, the
-        patched ones when LoRAs change."""
+        patched ones when LoRAs change. Returns what _refit_times reports, or None if nothing changed."""
         engine, weights = self.engine, self.weights
         weights.refresh()
         # The UNet's weights; anything else refittable keeps what the plan holds.
         wanted = {name: weights.signature(name) for name in engine.weight_names if weights.has(name)}
         changed = [name for name in wanted if self.applied.get(name) != wanted[name]]
         if not changed:
-            return
+            return None
         start = time.time()
         self.applied = {}
         torch.cuda.current_stream().synchronize()  # no inference in flight while the weights change
-        engine.refit(changed, weights.tensor)
+        seconds = engine.refit(changed, weights.tensor)
         self.applied = wanted
-        if len(changed) < len(wanted):
-            log(f"Refitted {len(changed)} weights in {time.time() - start:.1f}s")
+        refit = {**seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
+        if not quiet:
+            log(f"Refitted {len(changed)} weights in {time.time() - start:.1f}s: {_refit_times(refit)}")
+        return refit
+
+
+def _refit_times(refit: dict) -> str:
+    patched = f", {refit['patched']} with LoRAs" if refit["patched"] else ""
+    return f"{refit['count']} weights {refit['weights']:.1f}s{patched}, TensorRT refit {refit['tensorrt']:.1f}s"
 
 
 def _loaded_entries(*models):

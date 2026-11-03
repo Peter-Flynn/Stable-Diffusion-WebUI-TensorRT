@@ -71,6 +71,9 @@ class EffectiveWeights:
         heads = [self.base(n).reshape(-1)[:16].float().cpu() for n in sorted(self.params)]
         return hashlib.sha256(torch.cat(heads).numpy().tobytes()).hexdigest() if heads else ""
 
+    def is_patched(self, name: str) -> bool:
+        return bool(self.patches.get(PREFIX + name))
+
     def signature(self, name: str):
         patches = self.patches.get(PREFIX + name)
         return self.base_version, _identity(patches) if patches else None
