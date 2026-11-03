@@ -17,7 +17,7 @@ FAMILY_NAMES = {"xl": "SDXL", "sd": "SD 1.x/2.x"}
 HELP = """
 **How it works.** An engine is compiled for a UNet *architecture*, not a checkpoint: every SDXL (or SD 1.5, ...) checkpoint with that architecture runs on it with its own weights, and LoRAs work as usual. Engine files hold no weights, so they're small and load quickly.
 
-**Profiles** are the image sizes, batch sizes and prompt lengths an engine runs. Static profiles (one size) are the fastest; ranges cover more sizes. Add one per size you use, e.g. your base size and your Hires. fix size: switching between them costs nothing. Anything no profile covers runs on PyTorch.
+**Profiles** are the image sizes, batch sizes and prompt lengths an engine runs. Fixed-size profiles are the fastest; ranges cover more sizes. Add one per size you use, e.g. your base size and your Hires. fix size: switching between them costs nothing. Anything no profile covers runs on PyTorch.
 
 **Use it** with `SD Unet` set to `Automatic` (or the `[TRT]` engine); `None` uses PyTorch. ControlNet and other UNet patches can't run on engines, so those generations use PyTorch.
 """
@@ -170,17 +170,23 @@ def build(draft, optimization_level, progress=gr.Progress()):
 
 
 def delete_engine(choice, draft):
+    from modules.call_queue import queue_lock
+
     record = _engine_choices().get(choice)
     if record is not None:
-        _refresh_unet_list()
-        store.delete(record)
+        with queue_lock:  # not while a generation uses it
+            _refresh_unet_list()
+            store.delete(record)
+            sd_unet.list_unets()
         common.log(f"Deleted {record.plan}")
-        sd_unet.list_unets()
     return refresh(reset_draft=False, draft=draft)
 
 
 def delete_legacy(draft):
-    freed = store.remove_legacy_files()
+    from modules.call_queue import queue_lock
+
+    with queue_lock:
+        freed = store.remove_legacy_files()
     common.log(f"Deleted files from older versions of the extension ({common.gib(freed)})")
     return refresh(reset_draft=False, draft=draft)
 

@@ -43,8 +43,9 @@ class Profile:
         )
 
     @property
-    def static(self) -> bool:
-        return all(getattr(self, f)[0] == getattr(self, f)[2] for f in FIELDS)
+    def fixed_size(self) -> bool:
+        """One size and batch size: the fastest kind (a prompt length range costs next to nothing)."""
+        return all(getattr(self, f)[0] == getattr(self, f)[2] for f in ("width", "height", "batch"))
 
     def describe(self) -> str:
         def span(values, unit=""):
@@ -54,7 +55,7 @@ class Profile:
         size = f"{self.width[1]}x{self.height[1]}" if self.width[0] == self.width[2] and self.height[0] == self.height[2] else (
             f"{span(self.width)} x {span(self.height)}"
         )
-        return f"{size}, batch {span(self.batch)}, {span(self.tokens)} tokens{' (static)' if self.static else ''}"
+        return f"{size}, batch {span(self.batch)}, {span(self.tokens)} tokens{' (fixed size)' if self.fixed_size else ''}"
 
     def unet_shapes(self, in_channels: int, context_dim: int, adm_channels: int) -> dict:
         """{input: [min, opt, max] shapes}. The UNet batch holds cond and uncond (2 per image); dynamic
@@ -104,7 +105,9 @@ def covers_size(profile_shapes: list, height: int, width: int, batch: int = 1) -
     )
 
 
-def _p(w, h, batch=(1, 1, 1), tokens=(75, 75, 75)):
+def _p(w, h, batch=(1, 1, 1), tokens=(75, 75, 300)):
+    """Prompt lengths are a range by default: they barely affect speed, and reForge pads the prompt and
+    negative prompt to a common length (up to 4x the shorter one)."""
     return Profile(w if isinstance(w, tuple) else (w,) * 3, h if isinstance(h, tuple) else (h,) * 3, batch, tokens)
 
 
@@ -113,15 +116,15 @@ PRESETS = {
         "1024x1024": _p(1024, 1024),
         "832x1216": _p(832, 1216),
         "1216x832": _p(1216, 832),
-        "768-1344 (any SDXL aspect ratio)": _p((768, 1024, 1344), (768, 1024, 1344), tokens=(75, 75, 150)),
+        "768-1344 (any SDXL aspect ratio)": _p((768, 1024, 1344), (768, 1024, 1344)),
         "1536x1536 (Hires. fix 1.5x of 1024)": _p(1536, 1536),
-        "1024-2048 (Hires. fix up to 2x)": _p((1024, 1536, 2048), (1024, 1536, 2048), tokens=(75, 75, 150)),
+        "1024-2048 (Hires. fix up to 2x)": _p((1024, 1536, 2048), (1024, 1536, 2048)),
     },
     "sd": {
         "512x512": _p(512, 512),
         "512x768": _p(512, 768),
         "768x512": _p(768, 512),
-        "512-768, batch 1-4": _p((512, 512, 768), (512, 512, 768), (1, 1, 4), (75, 75, 150)),
+        "512-768, batch 1-4": _p((512, 512, 768), (512, 512, 768), (1, 1, 4)),
         "768x768": _p(768, 768),
         "1024x1024 (Hires. fix 2x of 512)": _p(1024, 1024),
     },

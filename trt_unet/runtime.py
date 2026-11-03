@@ -261,6 +261,7 @@ class Pass:
     def __init__(self, model: TrtModel, patcher, x):
         self.model, self.patcher = model, patcher
         self.module = patcher.model.diffusion_model
+        self.shapes, self.takes_y = model.record.shapes, bool(model.record.arch.adm_channels)
         self.shape = (x.shape[0] * 2, *x.shape[1:])
         self.fallback = None
         self.checked = False
@@ -296,9 +297,13 @@ class Pass:
 
     def run(self, x, timesteps, context, y):
         b, _, h, w = x.shape
-        choice = profiles.select(self.model.record.shapes, b, h, w, context.shape[1])
+        choice = profiles.select(self.shapes, b, h, w, context.shape[1])
         if choice is None:
-            self.fall_back(f"No profile of the engine runs {w * 8}x{h * 8}, UNet batch {b}, context {context.shape[1]}")
+            tokens = context.shape[1] // profiles.CONTEXT_PER_CHUNK * profiles.TOKENS_PER_CHUNK
+            self.fall_back(
+                f"No profile of the engine runs {w * 8}x{h * 8} with a UNet batch of {b} and {tokens}-token prompts "
+                "(reForge pads the prompt and negative prompt to a common length)"
+            )
         index, padded, repeats = choice
         timesteps = timesteps.reshape(-1)
         feed = {
@@ -306,7 +311,7 @@ class Pass:
             "timesteps": timesteps if timesteps.shape[0] == b else timesteps.expand(b),
             "encoder_hidden_states": context.repeat(1, repeats, 1) if repeats > 1 else context,
         }
-        if y is not None and self.model.record.arch.adm_channels:
+        if y is not None and self.takes_y:
             feed["y"] = y
         if padded > b:
             feed = {k: v.repeat(-(-padded // b), *([1] * (v.dim() - 1)))[:padded] for k, v in feed.items()}
