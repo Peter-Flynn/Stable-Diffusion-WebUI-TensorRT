@@ -11,13 +11,12 @@ from modules.ui_components import ToolButton
 
 from . import arch as arch_mod
 from . import common, store
-from .profiles import FIELDS, PRESETS, Profile, default_profiles
+from .profiles import FIELDS, PRESETS, Profile, default_profiles, presets_for
 
 JS = "js" if int(gr.__version__.split(".")[0]) >= 4 else "_js"
 NEW = "New profile"
 FIELD_LABELS = {"width": "Width", "height": "Height", "batch": "Batch size", "tokens": "Prompt tokens"}
 LEVEL_LABELS = {"min": "min", "opt": "optimal", "max": "max"}
-FAMILY_NAMES = {"xl": "SDXL", "sd": "SD 1.5"}
 BUILDING = threading.Event()
 HELP = """
 **Engines** are compiled for a UNet architecture, not a checkpoint: every checkpoint with that architecture (fine-tunes, merges, v-prediction ones) runs on the same engine with its own weights, LoRAs included. Engine files hold no weights; while loaded, an engine takes about as much VRAM as the checkpoint's UNet.
@@ -38,14 +37,13 @@ def _n(count: int, word: str) -> str:
 
 
 def _preset_values():
-    return {f"{FAMILY_NAMES[family]}: {name}": [v for f in FIELDS for v in getattr(p, f)] for family, presets in PRESETS.items() for name, p in presets.items()}
+    """{name: the 12 form values} of every family's presets (their names are distinct)."""
+    return {name: [v for f in FIELDS for v in getattr(p, f)] for presets in PRESETS.values() for name, p in presets.items()}
 
 
 def _preset_choices(arch):
-    if arch is None:
-        return list(_preset_values())
-    family = FAMILY_NAMES["xl" if arch.adm_channels else "sd"]
-    return [name for name in _preset_values() if name.startswith(family + ":")]
+    """The loaded architecture's presets."""
+    return list(_preset_values()) if arch is None else list(presets_for(arch.adm_channels))
 
 
 def _current():
@@ -72,11 +70,20 @@ def _stale(arch):
         return None
 
 
+def _tensorrt_package() -> str:
+    try:
+        import torch
+
+        return f"tensorrt-cu{torch.version.cuda.split('.')[0]}"
+    except Exception:
+        return "tensorrt"
+
+
 def _status(sd_model, arch, record) -> str:
     try:
         version = common.trt_version()
     except Exception as e:
-        return f"### TensorRT isn't available\n`{e}`. Install it (`pip install tensorrt`) and restart the WebUI."
+        return f"### TensorRT isn't available\n`{e}`\n\nInstall the build for PyTorch's CUDA (`pip install {_tensorrt_package()}`) and restart the WebUI."
     if sd_model is None:
         return "No checkpoint is loaded. Load one, then refresh this tab."
     name = sd_model.sd_checkpoint_info.model_name
@@ -146,7 +153,7 @@ def _engines_view(arch) -> str:
 
 
 def _engine_choices():
-    return {f"{r.arch.label}, TensorRT {r.meta['trt']} ({r.meta['gpu']})": r for r in store.records()}
+    return {f"{r.arch.label} · {r.meta['gpu_name']}, TensorRT {r.meta['trt']}": r for r in store.records()}
 
 
 def refresh(draft=None, draft_arch=None):
@@ -318,7 +325,7 @@ def on_ui_tabs():
                 with gr.Accordion("Edit profiles", open=False, elem_id="trt_editor"):
                     with gr.Row():
                         selector = gr.Dropdown(label="Profile", choices=[NEW], value=NEW, elem_id="trt_selector")
-                        preset = gr.Dropdown(label="Fill in from a preset", choices=list(presets), elem_id="trt_preset")
+                        preset = gr.Dropdown(label="Fill in from a preset", choices=[], elem_id="trt_preset")
                     numbers = []
                     for f_index, field in enumerate(FIELDS):
                         with gr.Row():
