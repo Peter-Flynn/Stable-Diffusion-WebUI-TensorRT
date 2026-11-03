@@ -70,20 +70,11 @@ def _stale(arch):
         return None
 
 
-def _tensorrt_package() -> str:
-    try:
-        import torch
-
-        return f"tensorrt-cu{torch.version.cuda.split('.')[0]}"
-    except Exception:
-        return "tensorrt"
-
-
 def _status(sd_model, arch, record) -> str:
     try:
         version = common.trt_version()
     except Exception as e:
-        return f"### TensorRT isn't available\n`{e}`\n\nInstall the build for PyTorch's CUDA (`pip install {_tensorrt_package()}`) and restart the WebUI."
+        return f"### TensorRT isn't available\n`{e}`\n\nRestart the WebUI: the extension installs or updates it."
     if sd_model is None:
         return "No checkpoint is loaded. Load one, then refresh this tab."
     name = sd_model.sd_checkpoint_info.model_name

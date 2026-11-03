@@ -231,6 +231,7 @@ def build(arch: Arch, patcher, profile_list: list, optimization_level=None, prog
     saved Record as "record"."""
     from . import runtime
 
+    common.trt_version()  # installed and new enough
     runtime.release_all()
     common.inference_mode(common.mm().unload_all_models)()
     common.mm().soft_empty_cache(force=True)

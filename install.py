@@ -4,50 +4,31 @@ from importlib import metadata
 
 import launch
 
-MIN_TRT = (10, 1)
-
-
-def torch_cuda() -> str:
-    """PyTorch's CUDA major version ("12"), or None."""
-    try:
-        import torch
-
-        return torch.version.cuda.split(".")[0] if torch.version.cuda else None
-    except Exception:
-        return None
+MIN_TRT = (11, 0)
 
 
 def installed_tensorrt():
-    """(version, {CUDA majors of the installed TensorRT libraries}), or (None, set())."""
-    version, cudas = None, set()
+    """(package, version) of the installed TensorRT, whichever CUDA build it is (tensorrt, tensorrt-cu12, ...),
+    or (None, None)."""
+    found = []
     for dist in metadata.distributions():
         name = (dist.metadata.get("Name") or "").lower().replace("_", "-")
-        if name == "tensorrt" or re.fullmatch(r"tensorrt-cu\d+(-bindings)?", name):
-            version = version or dist.version
-        match = re.fullmatch(r"tensorrt-cu(\d+)-libs", name)
+        match = re.fullmatch(r"(tensorrt(?:-cu\d+)?)(-bindings)?", name)
         if match:
-            cudas.add(match.group(1))
-    return version, cudas
+            found.append((match.group(2) is not None, match.group(1), dist.version))  # the package before its bindings
+    return min(found)[1:] if found else (None, None)
 
 
 def install():
     if os.environ.get("TRT_EXTENSION_SKIP_INSTALL", "").lower() in ("1", "true", "yes"):
         return
-    cuda = torch_cuda()
-    # The plain `tensorrt` package is the newest CUDA's build (13.x), not necessarily PyTorch's.
-    package = f"tensorrt-cu{cuda}" if cuda else "tensorrt"
-    version, cudas = installed_tensorrt()
-    if version is None:
-        print(f"[TensorRT] Installing {package}...")
-        launch.run_pip(f"install {package}", package, live=True)
+    package, version = installed_tensorrt()
+    if package is None:
+        print("[TensorRT] Installing TensorRT...")
+        launch.run_pip("install tensorrt", "tensorrt", live=True)
     elif tuple(map(int, re.findall(r"\d+", version)[:2])) < MIN_TRT:
-        print(f"[TensorRT] TensorRT {version} is too old; this extension needs {'.'.join(map(str, MIN_TRT))} or later (pip install -U {package}).")
-    elif cuda and cudas and cuda not in cudas:
-        others = " ".join(f"tensorrt-cu{c}{part}" for c in sorted(cudas) for part in ("", "-libs", "-bindings"))
-        print(
-            f"[TensorRT] The installed TensorRT is built for CUDA {'/'.join(sorted(cudas))}, PyTorch for CUDA {cuda}. "
-            f"If engines fail to build or load: pip uninstall -y tensorrt {others}, then pip install {package}"
-        )
+        print(f"[TensorRT] Updating {package} {version}: this extension needs TensorRT {MIN_TRT[0]} or later...")
+        launch.run_pip(f"install -U {package}", package, live=True)  # the same CUDA build
     if not launch.is_installed("onnx"):
         launch.run_pip("install onnx", "onnx", live=True)
 

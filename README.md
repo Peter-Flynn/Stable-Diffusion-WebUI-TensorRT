@@ -26,10 +26,8 @@ NoobAI and other fine-tunes, v-prediction ones too) on RTX 2080 Ti and newer GPU
 ## Requirements
 
 - reForge, with an NVIDIA RTX 2080 Ti or newer and a recent driver.
-- TensorRT 10.1 or later, built for PyTorch's CUDA version. If TensorRT is missing, the extension installs the
-  matching build (`tensorrt-cu12` for reForge's default PyTorch; plain `tensorrt` is the CUDA 13 build), and
-  `onnx`. It never replaces an installed TensorRT, but says if it's built for another CUDA version. Set
-  `TRT_EXTENSION_SKIP_INSTALL=1` to install nothing.
+- TensorRT 11 or later, any CUDA build of it. The extension installs or updates TensorRT if it's missing or older,
+  and `onnx`. Set `TRT_EXTENSION_SKIP_INSTALL=1` to install nothing.
 
 ## Use
 

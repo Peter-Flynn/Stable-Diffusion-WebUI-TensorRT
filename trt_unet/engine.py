@@ -6,9 +6,12 @@ import torch
 
 
 _DTYPES = {
-    getattr(trt.DataType, t): getattr(torch, d)
-    for t, d in (("FLOAT", "float32"), ("HALF", "float16"), ("BF16", "bfloat16"), ("INT32", "int32"), ("INT64", "int64"), ("BOOL", "bool"))
-    if hasattr(trt.DataType, t)
+    trt.DataType.FLOAT: torch.float32,
+    trt.DataType.HALF: torch.float16,
+    trt.DataType.BF16: torch.bfloat16,
+    trt.DataType.INT32: torch.int32,
+    trt.DataType.INT64: torch.int64,
+    trt.DataType.BOOL: torch.bool,
 }
 _MEMORY_HINTS = ("memory", "alloc")
 DEVICE = "cuda"
@@ -118,9 +121,7 @@ class Engine:
         try:
             ok = refitter.refit_cuda_engine()
         finally:
-            release = getattr(refitter, "release_refit_resources", None)
-            if release is not None:
-                release()  # else the refit's scratch memory stays allocated as long as the engine
+            refitter.release_refit_resources()  # else the refit's scratch memory stays allocated as long as the engine
         if not ok:
             raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
 
@@ -147,14 +148,8 @@ class Engine:
 
     def activation_bytes(self) -> int:
         """For the profile and input shapes set on the context."""
-        try:
-            size = int(self.context.update_device_memory_size_for_shapes())
-            if size > 0:
-                return size
-        except Exception:
-            pass
-        get = getattr(self.engine, "get_device_memory_size_for_profile_v2", None) or self.engine.get_device_memory_size_for_profile
-        return int(get(self.profile))
+        size = int(self.context.update_device_memory_size_for_shapes())  # 0 if it can't tell
+        return size if size > 0 else int(self.engine.get_device_memory_size_for_profile_v2(self.profile))
 
     def estimate_activation_bytes(self, profile: int, shapes: dict, stream: int) -> int:
         self._context()

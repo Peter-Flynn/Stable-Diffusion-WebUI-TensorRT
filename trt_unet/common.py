@@ -51,9 +51,15 @@ def gpu_tag() -> str:
     return f"sm{major}{minor}"
 
 
+MIN_TRT = 11
+
+
 def trt_version() -> str:
+    """The installed TensorRT's version; raises if it's missing or older than this extension needs."""
     import tensorrt
 
+    if int(tensorrt.__version__.split(".")[0]) < MIN_TRT:
+        raise RuntimeError(f"TensorRT {tensorrt.__version__} is installed; this extension needs {MIN_TRT} or later")
     return tensorrt.__version__
 
 

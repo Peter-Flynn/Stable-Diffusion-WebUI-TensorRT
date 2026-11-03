@@ -120,21 +120,14 @@ def _progress_sender(min_interval=0.5):
     return send
 
 
-def _flag(enum, name):
-    return getattr(enum, name, None)
-
-
 class NoEngine(RuntimeError):
     pass
 
 
 def build(job, logger, progress, strip=True):
     builder = trt.Builder(logger)
-    typed = _flag(trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED")
-    network = builder.create_network(0 if typed is None else 1 << int(typed))  # precision comes from the FP16 graph
+    network = builder.create_network(0)  # strongly typed: precision comes from the FP16 graph
     parser = trt.OnnxParser(network, logger)
-    if _flag(trt.OnnxParserFlag, "NATIVE_INSTANCENORM") is not None:
-        parser.set_flag(trt.OnnxParserFlag.NATIVE_INSTANCENORM)
     if not parser.parse_from_file(job["onnx"]):
         raise RuntimeError("TensorRT could not parse the ONNX model: " + "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
 
@@ -148,9 +141,8 @@ def build(job, logger, progress, strip=True):
         config.set_flag(trt.BuilderFlag.STRIP_PLAN)
     if job.get("optimization_level") is not None:
         config.builder_optimization_level = int(job["optimization_level"])
-    resize = _flag(getattr(trt, "PreviewFeature", None), "RUNTIME_ACTIVATION_RESIZE_10_10")
-    if resize is not None and any(lo != hi for shapes in job["profiles"] for lo, _, hi in shapes.values()):
-        config.set_preview_feature(resize, True)  # activation memory sized for the shapes in use
+    if any(lo != hi for shapes in job["profiles"] for lo, _, hi in shapes.values()):
+        config.set_preview_feature(trt.PreviewFeature.RUNTIME_ACTIVATION_RESIZE_10_10, True)  # activation memory sized for the shapes in use
     config.progress_monitor = progress
 
     cache_path = job.get("timing_cache")
