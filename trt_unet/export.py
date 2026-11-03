@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +22,7 @@ from .arch import Arch, unet_config
 from .common import log
 
 INPUTS = ("sample", "timesteps", "encoder_hidden_states", "y")
+PLACEHOLDER_STRIDE = 256  # bytes between the placeholder weights' starts
 CANCEL = threading.Event()
 DYNAMIC_AXES = {
     "sample": {0: "batch", 2: "height", 3: "width"},
@@ -93,8 +95,10 @@ def _fresh_unet(config: dict, device, dtype=torch.float16):
 
 
 def _placeholder_weights(onnx_path: str, input_names) -> dict:
-    """Turns the exported weight inputs into initializers that all read one shared block of zeros, so
-    the graph stays small: TensorRT only needs their shapes, the checkpoint provides the values."""
+    """Turns the exported weight inputs into initializers that read a small file of zeros, so the graph
+    stays small: TensorRT only needs their shapes, the checkpoint provides the values. TensorRT tells
+    weights apart by their memory (the parser maps the file once), so each starts at its own offset;
+    their ranges overlap, so the file is about as large as the largest weight."""
     import onnx
 
     model = onnx.load(onnx_path)
@@ -103,7 +107,7 @@ def _placeholder_weights(onnx_path: str, input_names) -> dict:
     weights = [i for i in graph.input if i.name not in input_names]
     sizes = {onnx.TensorProto.FLOAT16: 2, onnx.TensorProto.BFLOAT16: 2, onnx.TensorProto.FLOAT: 4, onnx.TensorProto.INT64: 8}
     data_name = os.path.basename(onnx_path) + ".zeros"
-    shapes, largest = {}, 0
+    shapes, end = {}, 0
     for value in weights:
         graph.input.remove(value)
         if value.name not in used:
@@ -111,16 +115,17 @@ def _placeholder_weights(onnx_path: str, input_names) -> dict:
         t = value.type.tensor_type
         dims = [d.dim_value for d in t.shape.dim]
         nbytes = math.prod(dims) * sizes[t.elem_type]
-        largest = max(largest, nbytes)
+        offset = len(shapes) * PLACEHOLDER_STRIDE
+        end = max(end, offset + nbytes)
         init = graph.initializer.add()
         init.name, init.data_type, init.data_location = value.name, t.elem_type, onnx.TensorProto.EXTERNAL
         init.dims.extend(dims)
-        for key, val in (("location", data_name), ("offset", "0"), ("length", str(nbytes))):
+        for key, val in (("location", data_name), ("offset", str(offset)), ("length", str(nbytes))):
             entry = init.external_data.add()
             entry.key, entry.value = key, val
         shapes[value.name] = dims
     with open(os.path.join(os.path.dirname(onnx_path), data_name), "wb") as f:
-        f.truncate(largest)
+        f.truncate(end)
     onnx.save(model, onnx_path)
     return shapes
 
@@ -150,7 +155,9 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
     if "dynamo" in inspect.signature(torch.onnx.export).parameters:
         kwargs["dynamo"] = False
     log(f"Exporting the {arch.name} UNet graph...")
-    with _traceable_attention():
+    with _traceable_attention(), warnings.catch_warnings():
+        # The values it warns about (shape checks, the head size) are fixed for an architecture.
+        warnings.simplefilter("ignore", torch.jit.TracerWarning)
         torch.onnx.export(unet, tuple(inputs), path, **kwargs)
     expected = {k: list(v.shape) for k, v in unet.state_dict(keep_vars=True).items()}
     del unet, inputs
