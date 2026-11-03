@@ -1,103 +1,44 @@
-# TensorRT Extension for Stable Diffusion WebUI (TensorRT 10 & 11)
+# TensorRT for reForge
 
-A modernized fork of NVIDIA's TensorRT extension for Stable Diffusion WebUI, tested with
-[stable-diffusion-webui-reForge](https://github.com/Panchovix/stable-diffusion-webui-reForge) and
-Automatic1111. Based on [ventus34's Blackwell fork](https://github.com/ventus34/Stable-Diffusion-WebUI-TensorRT-Blackwell),
-with fixes collected from other community forks.
+Runs the Stable Diffusion UNet of [stable-diffusion-webui-reForge](https://github.com/Panchovix/stable-diffusion-webui-reForge)
+on NVIDIA TensorRT engines. Supports SD 1.x, SD 2.x and SDXL-architecture checkpoints (including Pony, Illustrious,
+NoobAI and other fine-tunes, v-prediction ones too) on RTX 2080 Ti and newer GPUs.
 
-Supports Stable Diffusion 1.5, 2.1, SDXL, SDXL Turbo, and LCM.
+## How it works
 
----
-
-## What's different from upstream
-
-- **TensorRT 10 and 11.** TensorRT 11 removed weakly typed precision flags (`BuilderFlag.FP16`): engines are built
-  *strongly typed*, so precision comes from the ONNX graph. On reForge the UNet is exported in FP16 throughout (an
-  autocast export leaves normalizations, softmax and residual adds in FP32, which made engines slower than PyTorch);
-  A1111 exports under autocast. On TensorRT 10 the classic FP16 build is used.
-- **No Polygraphy, Optimum or ONNX graph tools.** Engines are built and run with the TensorRT Python API directly;
-  TensorRT does the graph cleanup itself.
-- **Lower VRAM use.** Activation memory comes from PyTorch's allocator, so it's shared with the rest of the WebUI, and
-  dynamic engines size it for the shapes in use rather than the profile maximum (TensorRT >= 10.10). ONNX export
-  traces at a small resolution.
-- **Fewer copies per step.** Inputs that already match the engine's dtype are bound directly; outputs aren't cloned.
-- **LoRA fixes.** LoRA export works on reForge/Forge (LoRAs are applied through the ModelPatcher there), refit weights
-  match the engine's weight dtypes (required for strongly typed engines), `<lora:name>` without a weight works, the UNet
-  weight of `<lora:name:te:unet>` is honored, aliases from LoRA cards resolve, LoRAs in subfolders are listed, and bf16/fp8
-  checkpoints no longer crash the weight mapping. On reForge, converting a LoRA only reads the weights it changes.
-- **Non-destructive installer.** `install.py` never uninstalls or replaces your TensorRT. Set
-  `TRT_EXTENSION_SKIP_INSTALL=1` to make it install nothing at all (useful for Nix or other managed environments).
-- **reForge support.** Hooks `ldm_patched`'s `UNetModel.forward`, uses an ONNX-exportable attention during export, and
-  forces the TorchScript ONNX exporter (`dynamo=False`).
-- **Plays nicely with reForge's model manager.** The PyTorch UNet is unloaded through the manager (never moved behind
-  its back, which caused "Expected all tensors to be on the same device" errors), and while an engine is active reForge
-  keeps the UNet's weights in system RAM instead of loading them into VRAM next to the engine. The manager can't see
-  TensorRT's memory, so the two take turns: it unloads models to make room for an engine and its activations, and an
-  engine steps aside (and reloads for sampling) when the text encoder or another model wouldn't fully fit next to it.
-- **Engines build in their own process.** TensorRT's builder holds on to VRAM after a build; in a separate process it
-  all goes back to the driver when the build ends, so models load fully again afterwards. LoRA refits release the
-  resources TensorRT caches for them.
-- **Out-of-memory handling.** Builds report kernels TensorRT skipped for lack of VRAM (they make engines slower) and
-  free models first. At runtime an OOM is retried once, then the generation finishes on PyTorch; inputs no engine
-  profile covers also run on PyTorch instead of failing, and so does a generation whose engine output has NaN/Inf
-  values. Load errors distinguish "out of memory" from "rebuild needed".
-- **Profile selection that matches the sampler.** Prompt lengths are counted with the WebUI's own tokenizer (emphasis,
-  `BREAK`, embeddings, prompt editing), reForge's cond/uncond batching is accounted for, and the same scoring is used before
-  and during sampling, so engines aren't reloaded mid-generation.
-- Respects `SD Unet: None`, shows errors in the UI instead of swallowing them, and warns when ControlNet inputs are
-  ignored by a TensorRT engine. A LoRA that hasn't been converted (or doesn't match the engine), or an engine selected
-  for another checkpoint, makes that generation use PyTorch instead of producing wrong images.
-- SD Unet labels stay the same when a checkpoint gets more engines, so a saved selection keeps working.
-
----
+- **Engines are compiled per architecture, not per checkpoint.** An engine is built without weights; the loaded
+  checkpoint's weights are put into it when it loads. One SDXL engine runs every SDXL checkpoint, so switching
+  checkpoints doesn't need a new export, and engine files are megabytes instead of gigabytes.
+- **LoRAs just work.** The engine gets exactly the weights reForge would use for PyTorch, LoRAs (and any other weight
+  patch reForge supports) included. When the LoRAs change, only the weights they touch are updated. There is no
+  conversion step.
+- **One engine, several profiles.** A profile is a size range, batch range and prompt length range. The default is
+  every base resolution plus Hires. fix up to 2x of them, with prompts of up to 750 tokens; the engine switches between
+  profiles instantly, with one copy of the weights in VRAM. CFG 1 (Lightning, DMD2, Turbo) runs at half the batch
+  instead of padding.
+- **reForge manages its memory.** The engine is a model of reForge's model manager, which loads it, makes room for
+  it and unloads it when another model needs the VRAM, like the text encoder or VAE. While a pass runs on the
+  engine, the PyTorch UNet stays in RAM.
+- **Anything the engine can't run uses PyTorch:** sizes no profile covers, ControlNet, UNet patches (FreeU,
+  attention couple, ...), or an engine that fails to load or runs out of VRAM. You get a notice; the image is the
+  same as without TensorRT.
 
 ## Requirements
 
-- An NVIDIA GPU supported by your TensorRT version, with a recent driver.
-- PyTorch with CUDA.
-- TensorRT >= 10.0 (`tensorrt`, `tensorrt-cu12` or `tensorrt-cu13`). Blackwell (RTX 50-series) needs TensorRT >= 10.8.
+- reForge, with an NVIDIA RTX 2080 Ti or newer and a recent driver.
+- TensorRT 11 or later, any CUDA build of it. The extension installs or updates TensorRT if it's missing or older,
+  and `onnx`. Set `TRT_EXTENSION_SKIP_INSTALL=1` to install nothing.
 
-**Engines are tied to the TensorRT version and GPU they were built with.** After upgrading TensorRT, rebuild your engines
-(TensorRT tab → Advanced Settings → Force Rebuild). The extension reports this clearly if it can't load an engine.
+## Use
 
-**Upgrading from an earlier version on reForge:** export your engines again with the same settings. The first export
-re-exports the ONNX model in FP16 and the engines are rebuilt from it (no Force Rebuild needed). SD 1.5/2.1 LoRAs need
-converting again afterwards; SDXL ones keep working.
+1. Load a checkpoint and open the **TensorRT** tab. It shows the checkpoint's architecture.
+2. Click **Build engine**. The default profiles cover every base resolution and Hires. fix up to 2x of them; to
+   change them (e.g. batch sizes above 1), open **Edit profiles** first and use a preset or your own sizes. The
+   first build takes several minutes; later ones reuse the timing cache.
+3. Keep **SD Unet** (Settings → Stable Diffusion, or add `sd_unet` to the Quicksettings list) on `Automatic`, its
+   default: every checkpoint of that architecture now uses the engine. `None` uses PyTorch. The tab says if the
+   setting keeps the engine from being used.
 
----
-
-## Installation
-
-1. In the WebUI, open **Extensions → Install from URL** and paste this repository's URL.
-2. Restart the WebUI. On startup `install.py` installs TensorRT (only if it's missing), `onnx` and `onnxscript`.
-
-To install dependencies yourself instead:
-
-```bash
-pip install tensorrt onnx onnxscript --extra-index-url https://pypi.nvidia.com
-```
-
----
-
-## How to use
-
-1. Select your checkpoint in the WebUI.
-2. Open the **TensorRT** tab, pick a preset (or configure Advanced Settings) and click **Export**.
-   The first build takes a few minutes while TensorRT profiles kernels; later builds reuse the timing cache.
-3. Add `sd_unet` to **Settings → User Interface → Quicksettings list**, then select the `[TRT] ...` engine
-   (or leave it on `Automatic`). Choose `None` to use PyTorch.
-
-### LoRA
-
-1. Open **TensorRT → TensorRT LoRA**, select a LoRA and click **Convert to TensorRT**.
-2. Use it in your prompt as usual, e.g. `<lora:my_lora:0.8>`.
-
----
-
-## Tips
-
-- **Hires. fix**: use a dynamic engine that covers both the base and the upscaled resolution. Otherwise the upscaled pass
-  uses a second engine if one covers it, or PyTorch.
-- **Resolution**: width and height should be divisible by 64.
-- **Not supported by engines**: ControlNet and other UNet patches (FreeU, attention couple, ...). Set SD Unet to `None`
-  when you need them.
+Engines only load with the TensorRT version and GPU they were built with; after upgrading TensorRT, build again
+(the tab keeps the old engine's profiles).
+Engines live in `models/Unet-trt/<architecture>/`.

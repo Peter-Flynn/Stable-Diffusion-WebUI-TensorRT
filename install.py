@@ -4,42 +4,36 @@ from importlib import metadata
 
 import launch
 
-MIN_TRT_VERSION = (10, 0)
-NVIDIA_INDEX = "--extra-index-url https://pypi.nvidia.com"
+MIN_TRT = (11, 0)
 
 
 def installed_tensorrt():
-    """(distribution, version) of the installed TensorRT, preferring the meta package, or (None, None)."""
+    """(package, version) of the installed TensorRT, whichever CUDA build it is (tensorrt, tensorrt-cu12, ...),
+    or (None, None)."""
     found = []
     for dist in metadata.distributions():
         name = (dist.metadata.get("Name") or "").lower().replace("_", "-")
-        if name == "tensorrt" or re.fullmatch(r"tensorrt-cu\d+(-bindings)?", name):
-            found.append((name, dist.version))
-    found.sort(key=lambda x: (x[0] != "tensorrt", x[0]))
-    return found[0] if found else (None, None)
+        match = re.fullmatch(r"(tensorrt(?:-cu\d+)?)(-bindings)?", name)
+        if match:
+            found.append((match.group(2) is not None, match.group(1), dist.version))  # the package before its bindings
+    return min(found)[1:] if found else (None, None)
 
 
 def install():
     if os.environ.get("TRT_EXTENSION_SKIP_INSTALL", "").lower() in ("1", "true", "yes"):
-        print("[TensorRT Extension] TRT_EXTENSION_SKIP_INSTALL is set; not installing anything.")
         return
-
-    trt_pkg, trt_ver = installed_tensorrt()
-    if trt_pkg is None:
-        print("[TensorRT Extension] TensorRT is not installed. Installing the latest release...")
-        launch.run_pip(f"install tensorrt {NVIDIA_INDEX}", "tensorrt", live=True)
-    elif tuple(map(int, re.findall(r"\d+", trt_ver)[:2])) < MIN_TRT_VERSION:
-        print(
-            f"[TensorRT Extension] Warning: {trt_pkg}=={trt_ver} is older than {'.'.join(map(str, MIN_TRT_VERSION))} and "
-            f"isn't supported. Please upgrade it (pip install -U tensorrt {NVIDIA_INDEX})."
-        )
-
-    for pkg in ("onnx", "onnxscript"):
-        if not launch.is_installed(pkg):
-            launch.run_pip(f"install {pkg}", pkg, live=True)
+    package, version = installed_tensorrt()
+    if package is None:
+        print("[TensorRT] Installing TensorRT...")
+        launch.run_pip("install tensorrt", "tensorrt", live=True)
+    elif tuple(map(int, re.findall(r"\d+", version)[:2])) < MIN_TRT:
+        print(f"[TensorRT] Updating {package} {version}: this extension needs TensorRT {MIN_TRT[0]} or later...")
+        launch.run_pip(f"install -U {package}", package, live=True)  # the same CUDA build
+    if not launch.is_installed("onnx"):
+        launch.run_pip("install onnx", "onnx", live=True)
 
 
 try:
     install()
 except Exception as e:
-    print(f"[TensorRT Extension] Dependency installation failed: {e}")
+    print(f"[TensorRT] Installing dependencies failed: {e}")

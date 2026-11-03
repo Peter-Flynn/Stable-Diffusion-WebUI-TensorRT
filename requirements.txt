@@ -1,3 +1,0 @@
-tensorrt>=10.0
-onnx
-onnxscript
