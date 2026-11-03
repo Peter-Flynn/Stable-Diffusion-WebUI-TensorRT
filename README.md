@@ -32,10 +32,12 @@ NoobAI and other fine-tunes, v-prediction ones too) on RTX 2080 Ti and newer GPU
 ## Use
 
 1. Load a checkpoint and open the **TensorRT** tab. It shows the checkpoint's architecture.
-2. Pick profiles (presets cover common SDXL and SD 1.5 sizes) and click **Build engine**. The first build takes
-   several minutes; later ones reuse the timing cache.
-3. Set **SD Unet** (Settings → Stable Diffusion, or add `sd_unet` to the Quicksettings list) to `Automatic`. Every
-   checkpoint of that architecture now uses the engine. `None` uses PyTorch.
+2. Click **Build engine**. The default profiles cover every base resolution and Hires. fix up to 2x of them; add
+   others from the presets (e.g. batch sizes above 1) or your own sizes first. The first build takes several
+   minutes; later ones reuse the timing cache.
+3. Keep **SD Unet** (Settings → Stable Diffusion, or add `sd_unet` to the Quicksettings list) on `Automatic`, its
+   default: every checkpoint of that architecture now uses the engine. `None` uses PyTorch. The tab says if the
+   setting keeps the engine from being used.
 
 Engines only load with the TensorRT version and GPU they were built with; after upgrading TensorRT, build again.
 Engines live in `models/Unet-trt/<architecture>/`.
@@ -43,4 +45,5 @@ Engines live in `models/Unet-trt/<architecture>/`.
 ## Upgrading from earlier versions
 
 Old engines, ONNX files and converted LoRAs aren't used anymore and can take many GB: the TensorRT tab offers to
-delete them. Build an engine for each architecture you use; LoRAs need no conversion.
+delete them. Build an engine for each architecture you use; LoRAs need no conversion. An `SD Unet` setting that
+named an old engine is reset to `Automatic`.

@@ -6,6 +6,7 @@ runs on the engine, the PyTorch UNet stays in RAM (its patches still apply, it j
 
 import contextlib
 import math
+import re
 import sys
 import time
 import traceback
@@ -168,10 +169,14 @@ class TrtUnetOption(sd_unet.SdUnetOption):
     @property
     def model_name(self):
         """The loaded checkpoint if it has this architecture: what "Automatic" in SD Unet looks for."""
-        sd_model = arch_mod.loaded_model()
-        arch = arch_mod.detect(arch_mod.unet_patcher(sd_model)) if sd_model is not None else None
-        info = getattr(sd_model, "sd_checkpoint_info", None)
-        return getattr(info, "model_name", None) if arch is not None and arch.id == self.record.arch.id else None
+        try:
+            sd_model = arch_mod.loaded_model()
+            arch = arch_mod.detect(arch_mod.unet_patcher(sd_model)) if sd_model is not None else None
+            info = getattr(sd_model, "sd_checkpoint_info", None)
+            return getattr(info, "model_name", None) if arch is not None and arch.id == self.record.arch.id else None
+        except Exception as e:  # reForge asks every option at the start of each generation
+            log(f"Could not check the loaded model's architecture: {e}")
+            return None
 
     def create_unet(self):
         return TrtUnet(self)
@@ -191,10 +196,22 @@ class TrtUnet(sd_unet.SdUnet):
             _unload(model)
 
 
+LABEL = re.compile(r"\[TRT\] \w+ \([0-9a-f]{10}\)")
+
+
 def list_unets(options: list):
     for record in store.records():
         if record.loadable:
             options.append(TrtUnetOption(record))
+    try:  # SD Unet saved with an engine of an earlier version: it would silently select nothing
+        from modules import shared
+
+        saved = shared.opts.data.get("sd_unet")
+        if isinstance(saved, str) and saved.startswith("[TRT] ") and not LABEL.fullmatch(saved):
+            shared.opts.data["sd_unet"] = "Automatic"
+            log(f"SD Unet was set to {saved}, an engine of an earlier version of this extension; it's Automatic now.")
+    except Exception:
+        pass
 
 
 def _selected_record():
@@ -501,4 +518,7 @@ def new_generation():
         _pass.end()
     _pass = None
     common.new_generation()
-    install_hooks()
+    try:
+        install_hooks()
+    except Exception as e:
+        log(f"Could not hook reForge's sampler: {e}")

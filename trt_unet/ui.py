@@ -3,7 +3,7 @@ import traceback
 
 import gradio as gr
 
-from modules import sd_unet
+from modules import sd_unet, shared
 from modules.ui_common import refresh_symbol
 from modules.ui_components import ToolButton
 
@@ -59,8 +59,12 @@ def _status(sd_model, arch, record) -> str:
     if record is None:
         lines.append("No engine for this architecture yet: pick profiles below and build one.")
     else:
-        lines.append(f"**Engine:** {len(record.profiles)} profiles, {common.gib(record.disk_bytes)}, built {record.meta['created']}. "
-                     f"`SD Unet: Automatic` uses it for every {arch.family} checkpoint.")
+        lines.append(f"**Engine:** {len(record.profiles)} profiles, {common.gib(record.disk_bytes)}, built {record.meta['created']}.")
+        setting = getattr(shared.opts, "sd_unet", "Automatic")
+        if setting == "Automatic" or setting == f"[TRT] {arch.label}":
+            lines.append(f"`SD Unet` is `{setting}`: every {arch.family} checkpoint runs on this engine.")
+        else:
+            lines.append(f"**`SD Unet` is `{setting}`**, so generations don't use this engine. Set it to `Automatic` (Settings, Stable Diffusion).")
     return "\n\n".join(lines)
 
 
