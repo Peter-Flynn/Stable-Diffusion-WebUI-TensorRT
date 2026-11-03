@@ -142,10 +142,7 @@ class Engine:
             if self.memory is None or self.memory.numel() < size or self.memory.numel() > 2 * size:
                 self.memory = None
                 self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=DEVICE)
-            try:
-                self.context.set_device_memory(self.memory.data_ptr(), self.memory.numel())
-            except TypeError:  # TensorRT 10.0
-                self.context.device_memory = self.memory.data_ptr()
+            self.context.set_device_memory(self.memory.data_ptr(), self.memory.numel())
             self.memory_bound = True
 
     def activation_bytes(self) -> int:

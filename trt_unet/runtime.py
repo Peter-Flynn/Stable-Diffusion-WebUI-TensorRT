@@ -199,13 +199,13 @@ class TrtUnet(sd_unet.SdUnet):
 def list_unets(options: list):
     ours = [TrtUnetOption(record) for record in store.records() if record.loadable]
     options.extend(ours)
-    try:  # SD Unet naming an engine that's gone (deleted, or from an earlier version) would silently select nothing
+    try:  # SD Unet naming an engine that was deleted would silently select nothing
         from modules import shared
 
         saved = shared.opts.data.get("sd_unet")
         if isinstance(saved, str) and saved.startswith("[TRT] ") and saved not in {o.label for o in ours}:
             shared.opts.data["sd_unet"] = "Automatic"
-            log(f"SD Unet was set to {saved}, an engine that doesn't exist (anymore); it's Automatic now.")
+            log(f"SD Unet was set to {saved}, an engine that doesn't exist anymore; it's Automatic now.")
     except Exception:
         pass
 

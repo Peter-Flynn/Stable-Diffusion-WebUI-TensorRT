@@ -42,9 +42,3 @@ NoobAI and other fine-tunes, v-prediction ones too) on RTX 2080 Ti and newer GPU
 Engines only load with the TensorRT version and GPU they were built with; after upgrading TensorRT, build again
 (the tab keeps the old engine's profiles).
 Engines live in `models/Unet-trt/<architecture>/`.
-
-## Upgrading from earlier versions
-
-Old engines, ONNX files and converted LoRAs aren't used anymore and can take many GB: the TensorRT tab offers to
-delete them. Build an engine for each architecture you use; LoRAs need no conversion. An `SD Unet` setting that
-named an old engine is reset to `Automatic`.

@@ -87,7 +87,7 @@ def _status(sd_model, arch, record) -> str:
         stale = _stale(arch)
         if stale is not None:
             lines.append(
-                f"**The engine for this architecture was built for {stale.meta.get('gpu_name', stale.meta['gpu'])} with TensorRT {stale.meta['trt']}, "
+                f"**The engine for this architecture was built for {stale.meta['gpu_name']} with TensorRT {stale.meta['trt']}, "
                 "so it can't load here.** Build it again; its profiles are below."
             )
         else:
@@ -140,24 +140,13 @@ def _engines_view(arch) -> str:
     rows = ["| Architecture | Profiles | VRAM | Built for |", "|---|:-:|:-:|---|"]
     for r in records:
         name = f"**{r.arch.label}** · current" if r.loadable and arch is not None and r.arch.id == arch.id else r.arch.label
-        built = f"{r.meta.get('gpu_name', r.meta['gpu'])}, TensorRT {r.meta['trt']}" + ("" if r.loadable else " · **can't load here**")
+        built = f"{r.meta['gpu_name']}, TensorRT {r.meta['trt']}" + ("" if r.loadable else " · **can't load here**")
         rows.append(f"| {name} | {len(r.profiles)} | {common.gib(r.weight_bytes)} | {built} |")
     return "\n".join(rows)
 
 
 def _engine_choices():
     return {f"{r.arch.label}, TensorRT {r.meta['trt']} ({r.meta['gpu']})": r for r in store.records()}
-
-
-def _legacy_outputs():
-    files = store.legacy_files()
-    if not files:
-        return gr.update(value="", visible=False), gr.update(visible=False)
-    text = (
-        f"**Earlier versions of this extension left {_n(len(files), 'file')} here ({common.gib(store.size_of(files))}):** "
-        "old engines, ONNX models and converted LoRAs. Nothing uses them anymore."
-    )
-    return gr.update(value=text, visible=True), gr.update(visible=True)
 
 
 def refresh(draft=None, draft_arch=None):
@@ -181,7 +170,6 @@ def refresh(draft=None, draft_arch=None):
         _engines_view(arch),
         gr.update(choices=engines, value=None, visible=bool(engines)),
         gr.update(visible=bool(engines)),
-        *_legacy_outputs(),
         gr.update(visible=BUILDING.is_set()),
     )
 
@@ -315,16 +303,6 @@ def delete_engine(choice, draft, draft_arch):
     return refresh(draft, draft_arch)
 
 
-def delete_legacy(draft, draft_arch, confirmed):
-    from modules.call_queue import queue_lock
-
-    if confirmed == "yes":
-        with queue_lock:
-            freed = store.remove_legacy_files()
-        common.log(f"Deleted files from earlier versions of the extension ({common.gib(freed)})")
-    return refresh(draft, draft_arch)
-
-
 def on_ui_tabs():
     presets = _preset_values()
     first = [v for f in FIELDS for v in getattr(default_profiles(2816)[0], f)]
@@ -364,14 +342,11 @@ def on_ui_tabs():
                 engines = gr.Markdown(elem_id="trt_engines")
                 engine_choice = gr.Dropdown(label="Engine", choices=[], visible=False, elem_id="trt_engine_choice")
                 delete_button = gr.Button("Delete engine", variant="stop", size="sm", visible=False, elem_id="trt_delete")
-                legacy = gr.Markdown(visible=False, elem_id="trt_legacy_text")
-                legacy_button = gr.Button("Delete these files", variant="stop", size="sm", visible=False, elem_id="trt_legacy")
-                legacy_confirm = gr.Textbox(visible=False)
                 with gr.Accordion("How it works", open=False):
                     gr.Markdown(HELP)
 
         draft_outputs = [draft, table, selector, build_button]
-        outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, legacy, legacy_button, cancel_button]
+        outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, cancel_button]
         # In the browser; the preset menu empties again so the same preset can be picked twice.
         preset.change(
             None, [preset], [*numbers, preset],
@@ -388,9 +363,5 @@ def on_ui_tabs():
         delete_button.click(
             delete_engine, [engine_choice, draft, draft_arch], outputs,
             **{JS: "(choice, ...rest) => [choice && confirm('Delete the engine ' + choice + '? Building it again takes a while.') ? choice : null, ...rest.slice(0, 2)]"},
-        )
-        legacy_button.click(
-            delete_legacy, [draft, draft_arch, legacy_confirm], outputs,
-            **{JS: "(draft, draft_arch) => [draft, draft_arch, confirm('Delete the files from earlier versions of the extension?') ? 'yes' : '']"},
         )
     return [(tab, "TensorRT", "tensorrt")]
