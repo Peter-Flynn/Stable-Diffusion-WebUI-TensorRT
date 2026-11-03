@@ -1,6 +1,8 @@
 """A deserialized TensorRT engine: weights refitted from PyTorch tensors, several optimization profiles in
 one execution context, and activation memory from PyTorch's allocator sized for the shapes in use."""
 
+import ctypes
+import os
 from collections import deque
 
 import tensorrt as trt
@@ -58,6 +60,32 @@ def runtime():
     return _runtime
 
 
+def other_tensorrt(maps="/proc/self/maps") -> str:
+    """A TensorRT of another version that's visible to the whole process (Linux), or "". TensorRT's bindings
+    use it instead of their own if it was there before they were imported (preload.py imports them first)."""
+    if os.name == "nt":  # Windows binds each DLL to the libraries it names
+        return ""
+    major = int(trt.__version__.split(".")[0])
+    try:
+        version = ctypes.CDLL(None).getInferLibVersion()
+    except (AttributeError, OSError):
+        return ""  # none visible to the whole process
+    if version // 10000 == major:
+        return ""
+    try:
+        with open(maps) as f:
+            paths = sorted({line.split()[-1] for line in f if "/libnvinfer.so." in line and not line.rstrip().endswith(f"libnvinfer.so.{major}")})
+    except OSError:
+        paths = []
+    where = f" ({', '.join(paths)})" if paths else ""
+    return (
+        f"TensorRT {version // 10000}.{version // 100 % 100}{where} is loaded for the whole process, likely by another "
+        f"extension, and TensorRT's bindings may be calling it instead of TensorRT {trt.__version__}. "
+        "This extension's preload.py imports TensorRT before other extensions load to prevent that; "
+        "something loaded the other TensorRT even earlier."
+    )
+
+
 class Engine:
     def __init__(self, plan_path: str):
         self.plan_path = plan_path
@@ -86,7 +114,11 @@ class Engine:
                 vram = f"{gib(free)} of {gib(total)} VRAM free"
             except Exception as e:
                 vram = f"free VRAM unknown ({e})"
-            raise RuntimeError(f"TensorRT {trt.__version__} could not load {self.plan_path} ({len(plan)} bytes; {vram}). TensorRT said: {said}")
+            other = other_tensorrt()
+            raise RuntimeError(
+                f"TensorRT {trt.__version__} could not load {self.plan_path} ({len(plan)} bytes; {vram}). TensorRT said: {said}"
+                + (f". {other}" if other else "")
+            )
         self.io = []
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
