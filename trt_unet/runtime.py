@@ -82,9 +82,12 @@ class TrtModel:
     def partially_load(self, device, extra_memory=0, force_patch_weights=False):
         if self.loaded:
             return 0
-        if self.weights is None:
-            raise RuntimeError("no weights to load the engine with")
-        start, free = time.time(), torch.cuda.mem_get_info()[0]
+        if self.weights is None:  # a load outside a sampling pass: the loaded checkpoint's weights
+            patcher = arch_mod.unet_patcher()
+            if patcher is None:
+                raise RuntimeError("no checkpoint to take the engine's weights from")
+            self.weights = EffectiveWeights(patcher)
+        start, free, reserved = time.time(), torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
         engine = self._engine()
         engine.load()
         try:
@@ -93,7 +96,9 @@ class TrtModel:
         except Exception:
             engine.unload()
             raise
-        self.measured = max(self.measured, free - torch.cuda.mem_get_info()[0])
+        # TensorRT's own allocations, not what PyTorch cached meanwhile (e.g. computing LoRA weights)
+        used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
+        self.measured = max(self.measured, used)
         log(f"Loaded the {self.record.arch.label} engine ({common.gib(self.model_size())}) in {time.time() - start:.1f}s")
         return self.model_size()
 
@@ -117,6 +122,7 @@ class TrtModel:
             return
         start = time.time()
         self.applied = {}
+        torch.cuda.current_stream().synchronize()  # no inference in flight while the weights change
         engine.refit(changed, weights.tensor)
         self.applied = wanted
         if len(changed) < len(wanted):
@@ -163,7 +169,8 @@ class TrtUnetOption(sd_unet.SdUnetOption):
         """The loaded checkpoint if it has this architecture: what "Automatic" in SD Unet looks for."""
         sd_model = arch_mod.loaded_model()
         arch = arch_mod.detect(arch_mod.unet_patcher(sd_model)) if sd_model is not None else None
-        return sd_model.sd_checkpoint_info.model_name if arch is not None and arch.id == self.record.arch.id else None
+        info = getattr(sd_model, "sd_checkpoint_info", None)
+        return getattr(info, "model_name", None) if arch is not None and arch.id == self.record.arch.id else None
 
     def create_unet(self):
         return TrtUnet(self)
@@ -257,10 +264,31 @@ class Pass:
         self.shape = (x.shape[0] * 2, *x.shape[1:])
         self.fallback = None
         self.checked = False
+        self._hint_batching()
+
+    def _hint_batching(self):
+        """reForge splits cond and uncond into separate UNet calls when it thinks the PyTorch UNet's
+        activations won't fit. The engine's activations are already allocated, and a static profile would
+        pad a split call back to full size: batch whatever a profile takes."""
+        shapes = self.model.record.shapes
+
+        def memory_required(input_shape, cond_shapes={}):
+            b, _, h, w = input_shape[:4]
+            return 0 if profiles.covers_size(shapes, h, w, b) else float("inf")
+
+        self.patcher.model.memory_required = memory_required
+
+    def end(self):
+        """Undoes what the pass changed; the engine stays loaded for the next one."""
+        self.patcher.model.__dict__.pop("memory_required", None)
+        if self.model.loaded:
+            self.model.engine.release_activations()
+        self.model.weights = None  # don't keep this checkpoint alive
 
     def fall_back(self, reason: str):
         self.fallback = reason
         notify(f"{reason}; finishing this pass with PyTorch.")
+        self.patcher.model.__dict__.pop("memory_required", None)
         if self.model.loaded:
             self.model.engine.release_activations()
         _load_torch_unet(self.patcher, self.shape)
@@ -346,6 +374,7 @@ def _begin(record, patcher, x, prepare):
             if not isinstance(e, RuntimeError):
                 traceback.print_exc()
             notify(f"Could not run the engine ({e}); using PyTorch.")
+            model.weights = None
             _load_torch_unet(patcher, (x.shape[0] * 2, *x.shape[1:]))
             return None
     return Pass(model, patcher, x)
@@ -399,6 +428,8 @@ def _wrap_forward(original):
 def _wrap_prepare(original):
     def sampling_prepare(unet, x, *args, **kwargs):
         global _pass
+        if _pass is not None:
+            _pass.end()
         _pass = None
         record = _engine_record(unet, x)
         if record is None:
@@ -413,8 +444,8 @@ def _wrap_cleanup(original):
     def sampling_cleanup(unet, *args, **kwargs):
         global _pass
         p, _pass = _pass, None
-        if p is not None and p.model.loaded:
-            p.model.engine.release_activations()
+        if p is not None:
+            p.end()
         return original(unet, *args, **kwargs)
 
     sampling_cleanup._trt_original = original
@@ -447,6 +478,8 @@ def install_hooks():
 
 def new_generation():
     global _pass
+    if _pass is not None:  # an interrupted generation never cleaned up
+        _pass.end()
     _pass = None
     common.new_generation()
     install_hooks()

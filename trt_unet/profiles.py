@@ -27,10 +27,12 @@ class Profile:
         return {f: list(getattr(self, f)) for f in FIELDS}
 
     def validated(self, multiple: int) -> "Profile":
-        """Snapped to the sizes the model takes, each range ordered and containing its optimum."""
+        """Snapped to the sizes the model takes (outward, so the range still covers what was asked),
+        each range ordered and containing its optimum."""
 
         def fix(values, step, lowest):
-            lo, opt, hi = (max(lowest, int(round(v / step)) * step) for v in values)
+            lo, opt, hi = values
+            lo, opt, hi = (max(lowest, v * step) for v in (math.floor(lo / step), round(opt / step), math.ceil(hi / step)))
             return min(lo, opt), opt, max(hi, opt)
 
         return Profile(
@@ -95,8 +97,11 @@ def select(profile_shapes: list, batch: int, height: int, width: int, context: i
     return index, padded, repeats
 
 
-def covers_size(profile_shapes: list, height: int, width: int) -> bool:
-    return any(s["sample"][0][2] <= height <= s["sample"][2][2] and s["sample"][0][3] <= width <= s["sample"][2][3] for s in profile_shapes)
+def covers_size(profile_shapes: list, height: int, width: int, batch: int = 1) -> bool:
+    return any(
+        s["sample"][0][2] <= height <= s["sample"][2][2] and s["sample"][0][3] <= width <= s["sample"][2][3] and batch <= s["sample"][2][0]
+        for s in profile_shapes
+    )
 
 
 def _p(w, h, batch=(1, 1, 1), tokens=(75, 75, 75)):

@@ -169,20 +169,20 @@ def build(draft, optimization_level, progress=gr.Progress()):
     return (message, *refresh(reset_draft=False, draft=draft))
 
 
-def delete_engine(choice):
+def delete_engine(choice, draft):
     record = _engine_choices().get(choice)
     if record is not None:
         _refresh_unet_list()
         store.delete(record)
         common.log(f"Deleted {record.plan}")
         sd_unet.list_unets()
-    return refresh()
+    return refresh(reset_draft=False, draft=draft)
 
 
-def delete_legacy():
+def delete_legacy(draft):
     freed = store.remove_legacy_files()
     common.log(f"Deleted files from older versions of the extension ({common.gib(freed)})")
-    return refresh()
+    return refresh(reset_draft=False, draft=draft)
 
 
 def on_ui_tabs():
@@ -230,6 +230,6 @@ def on_ui_tabs():
         add_button.click(add_profile, [draft, *numbers], [draft, table, remove_index, note])
         remove_button.click(remove_profile, [draft, remove_index], [draft, table, remove_index])
         build_button.click(build, [draft, level], [result, *outputs])
-        delete_button.click(delete_engine, engine_choice, outputs)
-        legacy_button.click(delete_legacy, None, outputs)
+        delete_button.click(delete_engine, [engine_choice, draft], outputs)
+        legacy_button.click(delete_legacy, draft, outputs)
     return [(tab, "TensorRT", "tensorrt")]
