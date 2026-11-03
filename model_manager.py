@@ -41,7 +41,7 @@ def timing_cache_path() -> str:
 
 
 def _same_release(a: str, b: str) -> bool:
-    return a.split(".")[:2] == b.split(".")[:2]  # engines only load on the major.minor they were built with
+    return a.split(".")[:2] == b.split(".")[:2]
 
 
 class ModelManager:
@@ -67,7 +67,7 @@ class ModelManager:
         return data
 
     def _prune(self):
-        """Drop entries whose engine file is gone, and duplicates."""
+        """Drops entries whose engine file is gone, and duplicates."""
         engines = {f for f in os.listdir(TRT_MODEL_DIR) if f.endswith(".trt")}
         for models in self.all_models.values():
             for name in list(models):
@@ -86,18 +86,27 @@ class ModelManager:
 
     def add_entry(self, model_name: str, filepath: str, config: ModelConfig):
         entries = self.all_models.setdefault(CC, {}).setdefault(model_name, [])
-        entries[:] = [e for e in entries if e["filepath"] != filepath] + [{"filepath": filepath, "config": config}]
+        entry = {"filepath": filepath, "config": config}
+        index = next((i for i, e in enumerate(entries) if e["filepath"] == filepath), None)
+        if index is None:
+            entries.append(entry)
+        else:
+            entries[index] = entry  # profile numbers are part of SD Unet labels
         self.write_json()
 
     def has_engine(self, filepath: str) -> bool:
         return any(m["filepath"] == filepath for _, _, m in self.all_engines())
+
+    def get_entry(self, filepath: str):
+        """This GPU's entry for an engine file, or None."""
+        return next((e for entries in self.all_models.get(CC, {}).values() for e in entries if e["filepath"] == filepath), None)
 
     def _loadable(self, entry) -> bool:
         built_with = entry["config"].trt_version
         if entry["config"].lora:
             return False
         if not built_with or not self.trt_version or _same_release(built_with, self.trt_version):
-            return True  # an unknown version loads or reports a clear error
+            return True
         if entry["filepath"] not in self._reported:
             self._reported.add(entry["filepath"])
             print(

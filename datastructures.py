@@ -3,6 +3,9 @@ from dataclasses import dataclass, fields
 from enum import Enum
 from json import JSONEncoder
 
+ONNX_FP16 = "fp16"
+ONNX_AUTOCAST = "autocast"
+
 
 class SDVersion(Enum):
     SD1 = 1
@@ -32,6 +35,7 @@ class ModelConfig:
     vram: int
     unet_hidden_dim: int = 4
     trt_version: str = ""
+    onnx_flavor: str = ONNX_AUTOCAST  # engines from before fp16 exports were all built from autocast ones
 
     @classmethod
     def from_dict(cls, d):
@@ -45,9 +49,8 @@ class ModelConfig:
         return self.profile["encoder_hidden_states"][0][1]
 
     def is_compatible_from_dict(self, shapes: dict):
-        """(fits, distance from the profile's optimum) for {input name: tensor or shape}. A batch
-        below the minimum, and a context length dividing the minimum, fit by repetition (see
-        TrtUnet._pad_to_profile)."""
+        """(fits, distance from the optimum) for {input name: tensor or shape}. Batches below the
+        minimum, and contexts dividing its length, fit by repetition (TrtUnet._pad_to_profile)."""
         distance = 0.0
         exact = True
         for name, shape in shapes.items():
@@ -72,7 +75,7 @@ class ModelConfig:
         return True, distance
 
     def is_compatible(self, width: int, height: int, batch: int, tokens: int):
-        """is_compatible_from_dict for the UNet inputs of an image size (batch: cond + uncond)."""
+        """is_compatible_from_dict for an image size; batch counts cond + uncond."""
         shapes = {}
         for name, (_, opt, _) in self.profile.items():
             shape = [batch, *opt[1:]]
@@ -115,7 +118,7 @@ class ProfileSettings:
         return tuple(getattr(self, f.name) for f in fields(self)[:12])
 
     def token_to_dim(self, static_shapes: bool):
-        """Prompt tokens -> context length (77 per 75 tokens); static: everything at its optimum."""
+        """Prompt tokens -> context length (77 per 75); static: everything at its optimum."""
         self.t_min, self.t_opt, self.t_max = ((t // 75) * 77 for t in (self.t_min, self.t_opt, self.t_max))
         for axis in ("t", "bs", "h", "w"):
             opt = getattr(self, f"{axis}_opt")
@@ -131,7 +134,7 @@ class ProfileSettings:
         return self.h_min // 8, self.h_opt // 8, self.h_max // 8, self.w_min // 8, self.w_opt // 8, self.w_max // 8
 
     def get_batch_dim(self):
-        # Usually cond + uncond (2B); B with CFG 1 or when they run separately, which static engines pad.
+        # 2B for cond + uncond; dynamic engines also take B (CFG 1, separate batches), static ones pad.
         if self.static_shape or (self.bs_min == self.bs_max == self.bs_opt and self.h_min == self.h_max and self.w_min == self.w_max):
             return self.bs_opt * 2, self.bs_opt * 2, self.bs_opt * 2
         return self.bs_min, self.bs_opt * 2, self.bs_max * 2
@@ -162,4 +165,4 @@ class ProfilePresets:
         return list(self.profile_presets) + ["Default"]
 
     def get_default(self, is_xl: bool):
-        return copy.copy(self.default_xl if is_xl else self.default)  # callers mutate it
+        return copy.copy(self.default_xl if is_xl else self.default)

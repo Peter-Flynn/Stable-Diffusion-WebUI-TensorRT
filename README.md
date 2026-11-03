@@ -11,13 +11,15 @@ Supports Stable Diffusion 1.5, 2.1, SDXL, SDXL Turbo, and LCM.
 
 ## What's different from upstream
 
-- **TensorRT 10 and 11.** TensorRT 11 removed weakly typed precision flags (`BuilderFlag.FP16`). On TensorRT 11 engines
-  are built *strongly typed*: precision comes from the ONNX graph, which is exported under autocast, so convolutions and
-  matmuls still run in FP16. On TensorRT 10 the classic FP16 build is used.
-- **No Polygraphy at runtime.** Engines are built and run with the TensorRT Python API directly. `onnx-graphsurgeon` /
-  `polygraphy` are optional and only used for ONNX graph cleanup before a build. `optimum` is no longer needed.
-- **Lower VRAM use.** Activation memory is sized for the shapes actually in use (not the profile maximum) and comes from
-  PyTorch's allocator, so it's shared with the rest of the WebUI. ONNX export traces at a small resolution.
+- **TensorRT 10 and 11.** TensorRT 11 removed weakly typed precision flags (`BuilderFlag.FP16`): engines are built
+  *strongly typed*, so precision comes from the ONNX graph. On reForge the UNet is exported in FP16 throughout (an
+  autocast export leaves normalizations, softmax and residual adds in FP32, which made engines slower than PyTorch);
+  A1111 exports under autocast. On TensorRT 10 the classic FP16 build is used.
+- **No Polygraphy, Optimum or ONNX graph tools.** Engines are built and run with the TensorRT Python API directly;
+  TensorRT does the graph cleanup itself.
+- **Lower VRAM use.** Activation memory comes from PyTorch's allocator, so it's shared with the rest of the WebUI, and
+  dynamic engines size it for the shapes in use rather than the profile maximum (TensorRT >= 10.10). ONNX export
+  traces at a small resolution.
 - **Fewer copies per step.** Inputs that already match the engine's dtype are bound directly; outputs aren't cloned.
 - **LoRA fixes.** LoRA export works on reForge/Forge (LoRAs are applied through the ModelPatcher there), refit weights
   match the engine's weight dtypes (required for strongly typed engines), `<lora:name>` without a weight works, the UNet
@@ -37,13 +39,15 @@ Supports Stable Diffusion 1.5, 2.1, SDXL, SDXL Turbo, and LCM.
   resources TensorRT caches for them.
 - **Out-of-memory handling.** Builds report kernels TensorRT skipped for lack of VRAM (they make engines slower) and
   free models first. At runtime an OOM is retried once, then the generation finishes on PyTorch; inputs no engine
-  profile covers also run on PyTorch instead of failing. Load errors distinguish "out of memory" from "rebuild needed".
+  profile covers also run on PyTorch instead of failing, and so does a generation whose engine output has NaN/Inf
+  values. Load errors distinguish "out of memory" from "rebuild needed".
 - **Profile selection that matches the sampler.** Prompt lengths are counted with the WebUI's own tokenizer (emphasis,
   `BREAK`, embeddings, prompt editing), reForge's cond/uncond batching is accounted for, and the same scoring is used before
   and during sampling, so engines aren't reloaded mid-generation.
 - Respects `SD Unet: None`, shows errors in the UI instead of swallowing them, and warns when ControlNet inputs are
-  ignored by a TensorRT engine. A LoRA that hasn't been converted, or an engine selected for another checkpoint, makes that
-  generation use PyTorch instead of producing wrong images.
+  ignored by a TensorRT engine. A LoRA that hasn't been converted (or doesn't match the engine), or an engine selected
+  for another checkpoint, makes that generation use PyTorch instead of producing wrong images.
+- SD Unet labels stay the same when a checkpoint gets more engines, so a saved selection keeps working.
 
 ---
 
@@ -56,18 +60,21 @@ Supports Stable Diffusion 1.5, 2.1, SDXL, SDXL Turbo, and LCM.
 **Engines are tied to the TensorRT version and GPU they were built with.** After upgrading TensorRT, rebuild your engines
 (TensorRT tab → Advanced Settings → Force Rebuild). The extension reports this clearly if it can't load an engine.
 
+**Upgrading from an earlier version on reForge:** export your engines again with the same settings. The first export
+re-exports the ONNX model in FP16 and the engines are rebuilt from it (no Force Rebuild needed). SD 1.5/2.1 LoRAs need
+converting again afterwards; SDXL ones keep working.
+
 ---
 
 ## Installation
 
 1. In the WebUI, open **Extensions → Install from URL** and paste this repository's URL.
-2. Restart the WebUI. On startup `install.py` installs TensorRT (only if it's missing), `onnx`, `onnxscript`,
-   `onnx-graphsurgeon` and `polygraphy`.
+2. Restart the WebUI. On startup `install.py` installs TensorRT (only if it's missing), `onnx` and `onnxscript`.
 
 To install dependencies yourself instead:
 
 ```bash
-pip install tensorrt onnx onnxscript onnx-graphsurgeon polygraphy --extra-index-url https://pypi.nvidia.com
+pip install tensorrt onnx onnxscript --extra-index-url https://pypi.nvidia.com
 ```
 
 ---

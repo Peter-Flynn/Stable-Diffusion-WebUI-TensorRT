@@ -13,8 +13,8 @@ from modules.ui_components import FormRow, ToolButton
 
 import model_manager
 import unet_memory
-from datastructures import ModelConfig, ProfilePresets, ProfileSettings, SDVersion
-from exporter import export_lora, export_onnx, export_trt
+from datastructures import ONNX_AUTOCAST, ONNX_FP16, ModelConfig, ProfilePresets, ProfileSettings, SDVersion
+from exporter import export_lora, export_onnx, export_trt, onnx_flavor
 from model_helper import UNetModel
 from model_manager import TRT_MODEL_DIR, modelmanager
 
@@ -29,19 +29,14 @@ SLIDER_GROUPS = (  # column elem_id, label, (minimum, maximum, step), ProfileSet
 
 
 def clear_vram_for_export():
-    """Release an active engine and unload every model. Nothing is put back afterwards: the
-    WebUI loads what it needs on the next generation (the build runs in its own process, so
-    its VRAM is free again by then)."""
     unet_memory.free_vram_for_export()
     unet_memory.report_free_vram("after clearing VRAM for export")
 
 
 def load_unet_for_tracing():
-    """Only the UNet on the GPU, fully; VRAM must have been cleared."""
     try:
         if unet_memory.IS_FORGE_BACKEND:
-            # The original patcher: forge_objects.unet may carry the last generation's LoRA patches,
-            # which loading would merge into the traced weights.
+            # Not forge_objects.unet: loading it would merge the last generation's LoRA into the weights.
             original = getattr(shared.sd_model, "forge_objects_original", shared.sd_model.forge_objects)
             unet_memory.forge_model_management().load_models_gpu([original.unet], force_full_load=True)
         else:
@@ -57,8 +52,7 @@ def context_dim():
 
 
 def refresh_unet_options():
-    """Rebuild the SD Unet options so new or deleted engines take effect, dropping an active TensorRT
-    UNet (it holds the old engine list); the next generation creates it again."""
+    """Rebuilds the SD Unet options; an active TensorRT UNet (holding the old list) is dropped."""
     try:
         if hasattr(sd_unet.current_unet, "configs"):
             sd_unet.current_unet.deactivate()
@@ -91,25 +85,30 @@ def export_unet_to_trt(
         onnx_path = model_manager.onnx_path(model_name)
         filename = model_manager.trt_filename(model_name, model_hash, profile, static_shapes)
         trt_path = os.path.join(TRT_MODEL_DIR, filename)
+        # reForge's UNet handles fp32 timesteps itself; A1111's relies on autocast.
+        flavor = ONNX_FP16 if unet_memory.IS_FORGE_BACKEND and not use_fp32 and modelobj.is_fp16() else ONNX_AUTOCAST
 
         def register(trt_version):
-            config = ModelConfig(profile, static_shapes, use_fp32, modelobj.in_channels == 9, True, False, 0, modelobj.in_channels, trt_version)
+            config = ModelConfig(profile, static_shapes, use_fp32, modelobj.in_channels == 9, True, False, 0, modelobj.in_channels, trt_version, flavor)
             modelmanager.add_entry(model_name, filename, config)
             refresh_unet_options()
 
-        if os.path.exists(trt_path) and not force_export:
-            if not modelmanager.has_engine(filename):
-                register("")  # built before, but missing from model.json
+        existing = modelmanager.get_entry(filename)
+        if os.path.exists(trt_path) and not force_export and existing is not None and existing["config"].onnx_flavor == flavor:
             yield f"### ✅ This engine already exists: `{filename}`\n\nEnable **Force Rebuild** to build it again."
             return
 
         clear_vram_for_export()
         optimizations_off = True
         modelobj.apply_torch_model()
-        if not os.path.exists(onnx_path):
+        if onnx_flavor(onnx_path) != flavor:
             yield f"### ⏳ [1/2] Exporting the UNet to ONNX...\n- `{onnx_path}`\n\n*SDXL takes 1-3 minutes. Details are in the console.*"
             load_unet_for_tracing()
-            export_onnx(onnx_path, modelobj, settings, disable_optimizations=is_xl)
+            export_onnx(onnx_path, modelobj, settings, fp16=flavor == ONNX_FP16)
+            try:
+                os.remove(model_manager.weights_map_path(model_name))  # built from the old ONNX
+            except FileNotFoundError:
+                pass
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -137,13 +136,12 @@ def export_unet_to_trt(
     finally:
         if optimizations_off:
             try:
-                sd_hijack.model_hijack.apply_optimizations()  # undo apply_torch_model (A1111; a no-op on reForge)
+                sd_hijack.model_hijack.apply_optimizations()
             except Exception as e:
                 print(f"[TensorRT] Could not restore cross-attention optimizations: {e}", flush=True)
 
 
 def get_lora_checkpoints() -> dict:
-    """{name: {"filename": path relative to the LoRA folder, "version": SDVersion}}"""
     lora_dir = shared.cmd_opts.lora_dir
     loras = {}
     for root, _, files in os.walk(lora_dir, followlinks=True):
@@ -152,7 +150,7 @@ def get_lora_checkpoints() -> dict:
             if ext not in (".pt", ".ckpt", ".safetensors"):
                 continue
             version = SDVersion.Unknown
-            try:  # the LoRA's user metadata from the WebUI
+            try:
                 with open(os.path.join(root, name + ".json"), encoding="utf-8") as fp:
                     version = SDVersion.from_str(json.load(fp).get("sd version"))
             except Exception:
@@ -166,7 +164,7 @@ def get_valid_lora_checkpoints():
 
 
 def export_lora_to_trt(lora_label, force_export):
-    lora_name = (lora_label or "").rsplit(" (", 1)[0]  # "<name> (<version>)"
+    lora_name = (lora_label or "").rsplit(" (", 1)[0]
     lora = get_lora_checkpoints().get(lora_name)
     if lora is None:
         return f"## No LoRA model found for {lora_name}"
@@ -180,11 +178,11 @@ def export_lora_to_trt(lora_label, force_export):
     if os.path.exists(lora_path) and not force_export:
         return "## Already converted\n\nEnable **Force Rebuild** to convert it again."
 
-    clear_vram_for_export()  # on reForge this also unloads LoRA patches merged into the weights
+    clear_vram_for_export()  # also unpatches LoRAs merged into reForge's weights
     try:
         modelobj = UNetModel(shared.sd_model.model.diffusion_model, context_dim(), shared.sd_model.is_sdxl)
         if not unet_memory.IS_FORGE_BACKEND:
-            load_unet_for_tracing()  # A1111 merges LoRAs during a forward pass
+            load_unet_for_tracing()
         weights_map = model_manager.weights_map_path(model_name)
         if not os.path.exists(weights_map):
             modelobj.export_weights_map(onnx_path, weights_map)
@@ -219,7 +217,7 @@ def profiles_markdown() -> str:
 
 
 def get_engine_choices() -> dict:
-    """Label -> engine filename for every recorded engine (all GPUs and TensorRT versions)."""
+    """Label -> engine filename, for all GPUs and TensorRT versions."""
     choices = {}
     for cc, name, entry in modelmanager.all_engines():
         config = entry["config"]

@@ -1,3 +1,4 @@
+import contextlib
 import math
 import os
 import re
@@ -8,7 +9,7 @@ import numpy as np
 import onnx
 import torch
 from onnx import numpy_helper
-from safetensors.torch import load_file
+from safetensors import safe_open
 
 from modules import devices, prompt_parser, script_callbacks, scripts, sd_models, sd_unet, shared
 from modules.ui_common import refresh_symbol
@@ -22,7 +23,7 @@ from utilities import Engine
 
 AUTO_PROFILE = "Auto (Best Match / SD Unet default)"  # saved UI settings reference this text
 EXTRA_NETWORK_TAG = re.compile(r"<(\w+):([^>]+)>")
-HEADROOM = 256 * 2**20  # output, staging buffers and fragmentation, on top of what an engine reports
+HEADROOM = 256 * 2**20
 
 
 class NoProfileError(RuntimeError):
@@ -43,19 +44,17 @@ def _notify(message: str):
 
 
 def _free_cuda_cache():
-    """TensorRT allocates outside PyTorch, so memory PyTorch has cached is unavailable to it."""
     if unet_memory.IS_FORGE_BACKEND:
         unet_memory.forge_model_management().soft_empty_cache(force=True)
     torch.cuda.empty_cache()
 
 
 def current_model_name() -> str:
-    # model_name, like the WebUI's SD Unet matching; p.sd_model_name differs for checkpoints in subfolders
     return shared.sd_model.sd_checkpoint_info.model_name
 
 
 def hires_size(p):
-    """Image size of the Hires. fix pass (the WebUI only works it out after the scripts' process())."""
+    """The Hires. fix size, which the WebUI only works out after process()."""
     rx, ry = getattr(p, "hr_resize_x", 0), getattr(p, "hr_resize_y", 0)
     if not (rx or ry):
         return int(p.width * p.hr_scale), int(p.height * p.hr_scale)
@@ -63,14 +62,14 @@ def hires_size(p):
         return rx, rx * p.height // p.width
     if not rx:
         return ry * p.width // p.height, ry
-    return rx, ry  # upscaled to cover, then cropped
+    return rx, ry
 
 
 def format_profile_summary(config) -> str:
-    # Part of SD Unet option labels, which settings store: keep the format stable.
+    # Part of SD Unet labels, which settings store: keep the format stable.
     (bmin, _, hmin, wmin), (bopt, _, hopt, wopt), (bmax, _, hmax, wmax) = config.profile["sample"]
     tok = f", tok={config.profile['encoder_hidden_states'][1][1]}"
-    bs_opt, bs_min, bs_max = max(1, bopt // 2), max(1, (bmin + 1) // 2), max(1, bmax // 2)  # sample batch = 2 x batch size
+    bs_opt, bs_min, bs_max = max(1, bopt // 2), max(1, (bmin + 1) // 2), max(1, bmax // 2)
     opt = f"{wopt * 8}x{hopt * 8}"
     if config.static_shapes or (hmin, wmin, bs_min) == (hmax, wmax, bs_max):
         return f"{opt} (bs={bs_opt}{tok}, Static)"
@@ -80,11 +79,11 @@ def format_profile_summary(config) -> str:
 
 
 def prompt_tokens(text: str, steps: int) -> int:
-    """Context length the text encoder produces for a prompt: 77 per chunk of 75 tokens."""
+    """Context length of a prompt: 77 per chunk of 75 tokens."""
     text = EXTRA_NETWORK_TAG.sub("", text or "")
     try:
         variants = {t for schedule in prompt_parser.get_learned_conditioning_prompt_schedules([text], steps) for _, t in schedule}
-        chunks, _ = shared.sd_model.cond_stage_model.process_texts(sorted(variants))  # the WebUI's own tokenization
+        chunks, _ = shared.sd_model.cond_stage_model.process_texts(sorted(variants))
         return max(len(c) for c in chunks) * 77
     except Exception:
         words = re.findall(r"\w+|[^\w\s]", text)
@@ -92,9 +91,8 @@ def prompt_tokens(text: str, steps: int) -> int:
 
 
 def batched_token_count(pos: int, neg: int) -> int:
-    """Context length when cond and uncond are batched. reForge repeats both to the least common
-    multiple of their lengths if that's at most 4x the shorter one (else they run separately);
-    A1111 pads to the longer one."""
+    """reForge repeats cond and uncond to the LCM of their lengths if that's at most 4x the shorter
+    (else they run separately); A1111 pads to the longer one."""
     if unet_memory.IS_FORGE_BACKEND:
         lcm = math.lcm(pos, neg)
         if lcm // min(pos, neg) <= 4:
@@ -109,15 +107,14 @@ def prompt_token_counts(p):
 
 
 def unet_shape(p, cfg: float, pos: int, neg: int):
-    """(batch, context length) the UNet gets: cond and uncond batched, or cond alone where reForge
-    skips uncond (CFG 1)."""
+    """(batch, context length) of the UNet input; reForge skips uncond at CFG 1."""
     if unet_memory.IS_FORGE_BACKEND and (cfg < 0 or math.isclose(cfg, 1)):
         return p.batch_size, pos
     return p.batch_size * 2, batched_token_count(pos, neg)
 
 
 def parse_lora_tags(prompt: str):
-    """(name, UNet multiplier) per LoRA tag, read like the WebUI does: <lora:name:te:unet>, te=/unet=."""
+    """(name, UNet multiplier) per tag: <lora:name:te:unet>, te=/unet=."""
     loras = []
     for kind, args in EXTRA_NETWORK_TAG.findall(prompt or ""):
         if kind != "lora":
@@ -131,8 +128,7 @@ def parse_lora_tags(prompt: str):
 
 
 def resolve_trt_lora(tag_name: str, available: dict):
-    """Converted LoRAs are named after the LoRA file, but tags may use the alias from its metadata
-    (reForge's LoRA cards insert it): resolve them like the WebUI does."""
+    """Converted LoRAs are named after the file; tags may use the alias from its metadata."""
     if tag_name in available:
         return available[tag_name]
     try:
@@ -152,22 +148,31 @@ def resolve_trt_lora(tag_name: str, available: dict):
 
 
 def load_lora_refit(base_onnx: str, loras: list) -> dict:
-    """Engine weights with the LoRAs [(path, multiplier)] applied: base + multiplier x delta, for
-    each weight they change."""
-    deltas = {}
-    for path, scale in loras:
-        for name, delta in load_file(path).items():
-            delta = delta.float() * scale  # fp32 accumulation; also handles fp8/bf16 files
-            deltas[name] = deltas[name] + delta if name in deltas else delta
-    refit = {}
-    onnx_dir = os.path.dirname(base_onnx)
-    for init in onnx.load(base_onnx, load_external_data=False).graph.initializer:  # read only what's needed
-        delta = deltas.pop(init.name, None)
-        if delta is not None:
-            base = torch.from_numpy(numpy_helper.to_array(init, base_dir=onnx_dir).astype(np.float16))
-            refit[init.name] = (base.float() + delta).half()  # fp16 halves the RAM; refit converts to the engine's dtype
-    if deltas:
-        print(f"[TensorRT] Skipped {len(deltas)} LoRA weights this model doesn't have (LoRA for another model type?).", flush=True)
+    """Engine weights with the LoRAs [(path, multiplier)] applied, for the weights they change.
+    One weight at a time: SDXL LoRAs change gigabytes of them."""
+    with contextlib.ExitStack() as stack:
+        files = []
+        for path, scale in loras:
+            f = stack.enter_context(safe_open(path, framework="pt"))
+            files.append((f, set(f.keys()), scale))
+        missing = set().union(*(keys for _, keys, _ in files))
+        total = len(missing)
+        refit = {}
+        onnx_dir = os.path.dirname(base_onnx)
+        for init in onnx.load(base_onnx, load_external_data=False).graph.initializer:
+            if init.name not in missing:
+                continue
+            weight = torch.from_numpy(numpy_helper.to_array(init, base_dir=onnx_dir).astype(np.float32))
+            for f, keys, scale in files:
+                if init.name in keys:
+                    weight += f.get_tensor(init.name).float() * scale
+            refit[init.name] = weight.half()
+            missing.discard(init.name)
+    if len(missing) > 0.02 * total:
+        raise RuntimeError(
+            f"{len(missing)} of {total} LoRA weights aren't in {os.path.basename(base_onnx)} (a LoRA for another model "
+            "type, or converted before the model was exported again): convert it again in the TensorRT LoRA tab"
+        )
     return refit
 
 
@@ -201,18 +206,18 @@ class TrtUnet(sd_unet.SdUnet):
         self.is_auto = True
         self.loaded_config = None
         self.engine = None
-        self.refit_dict = {}  # LoRA weights, applied whenever an engine is loaded
+        self.refit_dict = {}
         self.refitted_keys = set()
         self._last_signature = None
         self._selected = False  # this generation's engine was chosen from real inputs
+        self._check_output = False
         self._warned_controlnet = False
         self._fallback_reason = None  # set: the rest of this generation runs on PyTorch
-        self._torch_restored = False  # a fallback handed the UNet back to PyTorch
-        self._input_shape = None  # of the latest UNet call
+        self._torch_restored = False
+        self._input_shape = None
 
     def configure(self, profile_idx: int, is_auto: bool, refit_dict: dict):
-        """Settings for a new generation. An engine that has to be (re)loaded is loaded at the first
-        UNet call, after the text encoder has run, so the two don't need VRAM at the same time."""
+        """Settings for a new generation. Engines load at the first UNet call, once the text encoder is done."""
         self._fallback_reason = None
         self._last_signature = None
         self._selected = False
@@ -226,14 +231,12 @@ class TrtUnet(sd_unet.SdUnet):
             self._refit()
 
     def _enter_fallback(self, reason: str, message: str):
-        """Finish this generation like an SD Unet = None generation: free the engine and hand the
-        UNet back to PyTorch. The next generation uses TensorRT again."""
+        """The rest of this generation runs like with SD Unet = None."""
         self._fallback_reason = reason
         self._last_signature = None
         self.release_engine()
         _free_cuda_cache()
-        # Before sampling, reForge's sampling_prepare loads it (TensorRT is inactive now); during
-        # sampling it already ran without it, so it's loaded here.
+        # Mid-sampling, sampling_prepare already ran without the UNet.
         unet_memory.restore_torch_unet(self._input_shape if unet_memory.in_trt_sampling else None)
         self._torch_restored = True
         _notify(message)
@@ -263,7 +266,7 @@ class TrtUnet(sd_unet.SdUnet):
         feed_dict = {k: v if v.is_cuda else v.to(devices.device) for k, v in feed_dict.items()}
 
         signature = tuple((k, tuple(v.shape)) for k, v in feed_dict.items())
-        if signature != self._last_signature:  # first step, Hires. fix pass, CFG 1 steps, ...
+        if signature != self._last_signature:
             try:
                 self._select_profile(feed_dict)
             except NoProfileError as e:
@@ -271,6 +274,7 @@ class TrtUnet(sd_unet.SdUnet):
             if self._fallback_reason is not None:
                 raise TrtFallback(self._fallback_reason)
             self._last_signature = signature
+            self._check_output = True
 
         feed_dict = self._pad_to_profile(feed_dict)
         stream = torch.cuda.current_stream().cuda_stream
@@ -278,7 +282,7 @@ class TrtUnet(sd_unet.SdUnet):
             out = self.engine.infer(feed_dict, stream)["latent"]
         except torch.cuda.OutOfMemoryError:
             print("[TensorRT] Out of GPU memory; freeing VRAM and retrying...", flush=True)
-            unet_memory.make_room(self.engine.max_activation_bytes() + HEADROOM)
+            unet_memory.make_room(self.engine.needed_activation_bytes() + HEADROOM)
             _free_cuda_cache()
             try:
                 out = self.engine.infer(feed_dict, stream)["latent"]
@@ -289,13 +293,21 @@ class TrtUnet(sd_unet.SdUnet):
                     "A smaller engine profile or freeing VRAM avoids this.",
                 )
                 raise TrtFallback(self._fallback_reason)
+        if self._check_output:
+            self._check_output = False
+            if not torch.isfinite(out).all():
+                self._enter_fallback(
+                    "non-finite output",
+                    "The engine produced NaN/Inf values; finishing this generation with PyTorch. Rebuild the engine "
+                    "(Force Rebuild), and report it if that doesn't help.",
+                )
+                raise TrtFallback(self._fallback_reason)
         return out[:b] if out.shape[0] != b else out
 
     def _select_profile(self, feed_dict):
         current = self.loaded_config["config"] if self.loaded_config else None
         compatible = current is not None and current.is_compatible_from_dict(feed_dict)[0]
-        # An engine load takes seconds: once chosen, keep an engine that can run the inputs (NGMS,
-        # CFG schedules and separate cond/uncond batches change the shapes mid-generation).
+        # Keep a chosen engine that fits: shapes change mid-generation (CFG schedules, NGMS, ...).
         if compatible and (self._selected or not self.is_auto):
             return
         self._selected = True
@@ -314,9 +326,8 @@ class TrtUnet(sd_unet.SdUnet):
             self.switch_engine()
 
     def _pad_to_profile(self, feed_dict):
-        """Pad inputs below the profile minimum by repetition, which leaves the result unchanged:
-        the batch (the output is sliced back) and the context (repeating all of it leaves
-        cross-attention unchanged)."""
+        """Pads by repetition, which leaves the result unchanged: the output is sliced back, and a
+        repeated context leaves cross-attention unchanged."""
         config = self.loaded_config["config"]
         b, min_b = feed_dict["sample"].shape[0], config.min_batch()
         if b < min_b:
@@ -335,11 +346,11 @@ class TrtUnet(sd_unet.SdUnet):
             self.engine.refit(self.refit_dict)
             self.refitted_keys = set(self.refit_dict)
         except Exception as e:
-            _notify(f"Couldn't apply LoRA weights to the engine ({e}). Generating without the LoRA.")
+            self._enter_fallback("the LoRA couldn't be applied", f"Couldn't apply the LoRA to the engine: {e} Using PyTorch for this generation.")
 
     def switch_engine(self):
         self.loaded_config = self.configs[self.profile_idx]
-        if self._fallback_reason is None:  # else PyTorch until this generation ends
+        if self._fallback_reason is None:
             self._last_signature = None
             self.activate()
 
@@ -350,13 +361,12 @@ class TrtUnet(sd_unet.SdUnet):
             self.engine = Engine(path)
         else:
             self.engine.reset(path)
+        self.engine.before_allocate = lambda size: unet_memory.make_room(size + HEADROOM)
         if self._torch_restored:
             unet_memory.offload_torch_unet()
             self._torch_restored = False
-        try:
-            unet_memory.make_room(os.path.getsize(path) + HEADROOM)  # the engine's weights
-        except OSError:
-            pass  # a missing file is reported by load()
+        with contextlib.suppress(OSError):
+            unet_memory.make_room(os.path.getsize(path) + HEADROOM)
         _free_cuda_cache()
         try:
             self.engine.load()
@@ -366,15 +376,12 @@ class TrtUnet(sd_unet.SdUnet):
             return
         print(f"[TensorRT] Loaded Profile {self.profile_idx}:\n{self.engine}", flush=True)
         self._refit()
-        if unet_memory.in_trt_sampling:  # else sampling_prepare makes room for the activations
-            unet_memory.make_room(self.engine.max_activation_bytes() + HEADROOM)
 
     def release_activation_memory(self):
         if self.engine is not None and self.engine.engine is not None:
             self.engine.release_activation_memory()
 
     def release_engine(self):
-        """Free the engine's VRAM without touching the PyTorch UNet."""
         if self.engine is not None:
             self.engine.reset()
         self.engine = None
@@ -382,7 +389,6 @@ class TrtUnet(sd_unet.SdUnet):
         self.refitted_keys = set()
 
     def deactivate(self):
-        """Called by the WebUI when switching away from TensorRT."""
         self.release_engine()
         unet_memory.restore_torch_unet()
 
@@ -405,16 +411,9 @@ def _loaded_engine():
     return None
 
 
-def _sampling_memory() -> int:
-    unet = _loaded_engine()
-    return unet.engine.max_activation_bytes() + HEADROOM if unet else 0
-
-
 def _before_model_load(models):
-    """reForge can't reclaim an engine's VRAM. If the weights it's about to load won't fit next to
-    the engine, even after unloading its other models, release the engine first (outside sampling
-    only; it's reloaded at the next UNet call). Otherwise they'd load partially, which slows them
-    down and breaks SDXL's text encoder."""
+    """reForge can't reclaim an engine's VRAM: if weights it's about to load won't fully fit next to
+    the engine (partially loaded, SDXL's text encoder breaks), the engine makes way until sampling."""
     unet = _loaded_engine()
     if unet is None or unet_memory.in_trt_sampling:
         return
@@ -430,20 +429,18 @@ def _before_model_load(models):
 unet_memory.callbacks.update(
     trt_active=_trt_active,
     sampling_done=_release_activation_memory,
-    sampling_memory=_sampling_memory,
     before_model_load=_before_model_load,
 )
 
 
 def profile_choices() -> List[str]:
-    model = getattr(getattr(sd_models, "model_data", None), "sd_model", None)  # shared.sd_model would load it while the UI builds
+    model = getattr(getattr(sd_models, "model_data", None), "sd_model", None)  # not shared.sd_model: that loads one
     configs = modelmanager.available_models().get(model.sd_checkpoint_info.model_name if model else None, [])
     return [AUTO_PROFILE] + [f"Profile {i}: {format_profile_summary(c['config'])}" for i, c in enumerate(configs)]
 
 
 def select_profiles(p, configs: List[dict], pos: int, neg: int, is_img2img: bool):
-    """(base pass profile, Hires. fix profile). No base profile: PyTorch. No Hires. fix profile: that
-    pass falls back to PyTorch."""
+    """(base profile, Hires. fix profile); None runs that pass on PyTorch."""
 
     def candidates(width, height, cfg):
         batch, tokens = unet_shape(p, cfg, pos, neg)
@@ -457,7 +454,7 @@ def select_profiles(p, configs: List[dict], pos: int, neg: int, is_img2img: bool
         return best, best
     hires = candidates(*hires_size(p), getattr(p, "hr_cfg", 0) or p.cfg_scale)
     both = [i for i in base if i in hires]
-    if both:  # one engine for both passes saves a reload
+    if both:
         best = min(both, key=lambda i: base[i] + hires[i])
         return best, best
     return best, min(hires, key=hires.get) if hires else None
@@ -505,7 +502,7 @@ class TensorRTScript(scripts.Script):
             gr.Warning("TensorRT: image sizes should be divisible by 64.")
 
     def get_loras(self, p, model_name: str):
-        loras = parse_lora_tags((p.all_prompts or [p.prompt])[0])  # the WebUI applies the first prompt's
+        loras = parse_lora_tags((p.all_prompts or [p.prompt])[0])  # the WebUI applies the first prompt's LoRAs
         key = (model_name, loras)
         if key == self.lora_key:
             return
@@ -522,11 +519,11 @@ class TensorRTScript(scripts.Script):
 
     def process(self, p, *args):
         unet_memory.install_hooks()
-        unet_memory.in_trt_sampling = False  # in case an interrupted generation never cleaned up
+        unet_memory.in_trt_sampling = False  # an interrupted generation never cleans up
         option = sd_unet.get_unet_option()
         model_name = current_model_name()
         if option is None and shared.opts.sd_unet == "Automatic" and model_name in modelmanager.available_models():
-            sd_unet.list_unets()  # options are built at startup; pick up engines exported since
+            sd_unet.list_unets()
             option = sd_unet.get_unet_option()
         if not isinstance(option, TrtUnetOption):
             return
@@ -564,11 +561,11 @@ class TensorRTScript(scripts.Script):
     def apply_unet(self, option):
         """TensorRT with profile self.idx, or PyTorch if it's None."""
         current = sd_unet.current_unet
-        sd_unet.current_unet_option = option  # keeps the WebUI's apply_unet from switching again
+        sd_unet.current_unet_option = option  # so the WebUI's own apply_unet keeps this
         if self.idx is not None and isinstance(current, TrtUnet) and current.option is option:
             return current.configure(self.idx, self.is_auto, self.lora_refit_dict)
         if current is not None:
-            getattr(current, "release_engine", current.deactivate)()  # the PyTorch UNet is handled below
+            getattr(current, "release_engine", current.deactivate)()
         if self.idx is None:
             sd_unet.current_unet = None
             unet_memory.restore_torch_unet()
@@ -580,7 +577,7 @@ class TensorRTScript(scripts.Script):
         unet.configure(self.idx, self.is_auto, self.lora_refit_dict)
 
     def post_sample(self, p, ps, *args):
-        _release_activation_memory()  # before the VAE decode (reForge: also the sampling_cleanup hook)
+        _release_activation_memory()
 
     def before_hr(self, p, *args):
         unet = sd_unet.current_unet
@@ -590,14 +587,18 @@ class TensorRTScript(scripts.Script):
 
 
 def list_unets(options):
+    # The same labels however many engines a checkpoint has: settings store them.
     for model_name, configs in modelmanager.available_models().items():
-        if len(configs) == 1:
-            options.append(TrtUnetOption(model_name, configs, f"[TRT] {model_name}"))
-            continue
         options.append(TrtUnetOption(model_name, configs, f"[TRT] {model_name} (Auto)"))
         for i, entry in enumerate(configs):
             label = f"[TRT] {model_name} [Profile {i}: {format_profile_summary(entry['config'])}]"
             options.append(TrtUnetOption(model_name, configs, label, forced_profile_idx=i))
+    try:  # checkpoints with one engine used to be labelled "[TRT] name"
+        saved, labels = shared.opts.sd_unet, {o.label for o in options}
+        if saved.startswith("[TRT] ") and saved not in labels and f"{saved} (Auto)" in labels:
+            shared.opts.data["sd_unet"] = f"{saved} (Auto)"
+    except Exception:
+        pass
 
 
 unet_memory.install_hooks()
