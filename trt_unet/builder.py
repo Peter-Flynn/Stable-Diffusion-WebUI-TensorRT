@@ -128,7 +128,15 @@ def build(job, logger, progress, strip=True):
     builder = trt.Builder(logger)
     network = builder.create_network(0)  # strongly typed: precision comes from the FP16 graph
     parser = trt.OnnxParser(network, logger)
-    if not parser.parse_from_file(job["onnx"]):
+    # The parser opens files through narrow paths, which on Windows can't hold every character (e.g. a
+    # user folder named in Japanese): parse from the model's folder with an ASCII relative path.
+    cwd, (folder, name) = os.getcwd(), os.path.split(os.path.abspath(job["onnx"]))
+    os.chdir(folder)
+    try:
+        parsed = parser.parse_from_file(name)
+    finally:
+        os.chdir(cwd)
+    if not parsed:
         raise RuntimeError("TensorRT could not parse the ONNX model: " + "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
 
     unmarked = [name for name in job["weights"] if not network.mark_weights_refittable(name)]
