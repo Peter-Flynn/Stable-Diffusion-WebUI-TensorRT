@@ -274,7 +274,7 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
         message = f"### The build failed\n`{e}`"
     finally:
         BUILDING.clear()
-    return (message, *refresh(draft, draft_arch))
+    return message, draft  # the rest of the tab is refreshed next, without progress shown on all of it
 
 
 def _build_started():
@@ -380,16 +380,20 @@ def on_ui_tabs():
             None, [preset], [*numbers, preset],
             **{JS: f"(name, ...current) => [...(({json.dumps(presets)})[name] || current.slice(0, {len(numbers)})), null]"},
         )
-        refresh_button.click(refresh, [draft, draft_arch], outputs)  # also clicked when the tab opens (javascript/tensorrt.js)
-        tab.load(refresh, None, outputs)
-        selector.change(select_profile, [draft, selector], [*numbers, save_button, remove_button])
-        add_button.click(add_profile, [draft, *numbers], [*draft_outputs, note])
-        save_button.click(save_profile, [draft, selector, *numbers], [*draft_outputs, note])
-        remove_button.click(remove_profile, [draft, selector], [*draft_outputs, note])
-        build_button.click(_build_started, None, [build_button, cancel_button, result], queue=False).then(build, [draft, draft_arch, level], [result, *outputs]).then(None, None, None, **refresh_sd_unet)
+        quiet = {"show_progress": "hidden"}  # quick updates: no progress overlay on every component they touch
+        refresh_button.click(refresh, [draft, draft_arch], outputs, **quiet)  # also clicked when the tab opens (javascript/tensorrt.js)
+        tab.load(refresh, None, outputs, **quiet)
+        selector.change(select_profile, [draft, selector], [*numbers, save_button, remove_button], **quiet)
+        add_button.click(add_profile, [draft, *numbers], [*draft_outputs, note], **quiet)
+        save_button.click(save_profile, [draft, selector, *numbers], [*draft_outputs, note], **quiet)
+        remove_button.click(remove_profile, [draft, selector], [*draft_outputs, note], **quiet)
+        # The build's progress shows once, in its result.
+        build_button.click(_build_started, None, [build_button, cancel_button, result], queue=False, **quiet).then(
+            build, [draft, draft_arch, level], [result, draft]
+        ).then(refresh, [draft, draft_arch], outputs, **quiet).then(None, None, None, **refresh_sd_unet)
         cancel_button.click(cancel_build, None, None, queue=False)
         delete_button.click(
-            delete_engine, [engine_choice, draft, draft_arch], outputs,
+            delete_engine, [engine_choice, draft, draft_arch], outputs, **quiet,
             **{JS: "(choice, ...rest) => [choice && confirm('Delete the engine ' + choice + '? Building it again takes a while.') ? choice : null, ...rest.slice(0, 2)]"},
         ).then(None, None, None, **refresh_sd_unet)
     return [(tab, "TensorRT", "tensorrt")]
