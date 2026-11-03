@@ -96,7 +96,7 @@ def _status(sd_model, arch, record) -> str:
     lines.append(f"**Engine:** built {record.meta['created']} with {_n(len(record.profiles), 'profile')}; takes about {common.gib(record.weight_bytes)} of VRAM while loaded.")
     setting = getattr(shared.opts, "sd_unet", "Automatic")
     if setting in ("Automatic", f"[TRT] {arch.label}"):
-        lines.append(f"`SD Unet` is `{setting}`, so every {arch.family} checkpoint runs on it.")
+        lines.append(f"`SD Unet` is `{setting}`, so every {arch.name} checkpoint runs on it.")
     else:
         lines.append(f"**`SD Unet` is `{setting}`, so generations don't use this engine.** Set it to `Automatic` in Settings, Stable Diffusion.")
     return "\n\n".join(lines)
@@ -247,7 +247,7 @@ def remove_profile(draft, choice):
 
 def _outcome(arch, result) -> str:
     if result["ok"]:
-        message = f"### Engine built\nEvery {arch.family} checkpoint runs on it with `SD Unet` set to `Automatic`."
+        message = f"### Engine built\nEvery {arch.name} checkpoint runs on it with `SD Unet` set to `Automatic`."
         if result.get("stripped") is False:
             message += " (TensorRT couldn't leave the weights out of it, so its file is as large as the UNet.)"
     elif result.get("error") == "cancelled":

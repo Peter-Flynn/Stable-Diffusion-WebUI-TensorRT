@@ -6,7 +6,6 @@ runs on the engine, the PyTorch UNet stays in RAM (its patches still apply, it j
 
 import contextlib
 import math
-import re
 import sys
 import time
 import traceback
@@ -197,22 +196,27 @@ class TrtUnet(sd_unet.SdUnet):
             _unload(model)
 
 
-LABEL = re.compile(r"\[TRT\] \w+ \([0-9a-f]{10}\)")
-
-
 def list_unets(options: list):
-    for record in store.records():
-        if record.loadable:
-            options.append(TrtUnetOption(record))
-    try:  # SD Unet saved with an engine of an earlier version: it would silently select nothing
+    ours = [TrtUnetOption(record) for record in store.records() if record.loadable]
+    options.extend(ours)
+    try:  # SD Unet naming an engine that's gone (deleted, or from an earlier version) would silently select nothing
         from modules import shared
 
         saved = shared.opts.data.get("sd_unet")
-        if isinstance(saved, str) and saved.startswith("[TRT] ") and not LABEL.fullmatch(saved):
+        if isinstance(saved, str) and saved.startswith("[TRT] ") and saved not in {o.label for o in ours}:
             shared.opts.data["sd_unet"] = "Automatic"
-            log(f"SD Unet was set to {saved}, an engine of an earlier version of this extension; it's Automatic now.")
+            log(f"SD Unet was set to {saved}, an engine that doesn't exist (anymore); it's Automatic now.")
     except Exception:
         pass
+
+
+def _explicit_choice() -> bool:
+    try:
+        from modules import shared
+
+        return str(shared.opts.sd_unet).startswith("[TRT] ")
+    except Exception:
+        return True
 
 
 def _selected_record():
@@ -389,8 +393,9 @@ def _engine_record(patcher, x):
     if record is None:
         return None
     arch = arch_mod.detect(patcher)
-    if arch is None or arch.id != record.arch.id:
-        notify(f"The selected engine is for {record.arch.label}, not {arch.label if arch else 'this model'}; using PyTorch.")
+    if arch is None or arch.id != record.arch.id:  # e.g. a refiner: with SD Unet on Automatic, that's expected
+        if _explicit_choice():
+            notify(f"The selected engine is for {record.arch.label}, not {arch.label if arch else 'this model'}; using PyTorch.")
         return None
     reason = _unsupported(patcher)
     if reason:

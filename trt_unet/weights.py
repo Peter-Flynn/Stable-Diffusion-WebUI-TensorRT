@@ -1,6 +1,9 @@
 """The weights an engine runs with: those PyTorch would use for the same UNet patcher, i.e. the loaded
 checkpoint's with the patcher's patches (LoRAs, LyCORIS, ...) applied the way reForge applies them."""
 
+import hashlib
+import weakref
+
 import torch
 
 from . import common
@@ -8,16 +11,34 @@ from . import common
 PREFIX = "diffusion_model."
 
 
+class _Same:
+    """Equal only to a _Same of the very same object while it exists. Unlike id(), which an object made
+    later can reuse (e.g. another LoRA of the same rank), and without keeping the object alive."""
+
+    __slots__ = ("ref",)
+
+    def __init__(self, obj):
+        try:
+            self.ref = weakref.ref(obj)
+        except TypeError:  # not weak-referenceable: keep it
+            self.ref = lambda: obj
+
+    def __eq__(self, other):
+        return isinstance(other, _Same) and self.ref() is not None and self.ref() is other.ref()
+
+    __hash__ = None
+
+
 def _identity(value):
     if isinstance(value, torch.Tensor):
-        return ("tensor", id(value), tuple(value.shape))
+        return ("tensor", _Same(value), tuple(value.shape))
     if isinstance(value, (list, tuple)):
         return tuple(_identity(v) for v in value)
     if isinstance(value, dict):
         return tuple(sorted((k, _identity(v)) for k, v in value.items()))
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
-    return ("object", id(value))
+    return ("object", _Same(value))
 
 
 class EffectiveWeights:
@@ -26,7 +47,7 @@ class EffectiveWeights:
         self.module = patcher.model.diffusion_model
         self.patches = getattr(patcher, "patches", {}) or {}
         self.refresh()
-        self.base_version = (id(self.module), self._fingerprint())
+        self.base_version = (_Same(self.module), self._fingerprint())
 
     def refresh(self):
         """Loading and unloading replace the module's parameters: read them again before a refit."""
@@ -44,11 +65,11 @@ class EffectiveWeights:
             raise RuntimeError(f"The engine has a weight this UNet doesn't ({name}); rebuild the engine")
         return (getattr(backup, "weight", backup) if backup is not None else self.params[name]).data
 
-    def _fingerprint(self):
-        """Tells checkpoints apart when one is loaded into the same module."""
-        names = sorted(self.params)
-        sample = [names[int(i * (len(names) - 1) / 7)] for i in range(8)] if names else []
-        return tuple(float(self.base(n).reshape(-1)[:64].float().sum()) for n in sample)
+    def _fingerprint(self) -> str:
+        """Tells checkpoints apart when one is loaded into the same module. Every weight counts: two
+        checkpoints can differ in some layers only (e.g. one is the other with a LoRA merged in)."""
+        heads = [self.base(n).reshape(-1)[:16].float().cpu() for n in sorted(self.params)]
+        return hashlib.sha256(torch.cat(heads).numpy().tobytes()).hexdigest() if heads else ""
 
     def signature(self, name: str):
         patches = self.patches.get(PREFIX + name)

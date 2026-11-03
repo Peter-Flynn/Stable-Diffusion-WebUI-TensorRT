@@ -7,6 +7,7 @@ import weakref
 from dataclasses import asdict, dataclass
 
 _IGNORED_CONFIG = {"dtype", "device", "operations", "disable_unet_model_creation"}
+NAMES = {"SD15": "SD 1.5", "SD20": "SD 2.x", "SDXL": "SDXL", "SDXLRefiner": "SDXL Refiner", "SSD1B": "SSD-1B"}
 _cache = {}
 
 
@@ -20,8 +21,13 @@ class Arch:
     multiple: int  # image sizes are multiples of this
 
     @property
+    def name(self) -> str:
+        """For people: "SD 1.5", "SDXL", ... (reForge's model config class otherwise)."""
+        return NAMES.get(self.family, self.family)
+
+    @property
     def label(self) -> str:
-        return f"{self.family} ({self.id.rsplit('-', 1)[-1]})"
+        return f"{self.name} ({self.id.rsplit('-', 1)[-1]})"
 
     def to_dict(self) -> dict:
         return asdict(self)

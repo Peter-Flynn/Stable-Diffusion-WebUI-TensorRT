@@ -149,7 +149,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
     )
     if "dynamo" in inspect.signature(torch.onnx.export).parameters:
         kwargs["dynamo"] = False
-    log(f"Exporting the {arch.family} UNet graph...")
+    log(f"Exporting the {arch.name} UNet graph...")
     with _traceable_attention():
         torch.onnx.export(unet, tuple(inputs), path, **kwargs)
     expected = {k: list(v.shape) for k, v in unet.state_dict(keep_vars=True).items()}

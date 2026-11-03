@@ -116,7 +116,7 @@ PRESETS = {
         "1024x1024": _p(1024, 1024),
         "832x1216": _p(832, 1216),
         "1216x832": _p(1216, 832),
-        "1024-3072 (Hires. fix: 2x of every SDXL resolution)": _p((1024, 1536, 3072), (1024, 1536, 3072)),
+        "640-3072 (Hires. fix up to 2x of every SDXL resolution)": _p((640, 1536, 3072), (640, 1536, 3072)),
         "640-1536, batch 1-4": _p((640, 1024, 1536), (640, 1024, 1536), (1, 1, 4)),
     },
     "sd": {
@@ -124,7 +124,7 @@ PRESETS = {
         "512x512": _p(512, 512),
         "512x768": _p(512, 768),
         "768x512": _p(768, 512),
-        "768-1536 (Hires. fix: 2x of every SD 1.5 resolution)": _p((768, 1024, 1536), (768, 1024, 1536)),
+        "512-1536 (Hires. fix up to 2x of every SD 1.5 resolution)": _p((512, 1024, 1536), (512, 1024, 1536)),
         "512-768, batch 1-4": _p((512, 512, 768), (512, 512, 768), (1, 1, 4)),
     },
 }
@@ -135,5 +135,7 @@ def presets_for(adm_channels: int) -> dict:
 
 
 def default_profiles(adm_channels: int) -> list:
-    """Every base resolution, and Hires. fix up to 2x of them: what most generations need."""
+    """Every base resolution, and Hires. fix up to 2x of them: what most generations need. The Hires. fix
+    profile starts at the smallest base size, since an upscaled portrait or landscape (e.g. 640x1536 at
+    1.5x: 960x2304) is wider than the base profile on one side only."""
     return [p for name, p in presets_for(adm_channels).items() if "every" in name]
