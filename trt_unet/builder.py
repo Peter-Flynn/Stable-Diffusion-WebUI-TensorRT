@@ -10,6 +10,7 @@ import time
 import tensorrt as trt
 from tqdm import tqdm
 
+PLACEHOLDER_MARK = 1717.0  # export.py starts each FP16 placeholder with this and its index
 PROGRESS = "@@trt-progress "
 RESULT = "@@trt-result "
 _MEMORY_HINTS = ("insufficient memory", "memory is insufficient", "could not be allocated", "out of memory")
@@ -124,7 +125,40 @@ class NoEngine(RuntimeError):
     pass
 
 
-def build(job, logger, progress, strip=True):
+def _null_placeholders(network, names) -> set:
+    """Swaps the parsed UNet weights (export.py's placeholders, told apart by the index they start with)
+    for TensorRT's null placeholders: a type and a size without data, which the builder doesn't keep or
+    convert. They're implicitly refittable. Returns the names swapped."""
+    swapped = set()
+    for i in range(network.num_layers):
+        layer = network.get_layer(i)
+        if layer.type == trt.LayerType.CONSTANT:
+            layer.__class__, slots = trt.IConstantLayer, ("weights",)
+        elif layer.type == trt.LayerType.CONVOLUTION:
+            layer.__class__, slots = trt.IConvolutionLayer, ("kernel", "bias")
+        else:
+            continue
+        for slot in slots:
+            weights = getattr(layer, slot)
+            if weights.dtype != trt.DataType.HALF or weights.size < 3:
+                continue
+            head = weights.numpy()[:3]
+            if head[0] != PLACEHOLDER_MARK:
+                continue  # not one of ours, or the parser changed it (e.g. transposed): stays as it is
+            index = int(head[1]) * 2048 + int(head[2])
+            if index >= len(names) or names[index] in swapped:
+                continue
+            setattr(layer, slot, trt.Weights(weights.dtype, 0, weights.size))
+            # TensorRT's own descriptor of the placeholder carries the name
+            if not network.set_weights_name(getattr(layer, slot), names[index]):
+                raise RuntimeError(f"TensorRT didn't take the name of the null placeholder for {names[index]}")
+            swapped.add(names[index])
+    return swapped
+
+
+def build(job, logger, progress, strip=True, null=False):
+    """null: TensorRT's null weight placeholders (strip only), which keep the builder from holding the
+    weights; else the placeholder data from the export, which the builder keeps like real weights."""
     builder = trt.Builder(logger)
     network = builder.create_network(0)  # strongly typed: precision comes from the FP16 graph
     parser = trt.OnnxParser(network, logger)
@@ -139,7 +173,10 @@ def build(job, logger, progress, strip=True):
     if not parsed:
         raise RuntimeError("TensorRT could not parse the ONNX model: " + "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
 
-    unmarked = [name for name in job["weights"] if not network.mark_weights_refittable(name)]
+    swapped = _null_placeholders(network, job["placeholders"]) if null and strip else set()
+    if swapped:
+        log(f"Building with null placeholders for {len(swapped)} of {len(job['weights'])} weights")
+    unmarked = [name for name in job["weights"] if name not in swapped and not network.mark_weights_refittable(name)]
     if unmarked:
         raise RuntimeError(f"{len(unmarked)} UNet weights aren't in the TensorRT network (e.g. {unmarked[0]})")
 
@@ -182,6 +219,21 @@ def build(job, logger, progress, strip=True):
         os.replace(cache_path + ".tmp", cache_path)
 
 
+def _peak_ram():
+    """This process's peak resident memory in bytes, or None."""
+    try:
+        import resource
+
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)
+    except ImportError:  # Windows
+        try:
+            import psutil
+
+            return psutil.Process().memory_info().peak_wset
+        except Exception:
+            return None
+
+
 def _exit_with_parent():
     """The parent holds our stdin open: EOF means it's gone, and nobody would use the engine."""
 
@@ -205,7 +257,13 @@ def main(job_path):
     try:
         log(f"Building with TensorRT {trt.__version__}")
         try:
-            build(job, logger, Progress(_progress_sender()))
+            try:
+                build(job, logger, Progress(_progress_sender()), null=True)
+            except Exception as e:
+                # TensorRT documents null placeholders for networks made through its API, not parsed ones
+                log(f"Building with null weight placeholders failed ({e}); building with placeholder data instead.")
+                logger.errors.clear()
+                build(job, logger, Progress(_progress_sender()))
             result["stripped"] = True
         except NoEngine:
             if not any(w in " ".join(logger.errors).lower() for w in ("refit", "strip", "weight")):
@@ -219,6 +277,9 @@ def main(job_path):
     except Exception as e:
         result["error"] = str(e)
         log(f"Engine build failed: {e}")
+    result["peak_ram"] = _peak_ram()
+    if result["peak_ram"]:
+        log(f"Peak RAM of the build: {result['peak_ram'] / 2**30:.2f} GiB")
     result["memory_warnings"] = len(logger.memory)
     result["memory_example"] = logger.memory[0] if logger.memory else None
     _send(RESULT, result)

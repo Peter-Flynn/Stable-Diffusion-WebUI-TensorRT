@@ -23,6 +23,7 @@ from .common import log
 
 INPUTS = ("sample", "timesteps", "encoder_hidden_states", "y")
 PLACEHOLDER_STRIDE = 256  # bytes between the placeholder weights' starts
+PLACEHOLDER_MARK = 1717.0  # each FP16 placeholder starts with this and its index (builder.py reads it)
 CANCEL = threading.Event()
 DYNAMIC_AXES = {
     "sample": {0: "batch", 2: "height", 3: "width"},
@@ -95,10 +96,12 @@ def _fresh_unet(config: dict, device, dtype=torch.float16):
 
 
 def _placeholder_weights(onnx_path: str, input_names) -> dict:
-    """Turns the exported weight inputs into initializers that read a small file of zeros, so the graph
-    stays small: TensorRT only needs their shapes, the checkpoint provides the values. TensorRT tells
-    weights apart by their memory (the parser maps the file once), so each starts at its own offset;
-    their ranges overlap, so the file is about as large as the largest weight."""
+    """Turns the exported weight inputs into initializers that read a small file, so the graph stays
+    small: TensorRT only needs their shapes, the checkpoint provides the values. TensorRT tells weights
+    apart by their memory (the parser maps the file once), so each starts at its own offset; their ranges
+    overlap, so the file is about as large as the largest weight. Each FP16 one starts with
+    PLACEHOLDER_MARK and its index (in the returned dict's order), so the builder can tell them apart in
+    the parsed network; the rest is zeros."""
     import onnx
 
     model = onnx.load(onnx_path)
@@ -107,7 +110,7 @@ def _placeholder_weights(onnx_path: str, input_names) -> dict:
     weights = [i for i in graph.input if i.name not in input_names]
     sizes = {onnx.TensorProto.FLOAT16: 2, onnx.TensorProto.BFLOAT16: 2, onnx.TensorProto.FLOAT: 4, onnx.TensorProto.INT64: 8}
     data_name = os.path.basename(onnx_path) + ".zeros"
-    shapes, end = {}, 0
+    shapes, end, marks = {}, 0, {}
     for value in weights:
         graph.input.remove(value)
         if value.name not in used:
@@ -117,6 +120,8 @@ def _placeholder_weights(onnx_path: str, input_names) -> dict:
         nbytes = math.prod(dims) * sizes[t.elem_type]
         offset = len(shapes) * PLACEHOLDER_STRIDE
         end = max(end, offset + nbytes)
+        if t.elem_type == onnx.TensorProto.FLOAT16 and nbytes >= 6:
+            marks[offset] = len(shapes)
         init = graph.initializer.add()
         init.name, init.data_type, init.data_location = value.name, t.elem_type, onnx.TensorProto.EXTERNAL
         init.dims.extend(dims)
@@ -126,6 +131,9 @@ def _placeholder_weights(onnx_path: str, input_names) -> dict:
         shapes[value.name] = dims
     with open(os.path.join(os.path.dirname(onnx_path), data_name), "wb") as f:
         f.truncate(end)
+        for offset, index in marks.items():
+            f.seek(offset)
+            f.write(torch.tensor([PLACEHOLDER_MARK, index // 2048, index % 2048], dtype=torch.float16).numpy().tobytes())
     onnx.save(model, onnx_path)
     return shapes
 
@@ -257,6 +265,7 @@ def build(arch: Arch, patcher, profile_list: list, optimization_level=None, prog
             "onnx": os.path.join(folder, "unet.onnx"),
             "plan": os.path.join(folder, "engine.plan"),
             "weights": sorted(shapes),
+            "placeholders": list(shapes),  # by index
             "profiles": profile_shapes,
             "timing_cache": store.timing_cache_path(),
             "optimization_level": optimization_level,
