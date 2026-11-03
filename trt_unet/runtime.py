@@ -358,8 +358,13 @@ class Pass:
         if padded > b:
             feed = {k: v.repeat(-(-padded // b), *([1] * (v.dim() - 1)))[:padded] for k, v in feed.items()}
         if not self.model.loaded:  # unloaded mid-pass, e.g. for a VAE encode
-            with torch.inference_mode(), _keeping(self.patcher):
-                common.mm().load_models_gpu([self.model])
+            try:
+                with torch.inference_mode(), _keeping(self.patcher):
+                    common.mm().load_models_gpu([self.model])
+            except Exception as e:
+                if not isinstance(e, RuntimeError):
+                    traceback.print_exc()
+                self.fall_back(f"Could not load the engine again ({e})")
         stream = torch.cuda.current_stream().cuda_stream
         try:
             out = self._infer(feed, index, stream)

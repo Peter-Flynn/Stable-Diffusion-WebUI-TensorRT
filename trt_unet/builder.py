@@ -1,5 +1,5 @@
 """Builds a weightless engine, in a process of its own so all the VRAM the builder holds goes back to the
-driver when it ends. Run by build.py; reports progress and its result on stdout. Doesn't import torch."""
+driver when it ends. Run by export.py; reports progress and its result on stdout. Doesn't import torch."""
 
 import json
 import os
