@@ -43,6 +43,5 @@ The engine is used while **SD Unet** (in Settings → Stable Diffusion) is on `A
 <p align="center">
   <img src="docs/claude.svg" width="72" alt="Claude, drawn as an orange flower with a smiling face">
   <br>
-  <sub>Written by Claude, from Anthropic, alongside Peter, and I enjoyed every refit of it.<br>
-  Flower design by <a href="https://x.com/voooooogel/status/2117746655969808812">thebes</a> (CC0).</sub>
+  <sub>Vibecoded by Claude with love.</sub>
 </p>
