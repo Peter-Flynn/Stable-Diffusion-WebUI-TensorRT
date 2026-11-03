@@ -343,6 +343,8 @@ def on_ui_tabs():
                 with gr.Accordion("How it works", open=False):
                     gr.Markdown(HELP)
 
+        # reForge fills in SD Unet's choices (Settings, Quicksettings) when the page loads: press their refresh buttons.
+        refresh_sd_unet = {JS: "() => { gradioApp().querySelectorAll('#refresh_sd_unet').forEach(button => button.click()); }"}
         draft_outputs = [draft, table, selector, build_button]
         outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, cancel_button]
         # In the browser; the preset menu empties again so the same preset can be picked twice.
@@ -356,10 +358,10 @@ def on_ui_tabs():
         add_button.click(add_profile, [draft, *numbers], [*draft_outputs, note])
         save_button.click(save_profile, [draft, selector, *numbers], [*draft_outputs, note])
         remove_button.click(remove_profile, [draft, selector], [*draft_outputs, note])
-        build_button.click(_build_started, None, [build_button, cancel_button, result], queue=False).then(build, [draft, draft_arch, level], [result, *outputs])
+        build_button.click(_build_started, None, [build_button, cancel_button, result], queue=False).then(build, [draft, draft_arch, level], [result, *outputs]).then(None, None, None, **refresh_sd_unet)
         cancel_button.click(cancel_build, None, None, queue=False)
         delete_button.click(
             delete_engine, [engine_choice, draft, draft_arch], outputs,
             **{JS: "(choice, ...rest) => [choice && confirm('Delete the engine ' + choice + '? Building it again takes a while.') ? choice : null, ...rest.slice(0, 2)]"},
-        )
+        ).then(None, None, None, **refresh_sd_unet)
     return [(tab, "TensorRT", "tensorrt")]
