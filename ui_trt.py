@@ -29,20 +29,11 @@ SLIDER_GROUPS = (  # column elem_id, label, (minimum, maximum, step), ProfileSet
 
 
 def clear_vram_for_export():
-    """Record what's loaded, then clear VRAM. Pass the result to restore_vram_after_export()."""
-    snapshot = unet_memory.snapshot_loaded_models()
+    """Release an active engine and unload every model. Nothing is put back afterwards: the
+    WebUI loads what it needs on the next generation (the build runs in its own process, so
+    its VRAM is free again by then)."""
     unet_memory.free_vram_for_export()
     unet_memory.report_free_vram("after clearing VRAM for export")
-    return snapshot
-
-
-def restore_vram_after_export(snapshot):
-    try:
-        unet_memory.free_all_models()
-        unet_memory.restore_loaded_models(snapshot)
-        sd_hijack.model_hijack.apply_optimizations()  # undo apply_torch_model (A1111; a no-op on reForge)
-    except Exception as e:
-        print(f"[TensorRT] Could not restore the previous model state: {e}", flush=True)
 
 
 def load_unet_for_tracing():
@@ -82,7 +73,7 @@ def export_unet_to_trt(
     bs_min, bs_opt, bs_max, h_min, h_opt, h_max, w_min, w_opt, w_max, t_min, t_opt, t_max,
     force_export, static_shapes, preset, optimization_level=3, progress=gr.Progress(),
 ):
-    snapshot = None
+    optimizations_off = False
     try:
         model = shared.sd_model
         is_xl = model.is_sdxl
@@ -112,7 +103,8 @@ def export_unet_to_trt(
             yield f"### ✅ This engine already exists: `{filename}`\n\nEnable **Force Rebuild** to build it again."
             return
 
-        snapshot = clear_vram_for_export()
+        clear_vram_for_export()
+        optimizations_off = True
         modelobj.apply_torch_model()
         if not os.path.exists(onnx_path):
             yield f"### ⏳ [1/2] Exporting the UNet to ONNX...\n- `{onnx_path}`\n\n*SDXL takes 1-3 minutes. Details are in the console.*"
@@ -143,8 +135,11 @@ def export_unet_to_trt(
         traceback.print_exc()
         yield f"### ❌ Export failed: `{e}`\n\nThe console has the details."
     finally:
-        if snapshot is not None:
-            restore_vram_after_export(snapshot)
+        if optimizations_off:
+            try:
+                sd_hijack.model_hijack.apply_optimizations()  # undo apply_torch_model (A1111; a no-op on reForge)
+            except Exception as e:
+                print(f"[TensorRT] Could not restore cross-attention optimizations: {e}", flush=True)
 
 
 def get_lora_checkpoints() -> dict:
@@ -185,7 +180,7 @@ def export_lora_to_trt(lora_label, force_export):
     if os.path.exists(lora_path) and not force_export:
         return "## Already converted\n\nEnable **Force Rebuild** to convert it again."
 
-    snapshot = clear_vram_for_export()  # on reForge this also unloads LoRA patches merged into the weights
+    clear_vram_for_export()  # on reForge this also unloads LoRA patches merged into the weights
     try:
         modelobj = UNetModel(shared.sd_model.model.diffusion_model, context_dim(), shared.sd_model.is_sdxl)
         if not unet_memory.IS_FORGE_BACKEND:
@@ -199,8 +194,6 @@ def export_lora_to_trt(lora_label, force_export):
     except Exception as e:
         traceback.print_exc()
         return f"## ❌ Conversion failed: `{e}`\n\nThe console has the details."
-    finally:
-        restore_vram_after_export(snapshot)
     return f"## Converted {lora_name} ({len(deltas)} weights)"
 
 

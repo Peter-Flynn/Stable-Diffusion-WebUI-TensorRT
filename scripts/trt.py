@@ -22,6 +22,7 @@ from utilities import Engine
 
 AUTO_PROFILE = "Auto (Best Match / SD Unet default)"  # saved UI settings reference this text
 EXTRA_NETWORK_TAG = re.compile(r"<(\w+):([^>]+)>")
+HEADROOM = 256 * 2**20  # output, staging buffers and fragmentation, on top of what an engine reports
 
 
 class NoProfileError(RuntimeError):
@@ -206,10 +207,12 @@ class TrtUnet(sd_unet.SdUnet):
         self._selected = False  # this generation's engine was chosen from real inputs
         self._warned_controlnet = False
         self._fallback_reason = None  # set: the rest of this generation runs on PyTorch
-        self._torch_restored = False  # a fallback fully loaded the PyTorch UNet
+        self._torch_restored = False  # a fallback handed the UNet back to PyTorch
+        self._input_shape = None  # of the latest UNet call
 
     def configure(self, profile_idx: int, is_auto: bool, refit_dict: dict):
-        """Settings for a new generation; loads the engine at most once."""
+        """Settings for a new generation. An engine that has to be (re)loaded is loaded at the first
+        UNet call, after the text encoder has run, so the two don't need VRAM at the same time."""
         self._fallback_reason = None
         self._last_signature = None
         self._selected = False
@@ -218,22 +221,25 @@ class TrtUnet(sd_unet.SdUnet):
         changed = refit_dict is not self.refit_dict
         self.profile_idx, self.refit_dict = profile_idx, refit_dict
         if reload:
-            self.activate()  # a fresh engine also undoes weights refitted for other LoRAs
+            self.release_engine()  # a fresh engine also undoes weights refitted for other LoRAs
         elif changed:
             self._refit()
 
     def _enter_fallback(self, reason: str, message: str):
-        """Finish this generation like an SD Unet = None generation: free the engine and fully load
-        the PyTorch UNet. The next generation uses TensorRT again."""
+        """Finish this generation like an SD Unet = None generation: free the engine and hand the
+        UNet back to PyTorch. The next generation uses TensorRT again."""
         self._fallback_reason = reason
         self._last_signature = None
         self.release_engine()
         _free_cuda_cache()
-        unet_memory.restore_torch_unet()
+        # Before sampling, reForge's sampling_prepare loads it (TensorRT is inactive now); during
+        # sampling it already ran without it, so it's loaded here.
+        unet_memory.restore_torch_unet(self._input_shape if unet_memory.in_trt_sampling else None)
         self._torch_restored = True
         _notify(message)
 
     def forward(self, x, timesteps=None, context=None, *args, **kwargs):
+        self._input_shape = tuple(x.shape)
         if self._fallback_reason is None and self.engine is None:
             self.activate()
         if self._fallback_reason is not None:
@@ -271,7 +277,8 @@ class TrtUnet(sd_unet.SdUnet):
         try:
             out = self.engine.infer(feed_dict, stream)["latent"]
         except torch.cuda.OutOfMemoryError:
-            print("[TensorRT] Out of GPU memory; freeing cached memory and retrying...", flush=True)
+            print("[TensorRT] Out of GPU memory; freeing VRAM and retrying...", flush=True)
+            unet_memory.make_room(self.engine.max_activation_bytes() + HEADROOM)
             _free_cuda_cache()
             try:
                 out = self.engine.infer(feed_dict, stream)["latent"]
@@ -346,6 +353,10 @@ class TrtUnet(sd_unet.SdUnet):
         if self._torch_restored:
             unet_memory.offload_torch_unet()
             self._torch_restored = False
+        try:
+            unet_memory.make_room(os.path.getsize(path) + HEADROOM)  # the engine's weights
+        except OSError:
+            pass  # a missing file is reported by load()
         _free_cuda_cache()
         try:
             self.engine.load()
@@ -355,6 +366,8 @@ class TrtUnet(sd_unet.SdUnet):
             return
         print(f"[TensorRT] Loaded Profile {self.profile_idx}:\n{self.engine}", flush=True)
         self._refit()
+        if unet_memory.in_trt_sampling:  # else sampling_prepare makes room for the activations
+            unet_memory.make_room(self.engine.max_activation_bytes() + HEADROOM)
 
     def release_activation_memory(self):
         if self.engine is not None and self.engine.engine is not None:
@@ -365,6 +378,7 @@ class TrtUnet(sd_unet.SdUnet):
         if self.engine is not None:
             self.engine.reset()
         self.engine = None
+        self.loaded_config = None
         self.refitted_keys = set()
 
     def deactivate(self):
@@ -384,7 +398,41 @@ def _release_activation_memory():
         unet.release_activation_memory()
 
 
-unet_memory.callbacks.update(trt_active=_trt_active, sampling_done=_release_activation_memory)
+def _loaded_engine():
+    unet = sd_unet.current_unet
+    if isinstance(unet, TrtUnet) and unet.engine is not None and unet.engine.engine is not None:
+        return unet
+    return None
+
+
+def _sampling_memory() -> int:
+    unet = _loaded_engine()
+    return unet.engine.max_activation_bytes() + HEADROOM if unet else 0
+
+
+def _before_model_load(models):
+    """reForge can't reclaim an engine's VRAM. If the weights it's about to load won't fit next to
+    the engine, even after unloading its other models, release the engine first (outside sampling
+    only; it's reloaded at the next UNet call). Otherwise they'd load partially, which slows them
+    down and breaks SDXL's text encoder."""
+    unet = _loaded_engine()
+    if unet is None or unet_memory.in_trt_sampling:
+        return
+    needed = unet_memory.weights_to_load(models)
+    if needed <= 0 or needed + unet_memory.minimum_inference_memory() <= unet_memory.vram_available_for(models):
+        return
+    names = sorted({type(getattr(m, "model", m)).__name__ for m in models if m is not None and not unet_memory.is_unet(m)})
+    print(f"[TensorRT] Releasing the engine to make room for {', '.join(names)}; it's reloaded for sampling.", flush=True)
+    unet.release_engine()
+    _free_cuda_cache()
+
+
+unet_memory.callbacks.update(
+    trt_active=_trt_active,
+    sampling_done=_release_activation_memory,
+    sampling_memory=_sampling_memory,
+    before_model_load=_before_model_load,
+)
 
 
 def profile_choices() -> List[str]:
@@ -474,6 +522,7 @@ class TensorRTScript(scripts.Script):
 
     def process(self, p, *args):
         unet_memory.install_hooks()
+        unet_memory.in_trt_sampling = False  # in case an interrupted generation never cleaned up
         option = sd_unet.get_unet_option()
         model_name = current_model_name()
         if option is None and shared.opts.sd_unet == "Automatic" and model_name in modelmanager.available_models():

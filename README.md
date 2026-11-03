@@ -29,7 +29,12 @@ Supports Stable Diffusion 1.5, 2.1, SDXL, SDXL Turbo, and LCM.
   forces the TorchScript ONNX exporter (`dynamo=False`).
 - **Plays nicely with reForge's model manager.** The PyTorch UNet is unloaded through the manager (never moved behind
   its back, which caused "Expected all tensors to be on the same device" errors), and while an engine is active reForge
-  keeps the UNet's weights in system RAM instead of loading them into VRAM next to the engine.
+  keeps the UNet's weights in system RAM instead of loading them into VRAM next to the engine. The manager can't see
+  TensorRT's memory, so the two take turns: it unloads models to make room for an engine and its activations, and an
+  engine steps aside (and reloads for sampling) when the text encoder or another model wouldn't fully fit next to it.
+- **Engines build in their own process.** TensorRT's builder holds on to VRAM after a build; in a separate process it
+  all goes back to the driver when the build ends, so models load fully again afterwards. LoRA refits release the
+  resources TensorRT caches for them.
 - **Out-of-memory handling.** Builds report kernels TensorRT skipped for lack of VRAM (they make engines slower) and
   free models first. At runtime an OOM is retried once, then the generation finishes on PyTorch; inputs no engine
   profile covers also run on PyTorch instead of failing. Load errors distinguish "out of memory" from "rebuild needed".
