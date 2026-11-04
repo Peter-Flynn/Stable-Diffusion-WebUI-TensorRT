@@ -10,6 +10,7 @@ loaded)."""
 import contextlib
 import math
 import sys
+import threading
 import time
 import traceback
 import weakref
@@ -756,7 +757,9 @@ def _wrap_vae_decode(original):
     the UNet engines loaded; anything else decodes on PyTorch, as reForge would."""
 
     def decode(self, samples_in, vae_options={}):
-        if not vae_options and setting() in (AUTOMATIC, SPEED_HACKS):
+        # Not from another thread: reForge's progress endpoint decodes "Full" live previews on its own,
+        # while the generation's thread samples on the UNet engine.
+        if not vae_options and setting() in (AUTOMATIC, SPEED_HACKS) and threading.get_ident() == _generation_thread:
             try:
                 with _keeping(*[m for m in _models.values() if m.loaded]):
                     pixels = vae_mod.decode(self, samples_in)
@@ -820,6 +823,7 @@ def new_batch():
 
 
 _generation = None  # weakref to the generation's processing object, for its infotext
+_generation_thread = None  # the thread generations run in
 
 
 def _note_speed_hacks():
@@ -829,10 +833,11 @@ def _note_speed_hacks():
 
 
 def new_generation(p=None):
-    global _generation
+    global _generation, _generation_thread
     end_pass()  # a generation that failed mid-pass never cleaned up
     common.new_generation()
     _generation = weakref.ref(p) if p is not None else None
+    _generation_thread = threading.get_ident()
     if setting() not in (AUTOMATIC, SPEED_HACKS):  # SD Unet is None: give their VRAM back, and the RAM
         for model in list(_models.values()):
             if model.loaded:

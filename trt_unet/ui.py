@@ -222,6 +222,8 @@ def _vae_part(draft) -> str:
 
 
 def _vae_line(draft) -> str:
+    if not vae_mod.available():
+        return ""
     part = _vae_part(draft)
     if part:
         return f"**Building also builds the engines for {part}.**"

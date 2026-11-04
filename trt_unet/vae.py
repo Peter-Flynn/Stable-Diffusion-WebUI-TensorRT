@@ -212,11 +212,20 @@ def delete_for(arch_id: str, gpu: str, trt: str):
         _remove(path[: -len(".json")])
 
 
+def available() -> bool:
+    """Whether TensorRT is installed and new enough (the tab says when it isn't)."""
+    try:
+        common.trt_version()
+        return True
+    except Exception:
+        return False
+
+
 def needs_build(arch, profiles: list, vae=None) -> str:
     """Why building these profiles builds the decoder engines too ("" if there's nothing to build): none
     for the loaded VAE's decoder and precision cover the profiles' sizes."""
     vae = vae if vae is not None else loaded_vae()
-    if arch is None or not profiles or vae is None or unsupported(vae):
+    if arch is None or not profiles or vae is None or unsupported(vae) or not available():
         return ""
     try:
         cfg, wanted, dtype = config(vae), digest(vae), dtype_name(vae.vae_dtype)
@@ -497,7 +506,7 @@ class VaeModel:
 
 
 _models = {}  # Record.base -> VaeModel
-_told = set()  # records whose precision mismatch was logged
+_told = set()  # what was logged once already: records with another precision, architectures without engines
 _weights_key = None  # (the VAE's model, the generation, the key of its decoder's weights)
 
 
@@ -575,8 +584,9 @@ def decode(vae, samples_in):
         return None
     record = record_for(arch.id, vae)
     if record is None:
-        if store.engines(arch.id):
-            notify("The VAE decoder has no TensorRT engines yet; build the engines again in the TensorRT tab to add them.")
+        if arch.id not in _told and store.engines(arch.id):  # the tab shows it as to build, too
+            _told.add(arch.id)
+            log("The VAE decoder has no engines for this architecture yet: build in the TensorRT tab to add them.")
         return None
     b, c, h, w = samples_in.shape
     if not record.covers(b, c, h, w):
@@ -594,7 +604,12 @@ def decode(vae, samples_in):
             n = _fit(model, b, h, w)
             if not n:
                 return None
-            return _run(model, vae, samples_in, n)
+            start = time.time()
+            pixels = _run(model, vae, samples_in, n)  # ends with a copy to the CPU, so the time is the decode's
+            if pixels is not None:
+                at_once = f", {n} at a time" if n < b else ""
+                log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} on the VAE decoder engines in {time.time() - start:.2f}s{at_once}")
+            return pixels
     except torch.cuda.OutOfMemoryError:
         log("Ran out of VRAM decoding on the VAE engines; decoding on PyTorch.")
         return None
