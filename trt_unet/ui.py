@@ -11,6 +11,7 @@ from modules.ui_components import ToolButton
 
 from . import arch as arch_mod
 from . import common, store
+from . import vae as vae_mod
 from .profiles import FIELDS, PRESETS, Profile, default_profiles, presets_for
 
 JS = "js" if int(gr.__version__.split(".")[0]) >= 4 else "_js"
@@ -31,6 +32,8 @@ HELP = """
 **Building** makes the engines match the profiles: per-profile, it builds the profiles that have no engine yet, one at a time, and deletes the engines of profiles that are gone; merged, it builds the engine again whenever the profiles change.
 
 **SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engines of the loaded checkpoint's architecture, `Speed Hacks` uses them with Speed Hacks, `None` always uses PyTorch.
+
+**The VAE decoder** gets engines too, built with the UNet's for the sizes its profiles cover, in the precision reForge runs the VAE in (BF16 where the GPU has it, FP32 below, or what a `--vae-in-*` flag says at build time), so any VAE of the architecture decodes on them. Each decode runs on them when they fit in the VRAM free, as many images at a time as fit, and on PyTorch otherwise.
 
 **Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and, late in a pass, wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). The first 30% and last 5% of steps run in full, so composition and detail stay close (both shares are in Settings, Stable Diffusion, TensorRT). Passes of 12 steps or more should run roughly 1.6x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
 """
@@ -209,6 +212,26 @@ def _status(sd_model, arch, records, asking=False) -> str:
     return "\n\n".join(lines)
 
 
+def _vae_part(draft) -> str:
+    """What building the draft builds of the VAE decoder's engines (vae.needs_build), "" if nothing."""
+    try:
+        return vae_mod.needs_build(arch_mod.detect(), [Profile.from_dict(d) for d in draft])
+    except Exception as e:
+        common.log(f"Could not check the VAE decoder engines: {e}")
+        return ""
+
+
+def _vae_line(draft) -> str:
+    part = _vae_part(draft)
+    if part:
+        return f"**Building also builds the engines for {part}.**"
+    vae = vae_mod.loaded_vae()
+    reason = "no VAE is loaded" if vae is None else vae_mod.unsupported(vae)
+    if reason:
+        return f"*The VAE decodes on PyTorch: {reason}.*"
+    return "*The VAE decoder's engines are built for these sizes.*"
+
+
 def _draft_view(draft: list, records, mode) -> str:
     if not draft:
         return "*No profiles. Add at least one to build an engine.*"
@@ -230,6 +253,7 @@ def _draft_view(draft: list, records, mode) -> str:
             rows.append(f"**Building deletes the {_n(extra, 'engine')} these profiles don't use.**")
     elif extra:
         rows.append(f"**Building also deletes the {_n(extra, 'engine')} of profiles no longer listed.**")
+    rows.append(_vae_line(draft))
     return "\n".join(rows)
 
 
@@ -249,14 +273,17 @@ def _draft_outputs(draft, records, select=None):
     choices = [NEW] + [_label(i, d) for i, d in enumerate(draft)]
     selected = _label(select, draft[select]) if select is not None and select < len(draft) else NEW
     todo, extra = _plan(draft, records, mode)
+    vae_part = _vae_part(draft) if draft else ""
     if todo:
         build_label = "Build the merged engine" if mode == store.MERGED else f"Build {_n(len(todo), 'engine')}"
+    elif vae_part:
+        build_label = "Build the VAE decoder's engines"
     else:
         build_label = "Update engines" if extra else "Engines up to date"
     return (
         _draft_view(draft, records, mode),
         gr.update(choices=choices, value=selected),
-        gr.update(value=build_label, interactive=bool(draft) and bool(todo or extra) and not BUILDING.is_set()),
+        gr.update(value=build_label, interactive=bool(draft) and bool(todo or extra or vae_part) and not BUILDING.is_set()),
     )
 
 
@@ -413,7 +440,8 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
             message = "### Engine up to date\n" + (f"Built the merged engine, {_n(todo, 'profile')}" if built else "The merged engine holds these profiles")
             message += (f", and deleted {_n(deleted, 'engine')} it replaces" if deleted else "") + f". Every {arch.name} checkpoint runs on it with `SD Unet` set to `Automatic` or `Speed Hacks`."
         else:
-            message = f"### Engines up to date\nBuilt {_n(built, 'engine')}" + (f", deleted {_n(deleted, 'engine')} of profiles no longer listed" if deleted else "")
+            first = f"Built {_n(built, 'engine')}" if built else "The UNet engines were up to date"
+            message = f"### Engines up to date\n{first}" + (f", deleted {_n(deleted, 'engine')} of profiles no longer listed" if deleted else "")
             message += f". Every {arch.name} checkpoint runs on them with `SD Unet` set to `Automatic` or `Speed Hacks`."
         if any(r.meta.get("stripped") is False for r in result["records"]):
             message += " (TensorRT couldn't leave the weights out of some of them, so their files are as large as the UNet.)"
@@ -431,6 +459,10 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
                     f" A merged engine's build needs at least {MERGED_RAM} GB of RAM; per-profile engines build one profile at a "
                     "time (to switch, delete every engine)."
                 )
+    if result.get("vae") is not None:
+        message += f"\n\nBuilt the VAE decoder's engines, in {vae_mod.label(result['vae'].meta['dtype'])}: decodes run on them whenever they fit in the VRAM free."
+    elif result.get("vae_error") and result["vae_error"] != "cancelled":
+        message += f"\n\nThe VAE decoder's engines couldn't be built (`{result['vae_error']}`), so it decodes on PyTorch. The console has the details."
     if result.get("memory_warnings"):
         message += (
             f"\n\nTensorRT skipped {result['memory_warnings']} kernels that need more VRAM than is free at a profile's largest sizes, "
@@ -459,10 +491,13 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
                 mode = store.mode()
                 profile_list = [Profile.from_dict(d) for d in draft]
                 todo, _ = _plan(draft, records, mode)
+                vae_part = _vae_part(draft)
                 _refresh_unet_list()
                 result = {"ok": True, "records": []}
-                if todo:
-                    result = export.build(arch, patcher, [(i, profile_list[i]) for i in todo], int(optimization_level), lambda f, t: progress(f, desc=t), mode)
+                if todo or vae_part:
+                    result = export.build(
+                        arch, patcher, [(i, profile_list[i]) for i in todo], int(optimization_level), lambda f, t: progress(f, desc=t), mode, profiles=profile_list,
+                    )
                 deleted = store.keep_only(arch.id, profile_list, mode) if result["ok"] else 0
                 _refresh_unet_list()
                 message = _outcome(arch, len(todo), deleted, result, mode)
@@ -493,6 +528,7 @@ def delete_engine(choice, draft, draft_arch):
         with queue_lock:  # not while a generation uses them
             _refresh_unet_list()
             store.delete(group)
+            vae_mod.delete_for(group[0].meta["arch"]["id"], group[0].meta["gpu"], group[0].meta["trt"])
             sd_unet.list_unets()
         common.log(f"Deleted the {len(group)} engines of {choice}")
     return refresh(draft, draft_arch)

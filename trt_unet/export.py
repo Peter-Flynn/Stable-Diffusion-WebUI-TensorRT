@@ -384,14 +384,17 @@ def _build_plan(job: dict, folder: str, step) -> dict:
 SHALLOW_SHARE = 0.15  # of each engine's build progress, for its shallow engine
 
 
-def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=None, mode=store.PER_PROFILE) -> dict:
+def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=None, mode=store.PER_PROFILE, profiles=None) -> dict:
     """Exports the UNet graphs once and builds the engines for the (index, Profile)s in `todo`, each in a
     builder process of its own: per-profile, an engine for each, one at a time, so a build only ever holds
     one profile; merged, one engine holding them all. Each engine gets a shallow engine for Speed Hacks
-    (speed.py) beside it; if that one can't be built, the engine is kept without it. Returns the last
-    builder result, with "records": the engines saved, those before a failure or cancel included, and
-    "hack_errors": why shallow engines couldn't be built."""
+    (speed.py) beside it; if that one can't be built, the engine is kept without it. Then, if the VAE
+    decoder's engines (vae.py) don't cover `profiles` (all of the architecture's), it builds those. Returns
+    the last builder result, with "records": the engines saved, those before a failure or cancel included,
+    "hack_errors": why shallow engines couldn't be built, and "vae": the decoder engines' Record, or
+    "vae_error": why they couldn't be built."""
     from . import runtime
+    from . import vae as vae_mod
 
     common.trt_version()  # installed and new enough
     runtime.release_all()
@@ -402,13 +405,18 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
     os.makedirs(folder)
     records, result, warnings, hack_errors = [], {"ok": True}, 0, []
     before = {r.engine_key: r for r in store.engines(arch.id)}  # what these builds replace
+    vae_part = vae_mod.needs_build(arch, profiles) if profiles else ""
+    merged = mode == store.MERGED
+    groups = ([todo] if todo else []) if merged else [[item] for item in todo]  # the profiles of each engine
+    total = len(groups) + (1 if vae_part else 0)  # parts of the build's progress
+    vae_record = vae_error = None
     try:
-        if progress:
-            progress(0.0, "Exporting the UNet graphs")
-        graphs = export_onnx(arch, patcher, folder)
-        shapes = graphs["unet"]
-        merged = mode == store.MERGED
-        groups = ([todo] if todo else []) if merged else [[item] for item in todo]  # the profiles of each engine
+        graphs = shapes = None
+        if groups:
+            if progress:
+                progress(0.0, "Exporting the UNet graphs")
+            graphs = export_onnx(arch, patcher, folder)
+            shapes = graphs["unet"]
         for n, group in enumerate(groups):
             if CANCEL.is_set():
                 result = {"ok": False, "error": "cancelled"}
@@ -422,8 +430,8 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             if progress:
                 title = (f"Merged engine, {len(group)} profiles" if merged else f"Profile {group[0][0] + 1} ({n + 1} of {len(groups)} to build)")
                 share = 1 - SHALLOW_SHARE if graphs["shallow"] is not None else 1
-                step = lambda f, t, n=n, title=title, share=share: progress((n + share * f) / len(groups), f"{title}: {t}")
-                shallow_step = lambda f, t, n=n, title=title: progress((n + 1 - SHALLOW_SHARE + SHALLOW_SHARE * f) / len(groups), f"{title}, Speed Hacks part: {t}")
+                step = lambda f, t, n=n, title=title, share=share: progress((n + share * f) / total, f"{title}: {t}")
+                shallow_step = lambda f, t, n=n, title=title: progress((n + 1 - SHALLOW_SHARE + SHALLOW_SHARE * f) / total, f"{title}, Speed Hacks part: {t}")
             unet_shapes = [p.unet_shapes(arch.in_channels, arch.context_dim, arch.adm_channels) for _, p in group]
             job = {
                 "onnx": os.path.join(folder, "unet.onnx"),
@@ -490,6 +498,17 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 meta["speed_hacks_retried"] = replaced is not None and "speed_hacks_error" in replaced.meta
             records.append(store.save(arch, job["plan"], meta, shallow_plan))
             log(f"Built {records[-1].describe()} in {time.time() - start:.0f}s")
-        return {**result, "records": records, "memory_warnings": warnings, "hack_errors": hack_errors}
+        if vae_part and result["ok"] and not CANCEL.is_set():
+            start = time.time()
+            log(f"Building the {arch.label} engines for {vae_part}.")
+            step = (lambda f, t: progress((len(groups) + f) / total, f"VAE decoder: {t}")) if progress else None
+            vae_record, vae_error = vae_mod.build(arch, profiles, folder, optimization_level, step)
+            if vae_record is not None:
+                log(f"Built the VAE decoder engines in {time.time() - start:.0f}s")
+            elif vae_error == "cancelled" or CANCEL.is_set():
+                result = {"ok": False, "error": "cancelled"}
+            else:
+                log(f"Building the VAE decoder engines failed ({vae_error}); the VAE decodes on PyTorch.")
+        return {**result, "records": records, "memory_warnings": warnings, "hack_errors": hack_errors, "vae": vae_record, "vae_error": vae_error}
     finally:
         shutil.rmtree(folder, ignore_errors=True)

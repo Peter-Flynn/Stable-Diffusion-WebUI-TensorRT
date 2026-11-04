@@ -20,6 +20,7 @@ from modules import sd_unet
 
 from . import arch as arch_mod
 from . import common, profiles, speed, store
+from . import vae as vae_mod
 from . import weights as weights_mod
 from .common import inference_mode, log, notify
 from .weights import EffectiveWeights
@@ -224,6 +225,7 @@ def release_all():
         _unload(model)
     _models.clear()
     _last_used.clear()
+    vae_mod.release_all()
     weights_mod.clear_computed()
     common.mm().soft_empty_cache(force=True)
 
@@ -749,6 +751,26 @@ def _wrap_denoiser(original):
     return forward
 
 
+def _wrap_vae_decode(original):
+    """Decodes on the VAE decoder's engines when SD Unet runs the engines and they fit (vae.py), keeping
+    the UNet engines loaded; anything else decodes on PyTorch, as reForge would."""
+
+    def decode(self, samples_in, vae_options={}):
+        if not vae_options and setting() in (AUTOMATIC, SPEED_HACKS):
+            try:
+                with _keeping(*[m for m in _models.values() if m.loaded]):
+                    pixels = vae_mod.decode(self, samples_in)
+                if pixels is not None:
+                    return pixels
+            except Exception as e:
+                traceback.print_exc()
+                notify(f"The VAE decoder engines failed ({e}); decoding on PyTorch")
+        return original(self, samples_in, vae_options)
+
+    decode._trt_original = original
+    return decode
+
+
 def _rebind(owner, name, wrap):
     """Wraps owner.name, also where modules imported it by name."""
     current = getattr(owner, name)
@@ -773,6 +795,13 @@ def install_hooks():
     _rebind(forge_sampler, "sampling_cleanup", _wrap_cleanup)
     _rebind(common.mm(), "free_memory", _wrap_free_memory)
     _rebind(common.mm(), "unload_all_models", _wrap_unload_all)
+    try:  # the VAE decoder's engines: decodes run on PyTorch without them
+        from ldm_patched.modules import sd as ldm_sd
+
+        if not hasattr(ldm_sd.VAE.decode, "_trt_original"):
+            ldm_sd.VAE.decode = _wrap_vae_decode(ldm_sd.VAE.decode)
+    except Exception as e:
+        log(f"Could not hook reForge's VAE, so it decodes on PyTorch: {e}")
     try:  # Speed Hacks only: the engines run without it
         from modules import sd_samplers_cfg_denoiser
 
@@ -808,6 +837,7 @@ def new_generation(p=None):
         for model in list(_models.values()):
             if model.loaded:
                 _unload(model)
+        vae_mod.release_all()
         weights_mod.clear_computed()
     try:
         install_hooks()

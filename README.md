@@ -50,6 +50,11 @@ TensorRT. Passes of 12 steps or more should run roughly 1.6x as fast as on the e
 little less precise, so a seed gives a somewhat different image than without them. Fewer steps (e.g. with few-step
 LoRAs) run as usual.
 
+**VAE decoding.** The VAE's decoder gets engines too, built along with the UNet's for the same sizes. They run in the
+precision reForge picks for the VAE (BF16 on RTX 30 series and newer, FP32 before; a `--vae-in-*` flag at build time
+overrides it), so any VAE of the architecture decodes on them. A decode runs on them whenever they fit in the VRAM
+that's free, and on PyTorch otherwise.
+
 > [!NOTE]
 > An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build again;
 > the tab keeps the profiles.

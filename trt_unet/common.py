@@ -24,7 +24,12 @@ def notify(message: str, once: bool = True):
         pass
 
 
+generation = 0  # counts generations, for what's computed once per generation
+
+
 def new_generation():
+    global generation
+    generation += 1
     _notified.clear()
 
 
