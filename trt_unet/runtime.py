@@ -91,6 +91,10 @@ class TrtModel:
         start, free, reserved = time.time(), torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
         engine = self._engine()
         plan_seconds = engine.load()
+        missing = sorted(set(self.record.weight_names) - set(engine.weight_names))
+        if missing:
+            engine.unload()
+            raise RuntimeError(f"The engine can't take {len(missing)} of the UNet's weights (e.g. {missing[0]}); delete it and build it again")
         try:
             self.applied = {}
             refit = self.sync(quiet=True)
