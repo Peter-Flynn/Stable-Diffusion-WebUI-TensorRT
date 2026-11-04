@@ -22,6 +22,7 @@ from .weights import EffectiveWeights
 
 HEADROOM = 256 * 2**20
 _models = {}  # Record.key -> TrtModel
+_last_used = {}  # arch id -> Record.key of the engine the batch being generated last ran on (see new_batch)
 _pass = None  # the sampling pass running on an engine
 
 
@@ -139,7 +140,8 @@ class TrtModel:
 
 def _refit_times(refit: dict) -> str:
     patched = f", {refit['patched']} with LoRAs" if refit["patched"] else ""
-    return f"{refit['count']} weights {refit['weights']:.1f}s{patched}, TensorRT refit {refit['tensorrt']:.1f}s"
+    staged = f" ({common.gib(refit['staged'])} of the weights from VRAM)" if refit.get("staged") else ""
+    return f"{refit['count']} weights {refit['weights']:.1f}s{patched}, TensorRT refit {refit['tensorrt']:.1f}s{staged}"
 
 
 def _loaded_entries(*models):
@@ -156,10 +158,20 @@ def _unload(model: TrtModel):
     model.detach()
 
 
+def end_pass():
+    """Ends the sampling pass running on an engine, if any: its hooks on the model manager go."""
+    global _pass
+    p, _pass = _pass, None
+    if p is not None:
+        p.end()
+
+
 def release_all():
+    end_pass()  # a generation that failed mid-pass left its hooks in place
     for model in list(_models.values()):
         _unload(model)
     _models.clear()
+    _last_used.clear()
     common.mm().soft_empty_cache(force=True)
 
 
@@ -248,6 +260,8 @@ def _unsupported(patcher) -> str:
         kinds.append("UNet wrappers")
     if any(k.startswith("diffusion_model.") for k in getattr(patcher, "object_patches", {})):
         kinds.append("replaced UNet modules")
+    if any(v for k, v in (getattr(patcher, "weight_wrapper_patches", None) or {}).items() if k.startswith("diffusion_model.")):
+        kinds.append("weight wrappers")
     if getattr(patcher, "hook_patches", None):
         kinds.append("scheduled weights")
     return f"UNet patches ({', '.join(kinds)})" if kinds else ""
@@ -305,6 +319,7 @@ class Pass:
         self.weights = EffectiveWeights(patcher)
         self.module = patcher.model.diffusion_model
         arch = records[0].arch
+        self.arch_id = arch.id
         self.shapes, self.takes_y = [r.shapes for r in records], bool(arch.adm_channels)
         self.channels, self.context_dim = arch.in_channels, arch.context_dim
         self.shape = (x.shape[0] * 2, *x.shape[1:])
@@ -329,8 +344,15 @@ class Pass:
             # Other loads mid-pass (e.g. a live preview's decoder) unload other models first: unloading
             # the engine would mean reloading it on the next step, the UNet would lose its patches.
             self._hold(_keeping(model, self.patcher))
+        _last_used[self.arch_id] = record.key
         model.sync()
         return model
+
+    def preferred(self):
+        """The index of the engine this batch's earlier passes ran on, which this pass stays on while it
+        fits, even if another profile suits the sizes better: loading another means refitting every weight."""
+        key = _last_used.get(self.arch_id)
+        return next((i for i, r in enumerate(self.records) if r.key == key), None)
 
     def _hold(self, keep):
         if self._keep is not None:
@@ -379,7 +401,7 @@ class Pass:
         b, c, h, w = x.shape
         if c != self.channels or context.shape[2] != self.context_dim:
             self.fall_back(f"The UNet got {c} input channels and {context.shape[2]}-wide prompts, the engine takes {self.channels} and {self.context_dim}")
-        choice = profiles.select(self.shapes, b, h, w, context.shape[1])
+        choice = profiles.select(self.shapes, b, h, w, context.shape[1], prefer=self.preferred())
         if choice is None:
             tokens = context.shape[1] // profiles.CONTEXT_PER_CHUNK * profiles.TOKENS_PER_CHUNK
             self.fall_back(
@@ -472,7 +494,8 @@ def _begin(records, patcher, x, prepare):
         p = Pass(records, patcher, x)
         try:
             b, _, h, w = x.shape
-            choice = profiles.select(p.shapes, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select(p.shapes, b, h, w, profiles.CONTEXT_PER_CHUNK)
+            prefer = p.preferred()
+            choice = profiles.select(p.shapes, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK, prefer) or profiles.select(p.shapes, b, h, w, profiles.CONTEXT_PER_CHUNK, prefer)
             index = choice[0] if choice else next(i for i, s in enumerate(p.shapes) if profiles.covers_size([s], h, w, b))
             model = p.use(records[index])
             _make_room_for_activations(model, patcher, x)
@@ -499,7 +522,8 @@ def _make_room_for_activations(model: TrtModel, patcher, x):
 def _activation_estimate(model: TrtModel, x) -> int:
     b, c, h, w = x.shape
     s = model.record.shapes
-    choice = profiles.select([s], 2 * b, h, w, profiles.CONTEXT_PER_CHUNK)
+    # cond and uncond batched, or one at a time if the profile can't batch them (e.g. at its largest batch)
+    choice = profiles.select([s], 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select([s], b, h, w, profiles.CONTEXT_PER_CHUNK)
     if choice is None:
         return 0
     _, padded, _ = choice
@@ -534,9 +558,7 @@ def _wrap_forward(original):
 def _wrap_prepare(original):
     def sampling_prepare(unet, x, *args, **kwargs):
         global _pass
-        if _pass is not None:
-            _pass.end()
-        _pass = None
+        end_pass()
         records = _engine_records(unet, x)
         if records is None:
             return original(unet, x, *args, **kwargs)
@@ -548,10 +570,7 @@ def _wrap_prepare(original):
 
 def _wrap_cleanup(original):
     def sampling_cleanup(unet, *args, **kwargs):
-        global _pass
-        p, _pass = _pass, None
-        if p is not None:
-            p.end()
+        end_pass()
         return original(unet, *args, **kwargs)
 
     sampling_cleanup._trt_original = original
@@ -582,11 +601,15 @@ def install_hooks():
     _rebind(forge_sampler, "sampling_cleanup", _wrap_cleanup)
 
 
+def new_batch():
+    """A batch's first pass runs on the engine whose profile fits it best, and its later passes (e.g. its
+    Hires. fix) stay on that engine while it covers their sizes. The next batch starts afresh, so nothing
+    keeps running on an engine picked for other sizes."""
+    _last_used.clear()
+
+
 def new_generation():
-    global _pass
-    if _pass is not None:  # an interrupted generation never cleaned up
-        _pass.end()
-    _pass = None
+    end_pass()  # a generation that failed mid-pass never cleaned up
     common.new_generation()
     try:
         install_hooks()

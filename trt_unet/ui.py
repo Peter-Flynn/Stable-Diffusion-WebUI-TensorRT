@@ -21,7 +21,7 @@ BUILDING = threading.Event()
 HELP = """
 **Engines** are compiled for a UNet architecture, not a checkpoint: every checkpoint with that architecture (fine-tunes, merges, v-prediction ones) runs on the same engines with its own weights, LoRAs included. Engine files hold no weights.
 
-**Profiles** are the image sizes, batch sizes and prompt lengths the engines run, one engine each. TensorRT tunes each profile for its optimal values and accepts anything from min to max; narrower ranges build faster and can run a little faster. Only the engine for the sizes being generated is loaded, taking about as much VRAM as the checkpoint's UNet; a pass in another profile's sizes (e.g. Hires. fix) loads that one instead. Anything no profile covers, and ControlNet or other UNet patches, runs on PyTorch.
+**Profiles** are the image sizes, batch sizes and prompt lengths the engines run, one engine each. TensorRT tunes each profile for its optimal values and accepts anything from min to max; narrower ranges build faster and can run a little faster. Only one engine is loaded at a time, taking about as much VRAM as the checkpoint's UNet. Each batch starts on the engine whose profile fits it best, and its later passes (e.g. Hires. fix) stay on that engine while it covers their sizes; a pass it doesn't cover loads the engine of a profile that does. Anything no profile covers, and ControlNet or other UNet patches, runs on PyTorch.
 
 **Building** makes the engines match the profiles: it builds the profiles that have no engine yet, one at a time, and deletes the engines of profiles that are gone.
 
@@ -235,11 +235,21 @@ def _read_profile(values):
     return profile, note
 
 
+def _same_as(draft, profile, skip=None):
+    """The index of the draft's profile equal to `profile`, `skip` aside, or None: profiles are one engine
+    each, so each is listed once."""
+    key = store.profile_key(profile)
+    return next((i for i, k in enumerate(_keys(draft)) if k == key and i != skip), None)
+
+
 def add_profile(draft, *values):
     records = _current()[3]
     profile, note = _read_profile(values)
     if profile is None:
         return (draft, *_draft_outputs(draft, records), note)
+    same = _same_as(draft, profile)
+    if same is not None:
+        return (draft, *_draft_outputs(draft, records, select=same), f"That's profile #{same + 1} already.")
     draft = list(draft) + [profile.to_dict()]
     return (draft, *_draft_outputs(draft, records, select=len(draft) - 1), note)
 
@@ -250,6 +260,9 @@ def save_profile(draft, choice, *values):
     profile, note = _read_profile(values)
     if profile is None or index is None or index >= len(draft):
         return (draft, *_draft_outputs(draft, records, select=index), note)
+    same = _same_as(draft, profile, skip=index)
+    if same is not None:
+        return (draft, *_draft_outputs(draft, records, select=index), f"That's profile #{same + 1} already; #{index + 1} is unchanged.")
     draft = list(draft)
     draft[index] = profile.to_dict()
     return (draft, *_draft_outputs(draft, records, select=index), note)

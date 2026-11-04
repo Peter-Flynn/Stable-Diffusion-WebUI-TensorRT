@@ -13,6 +13,9 @@ class TensorRT(scripts.Script):
     def process(self, p, *args):
         runtime.new_generation()
 
+    def before_process_batch(self, p, *args, **kwargs):
+        runtime.new_batch()
+
 
 try:
     runtime.install_hooks()

@@ -30,8 +30,8 @@ PyTorch instead, with a notice.
    next launch (set `TRT_EXTENSION_SKIP_INSTALL=1` to skip that).
 2. Load a checkpoint, open the **TensorRT** tab and click **Build engines**: one engine per profile, built one at a
    time. The first build takes a few minutes.
-3. Generate. Every checkpoint with the same architecture now uses the engines; only the one for the sizes being
-   generated is loaded.
+3. Generate. Every checkpoint with the same architecture now uses the engines. One is loaded at a time: each
+   batch runs on the one that fits it best, and its Hires. fix stays on it if it covers the larger size.
 
 The engines are used while **SD Unet** (in Settings → Stable Diffusion) is on `Automatic`, the default. Set it to
 `None` to use PyTorch.

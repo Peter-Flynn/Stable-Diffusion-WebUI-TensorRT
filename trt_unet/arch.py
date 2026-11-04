@@ -7,6 +7,9 @@ import weakref
 from dataclasses import asdict, dataclass
 
 _IGNORED_CONFIG = {"dtype", "device", "operations", "disable_unet_model_creation"}
+# Scaled FP8 checkpoints' per-layer scales: the engine gets the weights with them applied (weights.py),
+# so these checkpoints run on the same engines as the others of their architecture.
+_IGNORED_WEIGHTS = (".scale_weight", ".scale_input")
 NAMES = {"SD15": "SD 1.5", "SD20": "SD 2.x", "SDXL": "SDXL", "SDXLRefiner": "SDXL Refiner", "SSD1B": "SSD-1B"}
 _cache = {}
 
@@ -71,7 +74,7 @@ def detect(patcher=None):
     arch = None
     if _supported(module):
         config = unet_config(patcher)
-        shapes = sorted((k, list(v.shape)) for k, v in module.state_dict(keep_vars=True).items())
+        shapes = sorted((k, list(v.shape)) for k, v in module.state_dict(keep_vars=True).items() if not k.endswith(_IGNORED_WEIGHTS))
         family = type(patcher.model.model_config).__name__
         digest = hashlib.sha256(json.dumps([sorted((k, repr(v)) for k, v in config.items()), shapes]).encode()).hexdigest()
         adm = (config.get("adm_in_channels") or 0) if config.get("num_classes") == "sequential" else 0
