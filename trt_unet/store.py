@@ -202,9 +202,9 @@ def _read(meta_path: str):
                 raise ValueError("its profiles, their shapes and their indexes don't match")
             record.arch  # complete
             hacks = meta.get("speed_hacks")
-            if hacks and len(hacks.get("shapes") or []) != len(record.indexes):
-                common.log(f"Ignoring the Speed Hacks part of {meta_path}: its shapes don't match its profiles")
-                meta.pop("speed_hacks")
+            if hacks and (not isinstance(hacks.get("plan"), str) or len(hacks.get("shapes") or []) != len(record.indexes)):
+                common.log(f"Ignoring the Speed Hacks part of {meta_path}: its plan or shapes are missing")
+                meta.pop("speed_hacks")  # building again adds it
             return record
     except Exception as e:
         common.log(f"Ignoring {meta_path}: {e}")

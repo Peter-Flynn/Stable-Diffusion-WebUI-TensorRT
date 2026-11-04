@@ -437,7 +437,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             warnings += result.get("memory_warnings") or 0
             if not result["ok"]:
                 break
-            hacks, shallow_plan = None, None
+            hacks = shallow_plan = hack_error = None
             if graphs["shallow"] is not None:
                 shallow_job = {
                     **job,
@@ -462,10 +462,12 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                         "stripped": shallow["stripped"],
                     }
                 else:
-                    hack_errors.append(str(shallow.get("error")))
-                    log(f"Building the Speed Hacks part failed ({shallow.get('error')}); keeping the engine without it.")
-            elif not CANCEL.is_set():
-                hack_errors.append("the shallow UNet graph couldn't be exported")
+                    hack_error = str(shallow.get("error"))
+                    log(f"Building the Speed Hacks part failed ({hack_error}); keeping the engine without it.")
+            else:
+                hack_error = "the shallow UNet graph couldn't be exported"
+            if hack_error:
+                hack_errors.append(hack_error)
             if merged:
                 meta = {"mode": store.MERGED, "profiles": [p.to_dict() for _, p in group], "indexes": [i for i, _ in group], "shapes": unet_shapes}
             else:
@@ -481,8 +483,8 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             })
             if hacks:
                 meta["speed_hacks"] = hacks
-            elif hack_errors:
-                meta["speed_hacks_error"] = hack_errors[-1]  # built since Speed Hacks, without them: not outdated
+            else:
+                meta["speed_hacks_error"] = hack_error  # built since Speed Hacks, without them: not outdated
             records.append(store.save(arch, job["plan"], meta, shallow_plan))
             log(f"Built {records[-1].describe()} in {time.time() - start:.0f}s")
         return {**result, "records": records, "memory_warnings": warnings, "hack_errors": hack_errors}

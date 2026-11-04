@@ -353,7 +353,7 @@ class Pass:
         self.channels, self.context_dim = arch.in_channels, arch.context_dim
         self.shape = (x.shape[0] * 2, *x.shape[1:])
         self.fallback = None
-        self.checked = False
+        self.checked = self.shallow_checked = False  # whether the engine's, and its shallow partner's, first output was finite
         self._keep = None
         self._hint_batching()
 
@@ -475,21 +475,31 @@ class Pass:
         slot = deep = None
         if self.schedule is not None and self.model.shallow_loaded:
             slot, deep = self.schedule.call(feed["sample"].shape)
+        out = self._infer_with_room(feed, profile, stream, slot, deep)
+        if deep is None and not self.checked:
+            self.checked = True
+            if not torch.isfinite(out).all():
+                self.fall_back("The engine produced NaN/Inf values")
+        if deep is not None and not self.shallow_checked:
+            self.shallow_checked = True
+            if not torch.isfinite(out).all():
+                notify("The Speed Hacks part of the engine produced NaN/Inf values; running this pass without Speed Hacks")
+                self.schedule = None
+                out = self._infer_with_room(feed, profile, stream)
+        return out[:b].to(x.dtype)
+
+    def _infer_with_room(self, feed, profile, stream, slot=None, deep=None):
+        """_infer, again after unloading other models if it ran out of VRAM."""
         try:
-            out = self._infer(feed, profile, stream, slot, deep)
+            return self._infer(feed, profile, stream, slot, deep)
         except torch.cuda.OutOfMemoryError:
             self.model.engine.release_activations()
             common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
             common.mm().soft_empty_cache(force=True)
             try:
-                out = self._infer(feed, profile, stream, slot, deep)
+                return self._infer(feed, profile, stream, slot, deep)
             except torch.cuda.OutOfMemoryError:
                 self.fall_back("Out of VRAM running the engine")
-        if not self.checked:
-            self.checked = True
-            if not torch.isfinite(out).all():
-                self.fall_back("The engine produced NaN/Inf values")
-        return out[:b].to(x.dtype)
 
     def _infer(self, feed, profile, stream, slot=None, deep=None):
         """The engine's output, or with a deep feature, its shallow partner's. The engine's deep feature is

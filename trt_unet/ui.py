@@ -410,10 +410,10 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
     if result["ok"]:
         if merged:
             message = "### Engine up to date\n" + (f"Built the merged engine, {_n(todo, 'profile')}" if built else "The merged engine holds these profiles")
-            message += (f", and deleted {_n(deleted, 'engine')} it replaces" if deleted else "") + f". Every {arch.name} checkpoint runs on it with `SD Unet` set to `Automatic`."
+            message += (f", and deleted {_n(deleted, 'engine')} it replaces" if deleted else "") + f". Every {arch.name} checkpoint runs on it with `SD Unet` set to `Automatic` or `Speed Hacks`."
         else:
             message = f"### Engines up to date\nBuilt {_n(built, 'engine')}" + (f", deleted {_n(deleted, 'engine')} of profiles no longer listed" if deleted else "")
-            message += f". Every {arch.name} checkpoint runs on them with `SD Unet` set to `Automatic`."
+            message += f". Every {arch.name} checkpoint runs on them with `SD Unet` set to `Automatic` or `Speed Hacks`."
         if any(r.meta.get("stripped") is False for r in result["records"]):
             message += " (TensorRT couldn't leave the weights out of some of them, so their files are as large as the UNet.)"
         if result.get("hack_errors"):

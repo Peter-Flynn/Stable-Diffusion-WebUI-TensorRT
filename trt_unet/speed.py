@@ -22,6 +22,7 @@ SMOOTHNESS = 0.01  # AdaptiveDiffusion's threshold (its SD 1.5 and SDXL setting)
 WARMUP = 2  # evaluations run in full at the start of a pass
 TAIL = 0.1  # the share of a pass's evaluations run in full at its end
 MIN_EVALUATIONS = 12
+MAX_AGE = INTERVAL - 1 + MAX_STRETCH  # evaluations a deep feature is used for after its own
 
 
 # --- The two halves, as exported. Like UNetModel._forward without what an engine can't run anyway
@@ -95,20 +96,22 @@ class Schedule:
     each call's deep feature. A UNet call that has no deep feature of its shape to use runs in full."""
 
     def __init__(self):
+        self.index = None  # the evaluation running; None until the denoiser says (without it, all run in full)
         self.decision = "full"
         self.last_full = None  # the last evaluation decided full
         self.stretched = 0  # evaluations it was put off by since it was due
         self.latents = []  # the last 4 evaluations' sampler latents
         self.slot = 0  # UNet calls so far in this evaluation
-        # (slot, sample shape) -> deep feature: e.g. with "Negative Guidance minimum sigma", every other
-        # evaluation runs its conds without the unconds, so a slot's calls alternate between two shapes
+        # (slot, sample shape) -> (deep feature, the evaluation it's from): e.g. with "Negative Guidance
+        # minimum sigma", every other evaluation runs its conds without the unconds, so a slot's calls
+        # alternate between two shapes, and each shape's feature is only as fresh as its last full call
         self.deep = {}
         self.shallow_calls = self.full_calls = 0
 
     def begin(self, index: int, total, steps, x):
         """Evaluation `index` of `total` (the sampler takes `steps` steps, so more evaluations than steps
         means it evaluates more than once per step) starts, at sampler latent `x`."""
-        self.slot = 0
+        self.index, self.slot = index, 0
         self.latents = (self.latents + [x.detach().clone()])[-4:]
         self.decision = self._decide(index, total, steps)
         if self.decision == "full":
@@ -137,14 +140,18 @@ class Schedule:
         return norms[0] <= SMOOTHNESS * norms[1]
 
     def call(self, shape) -> tuple:
-        """(slot, the deep feature to run it shallow on, or None to run it in full) for the next UNet call."""
+        """(slot, the deep feature to run it shallow on, or None to run it in full) for the next UNet call;
+        the slot is None if its deep feature isn't to be kept."""
+        if self.index is None:
+            self.full_calls += 1
+            return None, None
         slot, self.slot = self.slot, self.slot + 1
-        cached = self.deep.get((slot, tuple(shape)))
-        if self.decision == "shallow" and cached is not None:
+        kept = self.deep.get((slot, tuple(shape)))
+        if self.decision == "shallow" and kept is not None and self.index - kept[1] <= MAX_AGE:
             self.shallow_calls += 1
-            return slot, cached
+            return slot, kept[0]
         self.full_calls += 1
         return slot, None
 
     def keep(self, slot: int, shape, deep):
-        self.deep[(slot, tuple(shape))] = deep
+        self.deep[(slot, tuple(shape))] = (deep, self.index)
