@@ -22,6 +22,7 @@ from .weights import EffectiveWeights
 
 HEADROOM = 256 * 2**20
 _models = {}  # Record.key -> TrtModel
+_last_used = {}  # arch id -> Record.key of the engine the batch being generated last ran on (see new_batch)
 _pass = None  # the sampling pass running on an engine
 
 
@@ -160,6 +161,7 @@ def release_all():
     for model in list(_models.values()):
         _unload(model)
     _models.clear()
+    _last_used.clear()
     common.mm().soft_empty_cache(force=True)
 
 
@@ -305,6 +307,7 @@ class Pass:
         self.weights = EffectiveWeights(patcher)
         self.module = patcher.model.diffusion_model
         arch = records[0].arch
+        self.arch_id = arch.id
         self.shapes, self.takes_y = [r.shapes for r in records], bool(arch.adm_channels)
         self.channels, self.context_dim = arch.in_channels, arch.context_dim
         self.shape = (x.shape[0] * 2, *x.shape[1:])
@@ -329,8 +332,15 @@ class Pass:
             # Other loads mid-pass (e.g. a live preview's decoder) unload other models first: unloading
             # the engine would mean reloading it on the next step, the UNet would lose its patches.
             self._hold(_keeping(model, self.patcher))
+        _last_used[self.arch_id] = record.key
         model.sync()
         return model
+
+    def preferred(self):
+        """The index of the engine this batch's earlier passes ran on, which this pass stays on while it
+        fits, even if another profile suits the sizes better: loading another means refitting every weight."""
+        key = _last_used.get(self.arch_id)
+        return next((i for i, r in enumerate(self.records) if r.key == key), None)
 
     def _hold(self, keep):
         if self._keep is not None:
@@ -379,7 +389,7 @@ class Pass:
         b, c, h, w = x.shape
         if c != self.channels or context.shape[2] != self.context_dim:
             self.fall_back(f"The UNet got {c} input channels and {context.shape[2]}-wide prompts, the engine takes {self.channels} and {self.context_dim}")
-        choice = profiles.select(self.shapes, b, h, w, context.shape[1])
+        choice = profiles.select(self.shapes, b, h, w, context.shape[1], prefer=self.preferred())
         if choice is None:
             tokens = context.shape[1] // profiles.CONTEXT_PER_CHUNK * profiles.TOKENS_PER_CHUNK
             self.fall_back(
@@ -472,7 +482,8 @@ def _begin(records, patcher, x, prepare):
         p = Pass(records, patcher, x)
         try:
             b, _, h, w = x.shape
-            choice = profiles.select(p.shapes, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select(p.shapes, b, h, w, profiles.CONTEXT_PER_CHUNK)
+            prefer = p.preferred()
+            choice = profiles.select(p.shapes, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK, prefer) or profiles.select(p.shapes, b, h, w, profiles.CONTEXT_PER_CHUNK, prefer)
             index = choice[0] if choice else next(i for i, s in enumerate(p.shapes) if profiles.covers_size([s], h, w, b))
             model = p.use(records[index])
             _make_room_for_activations(model, patcher, x)
@@ -580,6 +591,13 @@ def install_hooks():
         openaimodel.UNetModel.forward = _wrap_forward(openaimodel.UNetModel.forward)
     _rebind(forge_sampler, "sampling_prepare", _wrap_prepare)
     _rebind(forge_sampler, "sampling_cleanup", _wrap_cleanup)
+
+
+def new_batch():
+    """A batch's first pass runs on the engine whose profile fits it best, and its later passes (e.g. its
+    Hires. fix) stay on that engine while it covers their sizes. The next batch starts afresh, so nothing
+    keeps running on an engine picked for other sizes."""
+    _last_used.clear()
 
 
 def new_generation():

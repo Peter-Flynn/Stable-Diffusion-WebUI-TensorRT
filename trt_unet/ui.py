@@ -21,7 +21,7 @@ BUILDING = threading.Event()
 HELP = """
 **Engines** are compiled for a UNet architecture, not a checkpoint: every checkpoint with that architecture (fine-tunes, merges, v-prediction ones) runs on the same engines with its own weights, LoRAs included. Engine files hold no weights.
 
-**Profiles** are the image sizes, batch sizes and prompt lengths the engines run, one engine each. TensorRT tunes each profile for its optimal values and accepts anything from min to max; narrower ranges build faster and can run a little faster. Only the engine for the sizes being generated is loaded, taking about as much VRAM as the checkpoint's UNet; a pass in another profile's sizes (e.g. Hires. fix) loads that one instead. Anything no profile covers, and ControlNet or other UNet patches, runs on PyTorch.
+**Profiles** are the image sizes, batch sizes and prompt lengths the engines run, one engine each. TensorRT tunes each profile for its optimal values and accepts anything from min to max; narrower ranges build faster and can run a little faster. Only one engine is loaded at a time, taking about as much VRAM as the checkpoint's UNet. Each batch starts on the engine whose profile fits it best, and its later passes (e.g. Hires. fix) stay on that engine while it covers their sizes; a pass it doesn't cover loads the engine of a profile that does. Anything no profile covers, and ControlNet or other UNet patches, runs on PyTorch.
 
 **Building** makes the engines match the profiles: it builds the profiles that have no engine yet, one at a time, and deletes the engines of profiles that are gone.
 
