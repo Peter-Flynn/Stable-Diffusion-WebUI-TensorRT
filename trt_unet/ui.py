@@ -240,8 +240,6 @@ def _outcome(arch, result) -> str:
         message = "### Build cancelled\nThe existing engine, if any, is unchanged."
     else:
         message = f"### The build failed\n`{result.get('error')}`\n\nThe console has the details. The existing engine, if any, is unchanged."
-    if result.get("peak_ram"):
-        message += f"\n\nThe build used up to {common.gib(result['peak_ram'])} of RAM."
     if result.get("memory_warnings"):
         message += (
             f"\n\nTensorRT skipped {result['memory_warnings']} kernels that need more VRAM than is free at a profile's largest sizes, "
