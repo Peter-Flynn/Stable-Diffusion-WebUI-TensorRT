@@ -50,6 +50,7 @@ class TrtModel:
         self.offload_device = torch.device("cpu")
         self.engine = self.shallow = None
         self.want_shallow = False  # load the shallow engine with this one
+        self.shallow_failed = False  # its load failed: not tried again until this engine loads again
         self.weights = None  # EffectiveWeights the engines should run with
         self.applied = {}  # "unet" / "shallow" -> {weight name: signature of what's in that engine}
         self.measured = 0
@@ -111,7 +112,7 @@ class TrtModel:
             except Exception as e:  # the engine runs without it
                 log(f"Could not load the Speed Hacks part of the {self.record.label} ({e}); running without it.")
                 self.shallow.unload()
-                self.want_shallow = False
+                self.want_shallow, self.shallow_failed = False, True
         try:
             self.applied = {}
             refit = self.sync(quiet=True)
@@ -139,6 +140,7 @@ class TrtModel:
             self.sync(quiet=True)
         except Exception:
             self.shallow.unload()
+            self.want_shallow, self.shallow_failed = False, True
             raise
         used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
         self.measured += max(used, 0)
@@ -152,7 +154,7 @@ class TrtModel:
             if self.shallow is not None:
                 self.shallow.unload()
             self.engine.unload()
-            self.applied = {}
+            self.applied, self.shallow_failed = {}, False
         return self.model
 
     def sync(self, quiet=False):
@@ -367,7 +369,7 @@ class Pass:
                     _unload(other)
             self._hold(None)
             model.weights = self.weights
-            model.want_shallow = model.want_shallow or (self.schedule is not None and record.speed_hacks is not None)
+            model.want_shallow = model.want_shallow or (self.schedule is not None and record.speed_hacks is not None and not model.shallow_failed)
             with torch.inference_mode(), _keeping(self.patcher):
                 common.mm().load_models_gpu([model])
             self.model = model
@@ -375,7 +377,7 @@ class Pass:
             # the engine would mean reloading it on the next step, the UNet would lose its patches.
             self._hold(_keeping(model, self.patcher))
         _last_used[self.arch_id] = record.key
-        if self.schedule is not None and record.speed_hacks and not model.shallow_loaded:
+        if self.schedule is not None and record.speed_hacks and not model.shallow_loaded and not model.shallow_failed:
             model.want_shallow = True
             try:
                 with torch.inference_mode():
