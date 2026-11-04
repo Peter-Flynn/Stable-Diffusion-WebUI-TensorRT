@@ -158,7 +158,16 @@ def _unload(model: TrtModel):
     model.detach()
 
 
+def end_pass():
+    """Ends the sampling pass running on an engine, if any: its hooks on the model manager go."""
+    global _pass
+    p, _pass = _pass, None
+    if p is not None:
+        p.end()
+
+
 def release_all():
+    end_pass()  # a generation that failed mid-pass left its hooks in place
     for model in list(_models.values()):
         _unload(model)
     _models.clear()
@@ -251,6 +260,8 @@ def _unsupported(patcher) -> str:
         kinds.append("UNet wrappers")
     if any(k.startswith("diffusion_model.") for k in getattr(patcher, "object_patches", {})):
         kinds.append("replaced UNet modules")
+    if any(v for k, v in (getattr(patcher, "weight_wrapper_patches", None) or {}).items() if k.startswith("diffusion_model.")):
+        kinds.append("weight wrappers")
     if getattr(patcher, "hook_patches", None):
         kinds.append("scheduled weights")
     return f"UNet patches ({', '.join(kinds)})" if kinds else ""
@@ -511,7 +522,8 @@ def _make_room_for_activations(model: TrtModel, patcher, x):
 def _activation_estimate(model: TrtModel, x) -> int:
     b, c, h, w = x.shape
     s = model.record.shapes
-    choice = profiles.select([s], 2 * b, h, w, profiles.CONTEXT_PER_CHUNK)
+    # cond and uncond batched, or one at a time if the profile can't batch them (e.g. at its largest batch)
+    choice = profiles.select([s], 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select([s], b, h, w, profiles.CONTEXT_PER_CHUNK)
     if choice is None:
         return 0
     _, padded, _ = choice
@@ -546,9 +558,7 @@ def _wrap_forward(original):
 def _wrap_prepare(original):
     def sampling_prepare(unet, x, *args, **kwargs):
         global _pass
-        if _pass is not None:
-            _pass.end()
-        _pass = None
+        end_pass()
         records = _engine_records(unet, x)
         if records is None:
             return original(unet, x, *args, **kwargs)
@@ -560,10 +570,7 @@ def _wrap_prepare(original):
 
 def _wrap_cleanup(original):
     def sampling_cleanup(unet, *args, **kwargs):
-        global _pass
-        p, _pass = _pass, None
-        if p is not None:
-            p.end()
+        end_pass()
         return original(unet, *args, **kwargs)
 
     sampling_cleanup._trt_original = original
@@ -602,10 +609,7 @@ def new_batch():
 
 
 def new_generation():
-    global _pass
-    if _pass is not None:  # an interrupted generation never cleaned up
-        _pass.end()
-    _pass = None
+    end_pass()  # a generation that failed mid-pass never cleaned up
     common.new_generation()
     try:
         install_hooks()

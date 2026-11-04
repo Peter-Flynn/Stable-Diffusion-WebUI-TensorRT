@@ -235,11 +235,21 @@ def _read_profile(values):
     return profile, note
 
 
+def _same_as(draft, profile, skip=None):
+    """The index of the draft's profile equal to `profile`, `skip` aside, or None: profiles are one engine
+    each, so each is listed once."""
+    key = store.profile_key(profile)
+    return next((i for i, k in enumerate(_keys(draft)) if k == key and i != skip), None)
+
+
 def add_profile(draft, *values):
     records = _current()[3]
     profile, note = _read_profile(values)
     if profile is None:
         return (draft, *_draft_outputs(draft, records), note)
+    same = _same_as(draft, profile)
+    if same is not None:
+        return (draft, *_draft_outputs(draft, records, select=same), f"That's profile #{same + 1} already.")
     draft = list(draft) + [profile.to_dict()]
     return (draft, *_draft_outputs(draft, records, select=len(draft) - 1), note)
 
@@ -250,6 +260,9 @@ def save_profile(draft, choice, *values):
     profile, note = _read_profile(values)
     if profile is None or index is None or index >= len(draft):
         return (draft, *_draft_outputs(draft, records, select=index), note)
+    same = _same_as(draft, profile, skip=index)
+    if same is not None:
+        return (draft, *_draft_outputs(draft, records, select=index), f"That's profile #{same + 1} already; #{index + 1} is unchanged.")
     draft = list(draft)
     draft[index] = profile.to_dict()
     return (draft, *_draft_outputs(draft, records, select=index), note)
