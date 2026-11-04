@@ -11,7 +11,7 @@ from . import common
 from .arch import Arch
 from .profiles import Profile
 
-FORMAT = 2  # 2: Linear weights enter transposed
+FORMAT = 1
 
 
 def root() -> str:
@@ -54,11 +54,6 @@ class Record:
     @property
     def weight_names(self) -> list:
         return self.meta["weights"]
-
-    @property
-    def transposed(self) -> set:
-        """Weights the engine takes transposed."""
-        return set(self.meta["transposed"])
 
     @property
     def key(self) -> str:
