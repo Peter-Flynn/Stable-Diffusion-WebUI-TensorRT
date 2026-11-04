@@ -261,10 +261,16 @@ def build(arch: Arch, patcher, profile_list: list, optimization_level=None, prog
             "timing_cache": store.timing_cache_path(),
             "optimization_level": optimization_level,
         }
-        with open(os.path.join(folder, "job.json"), "w", encoding="utf-8") as f:
-            json.dump(job, f)
         log(f"Building the {arch.label} engine ({len(profile_list)} profiles); the first build takes several minutes.")
-        result = run_builder(os.path.join(folder, "job.json"), progress)
+        for strip in (True, False):
+            with open(os.path.join(folder, "job.json"), "w", encoding="utf-8") as f:
+                json.dump({**job, "strip": strip}, f)
+            result = run_builder(os.path.join(folder, "job.json"), progress)
+            result["stripped"] = strip
+            if not result.get("retry_without_strip"):
+                break
+            # Without stripping, the plan holds placeholder weights (GBs) but runs the same way.
+            log("Building a weight-stripped engine failed; building one that stores placeholder weights instead.")
         if result["ok"]:
             meta = {
                 "profiles": [p.to_dict() for p in profile_list],
