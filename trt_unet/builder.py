@@ -20,19 +20,21 @@ def log(message):
 
 
 class Logger(trt.ILogger):
-    """Errors, each warning once, and a count of the out-of-memory warnings TensorRT gives when it has
-    to skip kernels."""
+    """Errors, each warning once, and the number of out-of-memory warnings TensorRT gives when it has to
+    skip kernels (with the first one): a build can give a great many."""
 
     def __init__(self):
         trt.ILogger.__init__(self)
-        self.errors, self.memory, self._seen = [], [], set()
+        self.errors, self._seen = [], set()
+        self.memory_warnings, self.memory_example = 0, None
 
     def log(self, severity, msg):
         level = int(severity)
         if level > int(trt.ILogger.Severity.WARNING):
             return
         if any(h in msg.lower() for h in _MEMORY_HINTS) and level == int(trt.ILogger.Severity.WARNING):
-            self.memory.append(msg)
+            self.memory_warnings += 1
+            self.memory_example = self.memory_example or msg
         elif level <= int(trt.ILogger.Severity.ERROR):
             self.errors.append(msg)
             print(f"[TensorRT] ERROR: {msg}", flush=True)
@@ -163,6 +165,7 @@ def build(job, logger, progress, strip=True):
     except Exception as e:
         log(f"Ignoring the unreadable timing cache: {e}")
         cache = config.create_timing_cache(b"")
+    del data  # TensorRT has its own copy; the file can be large (it keeps compiled kernels from every build)
     config.set_timing_cache(cache, ignore_mismatch=True)
 
     for shapes in job["profiles"]:
@@ -176,6 +179,7 @@ def build(job, logger, progress, strip=True):
         raise NoEngine("TensorRT returned no engine" + (f": {logger.errors[-1]}" if logger.errors else ""))
     with open(job["plan"], "wb") as f:
         f.write(memoryview(plan))
+    del plan
     if cache_path:
         with open(cache_path + ".tmp", "wb") as f:
             f.write(memoryview(config.get_timing_cache().serialize()))
@@ -201,26 +205,21 @@ def main(job_path):
         job = json.load(f)
     _exit_with_parent()
     logger = Logger()
+    strip = job.get("strip", True)
     result = {"ok": False, "error": None}
     try:
         log(f"Building with TensorRT {trt.__version__}")
-        try:
-            build(job, logger, Progress(_progress_sender()))
-            result["stripped"] = True
-        except NoEngine:
-            if not any(w in " ".join(logger.errors).lower() for w in ("refit", "strip", "weight")):
-                raise
-            # Without stripping, the plan holds placeholder weights (GBs) but runs the same way.
-            log("Building a weight-stripped engine failed; building one that stores placeholder weights instead.")
-            logger.errors.clear()
-            build(job, logger, Progress(_progress_sender()), strip=False)
-            result["stripped"] = False
+        build(job, logger, Progress(_progress_sender()), strip=strip)
         result["ok"] = True
     except Exception as e:
         result["error"] = str(e)
-        log(f"Engine build failed: {e}")
-    result["memory_warnings"] = len(logger.memory)
-    result["memory_example"] = logger.memory[0] if logger.memory else None
+        # TensorRT refusing to strip the weights: export.py builds again without, in a new process (this
+        # one still holds what the failed build left behind)
+        result["retry_without_strip"] = strip and isinstance(e, NoEngine) and any(w in " ".join(logger.errors).lower() for w in ("refit", "strip", "weight"))
+        if not result["retry_without_strip"]:
+            log(f"Engine build failed: {e}")
+    result["memory_warnings"] = logger.memory_warnings
+    result["memory_example"] = logger.memory_example
     _send(RESULT, result)
     return 0 if result["ok"] else 1
 
