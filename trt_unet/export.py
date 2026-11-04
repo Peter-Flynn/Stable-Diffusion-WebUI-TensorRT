@@ -325,10 +325,11 @@ def run_builder(job_path: str, progress=None) -> dict:
     return result
 
 
-def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=None) -> dict:
-    """Exports the UNet graph once and builds an engine for each (index, Profile) in `todo`, one at a time,
-    each in a builder process of its own: a build only ever holds one profile. Returns the last builder
-    result, with "records": the engines saved, those before a failure or cancel included."""
+def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=None, mode=store.PER_PROFILE) -> dict:
+    """Exports the UNet graph once and builds the engines for the (index, Profile)s in `todo`, each in a
+    builder process of its own: per-profile, an engine for each, one at a time, so a build only ever holds
+    one profile; merged, one engine holding them all. Returns the last builder result, with "records": the
+    engines saved, those before a failure or cancel included."""
     from . import runtime
 
     common.trt_version()  # installed and new enough
@@ -343,24 +344,31 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
         if progress:
             progress(0.0, "Exporting the UNet graph")
         shapes = export_onnx(arch, patcher, folder)
-        for n, (index, profile) in enumerate(todo):
+        merged = mode == store.MERGED
+        groups = ([todo] if todo else []) if merged else [[item] for item in todo]  # the profiles of each engine
+        for n, group in enumerate(groups):
             if CANCEL.is_set():
                 result = {"ok": False, "error": "cancelled"}
                 break
             start = time.time()
+            if merged:
+                what, detail = f"merged engine ({len(group)} profiles)", "; ".join(p.describe() for _, p in group)
+            else:
+                what, detail = f"engine for profile {group[0][0] + 1}", f"{group[0][1].describe()} ({n + 1} of {len(groups)})"
             step = None
             if progress:
-                step = lambda f, t, n=n, index=index: progress((n + f) / len(todo), f"Profile {index + 1} ({n + 1} of {len(todo)} to build): {t}")
-            unet_shapes = profile.unet_shapes(arch.in_channels, arch.context_dim, arch.adm_channels)
+                title = (f"Merged engine, {len(group)} profiles" if merged else f"Profile {group[0][0] + 1} ({n + 1} of {len(groups)} to build)")
+                step = lambda f, t, n=n, title=title: progress((n + f) / len(groups), f"{title}: {t}")
+            unet_shapes = [p.unet_shapes(arch.in_channels, arch.context_dim, arch.adm_channels) for _, p in group]
             job = {
                 "onnx": os.path.join(folder, "unet.onnx"),
                 "plan": os.path.join(folder, "engine.plan"),
                 "weights": sorted(shapes),
-                "profiles": [unet_shapes],
+                "profiles": unet_shapes,
                 "timing_cache": store.timing_cache_path(),
                 "optimization_level": optimization_level,
             }
-            log(f"Building the {arch.label} engine for profile {index + 1}, {profile.describe()} ({n + 1} of {len(todo)}); the first build takes several minutes.")
+            log(f"Building the {arch.label} {what}, {detail}; the first build takes several minutes.")
             for strip in (True, False):
                 with open(os.path.join(folder, "job.json"), "w", encoding="utf-8") as f:
                     json.dump({**job, "strip": strip}, f)
@@ -373,10 +381,11 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             warnings += result.get("memory_warnings") or 0
             if not result["ok"]:
                 break
-            meta = {
-                "profile": profile.to_dict(),
-                "index": index,
-                "shapes": unet_shapes,
+            if merged:
+                meta = {"mode": store.MERGED, "profiles": [p.to_dict() for _, p in group], "indexes": [i for i, _ in group], "shapes": unet_shapes}
+            else:
+                meta = {"mode": store.PER_PROFILE, "profile": group[0][1].to_dict(), "index": group[0][0], "shapes": unet_shapes[0]}
+            meta.update({
                 "weights": job["weights"],
                 "weight_bytes": sum(math.prod(s) * 2 for s in shapes.values()),
                 "stripped": result["stripped"],
@@ -384,7 +393,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 "gpu": common.gpu_tag(),
                 "gpu_name": torch.cuda.get_device_name(),
                 "created": time.strftime("%Y-%m-%d %H:%M"),
-            }
+            })
             records.append(store.save(arch, job["plan"], meta))
             log(f"Built {records[-1].describe()} in {time.time() - start:.0f}s")
         return {**result, "records": records, "memory_warnings": warnings}

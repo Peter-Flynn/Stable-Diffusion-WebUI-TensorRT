@@ -89,18 +89,19 @@ def fit(shapes: dict, batch: int, height: int, width: int, context: int):
     return score, padded, repeats
 
 
-def select(profile_shapes: list, batch: int, height: int, width: int, context: int, prefer: int = None):
+def select(profile_shapes: list, batch: int, height: int, width: int, context: int, prefer=()):
     """(profile index, padded batch, context repeats) of the best profile for these inputs, or None. The
-    `prefer`red profile (the engine in use) wins whenever it fits with no more padding or context repeats
-    than the best: switching means loading another engine, which takes far longer than running these
-    sizes on a profile tuned for others (e.g. a Hires. fix the first pass's profile also covers)."""
+    `prefer`red profiles (the engine in use's) win whenever one fits with no more padding or context
+    repeats than the best: switching means loading another engine, which takes far longer than running
+    these sizes on a profile tuned for others (e.g. a Hires. fix the first pass's profile also covers)."""
     fits = [(f, i) for i, s in enumerate(profile_shapes) if (f := fit(s, batch, height, width, context))]
     if not fits:
         return None
-    (score, padded, repeats), index = min(fits)
-    preferred = next((f for f, i in fits if i == prefer), None)
-    if preferred is not None and preferred[0][:2] <= score[:2]:
-        (_, padded, repeats), index = preferred, prefer
+    best = min(fits)
+    preferred = [f for f in fits if f[1] in prefer]
+    if preferred and min(preferred)[0][0][:2] <= best[0][0][:2]:
+        best = min(preferred)
+    (_, padded, repeats), index = best
     return index, padded, repeats
 
 
