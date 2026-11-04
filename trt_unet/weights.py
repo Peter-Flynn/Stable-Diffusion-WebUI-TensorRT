@@ -46,6 +46,14 @@ class EffectiveWeights:
         self.patcher = patcher
         self.module = patcher.model.diffusion_model
         self.patches = getattr(patcher, "patches", {}) or {}
+        # Layers that store a weight in another form than they use it, e.g. scaled FP8 checkpoints' Linear
+        # layers (weight * scale_weight). reForge converts their weights before patching them; so does this.
+        self.converters = {
+            f"{n}.{p}": getattr(m, f"convert_{p}")
+            for n, m in self.module.named_modules()
+            for p, _ in m.named_parameters(recurse=False)
+            if callable(getattr(m, f"convert_{p}", None))
+        }
         self.refresh()
         self.base_version = (_Same(self.module), self._fingerprint())
 
@@ -79,14 +87,20 @@ class EffectiveWeights:
         return self.base_version, _identity(patches) if patches else None
 
     def tensor(self, name: str) -> torch.Tensor:
+        """The weight PyTorch runs with: as stored, or, if it's converted or patched, computed in FP32 on
+        the GPU (converted, then patched, like reForge does) and kept in FP16."""
         base = self.base(name)
         patches = self.patches.get(PREFIX + name)
-        if not patches:
+        convert = self.converters.get(name)
+        if not patches and convert is None:
             return base
-        try:
-            from ldm_patched.modules.lora import calculate_weight as calculate
-        except ImportError:
-            calculate = self.patcher.calculate_weight
         weight = base.to(common.mm().get_torch_device(), torch.float32, copy=True)
-        weight = calculate(patches, weight, PREFIX + name)
+        if convert is not None:
+            weight = convert(weight, inplace=True)
+        if patches:
+            try:
+                from ldm_patched.modules.lora import calculate_weight as calculate
+            except ImportError:
+                calculate = self.patcher.calculate_weight
+            weight = calculate(patches, weight, PREFIX + name)
         return weight.to(torch.float16).cpu()  # in RAM until the refit: patched SDXL weights add up to GBs
