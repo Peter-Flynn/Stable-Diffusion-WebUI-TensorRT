@@ -10,8 +10,8 @@ difference is small next to the first-order one), the noise prediction barely ch
 reuse the last one. Here that test decides when a due full evaluation can wait: on SDXL a shallow call
 costs a few percent of a full one, so it's no slower than reusing the prediction, and closer to it.
 
-The first and last evaluations of a pass always run in full, and passes of fewer evaluations than
-MIN_EVALUATIONS (e.g. few-step LoRAs) don't use any of it."""
+The first and last evaluations of a pass always run in full, and passes of fewer sampler steps than
+MIN_STEPS (e.g. few-step LoRAs, whose samplers may evaluate twice per step) don't use any of it."""
 
 import torch
 
@@ -21,7 +21,7 @@ MAX_STRETCH = 2  # ...or up to this many later while the sampler's trajectory is
 SMOOTHNESS = 0.01  # AdaptiveDiffusion's threshold (its SD 1.5 and SDXL setting)
 WARMUP = 2  # evaluations run in full at the start of a pass
 TAIL = 0.1  # the share of a pass's evaluations run in full at its end
-MIN_EVALUATIONS = 12
+MIN_STEPS = 12
 MAX_AGE = INTERVAL - 1 + MAX_STRETCH  # evaluations a deep feature is used for after its own
 
 
@@ -118,7 +118,7 @@ class Schedule:
             self.last_full, self.stretched = index, 0
 
     def _decide(self, index, total, steps) -> str:
-        if not total or total < MIN_EVALUATIONS:
+        if not total or not steps or steps < MIN_STEPS:
             return "full"
         if index < WARMUP or index >= total - max(1, round(TAIL * total)) or self.last_full is None:
             return "full"

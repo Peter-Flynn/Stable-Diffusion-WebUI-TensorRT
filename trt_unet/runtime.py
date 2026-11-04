@@ -538,8 +538,13 @@ def _engine_records(patcher, x):
         notify(f"No profile of the {arch.label} engines covers {w * 8}x{h * 8} at batch size {b}; using PyTorch for this pass. Add one in the TensorRT tab.")
         return None, False
     hacks = chosen == SPEED_HACKS and any(r.speed_hacks for r in records)
-    if chosen == SPEED_HACKS and not all(r.speed_hacks for r in records):
-        notify(f"Some of the {arch.label} engines were built without Speed Hacks, and run without them; build them again in the TensorRT tab.")
+    if chosen == SPEED_HACKS:
+        outdated = sum(r.outdated for r in records)
+        failed = sum(not r.speed_hacks and not r.outdated for r in records)
+        if outdated:
+            notify(f"{outdated} of the {arch.label} engines were built before Speed Hacks, and run without them; build them again in the TensorRT tab.")
+        if failed:
+            notify(f"Speed Hacks couldn't be built for {failed} of the {arch.label} engines (the build's console output says why), so they run without them.")
     return records, hacks
 
 
