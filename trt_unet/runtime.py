@@ -128,8 +128,7 @@ class TrtModel:
         start = time.time()
         self.applied = {}
         torch.cuda.current_stream().synchronize()  # no inference in flight while the weights change
-        transposed = self.record.transposed
-        seconds = engine.refit(changed, lambda name: weights.tensor(name).t() if name in transposed else weights.tensor(name))
+        seconds = engine.refit(changed, weights.tensor)
         self.applied = wanted
         refit = {**seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
         if not quiet:
