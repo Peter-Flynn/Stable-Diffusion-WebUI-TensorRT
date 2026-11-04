@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 
+import numpy as np
 import tensorrt as trt
 from tqdm import tqdm
 
@@ -141,22 +142,23 @@ def _null_placeholders(network, names, sizes) -> set:
             continue
         for slot in slots:
             try:
-                weights = getattr(layer, slot)
-                slots_seen[f"{layer.type.name.lower()}.{slot} {weights.dtype.name}"] += 1
-                if weights.dtype != trt.DataType.HALF or weights.size < 3:
+                values = getattr(layer, slot)  # a NumPy array: TensorRT's layers hand out their weights' values
+                values = values if isinstance(values, np.ndarray) else values.numpy()
+                slots_seen[f"{layer.type.name.lower()}.{slot} {values.dtype}"] += 1
+                if values.dtype != np.float16 or values.size < 3:
                     continue
-                head = weights.numpy()[:3]
+                head = values.reshape(-1)[:3]
             except Exception as e:
                 problems[f"{layer.type.name.lower()}.{slot}: {type(e).__name__}: {e}"] += 1
                 continue
             if len(samples) < 4:
-                samples.append(f"{weights.size} values from {[float(v) for v in head]}")
+                samples.append(f"{values.size} values from {[float(v) for v in head]}")
             if head[0] != PLACEHOLDER_MARK:
                 continue  # not one of ours, or the parser changed it (e.g. transposed): stays as it is
             index = int(head[1]) * 2048 + int(head[2])
-            if index >= len(names) or names[index] in swapped or weights.size != sizes[index]:
+            if index >= len(names) or names[index] in swapped or values.size != sizes[index]:
                 continue  # e.g. a weight the parser rearranged that happens to start like a placeholder
-            setattr(layer, slot, trt.Weights(weights.dtype, 0, weights.size))
+            setattr(layer, slot, trt.Weights(trt.DataType.HALF, 0, values.size))
             # TensorRT's own descriptor of the placeholder carries the name
             if not network.set_weights_name(getattr(layer, slot), names[index]):
                 raise RuntimeError(f"TensorRT didn't take the name of the null placeholder for {names[index]}")
