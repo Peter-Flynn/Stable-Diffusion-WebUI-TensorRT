@@ -9,7 +9,6 @@ from collections import deque
 import tensorrt as trt
 import torch
 
-from .builder import PLACEHOLDER_PREFIX
 from .common import gib, log
 
 # Refitting prepares the weights for the GPU on the CPU, by default on one thread. Weights come straight
@@ -134,10 +133,7 @@ class Engine:
             name = self.engine.get_tensor_name(i)
             is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
             self.io.append((name, is_input, torch_dtype(self.engine.get_tensor_dtype(name))))
-        # The UNet's weight names; null placeholders are refitted as "placeholder/<weight>"
-        self.trt_names = {name[len(PLACEHOLDER_PREFIX):] if name.startswith(PLACEHOLDER_PREFIX) else name: name
-                          for name in trt.Refitter(self.engine, LOGGER).get_all_weights()}
-        self.weight_names = list(self.trt_names)
+        self.weight_names = list(trt.Refitter(self.engine, LOGGER).get_all_weights())
         self.context = None  # created once the weights are in
         self._reset_context_state()
         return time.perf_counter() - start
@@ -171,12 +167,9 @@ class Engine:
                     log(f"Could not set the refitter's {setting}: {e}")
         keep, seconds = [], {"weights": 0.0, "tensorrt": 0.0}
 
-        unet_names = {trt_name: name for name, trt_name in self.trt_names.items()}
-
-        def put(name):  # a UNet weight's name
+        def put(name):
             start = time.perf_counter()
-            trt_name = self.trt_names.get(name, name)
-            proto = refitter.get_weights_prototype(trt_name)
+            proto = refitter.get_weights_prototype(name)
             t = tensor_for(name).to(dtype=torch_dtype(proto.dtype)).contiguous()
             if t.numel() != proto.size:
                 raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
@@ -184,15 +177,15 @@ class Engine:
             location = trt.TensorLocation.DEVICE if t.is_cuda else trt.TensorLocation.HOST
             given = time.perf_counter()
             seconds["weights"] += given - start
-            if not refitter.set_named_weights(trt_name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), location):
+            if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), location):
                 raise RuntimeError(f"TensorRT rejected weight {name}")
             seconds["tensorrt"] += time.perf_counter() - given
 
         LOGGER.clear()
         for name in names:
             put(name)
-        for trt_name in refitter.get_missing_weights():
-            put(unet_names.get(trt_name, trt_name))
+        for name in refitter.get_missing_weights():
+            put(name)
         start = time.perf_counter()
         try:
             ok = refitter.refit_cuda_engine()

@@ -7,12 +7,9 @@ import sys
 import threading
 import time
 
-import numpy as np
 import tensorrt as trt
 from tqdm import tqdm
 
-PLACEHOLDER_MARK = 1717.0  # export.py starts each FP16 placeholder with this and its index
-PLACEHOLDER_PREFIX = "placeholder/"  # names of the null placeholders' weights: "placeholder/<UNet weight>"
 PROGRESS = "@@trt-progress "
 RESULT = "@@trt-result "
 _MEMORY_HINTS = ("insufficient memory", "memory is insufficient", "could not be allocated", "out of memory")
@@ -127,74 +124,7 @@ class NoEngine(RuntimeError):
     pass
 
 
-def _checked(logger, what, call):
-    """TensorRT logs a rejected API call instead of raising: one that logged an error failed."""
-    before = len(logger.errors)
-    result = call()
-    if len(logger.errors) > before:
-        raise RuntimeError(f"{what}: {logger.errors[-1]}")
-    return result
-
-
-def _null_placeholders(network, logger, names, sizes) -> set:
-    """Gives the UNet weights in constant layers TensorRT's null placeholders (a type and a size, no data),
-    which the builder doesn't hold or convert. As NVIDIA documents them, a placeholder has to come with
-    the layer, so each weight gets a new constant layer created with one, named "placeholder/<weight>" (the
-    parser already gave the old one the weight's name), and the layers that read the old one read the new
-    one; the old one is left unused. Returns the UNet weights given placeholders; raises if TensorRT
-    rejects anything, before the network is built."""
-    found = {}  # UNet weight index -> its constant layers (export.py's placeholder, told apart by marker and size)
-    for i in range(network.num_layers):
-        layer = network.get_layer(i)
-        if layer.type != trt.LayerType.CONSTANT:
-            continue
-        layer.__class__ = trt.IConstantLayer
-        values = layer.weights  # a NumPy array: TensorRT's layers hand out their weights' values
-        values = values if isinstance(values, np.ndarray) else values.numpy()
-        if values.dtype != np.float16 or values.size < 3:
-            continue
-        head = values.reshape(-1)[:3]
-        if head[0] != PLACEHOLDER_MARK or not np.isfinite(head).all():
-            continue  # not one of ours, or the parser changed it (e.g. transposed): stays as it is
-        index = int(head[1]) * 2048 + int(head[2])
-        if index >= len(names) or values.size != sizes[index]:
-            continue
-        found.setdefault(index, []).append(layer)
-
-    replacement = {}  # old layer's output tensor name -> the new layer's
-    for index, layers in found.items():
-        name = names[index]
-        placeholder = trt.Weights(trt.DataType.HALF, 0, sizes[index])
-        new = _checked(logger, f"adding a null placeholder for {name}", lambda: network.add_constant(layers[0].shape, placeholder))
-        if new is None:
-            raise RuntimeError(f"TensorRT didn't add a null placeholder for {name}")
-        # TensorRT's own descriptor of the placeholder carries the name
-        if not _checked(logger, f"naming the null placeholder for {name}", lambda: network.set_weights_name(new.weights, PLACEHOLDER_PREFIX + name)):
-            raise RuntimeError(f"TensorRT didn't take the name of the null placeholder for {name}")
-        for layer in layers:
-            replacement[layer.get_output(0).name] = new.get_output(0)
-
-    rewired = set()
-    for i in range(network.num_layers):
-        layer = network.get_layer(i)
-        for j in range(layer.num_inputs):
-            tensor = layer.get_input(j)
-            if tensor is not None and tensor.name in replacement:
-                _checked(logger, f"connecting {layer.name} to a null placeholder", lambda: layer.set_input(j, replacement[tensor.name]))
-                if layer.get_input(j).name != replacement[tensor.name].name:
-                    raise RuntimeError(f"TensorRT didn't connect {layer.name} to its null placeholder")
-                rewired.add(tensor.name)
-    unused = set(replacement) - rewired
-    if unused:
-        raise RuntimeError(f"{len(unused)} weights' constant layers had no readers to connect")
-    log(f"Null placeholders for {len(found)} of {len(names)} UNet weights")
-    return {names[index] for index in found}
-
-
-def build(job, logger, progress, strip=True, null=False):
-    """null: TensorRT's null weight placeholders (strip only) for the UNet weights in constant layers,
-    which keeps the builder from holding them; else the export's placeholder data, which it holds like
-    real weights."""
+def build(job, logger, progress, strip=True):
     builder = trt.Builder(logger)
     network = builder.create_network(0)  # strongly typed: precision comes from the FP16 graph
     parser = trt.OnnxParser(network, logger)
@@ -209,19 +139,9 @@ def build(job, logger, progress, strip=True, null=False):
     if not parsed:
         raise RuntimeError("TensorRT could not parse the ONNX model: " + "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
 
-    nulls = _null_placeholders(network, logger, job["placeholders"], job["placeholder_sizes"]) if null and strip else set()
-    # Every UNet weight has to be refittable, or the engine bakes in the placeholder values.
-    unmarked = [
-        name for name in job["weights"]
-        if not (
-            network.are_weights_marked_refittable(PLACEHOLDER_PREFIX + name)
-            or network.mark_weights_refittable(PLACEHOLDER_PREFIX + name)
-            if name in nulls
-            else network.mark_weights_refittable(name)
-        )
-    ]
+    unmarked = [name for name in job["weights"] if not network.mark_weights_refittable(name)]
     if unmarked:
-        raise RuntimeError(f"{len(unmarked)} UNet weights aren't refittable in the TensorRT network (e.g. {unmarked[0]})")
+        raise RuntimeError(f"{len(unmarked)} UNet weights aren't in the TensorRT network (e.g. {unmarked[0]})")
 
     config = builder.create_builder_config()
     config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)  # only the UNet's weights: they come from the checkpoint
@@ -285,7 +205,7 @@ def main(job_path):
     try:
         log(f"Building with TensorRT {trt.__version__}")
         try:
-            build(job, logger, Progress(_progress_sender()), null=bool(job.get("null")))
+            build(job, logger, Progress(_progress_sender()))
             result["stripped"] = True
         except NoEngine:
             if not any(w in " ".join(logger.errors).lower() for w in ("refit", "strip", "weight")):
