@@ -302,9 +302,10 @@ def run_builder(job_path: str, progress=None) -> dict:
     return result
 
 
-def build(arch: Arch, patcher, profile_list: list, optimization_level=None, progress=None) -> dict:
-    """Exports and builds an engine for `arch` with these profiles. Returns the builder's result plus the
-    saved Record as "record"."""
+def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=None) -> dict:
+    """Exports the UNet graph once and builds an engine for each (index, Profile) in `todo`, one at a time,
+    each in a builder process of its own: a build only ever holds one profile. Returns the last builder
+    result, with "records": the engines saved, those before a failure or cancel included."""
     from . import runtime
 
     common.trt_version()  # installed and new enough
@@ -314,45 +315,55 @@ def build(arch: Arch, patcher, profile_list: list, optimization_level=None, prog
     folder = store.work_dir(arch)
     shutil.rmtree(folder, ignore_errors=True)
     os.makedirs(folder)
+    records, result, warnings = [], {"ok": True}, 0
     try:
         if progress:
             progress(0.0, "Exporting the UNet graph")
-        start = time.time()
         shapes = export_onnx(arch, patcher, folder)
-        if CANCEL.is_set():
-            return {"ok": False, "error": "cancelled"}
-        profile_shapes = [p.unet_shapes(arch.in_channels, arch.context_dim, arch.adm_channels) for p in profile_list]
-        job = {
-            "onnx": os.path.join(folder, "unet.onnx"),
-            "plan": os.path.join(folder, "engine.plan"),
-            "weights": sorted(shapes),
-            "profiles": profile_shapes,
-            "timing_cache": store.timing_cache_path(),
-            "optimization_level": optimization_level,
-        }
-        log(f"Building the {arch.label} engine ({len(profile_list)} profiles); the first build takes several minutes.")
-        for strip in (True, False):
-            with open(os.path.join(folder, "job.json"), "w", encoding="utf-8") as f:
-                json.dump({**job, "strip": strip}, f)
-            result = run_builder(os.path.join(folder, "job.json"), progress)
-            result["stripped"] = strip
-            if not result.get("retry_without_strip"):
+        for n, (index, profile) in enumerate(todo):
+            if CANCEL.is_set():
+                result = {"ok": False, "error": "cancelled"}
                 break
-            # Without stripping, the plan holds placeholder weights (GBs) but runs the same way.
-            log("Building a weight-stripped engine failed; building one that stores placeholder weights instead.")
-        if result["ok"]:
+            start = time.time()
+            step = None
+            if progress:
+                step = lambda f, t, n=n, index=index: progress((n + f) / len(todo), f"Profile {index + 1} ({n + 1} of {len(todo)} to build): {t}")
+            unet_shapes = profile.unet_shapes(arch.in_channels, arch.context_dim, arch.adm_channels)
+            job = {
+                "onnx": os.path.join(folder, "unet.onnx"),
+                "plan": os.path.join(folder, "engine.plan"),
+                "weights": sorted(shapes),
+                "profiles": [unet_shapes],
+                "timing_cache": store.timing_cache_path(),
+                "optimization_level": optimization_level,
+            }
+            log(f"Building the {arch.label} engine for profile {index + 1}, {profile.describe()} ({n + 1} of {len(todo)}); the first build takes several minutes.")
+            for strip in (True, False):
+                with open(os.path.join(folder, "job.json"), "w", encoding="utf-8") as f:
+                    json.dump({**job, "strip": strip}, f)
+                result = run_builder(os.path.join(folder, "job.json"), step)
+                result["stripped"] = strip
+                if not result.get("retry_without_strip"):
+                    break
+                # Without stripping, the plan holds placeholder weights (GBs) but runs the same way.
+                log("Building a weight-stripped engine failed; building one that stores placeholder weights instead.")
+            warnings += result.get("memory_warnings") or 0
+            if not result["ok"]:
+                break
             meta = {
-                "profiles": [p.to_dict() for p in profile_list],
-                "shapes": profile_shapes,
+                "profile": profile.to_dict(),
+                "index": index,
+                "shapes": unet_shapes,
                 "weights": job["weights"],
                 "weight_bytes": sum(math.prod(s) * 2 for s in shapes.values()),
+                "stripped": result["stripped"],
                 "trt": common.trt_version(),
                 "gpu": common.gpu_tag(),
                 "gpu_name": torch.cuda.get_device_name(),
                 "created": time.strftime("%Y-%m-%d %H:%M"),
             }
-            result["record"] = store.save(arch, job["plan"], meta)
-            log(f"Built {result['record'].describe()} in {time.time() - start:.0f}s")
-        return result
+            records.append(store.save(arch, job["plan"], meta))
+            log(f"Built {records[-1].describe()} in {time.time() - start:.0f}s")
+        return {**result, "records": records, "memory_warnings": warnings}
     finally:
         shutil.rmtree(folder, ignore_errors=True)

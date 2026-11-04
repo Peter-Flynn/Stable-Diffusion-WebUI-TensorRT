@@ -1,8 +1,9 @@
 """Running reForge's UNet on a TensorRT engine.
 
-The engine is a model of reForge's own model manager, so the manager makes room for it, unloads it when
-another model needs the VRAM and loads it back for sampling, like any other model. While a sampling pass
-runs on the engine, the PyTorch UNet stays in RAM (its patches still apply, it just isn't loaded)."""
+An architecture has an engine per profile, and a sampling pass loads the one for its sizes; only one is in
+VRAM at a time. Each is a model of reForge's own model manager, so the manager makes room for it, unloads it
+when another model needs the VRAM and loads it back for sampling, like any other model. While a sampling
+pass runs on an engine, the PyTorch UNet stays in RAM (its patches still apply, it just isn't loaded)."""
 
 import contextlib
 import math
@@ -101,7 +102,7 @@ class TrtModel:
         used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
         self.measured = max(self.measured, used)
         log(
-            f"Loaded the {self.record.arch.label} engine ({common.gib(self.model_size())}) in {time.time() - start:.1f}s: "
+            f"Loaded the {self.record.arch.label} engine for profile {self.record.index + 1} ({common.gib(self.model_size())}) in {time.time() - start:.1f}s: "
             f"plan {plan_seconds:.1f}s, " + (_refit_times(refit) if refit else "no weights to refit")
         )
         return self.model_size()
@@ -172,9 +173,11 @@ def model_for(record: store.Record) -> TrtModel:
 
 
 class TrtUnetOption(sd_unet.SdUnetOption):
-    def __init__(self, record: store.Record):
-        self.record = record
-        self.label = f"[TRT] {record.arch.label}"
+    """An architecture's engines."""
+
+    def __init__(self, arch):
+        self.arch = arch
+        self.label = f"[TRT] {arch.label}"
 
     @property
     def model_name(self):
@@ -183,7 +186,7 @@ class TrtUnetOption(sd_unet.SdUnetOption):
             sd_model = arch_mod.loaded_model()
             arch = arch_mod.detect(arch_mod.unet_patcher(sd_model)) if sd_model is not None else None
             info = getattr(sd_model, "sd_checkpoint_info", None)
-            return getattr(info, "model_name", None) if arch is not None and arch.id == self.record.arch.id else None
+            return getattr(info, "model_name", None) if arch is not None and arch.id == self.arch.id else None
         except Exception as e:  # reForge asks every option at the start of each generation
             log(f"Could not check the loaded model's architecture: {e}")
             return None
@@ -201,13 +204,13 @@ class TrtUnet(sd_unet.SdUnet):
         raise RuntimeError("TensorRT engines run through the UNet's own forward")
 
     def deactivate(self):
-        model = _models.get(self.option.record.key)
-        if model is not None:
-            _unload(model)
+        for model in list(_models.values()):
+            if model.record.arch.id == self.option.arch.id:
+                _unload(model)
 
 
 def list_unets(options: list):
-    ours = [TrtUnetOption(record) for record in store.records() if record.loadable]
+    ours = [TrtUnetOption(arch) for arch in {r.arch.id: r.arch for r in store.records() if r.loadable}.values()]
     options.extend(ours)
     try:  # SD Unet naming an engine that's gone (deleted, or built for another TensorRT or GPU) would select nothing
         from modules import shared
@@ -229,9 +232,9 @@ def _explicit_choice() -> bool:
         return True
 
 
-def _selected_record():
+def _selected_arch():
     unet = sd_unet.current_unet
-    return unet.option.record if isinstance(unet, TrtUnet) else None
+    return unet.option.arch if isinstance(unet, TrtUnet) else None
 
 
 def _unsupported(patcher) -> str:
@@ -292,30 +295,55 @@ def _load_torch_unet(patcher, shape):
 
 
 class Pass:
-    """One sampling pass on an engine. On anything the engine can't run, the rest of the pass falls back
-    to PyTorch, with the UNet loaded the way reForge would have."""
+    """One sampling pass on an architecture's engines: each UNet call runs on the engine of the profile
+    that fits it best, loaded (in place of another) when it isn't. On anything no engine can run, the rest
+    of the pass falls back to PyTorch, with the UNet loaded the way reForge would have."""
 
-    def __init__(self, model: TrtModel, patcher, x):
-        self.model, self.patcher = model, patcher
+    def __init__(self, records: list, patcher, x):
+        self.records, self.patcher = records, patcher
+        self.model = None
+        self.weights = EffectiveWeights(patcher)
         self.module = patcher.model.diffusion_model
-        arch = model.record.arch
-        self.shapes, self.takes_y = model.record.shapes, bool(arch.adm_channels)
+        arch = records[0].arch
+        self.shapes, self.takes_y = [r.shapes for r in records], bool(arch.adm_channels)
         self.channels, self.context_dim = arch.in_channels, arch.context_dim
         self.shape = (x.shape[0] * 2, *x.shape[1:])
         self.fallback = None
         self.checked = False
+        self._keep = None
         self._hint_batching()
-        # Other loads mid-pass (e.g. a live preview's decoder) unload other models first: unloading the
-        # engine would mean reloading it on the next step, the UNet would lose its patches.
-        self._keep = _keeping(model, patcher)
-        self._keep.__enter__()
+
+    def use(self, record):
+        """Loads the engine for `record` with the pass's weights, unloading any other engine first: one
+        engine in VRAM at a time."""
+        model = model_for(record)
+        if model is not self.model or not model.loaded:
+            for other in list(_models.values()):
+                if other is not model and other.loaded:
+                    _unload(other)
+            self._hold(None)
+            model.weights = self.weights
+            with torch.inference_mode(), _keeping(self.patcher):
+                common.mm().load_models_gpu([model])
+            self.model = model
+            # Other loads mid-pass (e.g. a live preview's decoder) unload other models first: unloading
+            # the engine would mean reloading it on the next step, the UNet would lose its patches.
+            self._hold(_keeping(model, self.patcher))
+        model.sync()
+        return model
+
+    def _hold(self, keep):
+        if self._keep is not None:
+            self._keep, old = None, self._keep
+            old.__exit__(None, None, None)
+        if keep is not None:
+            keep.__enter__()
+            self._keep = keep
 
     def _restore(self):
         self.patcher.model.__dict__.pop("memory_required", None)
-        if self._keep is not None:
-            self._keep, keep = None, self._keep
-            keep.__exit__(None, None, None)
-        if self.model.loaded:
+        self._hold(None)
+        if self.model is not None and self.model.loaded:
             self.model.engine.release_activations()
 
     def _hint_batching(self):
@@ -323,7 +351,7 @@ class Pass:
         UNet's memory estimate. With the engine's activations already allocated, batch whatever a profile
         runs: the whole batch, and prompts padded to the length reForge would pad them to (their least
         common multiple). Batches no profile runs are split, so each prompt runs at its own length."""
-        shapes = self.model.record.shapes
+        shapes = self.shapes
 
         def memory_required(input_shape, cond_shapes={}):
             b, _, h, w = input_shape[:4]
@@ -336,7 +364,9 @@ class Pass:
     def end(self):
         """Undoes what the pass changed; the engine stays loaded for the next one."""
         self._restore()
-        self.model.weights = None  # don't keep this checkpoint alive
+        for model in _models.values():
+            if model.weights is self.weights:
+                model.weights = None  # don't keep this checkpoint alive
 
     def fall_back(self, reason: str):
         self.fallback = reason
@@ -357,6 +387,7 @@ class Pass:
                 "(reForge pads the prompt and negative prompt to a common length)"
             )
         index, padded, repeats = choice
+        record = self.records[index]
         timesteps = timesteps.reshape(-1)
         feed = {
             "sample": x,
@@ -367,23 +398,24 @@ class Pass:
             feed["y"] = y
         if padded > b:
             feed = {k: v.repeat(-(-padded // b), *([1] * (v.dim() - 1)))[:padded] for k, v in feed.items()}
-        if not self.model.loaded:  # unloaded mid-pass, e.g. for a VAE encode
+        if self.model is None or self.model.record.key != record.key or not self.model.loaded:  # another profile, or unloaded mid-pass (e.g. for a VAE encode)
             try:
-                with torch.inference_mode(), _keeping(self.patcher):
-                    common.mm().load_models_gpu([self.model])
+                if self.model is not None and self.model.loaded:
+                    self.model.engine.release_activations()
+                self.use(record)
             except Exception as e:
                 if not isinstance(e, RuntimeError):
                     traceback.print_exc()
-                self.fall_back(f"Could not load the engine again ({e})")
+                self.fall_back(f"Could not load the engine for profile {record.index + 1} ({e})")
         stream = torch.cuda.current_stream().cuda_stream
         try:
-            out = self._infer(feed, index, stream)
+            out = self._infer(feed, 0, stream)
         except torch.cuda.OutOfMemoryError:
             self.model.engine.release_activations()
             common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
             common.mm().soft_empty_cache(force=True)
             try:
-                out = self._infer(feed, index, stream)
+                out = self._infer(feed, 0, stream)
             except torch.cuda.OutOfMemoryError:
                 self.fall_back("Out of VRAM running the engine")
         if not self.checked:
@@ -402,32 +434,33 @@ class Pass:
             self.fall_back(f"The engine failed ({e})")
 
 
-def _engine_record(patcher, x):
-    """The engine to run this pass on, or None for PyTorch."""
-    record = _selected_record()
-    if record is None:
+def _engine_records(patcher, x):
+    """The engines to run this pass on, or None for PyTorch."""
+    selected = _selected_arch()
+    if selected is None:
         return None
     arch = arch_mod.detect(patcher)
-    if arch is None or arch.id != record.arch.id:  # e.g. a refiner: with SD Unet on Automatic, that's expected
+    if arch is None or arch.id != selected.id:  # e.g. a refiner: with SD Unet on Automatic, that's expected
         if _explicit_choice():
-            notify(f"The selected engine is for {record.arch.label}, not {arch.label if arch else 'this model'}; using PyTorch.")
+            notify(f"The selected engines are for {selected.label}, not {arch.label if arch else 'this model'}; using PyTorch.")
         return None
     reason = _unsupported(patcher)
     if reason:
         notify(f"TensorRT engines can't apply {reason}; using PyTorch.")
         return None
+    records = store.engines(arch.id)
     b, _, h, w = x.shape
-    if not profiles.covers_size(record.shapes, h, w, b):
-        notify(f"No profile of the {arch.label} engine covers {w * 8}x{h * 8} at batch size {b}; using PyTorch for this pass. Add one in the TensorRT tab.")
+    if not profiles.covers_size([r.shapes for r in records], h, w, b):
+        notify(f"No profile of the {arch.label} engines covers {w * 8}x{h * 8} at batch size {b}; using PyTorch for this pass. Add one in the TensorRT tab.")
         return None
-    return record
+    return records
 
 
-def _begin(record, patcher, x, prepare):
-    """sampling_prepare for a pass on the engine: the Pass, or None if it fell back to PyTorch."""
+def _begin(records, patcher, x, prepare):
+    """sampling_prepare for a pass on the engines: the Pass, or None if it fell back to PyTorch. Loads the
+    engine for the likeliest sizes (cond and uncond batched, the shortest prompts) now, the others when needed."""
 
     mm = common.mm()
-    model = model_for(record)
     with torch.inference_mode():
         _unload_torch_unet(patcher)
         state = mm.vram_state, mm.free_memory
@@ -436,20 +469,21 @@ def _begin(record, patcher, x, prepare):
             prepare(patcher, x)
         finally:
             mm.vram_state, mm.free_memory = state
+        p = Pass(records, patcher, x)
         try:
-            model.weights = EffectiveWeights(patcher)
-            with _keeping(patcher):
-                mm.load_models_gpu([model])
-            model.sync()
+            b, _, h, w = x.shape
+            choice = profiles.select(p.shapes, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select(p.shapes, b, h, w, profiles.CONTEXT_PER_CHUNK)
+            index = choice[0] if choice else next(i for i, s in enumerate(p.shapes) if profiles.covers_size([s], h, w, b))
+            model = p.use(records[index])
             _make_room_for_activations(model, patcher, x)
         except Exception as e:
             if not isinstance(e, RuntimeError):
                 traceback.print_exc()
             notify(f"Could not run the engine ({e}); using PyTorch.")
-            model.weights = None
+            p.end()
             _load_torch_unet(patcher, (x.shape[0] * 2, *x.shape[1:]))
             return None
-    return Pass(model, patcher, x)
+    return p
 
 
 def _make_room_for_activations(model: TrtModel, patcher, x):
@@ -464,11 +498,11 @@ def _make_room_for_activations(model: TrtModel, patcher, x):
 
 def _activation_estimate(model: TrtModel, x) -> int:
     b, c, h, w = x.shape
-    choice = profiles.select(model.record.shapes, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK)
+    s = model.record.shapes
+    choice = profiles.select([s], 2 * b, h, w, profiles.CONTEXT_PER_CHUNK)
     if choice is None:
         return 0
-    index, padded, _ = choice
-    s = model.record.shapes[index]
+    _, padded, _ = choice
     shapes = {
         "sample": (padded, c, h, w),
         "timesteps": (padded,),
@@ -476,7 +510,7 @@ def _activation_estimate(model: TrtModel, x) -> int:
     }
     if "y" in s:
         shapes["y"] = (padded, s["y"][0][1])
-    return model.engine.estimate_activation_bytes(index, shapes, torch.cuda.current_stream().cuda_stream)
+    return model.engine.estimate_activation_bytes(0, shapes, torch.cuda.current_stream().cuda_stream)
 
 
 def _wrap_forward(original):
@@ -503,10 +537,10 @@ def _wrap_prepare(original):
         if _pass is not None:
             _pass.end()
         _pass = None
-        record = _engine_record(unet, x)
-        if record is None:
+        records = _engine_records(unet, x)
+        if records is None:
             return original(unet, x, *args, **kwargs)
-        _pass = _begin(record, unet, x, lambda u, v: original(u, v, *args, **kwargs))
+        _pass = _begin(records, unet, x, lambda u, v: original(u, v, *args, **kwargs))
 
     sampling_prepare._trt_original = original
     return sampling_prepare

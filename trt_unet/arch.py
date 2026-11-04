@@ -1,5 +1,5 @@
-"""A UNet's architecture: what an engine is compiled for. Every checkpoint with the same architecture
-(fine-tunes, merges, v-prediction variants) runs on the same engine with its own weights."""
+"""A UNet's architecture: what engines are compiled for. Every checkpoint with the same architecture
+(fine-tunes, merges, v-prediction variants) runs on the same engines with its own weights."""
 
 import hashlib
 import json

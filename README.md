@@ -7,36 +7,38 @@ TensorRT, fine-tunes like Pony, Illustrious and NoobAI included, on an RTX 2080 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/engines-dark.svg">
-    <img alt="NVIDIA's extension builds an engine for each checkpoint and converts each LoRA. This fork builds one engine for each architecture and loads the weights of whatever checkpoint and LoRAs are in use." src="docs/engines-light.svg" width="880">
+    <img alt="NVIDIA's extension builds an engine for each checkpoint and converts each LoRA. This fork builds engines for each architecture, one per profile, and loads the weights of whatever checkpoint and LoRAs are in use." src="docs/engines-light.svg" width="880">
   </picture>
 </p>
 
 ## How it differs
 
-|                    | NVIDIA's extension                       | This fork                                        |
-| ------------------ | ---------------------------------------- | ------------------------------------------------ |
-| WebUI              | Automatic1111                            | reForge                                          |
-| Engines            | One per checkpoint, GBs each             | One per architecture, with no weights inside     |
-| New checkpoint     | Build a new engine                       | Nothing to do                                    |
-| LoRAs              | Convert each one first                   | Work as usual                                    |
-| Hires. fix         | Build an engine that covers both sizes   | Covered by the default engine                    |
+|                | NVIDIA's extension                     | This fork                                             |
+| -------------- | -------------------------------------- | ----------------------------------------------------- |
+| WebUI          | Automatic1111                          | reForge                                               |
+| Engines        | One per checkpoint, GBs each           | One per profile of an architecture, no weights inside |
+| New checkpoint | Build a new engine                     | Nothing to do                                         |
+| LoRAs          | Convert each one first                 | Work as usual                                         |
+| Hires. fix     | Build an engine that covers both sizes | Covered by the default profiles                       |
 
-Anything the engine can't run, like ControlNet, UNet patches such as FreeU, or a size it wasn't built for, runs on
+Anything the engines can't run, like ControlNet, UNet patches such as FreeU, or a size no profile covers, runs on
 PyTorch instead, with a notice.
 
 ## Use
 
 1. Install from **Extensions → Install from URL** with this repo's URL. TensorRT 11 or later is installed on the
    next launch (set `TRT_EXTENSION_SKIP_INSTALL=1` to skip that).
-2. Load a checkpoint, open the **TensorRT** tab and click **Build engine**. The first build takes a few minutes.
-3. Generate. Every checkpoint with the same architecture now uses the engine.
+2. Load a checkpoint, open the **TensorRT** tab and click **Build engines**: one engine per profile, built one at a
+   time. The first build takes a few minutes.
+3. Generate. Every checkpoint with the same architecture now uses the engines; only the one for the sizes being
+   generated is loaded.
 
-The engine is used while **SD Unet** (in Settings → Stable Diffusion) is on `Automatic`, the default. Set it to
+The engines are used while **SD Unet** (in Settings → Stable Diffusion) is on `Automatic`, the default. Set it to
 `None` to use PyTorch.
 
 > [!NOTE]
-> An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build it again;
-> the tab keeps its profiles.
+> An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build again;
+> the tab keeps the profiles.
 
 <br>
 

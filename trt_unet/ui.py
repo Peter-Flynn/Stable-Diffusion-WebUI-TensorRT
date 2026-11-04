@@ -19,9 +19,11 @@ FIELD_LABELS = {"width": "Width", "height": "Height", "batch": "Batch size", "to
 LEVEL_LABELS = {"min": "min", "opt": "optimal", "max": "max"}
 BUILDING = threading.Event()
 HELP = """
-**Engines** are compiled for a UNet architecture, not a checkpoint: every checkpoint with that architecture (fine-tunes, merges, v-prediction ones) runs on the same engine with its own weights, LoRAs included. Engine files hold no weights; while loaded, an engine takes about as much VRAM as the checkpoint's UNet.
+**Engines** are compiled for a UNet architecture, not a checkpoint: every checkpoint with that architecture (fine-tunes, merges, v-prediction ones) runs on the same engines with its own weights, LoRAs included. Engine files hold no weights.
 
-**Profiles** are the image sizes, batch sizes and prompt lengths an engine runs. TensorRT tunes each profile for its optimal values and accepts anything from min to max; narrower ranges build faster and can run a little faster. Switching between the profiles of an engine (e.g. base size and Hires. fix) costs nothing. Anything no profile covers, and ControlNet or other UNet patches, runs on PyTorch.
+**Profiles** are the image sizes, batch sizes and prompt lengths the engines run, one engine each. TensorRT tunes each profile for its optimal values and accepts anything from min to max; narrower ranges build faster and can run a little faster. Only the engine for the sizes being generated is loaded, taking about as much VRAM as the checkpoint's UNet; a pass in another profile's sizes (e.g. Hires. fix) loads that one instead. Anything no profile covers, and ControlNet or other UNet patches, runs on PyTorch.
+
+**Building** makes the engines match the profiles: it builds the profiles that have no engine yet, one at a time, and deletes the engines of profiles that are gone.
 
 **SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engine of the loaded checkpoint's architecture, `None` always uses PyTorch.
 """
@@ -47,30 +49,44 @@ def _preset_choices(arch):
 
 
 def _current():
-    """(sd_model, patcher, arch, record) for the loaded checkpoint; any may be None."""
+    """(sd_model, patcher, arch, records) for the loaded checkpoint: records are its architecture's engines
+    (maybe none); the others may be None."""
     sd_model = arch_mod.loaded_model()
     patcher = arch_mod.unet_patcher(sd_model)
     arch = arch_mod.detect(patcher) if patcher is not None else None
-    record = None
+    records = []
     if arch is not None:
         try:
-            record = store.find(arch.id)
+            records = store.engines(arch.id)
         except Exception:
             pass
-    return sd_model, patcher, arch, record
+    return sd_model, patcher, arch, records
 
 
-def _stale(arch):
-    """An engine for this architecture that was built for another GPU or TensorRT version."""
+def _stale(arch) -> list:
+    """Engines for this architecture that were built for another GPU or TensorRT version (one such build's)."""
     if arch is None:
-        return None
+        return []
     try:
-        return next((r for r in store.records() if r.arch.id == arch.id and not r.loadable), None)
+        others = [r for r in store.records() if r.arch.id == arch.id and not r.loadable]
+        return [r for r in others if r.group == others[0].group]
     except Exception:
-        return None
+        return []
 
 
-def _status(sd_model, arch, record) -> str:
+def _keys(draft) -> list:
+    return [store.profile_key(Profile.from_dict(d)) for d in draft]
+
+
+def _plan(draft, records):
+    """(indexes of the draft's profiles that have no engine, how many engines no profile has)."""
+    built = {store.profile_key(r.profile) for r in records}
+    keys = _keys(draft)
+    todo = [i for i, k in enumerate(keys) if k not in built and k not in keys[:i]]
+    return todo, len(built - set(keys))
+
+
+def _status(sd_model, arch, records) -> str:
     try:
         version = common.trt_version()
     except Exception as e:
@@ -81,35 +97,40 @@ def _status(sd_model, arch, record) -> str:
     if arch is None:
         return f"`{name}` isn't a model TensorRT engines can run (SD 1.x, SD 2.x and SDXL architectures are supported)."
     lines = [f"**Checkpoint:** `{name}` · **Architecture:** {arch.label} · **TensorRT** {version}"]
-    if record is None:
+    if not records:
         stale = _stale(arch)
-        if stale is not None:
+        if stale:
             lines.append(
-                f"**The engine for this architecture was built for {stale.meta['gpu_name']} with TensorRT {stale.meta['trt']}, "
-                "so it can't load here.** Build it again; its profiles are below."
+                f"**The engines for this architecture were built for {stale[0].meta['gpu_name']} with TensorRT {stale[0].meta['trt']}, "
+                "so they can't load here.** Build them again; their profiles are below."
             )
         else:
-            lines.append("There's no engine for this architecture yet. The profiles below cover every common size: build one.")
+            lines.append("There are no engines for this architecture yet. The profiles below cover every common size: build them.")
         return "\n\n".join(lines)
-    lines.append(f"**Engine:** built {record.meta['created']} with {_n(len(record.profiles), 'profile')}; takes about {common.gib(record.weight_bytes)} of VRAM while loaded.")
+    lines.append(
+        f"**Engines:** {_n(len(records), 'profile')}, last built {max(r.meta['created'] for r in records)}; "
+        f"the one in use takes about {common.gib(records[0].weight_bytes)} of VRAM."
+    )
     setting = getattr(shared.opts, "sd_unet", "Automatic")
     if setting in ("Automatic", f"[TRT] {arch.label}"):
-        lines.append(f"`SD Unet` is `{setting}`, so every {arch.name} checkpoint runs on it.")
+        lines.append(f"`SD Unet` is `{setting}`, so every {arch.name} checkpoint runs on them.")
     else:
-        lines.append(f"**`SD Unet` is `{setting}`, so generations don't use this engine.** Set it to `Automatic` in Settings, Stable Diffusion.")
+        lines.append(f"**`SD Unet` is `{setting}`, so generations don't use these engines.** Set it to `Automatic` in Settings, Stable Diffusion.")
     return "\n\n".join(lines)
 
 
-def _draft_view(draft: list, record) -> str:
+def _draft_view(draft: list, records) -> str:
     if not draft:
         return "*No profiles. Add at least one to build an engine.*"
-    rows = ["| # | Width | Height | Batch size | Prompt tokens |", "|:-:|:-:|:-:|:-:|:-:|"]
-    for i, d in enumerate(draft):
+    built = {store.profile_key(r.profile) for r in records}
+    rows = ["| # | Width | Height | Batch size | Prompt tokens | Engine |", "|:-:|:-:|:-:|:-:|:-:|:-:|"]
+    for i, (d, key) in enumerate(zip(draft, _keys(draft))):
         p = Profile.from_dict(d)
-        rows.append(f"| {i + 1} | {_span(p.width)} | {_span(p.height)} | {_span(p.batch)} | {_span(p.tokens)} |")
+        rows.append(f"| {i + 1} | {_span(p.width)} | {_span(p.height)} | {_span(p.batch)} | {_span(p.tokens)} | {'built' if key in built else '**to build**'} |")
     rows.append("\n*Ranges show min-max (optimal).*")
-    if record is not None and [p.to_dict() for p in record.profiles] != draft:
-        rows.append("**These profiles differ from the engine's.** Rebuild to apply them.")
+    _, extra = _plan(draft, records)
+    if extra:
+        rows.append(f"**Building also deletes the {_n(extra, 'engine')} of profiles no longer listed.**")
     return "\n".join(rows)
 
 
@@ -123,46 +144,56 @@ def _index(choice):
     return int(match.group(1)) - 1 if match else None
 
 
-def _draft_outputs(draft, record, select=None):
+def _draft_outputs(draft, records, select=None):
     """Profile table, profile selector and build button for a draft."""
     choices = [NEW] + [_label(i, d) for i, d in enumerate(draft)]
     selected = _label(select, draft[select]) if select is not None and select < len(draft) else NEW
-    build_label = "Build engine" if record is None else "Rebuild engine"
-    return _draft_view(draft, record), gr.update(choices=choices, value=selected), gr.update(value=build_label, interactive=not BUILDING.is_set())
+    todo, extra = _plan(draft, records)
+    build_label = f"Build {_n(len(todo), 'engine')}" if todo else "Update engines" if extra else "Engines up to date"
+    return (
+        _draft_view(draft, records),
+        gr.update(choices=choices, value=selected),
+        gr.update(value=build_label, interactive=bool(draft) and bool(todo or extra) and not BUILDING.is_set()),
+    )
+
+
+def _groups() -> dict:
+    """{label: the engines one architecture has for one GPU and TensorRT version}."""
+    groups = {}
+    for r in store.records():
+        groups.setdefault(f"{r.arch.label} · {r.meta['gpu_name']}, TensorRT {r.meta['trt']}", []).append(r)
+    return groups
 
 
 def _engines_view(arch) -> str:
-    records = store.records()
-    if not records:
+    groups = _groups()
+    if not groups:
         return "*No engines yet.*"
     rows = ["| Architecture | Profiles | VRAM | Built for |", "|---|:-:|:-:|---|"]
-    for r in records:
+    for group in groups.values():
+        r = group[0]
         name = f"**{r.arch.label}** · current" if r.loadable and arch is not None and r.arch.id == arch.id else r.arch.label
         built = f"{r.meta['gpu_name']}, TensorRT {r.meta['trt']}" + ("" if r.loadable else " · **can't load here**")
-        rows.append(f"| {name} | {len(r.profiles)} | {common.gib(r.weight_bytes)} | {built} |")
+        rows.append(f"| {name} | {len(group)} | {common.gib(r.weight_bytes)} | {built} |")
     return "\n".join(rows)
-
-
-def _engine_choices():
-    return {f"{r.arch.label} · {r.meta['gpu_name']}, TensorRT {r.meta['trt']}": r for r in store.records()}
 
 
 def refresh(draft=None, draft_arch=None):
     """Everything on the tab, for the loaded checkpoint. Profiles being edited stay unless the architecture changed."""
-    sd_model, _, arch, record = _current()
+    sd_model, _, arch, records = _current()
     form = [gr.update()] * (len(FIELDS) * 3)
     if arch is not None and (draft is None or draft_arch != arch.id):
-        source = record or _stale(arch)
-        draft = [p.to_dict() for p in (source.profiles if source else default_profiles(arch.adm_channels))]
+        source = records or _stale(arch)
+        draft = [p.to_dict() for p in ([r.profile for r in source] if source else default_profiles(arch.adm_channels))]
         form = [v for f in FIELDS for v in getattr(default_profiles(arch.adm_channels)[0], f)]
     elif arch is None:
         draft = []
-    engines = list(_engine_choices())
+    engines = list(_groups())
     return (
-        _status(sd_model, arch, record),
+        _status(sd_model, arch, records),
         arch.id if arch else None,
         draft,
-        *_draft_outputs(draft, record),
+        *_draft_outputs(draft, records),
         *form,
         gr.update(choices=_preset_choices(arch), value=None),
         _engines_view(arch),
@@ -205,23 +236,23 @@ def _read_profile(values):
 
 
 def add_profile(draft, *values):
-    record = _current()[3]
+    records = _current()[3]
     profile, note = _read_profile(values)
     if profile is None:
-        return (draft, *_draft_outputs(draft, record), note)
+        return (draft, *_draft_outputs(draft, records), note)
     draft = list(draft) + [profile.to_dict()]
-    return (draft, *_draft_outputs(draft, record, select=len(draft) - 1), note)
+    return (draft, *_draft_outputs(draft, records, select=len(draft) - 1), note)
 
 
 def save_profile(draft, choice, *values):
-    record = _current()[3]
+    records = _current()[3]
     index = _index(choice)
     profile, note = _read_profile(values)
     if profile is None or index is None or index >= len(draft):
-        return (draft, *_draft_outputs(draft, record, select=index), note)
+        return (draft, *_draft_outputs(draft, records, select=index), note)
     draft = list(draft)
     draft[index] = profile.to_dict()
-    return (draft, *_draft_outputs(draft, record, select=index), note)
+    return (draft, *_draft_outputs(draft, records, select=index), note)
 
 
 def remove_profile(draft, choice):
@@ -231,15 +262,19 @@ def remove_profile(draft, choice):
     return (draft, *_draft_outputs(draft, _current()[3]), "")
 
 
-def _outcome(arch, result) -> str:
+def _outcome(arch, todo: int, deleted: int, result) -> str:
+    built = len(result["records"])
     if result["ok"]:
-        message = f"### Engine built\nEvery {arch.name} checkpoint runs on it with `SD Unet` set to `Automatic`."
-        if result.get("stripped") is False:
-            message += " (TensorRT couldn't leave the weights out of it, so its file is as large as the UNet.)"
-    elif result.get("error") == "cancelled":
-        message = "### Build cancelled\nThe existing engine, if any, is unchanged."
+        message = f"### Engines up to date\nBuilt {_n(built, 'engine')}" + (f", deleted {_n(deleted, 'engine')} of profiles no longer listed" if deleted else "")
+        message += f". Every {arch.name} checkpoint runs on them with `SD Unet` set to `Automatic`."
+        if any(r.meta.get("stripped") is False for r in result["records"]):
+            message += " (TensorRT couldn't leave the weights out of some of them, so their files are as large as the UNet.)"
     else:
-        message = f"### The build failed\n`{result.get('error')}`\n\nThe console has the details. The existing engine, if any, is unchanged."
+        done = f"{_n(built, 'engine')} of {todo} built; the other engines are unchanged."
+        if result.get("error") == "cancelled":
+            message = f"### Build cancelled\n{done}"
+        else:
+            message = f"### The build failed\n`{result.get('error')}`\n\nThe console has the details. {done}"
     if result.get("memory_warnings"):
         message += (
             f"\n\nTensorRT skipped {result['memory_warnings']} kernels that need more VRAM than is free at a profile's largest sizes, "
@@ -257,7 +292,7 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
     BUILDING.set()
     try:
         with queue_lock:  # not during a generation
-            _, patcher, arch, _ = _current()
+            _, patcher, arch, records = _current()
             if arch is None:
                 raise RuntimeError("Load a checkpoint TensorRT engines can run first.")
             if arch.id != draft_arch:  # the checkpoint changed since the tab showed these profiles
@@ -265,10 +300,15 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
             elif not draft:
                 raise RuntimeError("Add at least one profile.")
             else:
+                profile_list = [Profile.from_dict(d) for d in draft]
+                todo, _ = _plan(draft, records)
                 _refresh_unet_list()
-                result = export.build(arch, patcher, [Profile.from_dict(d) for d in draft], int(optimization_level), lambda f, t: progress(f, desc=t))
+                result = {"ok": True, "records": []}
+                if todo:
+                    result = export.build(arch, patcher, [(i, profile_list[i]) for i in todo], int(optimization_level), lambda f, t: progress(f, desc=t))
+                deleted = store.keep_only(arch.id, profile_list) if result["ok"] else 0
                 _refresh_unet_list()
-                message = _outcome(arch, result)
+                message = _outcome(arch, len(todo), deleted, result)
     except Exception as e:
         traceback.print_exc()
         message = f"### The build failed\n`{e}`"
@@ -291,13 +331,13 @@ def cancel_build():
 def delete_engine(choice, draft, draft_arch):
     from modules.call_queue import queue_lock
 
-    record = _engine_choices().get(choice) if choice else None
-    if record is not None:
-        with queue_lock:  # not while a generation uses it
+    group = _groups().get(choice) if choice else None
+    if group:
+        with queue_lock:  # not while a generation uses them
             _refresh_unet_list()
-            store.delete(record)
+            store.delete(group)
             sd_unet.list_unets()
-        common.log(f"Deleted {record.plan}")
+        common.log(f"Deleted the {len(group)} engines of {choice}")
     return refresh(draft, draft_arch)
 
 
@@ -357,14 +397,14 @@ def on_ui_tabs():
                 with gr.Accordion("Advanced", open=False):
                     level = gr.Slider(0, 5, value=3, step=1, label="Builder optimization level", info="Higher searches more kernels: much slower builds, sometimes slightly faster engines.")
                 with gr.Row():
-                    build_button = gr.Button("Build engine", variant="primary", elem_id="trt_build")
+                    build_button = gr.Button("Build engines", variant="primary", elem_id="trt_build")
                     cancel_button = gr.Button("Cancel build", visible=False, elem_id="trt_cancel")
                 result = gr.Markdown(elem_id="trt_result")
             with gr.Column(scale=2, variant="panel"):
                 gr.Markdown("### Engines")
                 engines = gr.Markdown(elem_id="trt_engines")
-                engine_choice = gr.Dropdown(label="Engine", choices=[], visible=False, elem_id="trt_engine_choice")
-                delete_button = gr.Button("Delete engine", variant="stop", size="sm", visible=False, elem_id="trt_delete")
+                engine_choice = gr.Dropdown(label="Engines", choices=[], visible=False, elem_id="trt_engine_choice")
+                delete_button = gr.Button("Delete engines", variant="stop", size="sm", visible=False, elem_id="trt_delete")
                 with gr.Accordion("How it works", open=False):
                     gr.Markdown(HELP)
         _sd_unet["sync"] = gr.Button(visible=False, elem_id="trt_sd_unet_sync")
@@ -394,6 +434,6 @@ def on_ui_tabs():
         cancel_button.click(cancel_build, None, None, queue=False)
         delete_button.click(
             delete_engine, [engine_choice, draft, draft_arch], outputs, **quiet,
-            **{JS: "(choice, ...rest) => [choice && confirm('Delete the engine ' + choice + '? Building it again takes a while.') ? choice : null, ...rest.slice(0, 2)]"},
+            **{JS: "(choice, ...rest) => [choice && confirm('Delete the engines of ' + choice + '? Building them again takes a while.') ? choice : null, ...rest.slice(0, 2)]"},
         ).then(None, None, None, **refresh_sd_unet)
     return [(tab, "TensorRT", "tensorrt")]
