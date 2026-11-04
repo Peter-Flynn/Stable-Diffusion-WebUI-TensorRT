@@ -29,7 +29,7 @@
 <text x="316.0" y="274.0" font-size="12" text-anchor="middle" fill="#8b949e">an export per LoRA</text>
 <rect x="452" y="1" width="428" height="328" rx="12" fill="#161b22" stroke="#30363d"/>
 <text x="476" y="38" font-size="17" font-weight="600" fill="#e6edf3">This fork</text>
-<text x="476" y="306" font-size="14" fill="#8b949e">One engine per architecture, weights from what's loaded</text>
+<text x="476" y="306" font-size="14" fill="#8b949e">One engine per profile, weights from what's loaded</text>
 <rect x="476" y="62" width="130" height="42" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
 <text x="541.0" y="88.0" font-size="14" text-anchor="middle" fill="#e6edf3">Illustrious</text>
 <path d="M608 83 C651.0 83 651.0 166 694 166" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#h)"/>
@@ -45,7 +45,7 @@
 <path d="M608 259 C651.0 259 651.0 186 694 186" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#h)"/>
 <rect x="696" y="120" width="160" height="112" rx="8" fill="#1c2a0c" stroke="#76b900" stroke-width="1.5"/>
 <text x="776.0" y="181.0" font-size="14" text-anchor="middle" fill="#e6edf3"></text>
-<text x="776" y="168" font-size="16" font-weight="600" text-anchor="middle" fill="#e6edf3">SDXL engine</text>
+<text x="776" y="168" font-size="16" font-weight="600" text-anchor="middle" fill="#e6edf3">SDXL engines</text>
 <text x="776" y="196" font-size="12" text-anchor="middle" fill="#8b949e">no weights inside;</text>
-<text x="776" y="212" font-size="12" text-anchor="middle" fill="#8b949e">gets them at load</text>
+<text x="776" y="212" font-size="12" text-anchor="middle" fill="#8b949e">get them at load</text>
 </svg>
