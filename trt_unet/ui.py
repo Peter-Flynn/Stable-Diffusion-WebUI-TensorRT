@@ -18,12 +18,17 @@ NEW = "New profile"
 FIELD_LABELS = {"width": "Width", "height": "Height", "batch": "Batch size", "tokens": "Prompt tokens"}
 LEVEL_LABELS = {"min": "min", "opt": "optimal", "max": "max"}
 BUILDING = threading.Event()
+SETTLED = threading.Event()  # the engine mode was chosen (or engines were there) since the WebUI started
+MODE_LABELS = {store.PER_PROFILE: "Per-profile engines", store.MERGED: "Merged engine"}
+MERGED_VRAM, MERGED_RAM = 24, 64  # GB a merged engine needs
 HELP = """
 **Engines** are compiled for a UNet architecture, not a checkpoint: every checkpoint with that architecture (fine-tunes, merges, v-prediction ones) runs on the same engines with its own weights, LoRAs included. Engine files hold no weights.
 
-**Profiles** are the image sizes, batch sizes and prompt lengths the engines run, one engine each. TensorRT tunes each profile for its optimal values and accepts anything from min to max; narrower ranges build faster and can run a little faster. Only one engine is loaded at a time, taking about as much VRAM as the checkpoint's UNet. Each batch starts on the engine whose profile fits it best, and its later passes (e.g. Hires. fix) stay on that engine while it covers their sizes; a pass it doesn't cover loads the engine of a profile that does. Anything no profile covers, and ControlNet or other UNet patches, runs on PyTorch.
+**Profiles** are the image sizes, batch sizes and prompt lengths the engines run. TensorRT tunes each profile for its optimal values and accepts anything from min to max; narrower ranges build faster and can run a little faster. Anything no profile covers, and ControlNet or other UNet patches, runs on PyTorch.
 
-**Building** makes the engines match the profiles: it builds the profiles that have no engine yet, one at a time, and deletes the engines of profiles that are gone.
+**Per-profile engines** (the engine mode, above) are one engine per profile. Only one is loaded at a time, taking about as much VRAM as the checkpoint's UNet. Each batch starts on the engine whose profile fits it best, and its later passes (e.g. Hires. fix) stay on that engine while it covers their sizes; a pass it doesn't cover loads the engine of a profile that does. **A merged engine** holds every profile, so passes in any of their sizes run without loading another engine, but it takes every profile's share of TensorRT's memory at once.
+
+**Building** makes the engines match the profiles: per-profile, it builds the profiles that have no engine yet, one at a time, and deletes the engines of profiles that are gone; merged, it builds the engine again whenever the profiles change.
 
 **SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engine of the loaded checkpoint's architecture, `None` always uses PyTorch.
 """
@@ -36,6 +41,71 @@ def _span(values) -> str:
 
 def _n(count: int, word: str) -> str:
     return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def _machine():
+    """(total VRAM, total RAM) in bytes; either may be None."""
+    vram = ram = None
+    try:
+        import torch
+
+        vram = torch.cuda.get_device_properties(common.mm().get_torch_device()).total_memory
+    except Exception:
+        pass
+    try:
+        import psutil
+
+        ram = psutil.virtual_memory().total
+    except Exception:
+        pass
+    return vram, ram
+
+
+def _mode_help(selected: str) -> str:
+    vram, ram = _machine()
+    have = " and ".join(f"{common.gib(n)} of {what}" for n, what in ((vram, "VRAM"), (ram, "RAM")) if n)
+    short = [what for n, what, need in ((vram, "VRAM", MERGED_VRAM), (ram, "RAM", MERGED_RAM)) if n and n < need * 10**9]
+    machine = f"This machine has {have}" + (f", less {' and '.join(short)} than a merged engine needs." if short else ".") if have else ""
+    if short and selected == store.MERGED:
+        machine = f"**{machine}** Building or loading a merged engine is likely to run out of memory here."
+    return "\n\n".join(line for line in (
+        "**Per-profile engines**: an engine for each profile, built one at a time, and only the one a generation's sizes need is "
+        "loaded. They need about the VRAM and RAM of one profile. A pass in sizes the loaded engine doesn't cover loads the "
+        "engine of a profile that does, which takes a few seconds.",
+        f"**Merged engine**: one engine holding every profile of an architecture, so passes in any of their sizes run without "
+        f"loading another engine. It holds every profile's share of TensorRT's memory at once, and its build takes them all "
+        f"at once: **it needs at least {MERGED_VRAM} GB of VRAM and {MERGED_RAM} GB of RAM.**",
+        machine,
+        "The mode is for every engine, and can only change while there are none.",
+    ) if line)
+
+
+def _mode_of(label) -> str:
+    return next((m for m, text in MODE_LABELS.items() if text == label), store.PER_PROFILE)
+
+
+def _mode_outputs(selected=None):
+    """The engine mode panel, and whether the rest of the tab shows: when the WebUI starts with no engines,
+    the tab first asks for the mode; while there are engines, it can't change."""
+    have = bool(store.records())  # any architecture's, built for any GPU or TensorRT version
+    if have:
+        SETTLED.set()
+    mode = store.mode()
+    asking = not SETTLED.is_set()
+    shown = _mode_of(selected) if selected and not have else mode
+    if asking:
+        title = "### Choose an engine mode\nThere are no engines yet. Choose how they're built:"
+    elif have:
+        title = f"**Engine mode:** {MODE_LABELS[mode]} · to change it, delete every engine first (in the Engines panel)."
+    else:
+        title = f"**Engine mode:** {MODE_LABELS[mode]} · there are no engines, so it can still change."
+    return (
+        title,
+        gr.update(value=MODE_LABELS[shown], visible=not have, interactive=not BUILDING.is_set()),
+        gr.update(value=_mode_help(shown), visible=not have),
+        gr.update(visible=asking),
+        gr.update(visible=not asking),
+    )
 
 
 def _preset_values():
@@ -78,15 +148,20 @@ def _keys(draft) -> list:
     return [store.profile_key(Profile.from_dict(d)) for d in draft]
 
 
-def _plan(draft, records):
-    """(indexes of the draft's profiles that have no engine, how many engines no profile has)."""
-    built = {store.profile_key(r.profile) for r in records}
+def _plan(draft, records, mode):
+    """(indexes of the draft's profiles to build, how many engines building deletes): per-profile, the
+    profiles that have no engine; merged, all of them unless the merged engine holds just these."""
     keys = _keys(draft)
-    todo = [i for i, k in enumerate(keys) if k not in built and k not in keys[:i]]
-    return todo, len(built - set(keys))
+    wanted = store.wanted_keys([Profile.from_dict(d) for d in draft], mode) if draft else set()
+    built = {r.engine_key for r in records}
+    if mode == store.MERGED:
+        todo = list(range(len(draft))) if draft and not wanted <= built else []
+    else:
+        todo = [i for i, k in enumerate(keys) if k not in built and k not in keys[:i]]
+    return todo, sum(1 for r in records if r.engine_key not in wanted)
 
 
-def _status(sd_model, arch, records) -> str:
+def _status(sd_model, arch, records, asking=False) -> str:
     try:
         version = common.trt_version()
     except Exception as e:
@@ -105,12 +180,16 @@ def _status(sd_model, arch, records) -> str:
                 "so they can't load here.** Build them again; their profiles are below."
             )
         else:
-            lines.append("There are no engines for this architecture yet. The profiles below cover every common size: build them.")
+            lines.append(
+                "There are no engines for this architecture yet. "
+                + ("Choose the engine mode below, then build them." if asking else "The profiles below cover every common size: build them.")
+            )
         return "\n\n".join(lines)
-    lines.append(
-        f"**Engines:** {_n(len(records), 'profile')}, last built {max(r.meta['created'] for r in records)}; "
-        f"the one in use takes about {common.gib(records[0].weight_bytes)} of VRAM."
-    )
+    held, created = len(store.slots(records)), max(r.meta["created"] for r in records)
+    if records[0].merged:
+        lines.append(f"**Engine:** merged, {_n(held, 'profile')}, built {created}; it takes at least {common.gib(records[0].weight_bytes)} of VRAM.")
+    else:
+        lines.append(f"**Engines:** {_n(held, 'profile')}, last built {created}; the one in use takes about {common.gib(records[0].weight_bytes)} of VRAM.")
     setting = getattr(shared.opts, "sd_unet", "Automatic")
     if setting in ("Automatic", f"[TRT] {arch.label}"):
         lines.append(f"`SD Unet` is `{setting}`, so every {arch.name} checkpoint runs on them.")
@@ -119,17 +198,22 @@ def _status(sd_model, arch, records) -> str:
     return "\n\n".join(lines)
 
 
-def _draft_view(draft: list, records) -> str:
+def _draft_view(draft: list, records, mode) -> str:
     if not draft:
         return "*No profiles. Add at least one to build an engine.*"
-    built = {store.profile_key(r.profile) for r in records}
+    todo, extra = _plan(draft, records, mode)
     rows = ["| # | Width | Height | Batch size | Prompt tokens | Engine |", "|:-:|:-:|:-:|:-:|:-:|:-:|"]
-    for i, (d, key) in enumerate(zip(draft, _keys(draft))):
+    for i, d in enumerate(draft):
         p = Profile.from_dict(d)
-        rows.append(f"| {i + 1} | {_span(p.width)} | {_span(p.height)} | {_span(p.batch)} | {_span(p.tokens)} | {'built' if key in built else '**to build**'} |")
+        rows.append(f"| {i + 1} | {_span(p.width)} | {_span(p.height)} | {_span(p.batch)} | {_span(p.tokens)} | {'**to build**' if i in todo else 'built'} |")
     rows.append("\n*Ranges show min-max (optimal).*")
-    _, extra = _plan(draft, records)
-    if extra:
+    if mode == store.MERGED:
+        rows.append("*One merged engine holds every profile: changing them builds it again.*")
+        if extra and todo:
+            rows.append("**Building replaces the merged engine built for other profiles.**")
+        elif extra:
+            rows.append(f"**Building deletes the {_n(extra, 'engine')} these profiles don't use.**")
+    elif extra:
         rows.append(f"**Building also deletes the {_n(extra, 'engine')} of profiles no longer listed.**")
     return "\n".join(rows)
 
@@ -146,12 +230,16 @@ def _index(choice):
 
 def _draft_outputs(draft, records, select=None):
     """Profile table, profile selector and build button for a draft."""
+    mode = store.mode()
     choices = [NEW] + [_label(i, d) for i, d in enumerate(draft)]
     selected = _label(select, draft[select]) if select is not None and select < len(draft) else NEW
-    todo, extra = _plan(draft, records)
-    build_label = f"Build {_n(len(todo), 'engine')}" if todo else "Update engines" if extra else "Engines up to date"
+    todo, extra = _plan(draft, records, mode)
+    if todo:
+        build_label = "Build the merged engine" if mode == store.MERGED else f"Build {_n(len(todo), 'engine')}"
+    else:
+        build_label = "Update engines" if extra else "Engines up to date"
     return (
-        _draft_view(draft, records),
+        _draft_view(draft, records, mode),
         gr.update(choices=choices, value=selected),
         gr.update(value=build_label, interactive=bool(draft) and bool(todo or extra) and not BUILDING.is_set()),
     )
@@ -174,23 +262,26 @@ def _engines_view(arch) -> str:
         r = group[0]
         name = f"**{r.arch.label}** · current" if r.loadable and arch is not None and r.arch.id == arch.id else r.arch.label
         built = f"{r.meta['gpu_name']}, TensorRT {r.meta['trt']}" + ("" if r.loadable else " · **can't load here**")
-        rows.append(f"| {name} | {len(group)} | {common.gib(r.weight_bytes)} | {built} |")
+        held = f"{len(store.slots(group))}" + (" (merged)" if any(e.merged for e in group) else "")
+        rows.append(f"| {name} | {held} | {common.gib(r.weight_bytes)} | {built} |")
     return "\n".join(rows)
 
 
-def refresh(draft=None, draft_arch=None):
-    """Everything on the tab, for the loaded checkpoint. Profiles being edited stay unless the architecture changed."""
+def refresh(draft=None, draft_arch=None, selected=None):
+    """Everything on the tab, for the loaded checkpoint. Profiles being edited stay unless the architecture
+    changed; `selected` is the engine mode picked but not chosen yet."""
     sd_model, _, arch, records = _current()
     form = [gr.update()] * (len(FIELDS) * 3)
     if arch is not None and (draft is None or draft_arch != arch.id):
         source = records or _stale(arch)
-        draft = [p.to_dict() for p in ([r.profile for r in source] if source else default_profiles(arch.adm_channels))]
+        draft = [p.to_dict() for p in (store.profiles_of(source) if source else default_profiles(arch.adm_channels))]
         form = [v for f in FIELDS for v in getattr(default_profiles(arch.adm_channels)[0], f)]
     elif arch is None:
         draft = []
     engines = list(_groups())
+    mode_outputs = _mode_outputs(selected)
     return (
-        _status(sd_model, arch, records),
+        _status(sd_model, arch, records, asking=not SETTLED.is_set()),
         arch.id if arch else None,
         draft,
         *_draft_outputs(draft, records),
@@ -200,7 +291,32 @@ def refresh(draft=None, draft_arch=None):
         gr.update(choices=engines, value=None, visible=bool(engines)),
         gr.update(visible=bool(engines)),
         gr.update(visible=BUILDING.is_set()),
+        *mode_outputs,
     )
+
+
+def choose_mode(label, draft, draft_arch):
+    """The first-start prompt's answer."""
+    try:
+        store.set_mode(_mode_of(label))
+        SETTLED.set()
+    except Exception as e:  # engines appeared meanwhile: they decide
+        common.log(f"Could not set the engine mode: {e}")
+    return refresh(draft, draft_arch)
+
+
+def change_mode(label, draft, draft_arch):
+    """The mode picked in the panel: saved right away once the first-start prompt is answered (only while
+    there are no engines; the panel hides otherwise), kept as a pick until then. Not during a build: its
+    engines will decide the mode."""
+    if not SETTLED.is_set():
+        return refresh(draft, draft_arch, selected=label)
+    if _mode_of(label) != store.mode() and not BUILDING.is_set():
+        try:
+            store.set_mode(_mode_of(label))
+        except Exception as e:
+            common.log(f"Could not change the engine mode: {e}")
+    return refresh(draft, draft_arch)
 
 
 def _refresh_unet_list():
@@ -275,19 +391,28 @@ def remove_profile(draft, choice):
     return (draft, *_draft_outputs(draft, _current()[3]), "")
 
 
-def _outcome(arch, todo: int, deleted: int, result) -> str:
-    built = len(result["records"])
+def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
+    built, merged = len(result["records"]), mode == store.MERGED
     if result["ok"]:
-        message = f"### Engines up to date\nBuilt {_n(built, 'engine')}" + (f", deleted {_n(deleted, 'engine')} of profiles no longer listed" if deleted else "")
-        message += f". Every {arch.name} checkpoint runs on them with `SD Unet` set to `Automatic`."
+        if merged:
+            message = "### Engine up to date\n" + (f"Built the merged engine, {_n(todo, 'profile')}" if built else "The merged engine holds these profiles")
+            message += (f", and deleted {_n(deleted, 'engine')} it replaces" if deleted else "") + f". Every {arch.name} checkpoint runs on it with `SD Unet` set to `Automatic`."
+        else:
+            message = f"### Engines up to date\nBuilt {_n(built, 'engine')}" + (f", deleted {_n(deleted, 'engine')} of profiles no longer listed" if deleted else "")
+            message += f". Every {arch.name} checkpoint runs on them with `SD Unet` set to `Automatic`."
         if any(r.meta.get("stripped") is False for r in result["records"]):
             message += " (TensorRT couldn't leave the weights out of some of them, so their files are as large as the UNet.)"
     else:
-        done = f"{_n(built, 'engine')} of {todo} built; the other engines are unchanged."
+        done = "The engines are unchanged." if merged else f"{_n(built, 'engine')} of {todo} built; the other engines are unchanged."
         if result.get("error") == "cancelled":
             message = f"### Build cancelled\n{done}"
         else:
             message = f"### The build failed\n`{result.get('error')}`\n\nThe console has the details. {done}"
+            if merged and "memory" in str(result.get("error")).lower():
+                message += (
+                    f" A merged engine's build needs at least {MERGED_RAM} GB of RAM; per-profile engines build one profile at a "
+                    "time (to switch, delete every engine)."
+                )
     if result.get("memory_warnings"):
         message += (
             f"\n\nTensorRT skipped {result['memory_warnings']} kernels that need more VRAM than is free at a profile's largest sizes, "
@@ -313,15 +438,16 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
             elif not draft:
                 raise RuntimeError("Add at least one profile.")
             else:
+                mode = store.mode()
                 profile_list = [Profile.from_dict(d) for d in draft]
-                todo, _ = _plan(draft, records)
+                todo, _ = _plan(draft, records, mode)
                 _refresh_unet_list()
                 result = {"ok": True, "records": []}
                 if todo:
-                    result = export.build(arch, patcher, [(i, profile_list[i]) for i in todo], int(optimization_level), lambda f, t: progress(f, desc=t))
-                deleted = store.keep_only(arch.id, profile_list) if result["ok"] else 0
+                    result = export.build(arch, patcher, [(i, profile_list[i]) for i in todo], int(optimization_level), lambda f, t: progress(f, desc=t), mode)
+                deleted = store.keep_only(arch.id, profile_list, mode) if result["ok"] else 0
                 _refresh_unet_list()
-                message = _outcome(arch, len(todo), deleted, result)
+                message = _outcome(arch, len(todo), deleted, result, mode)
     except Exception as e:
         traceback.print_exc()
         message = f"### The build failed\n`{e}`"
@@ -331,7 +457,7 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
 
 
 def _build_started():
-    return gr.update(interactive=False), gr.update(visible=True), ""
+    return gr.update(interactive=False), gr.update(visible=True), "", gr.update(interactive=False)  # the mode too, until its engines exist
 
 
 def cancel_build():
@@ -387,7 +513,12 @@ def on_ui_tabs():
             status = gr.Markdown(elem_id="trt_status")
             refresh_button = ToolButton(value=refresh_symbol, elem_id="trt_refresh")
         draft, draft_arch = gr.State([]), gr.State(None)
-        with gr.Row(equal_height=False):
+        with gr.Column(variant="panel", elem_id="trt_mode"):
+            mode_title = gr.Markdown(elem_id="trt_mode_title")
+            mode_radio = gr.Radio(list(MODE_LABELS.values()), value=MODE_LABELS[store.PER_PROFILE], show_label=False, elem_id="trt_mode_radio")
+            mode_help = gr.Markdown(elem_id="trt_mode_help")
+            mode_confirm = gr.Button("Start with this mode", variant="primary", visible=False, elem_id="trt_mode_confirm")
+        with gr.Row(equal_height=False) as main:
             with gr.Column(scale=3, variant="panel"):
                 gr.Markdown("### Profiles")
                 table = gr.Markdown(elem_id="trt_profiles")
@@ -427,7 +558,8 @@ def on_ui_tabs():
         # SD Unet's dropdown shows the engines (and the setting) of when the page loaded: update it.
         refresh_sd_unet = {JS: "() => { gradioApp().getElementById('trt_sd_unet_sync')?.click(); }"}
         draft_outputs = [draft, table, selector, build_button]
-        outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, cancel_button]
+        mode_outputs = [mode_title, mode_radio, mode_help, mode_confirm, main]
+        outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, cancel_button, *mode_outputs]
         # In the browser; the preset menu empties again so the same preset can be picked twice.
         preset.change(
             None, [preset], [*numbers, preset],
@@ -436,12 +568,14 @@ def on_ui_tabs():
         quiet = {"show_progress": "hidden"}  # quick updates: no progress overlay on every component they touch
         refresh_button.click(refresh, [draft, draft_arch], outputs, **quiet)  # also clicked when the tab opens (javascript/tensorrt.js)
         tab.load(refresh, None, outputs, **quiet)
+        mode_confirm.click(choose_mode, [mode_radio, draft, draft_arch], outputs, **quiet)
+        mode_radio.change(change_mode, [mode_radio, draft, draft_arch], outputs, **quiet)
         selector.change(select_profile, [draft, selector], [*numbers, save_button, remove_button], **quiet)
         add_button.click(add_profile, [draft, *numbers], [*draft_outputs, note], **quiet)
         save_button.click(save_profile, [draft, selector, *numbers], [*draft_outputs, note], **quiet)
         remove_button.click(remove_profile, [draft, selector], [*draft_outputs, note], **quiet)
         # The build's progress shows once, in its result.
-        build_button.click(_build_started, None, [build_button, cancel_button, result], queue=False, **quiet).then(
+        build_button.click(_build_started, None, [build_button, cancel_button, result, mode_radio], queue=False, **quiet).then(
             build, [draft, draft_arch, level], [result, draft]
         ).then(refresh, [draft, draft_arch], outputs, **quiet).then(None, None, None, **refresh_sd_unet)
         cancel_button.click(cancel_build, None, None, queue=False)

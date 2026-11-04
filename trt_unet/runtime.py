@@ -1,7 +1,7 @@
 """Running reForge's UNet on a TensorRT engine.
 
-An architecture has an engine per profile, and a sampling pass loads the one for its sizes; only one is in
-VRAM at a time. Each is a model of reForge's own model manager, so the manager makes room for it, unloads it
+An architecture has an engine per profile, or one merged engine holding them all (store.py), and a sampling
+pass loads the one for its sizes; only one is in VRAM at a time. Each is a model of reForge's own model manager, so the manager makes room for it, unloads it
 when another model needs the VRAM and loads it back for sampling, like any other model. While a sampling
 pass runs on an engine, the PyTorch UNet stays in RAM (its patches still apply, it just isn't loaded)."""
 
@@ -103,7 +103,7 @@ class TrtModel:
         used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
         self.measured = max(self.measured, used)
         log(
-            f"Loaded the {self.record.arch.label} engine for profile {self.record.index + 1} ({common.gib(self.model_size())}) in {time.time() - start:.1f}s: "
+            f"Loaded the {self.record.arch.label} {self.record.label} ({common.gib(self.model_size())}) in {time.time() - start:.1f}s: "
             f"plan {plan_seconds:.1f}s, " + (_refit_times(refit) if refit else "no weights to refit")
         )
         return self.model_size()
@@ -309,18 +309,20 @@ def _load_torch_unet(patcher, shape):
 
 
 class Pass:
-    """One sampling pass on an architecture's engines: each UNet call runs on the engine of the profile
-    that fits it best, loaded (in place of another) when it isn't. On anything no engine can run, the rest
-    of the pass falls back to PyTorch, with the UNet loaded the way reForge would have."""
+    """One sampling pass on an architecture's engines: each UNet call runs in the profile that fits it best,
+    on the engine holding it, loaded (in place of another) when it isn't. A merged engine holds every
+    profile, so it only ever changes profiles. On anything no engine can run, the rest of the pass falls
+    back to PyTorch, with the UNet loaded the way reForge would have."""
 
     def __init__(self, records: list, patcher, x):
         self.records, self.patcher = records, patcher
+        self.slots = store.slots(records)  # (record, optimization profile in it), in the profiles' order
         self.model = None
         self.weights = EffectiveWeights(patcher)
         self.module = patcher.model.diffusion_model
         arch = records[0].arch
         self.arch_id = arch.id
-        self.shapes, self.takes_y = [r.shapes for r in records], bool(arch.adm_channels)
+        self.shapes, self.takes_y = [r.profile_shapes[j] for r, j in self.slots], bool(arch.adm_channels)
         self.channels, self.context_dim = arch.in_channels, arch.context_dim
         self.shape = (x.shape[0] * 2, *x.shape[1:])
         self.fallback = None
@@ -348,11 +350,12 @@ class Pass:
         model.sync()
         return model
 
-    def preferred(self):
-        """The index of the engine this batch's earlier passes ran on, which this pass stays on while it
-        fits, even if another profile suits the sizes better: loading another means refitting every weight."""
+    def preferred(self) -> set:
+        """The profiles of the engine this batch's earlier passes ran on, which this pass stays on while it
+        fits, even if another engine's profile suits the sizes better: loading another means refitting
+        every weight. A merged engine holds them all, so it changes to whichever fits best."""
         key = _last_used.get(self.arch_id)
-        return next((i for i, r in enumerate(self.records) if r.key == key), None)
+        return {i for i, (r, _) in enumerate(self.slots) if r.key == key}
 
     def _hold(self, keep):
         if self._keep is not None:
@@ -409,7 +412,7 @@ class Pass:
                 "(reForge pads the prompt and negative prompt to a common length)"
             )
         index, padded, repeats = choice
-        record = self.records[index]
+        record, profile = self.slots[index]
         timesteps = timesteps.reshape(-1)
         feed = {
             "sample": x,
@@ -428,16 +431,16 @@ class Pass:
             except Exception as e:
                 if not isinstance(e, RuntimeError):
                     traceback.print_exc()
-                self.fall_back(f"Could not load the engine for profile {record.index + 1} ({e})")
+                self.fall_back(f"Could not load the {record.label} ({e})")
         stream = torch.cuda.current_stream().cuda_stream
         try:
-            out = self._infer(feed, 0, stream)
+            out = self._infer(feed, profile, stream)
         except torch.cuda.OutOfMemoryError:
             self.model.engine.release_activations()
             common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
             common.mm().soft_empty_cache(force=True)
             try:
-                out = self._infer(feed, 0, stream)
+                out = self._infer(feed, profile, stream)
             except torch.cuda.OutOfMemoryError:
                 self.fall_back("Out of VRAM running the engine")
         if not self.checked:
@@ -446,9 +449,9 @@ class Pass:
                 self.fall_back("The engine produced NaN/Inf values")
         return out[:b].to(x.dtype)
 
-    def _infer(self, feed, index, stream):
+    def _infer(self, feed, profile, stream):
         try:
-            return self.model.engine.infer(feed, index, stream)["latent"]
+            return self.model.engine.infer(feed, profile, stream)["latent"]
         except torch.cuda.OutOfMemoryError:
             raise
         except Exception as e:
@@ -472,7 +475,7 @@ def _engine_records(patcher, x):
         return None
     records = store.engines(arch.id)
     b, _, h, w = x.shape
-    if not profiles.covers_size([r.shapes for r in records], h, w, b):
+    if not profiles.covers_size([s for r in records for s in r.profile_shapes], h, w, b):
         notify(f"No profile of the {arch.label} engines covers {w * 8}x{h * 8} at batch size {b}; using PyTorch for this pass. Add one in the TensorRT tab.")
         return None
     return records
@@ -497,7 +500,7 @@ def _begin(records, patcher, x, prepare):
             prefer = p.preferred()
             choice = profiles.select(p.shapes, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK, prefer) or profiles.select(p.shapes, b, h, w, profiles.CONTEXT_PER_CHUNK, prefer)
             index = choice[0] if choice else next(i for i, s in enumerate(p.shapes) if profiles.covers_size([s], h, w, b))
-            model = p.use(records[index])
+            model = p.use(p.slots[index][0])
             _make_room_for_activations(model, patcher, x)
         except Exception as e:
             if not isinstance(e, RuntimeError):
@@ -521,12 +524,13 @@ def _make_room_for_activations(model: TrtModel, patcher, x):
 
 def _activation_estimate(model: TrtModel, x) -> int:
     b, c, h, w = x.shape
-    s = model.record.shapes
-    # cond and uncond batched, or one at a time if the profile can't batch them (e.g. at its largest batch)
-    choice = profiles.select([s], 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select([s], b, h, w, profiles.CONTEXT_PER_CHUNK)
+    held = model.record.profile_shapes
+    # cond and uncond batched, or one at a time if no profile can batch them (e.g. at its largest batch)
+    choice = profiles.select(held, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select(held, b, h, w, profiles.CONTEXT_PER_CHUNK)
     if choice is None:
         return 0
-    _, padded, _ = choice
+    profile, padded, _ = choice
+    s = held[profile]
     shapes = {
         "sample": (padded, c, h, w),
         "timesteps": (padded,),
@@ -534,7 +538,7 @@ def _activation_estimate(model: TrtModel, x) -> int:
     }
     if "y" in s:
         shapes["y"] = (padded, s["y"][0][1])
-    return model.engine.estimate_activation_bytes(0, shapes, torch.cuda.current_stream().cuda_stream)
+    return model.engine.estimate_activation_bytes(profile, shapes, torch.cuda.current_stream().cuda_stream)
 
 
 def _wrap_forward(original):

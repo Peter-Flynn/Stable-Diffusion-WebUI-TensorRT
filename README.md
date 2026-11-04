@@ -16,7 +16,7 @@ TensorRT, fine-tunes like Pony, Illustrious and NoobAI included, on an RTX 2080 
 |                | NVIDIA's extension                     | This fork                                             |
 | -------------- | -------------------------------------- | ----------------------------------------------------- |
 | WebUI          | Automatic1111                          | reForge                                               |
-| Engines        | One per checkpoint, GBs each           | One per profile of an architecture, no weights inside |
+| Engines        | One per checkpoint, GBs each           | One per profile of an architecture (or one for all of them), no weights inside |
 | New checkpoint | Build a new engine                     | Nothing to do                                         |
 | LoRAs          | Convert each one first                 | Work as usual                                         |
 | Hires. fix     | Build an engine that covers both sizes | Covered by the default profiles                       |
@@ -28,10 +28,15 @@ PyTorch instead, with a notice.
 
 1. Install from **Extensions → Install from URL** with this repo's URL. TensorRT 11 or later is installed on the
    next launch (set `TRT_EXTENSION_SKIP_INSTALL=1` to skip that).
-2. Load a checkpoint, open the **TensorRT** tab and click **Build engines**: one engine per profile, built one at a
-   time. The first build takes a few minutes.
+2. Load a checkpoint and open the **TensorRT** tab. The first time, it asks for the engine mode (below). Click
+   **Build engines**; the first build takes a few minutes.
 3. Generate. Every checkpoint with the same architecture now uses the engines. One is loaded at a time: each
    batch runs on the one that fits it best, and its Hires. fix stays on it if it covers the larger size.
+
+**Engine modes.** *Per-profile engines*, the default, are an engine per profile, built one at a time; only the one
+a generation's sizes need is loaded. A *merged engine* holds every profile of an architecture, so no pass ever
+loads another engine, but it takes every profile's share of TensorRT's memory at once, and its build takes them all
+at once: it needs at least 24 GB of VRAM and 64 GB of RAM. The mode can only change while there are no engines.
 
 The engines are used while **SD Unet** (in Settings → Stable Diffusion) is on `Automatic`, the default. Set it to
 `None` to use PyTorch.
