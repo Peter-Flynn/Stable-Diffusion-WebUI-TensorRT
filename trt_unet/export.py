@@ -7,7 +7,9 @@ import inspect
 import json
 import math
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -19,11 +21,12 @@ import torch.nn.functional as F
 
 from . import common, store
 from .arch import Arch, unet_config
-from .common import log
+from .common import gib, log
 
 INPUTS = ("sample", "timesteps", "encoder_hidden_states", "y")
 PLACEHOLDER_STRIDE = 256  # bytes between the placeholder weights' starts
 CANCEL = threading.Event()
+MEMORY_RESERVE = 2 * 2**30  # a build stops when less RAM and swap than this (or 5% of the RAM, if more) is free
 DYNAMIC_AXES = {
     "sample": {0: "batch", 2: "height", 3: "width"},
     "timesteps": {0: "batch"},
@@ -173,8 +176,16 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
 
 
 def _builder_env() -> dict:
-    """Unbuffered UTF-8 output, and the WebUI's GPU as the only visible device."""
+    """Unbuffered UTF-8 output, the WebUI's GPU as the only visible device, and the system's memory allocator:
+    the tcmalloc webui.sh preloads is slow to give memory the build frees back to the system."""
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+    preload = [p for p in re.split(r"[\s:]+", env.get("LD_PRELOAD", "")) if p]
+    if any("tcmalloc" in os.path.basename(p) for p in preload):
+        preload = [p for p in preload if "tcmalloc" not in os.path.basename(p)]
+        if preload:
+            env["LD_PRELOAD"] = ":".join(preload)
+        else:
+            del env["LD_PRELOAD"]
     try:
         index = common.mm().get_torch_device().index
         index = torch.cuda.current_device() if index is None else index
@@ -188,22 +199,74 @@ def _builder_env() -> dict:
     return env
 
 
+def _memory_short():
+    """Why the build has to stop, if the system is about to run out of memory, else None."""
+    try:
+        import psutil
+
+        ram, swap = psutil.virtual_memory(), psutil.swap_memory()
+    except Exception:
+        return None
+    free = ram.available + swap.free
+    if free >= max(MEMORY_RESERVE, ram.total // 20):
+        return None
+    return f"Stopped before the system ran out of memory ({gib(free)} of RAM and swap left). Build fewer or narrower profiles, or close other programs."
+
+
+def _exited(proc, block=False) -> bool:
+    """Whether the builder has exited. On POSIX it isn't reaped: until it is, no other process can get its ID,
+    which is also its process group's, so the group can still be killed."""
+    if os.name == "nt":
+        return (proc.wait() if block else proc.poll()) is not None
+    try:
+        return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG)) is not None
+    except ChildProcessError:  # reaped already
+        return True
+
+
+def _kill_tree(proc):
+    """The builder and whatever it started."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with contextlib.suppress(OSError):
+            proc.kill()
+    else:
+        with contextlib.suppress(OSError):  # nothing left
+            os.killpg(proc.pid, signal.SIGKILL)
+
+
 def run_builder(job_path: str, progress=None) -> dict:
+    """Runs builder.py on the job, as the leader of a process group of its own (on POSIX). When the builder
+    exits, is cancelled, or the system is about to run out of memory, everything in the group is killed."""
     from . import builder
 
     proc = subprocess.Popen(
         [sys.executable, "-u", os.path.abspath(builder.__file__), job_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=_builder_env(), text=True, encoding="utf-8", errors="replace", bufsize=1,
+        start_new_session=os.name != "nt",
     )
-    result = {}
+    result, state, lock = {}, {}, threading.Lock()
 
-    def cancel_watch():
-        while proc.poll() is None:
+    def stop(reason=None):
+        with lock:
+            if "code" not in state:  # not reaped yet
+                if reason:
+                    state.setdefault("reason", reason)
+                _kill_tree(proc)
+
+    def watch():
+        while "code" not in state:
             if CANCEL.wait(0.5):
-                proc.kill()
-                return
+                return stop("cancelled")
+            if _exited(proc):
+                return stop()  # anything it left running
+            short = _memory_short()
+            if short:
+                log(short)
+                return stop(short)
 
-    threading.Thread(target=cancel_watch, daemon=True).start()
+    threading.Thread(target=watch, daemon=True).start()
+    ended = False
     try:
         for line in proc.stdout:
             if line.startswith(builder.PROGRESS):
@@ -217,16 +280,22 @@ def run_builder(job_path: str, progress=None) -> dict:
             else:
                 sys.stdout.write(line)
                 sys.stdout.flush()
-        code = proc.wait()
+        ended = True
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
+        if not ended:
+            stop()
+        _exited(proc, block=True)
+        with lock:
+            _kill_tree(proc)
+            state["code"] = proc.wait()
         for stream in (proc.stdin, proc.stdout):
             with contextlib.suppress(Exception):
                 stream.close()
-    if CANCEL.is_set():
+    code, reason = state["code"], state.get("reason")
+    if CANCEL.is_set() or reason == "cancelled":
         result = {"ok": False, "error": "cancelled"}
+    elif reason:
+        result = {"ok": False, "error": reason}
     elif not result:
         result = {"ok": False, "error": f"the builder exited unexpectedly (code {code})"}
     result["ok"] = bool(result.get("ok")) and code == 0

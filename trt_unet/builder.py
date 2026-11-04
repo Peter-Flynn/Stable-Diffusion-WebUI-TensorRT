@@ -1,8 +1,10 @@
 """Builds a weightless engine, in a process of its own so all the VRAM the builder holds goes back to the
 driver when it ends. Run by export.py; reports progress and its result on stdout. Doesn't import torch."""
 
+import contextlib
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -187,7 +189,8 @@ def build(job, logger, progress, strip=True):
 
 
 def _exit_with_parent():
-    """The parent holds our stdin open: EOF means it's gone, and nobody would use the engine."""
+    """The parent holds our stdin open: EOF means it's gone, and nobody would use the engine. Anything this
+    process started goes too, if it leads its process group (export.py starts it that way on POSIX)."""
 
     def watch():
         try:
@@ -195,6 +198,9 @@ def _exit_with_parent():
                 pass
         except Exception:
             pass
+        if os.name != "nt" and os.getpgid(0) == os.getpid():
+            with contextlib.suppress(OSError):
+                os.killpg(0, signal.SIGKILL)
         os._exit(3)
 
     threading.Thread(target=watch, daemon=True).start()
