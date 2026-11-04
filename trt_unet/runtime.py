@@ -140,7 +140,8 @@ class TrtModel:
 
 def _refit_times(refit: dict) -> str:
     patched = f", {refit['patched']} with LoRAs" if refit["patched"] else ""
-    return f"{refit['count']} weights {refit['weights']:.1f}s{patched}, TensorRT refit {refit['tensorrt']:.1f}s"
+    staged = f" ({common.gib(refit['staged'])} of the weights from VRAM)" if refit.get("staged") else ""
+    return f"{refit['count']} weights {refit['weights']:.1f}s{patched}, TensorRT refit {refit['tensorrt']:.1f}s{staged}"
 
 
 def _loaded_entries(*models):

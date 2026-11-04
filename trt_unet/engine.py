@@ -11,11 +11,15 @@ import torch
 
 from .common import gib, log
 
-# Refitting prepares the weights for the GPU on the CPU, by default on one thread. Weights come straight
-# from PyTorch's FP16 tensors, and the engine's first output is checked for NaN/Inf, so TensorRT's own
-# pass over every weight is skipped.
+# Refitting prepares weights given in RAM for the GPU on the CPU, by default on one thread. Weights come
+# straight from PyTorch's FP16 tensors, and the engine's first output is checked for NaN/Inf, so
+# TensorRT's own pass over every weight is skipped.
 REFITTER_SETTINGS = {"max_threads": os.cpu_count() or 1, "weights_validation": False}
 _unsettable = set()
+# Weights given in VRAM are prepared on the GPU instead, so a refit copies as many there as fit, leaving
+# this much free for TensorRT's own refit memory. A stripped engine's first refit needs every weight at
+# once, so it can't go in parts; the weights that don't fit go from RAM.
+STAGING_RESERVE = 2**30
 
 
 _DTYPES = {
@@ -33,6 +37,19 @@ def torch_dtype(dtype):
     if dtype not in _DTYPES:
         raise TypeError(f"Unsupported TensorRT dtype {dtype}")
     return _DTYPES[dtype]
+
+
+def staging_budget() -> int:
+    """Bytes of weights a refit can copy to VRAM: what's free (PyTorch's unused cache included) but the reserve."""
+    try:
+        free = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    except Exception:
+        return 0
+    return max(0, free - STAGING_RESERVE)
+
+
+class _StagedRefitFailed(RuntimeError):
+    pass
 
 
 class Logger(trt.ILogger):
@@ -155,8 +172,19 @@ class Engine:
         self._reset_context_state()
 
     def refit(self, names, tensor_for) -> dict:
-        """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name)`. Returns the
-        seconds spent getting the weights ("weights") and in TensorRT ("tensorrt")."""
+        """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name, device)`, from
+        VRAM while there's room (see STAGING_RESERVE). Returns the seconds spent getting the weights
+        ("weights") and in TensorRT ("tensorrt"), and the bytes of them given in VRAM ("staged")."""
+        try:
+            return self._refit(names, tensor_for, staging_budget())
+        except _StagedRefitFailed as e:
+            failure = str(e)
+        # Out of the except block, so its traceback no longer holds the failed refit's copies in VRAM
+        log(f"{failure}; refitting from RAM instead.")
+        torch.cuda.empty_cache()
+        return self._refit(names, tensor_for, 0)
+
+    def _refit(self, names, tensor_for, budget: int) -> dict:
         refitter = trt.Refitter(self.engine, LOGGER)
         for setting, value in REFITTER_SETTINGS.items():
             try:
@@ -165,12 +193,26 @@ class Engine:
                 if setting not in _unsettable:
                     _unsettable.add(setting)
                     log(f"Could not set the refitter's {setting}: {e}")
-        keep, seconds = [], {"weights": 0.0, "tensorrt": 0.0}
+        keep, seconds = [], {"weights": 0.0, "tensorrt": 0.0, "staged": 0}
+
+        def get(name, proto):
+            nonlocal budget
+            dtype = torch_dtype(proto.dtype)
+            nbytes = proto.size * dtype.itemsize
+            if 0 < nbytes <= budget:
+                try:
+                    t = tensor_for(name, DEVICE).to(dtype=dtype).contiguous()
+                    budget -= nbytes
+                    seconds["staged"] += nbytes
+                    return t
+                except torch.cuda.OutOfMemoryError:
+                    budget = 0  # the rest from RAM
+            return tensor_for(name, "cpu").to(dtype=dtype).contiguous()
 
         def put(name):
             start = time.perf_counter()
             proto = refitter.get_weights_prototype(name)
-            t = tensor_for(name).to(dtype=torch_dtype(proto.dtype)).contiguous()
+            t = get(name, proto)
             if t.numel() != proto.size:
                 raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
             keep.append(t)
@@ -182,18 +224,35 @@ class Engine:
             seconds["tensorrt"] += time.perf_counter() - given
 
         LOGGER.clear()
-        for name in names:
-            put(name)
-        for name in refitter.get_missing_weights():
-            put(name)
-        start = time.perf_counter()
         try:
-            ok = refitter.refit_cuda_engine()
+            for name in names:
+                put(name)
+            for name in refitter.get_missing_weights():
+                put(name)
+            start = time.perf_counter()
+            if seconds["staged"]:
+                torch.cuda.current_stream().synchronize()  # the copies to VRAM are done before TensorRT reads them
+                seconds["weights"] += time.perf_counter() - start
+                start = time.perf_counter()
+            try:
+                ok = refitter.refit_cuda_engine()
+            finally:
+                refitter.release_refit_resources()  # else the refit's scratch memory stays allocated as long as the engine
+            seconds["tensorrt"] += time.perf_counter() - start
+        except torch.cuda.OutOfMemoryError:
+            # e.g. a LoRA weight computed on the GPU with the copies already there: try again with none
+            if not seconds["staged"]:
+                raise
+            raise _StagedRefitFailed("Ran out of VRAM refitting from it") from None
         finally:
-            refitter.release_refit_resources()  # else the refit's scratch memory stays allocated as long as the engine
-        seconds["tensorrt"] += time.perf_counter() - start
+            keep.clear()  # an error's traceback keeps this frame, and would keep the weights (GBs, maybe in VRAM)
         if not ok:
-            raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
+            said = f": {LOGGER.errors[-1]}" if LOGGER.errors else ""
+            if seconds["staged"]:
+                raise _StagedRefitFailed(f"Refitting the engine from VRAM failed{said}")
+            raise RuntimeError(f"Refitting the engine failed{said}")
+        if seconds["staged"]:
+            torch.cuda.empty_cache()  # the copies' VRAM back to the driver, for TensorRT and the other models
         return seconds
 
     def _set_shapes(self, profile: int, shapes: dict, stream: int):

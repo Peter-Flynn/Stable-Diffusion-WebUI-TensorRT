@@ -86,14 +86,14 @@ class EffectiveWeights:
         patches = self.patches.get(PREFIX + name)
         return self.base_version, _identity(patches) if patches else None
 
-    def tensor(self, name: str) -> torch.Tensor:
-        """The weight PyTorch runs with: as stored, or, if it's converted or patched, computed in FP32 on
-        the GPU (converted, then patched, like reForge does) and kept in FP16."""
+    def tensor(self, name: str, device="cpu") -> torch.Tensor:
+        """The weight PyTorch runs with, on `device`: as stored, or, if it's converted or patched, computed
+        in FP32 on the GPU (converted, then patched, like reForge does) and kept in FP16."""
         base = self.base(name)
         patches = self.patches.get(PREFIX + name)
         convert = self.converters.get(name)
         if not patches and convert is None:
-            return base
+            return base.to(device)
         weight = base.to(common.mm().get_torch_device(), torch.float32, copy=True)
         if convert is not None:
             weight = convert(weight, inplace=True)
@@ -103,4 +103,4 @@ class EffectiveWeights:
             except ImportError:
                 calculate = self.patcher.calculate_weight
             weight = calculate(patches, weight, PREFIX + name)
-        return weight.to(torch.float16).cpu()  # in RAM until the refit: patched SDXL weights add up to GBs
+        return weight.to(torch.float16).to(device)
