@@ -1,9 +1,10 @@
 """Running reForge's UNet on a TensorRT engine.
 
 An architecture has an engine per profile, or one merged engine holding them all (store.py), and a sampling
-pass loads the one for its sizes; only one is in VRAM at a time. Each is a model of reForge's own model manager, so the manager makes room for it, unloads it
-when another model needs the VRAM and loads it back for sampling, like any other model. While a sampling
-pass runs on an engine, the PyTorch UNet stays in RAM (its patches still apply, it just isn't loaded)."""
+pass loads the one for its sizes; only one is in VRAM at a time. Each is a model of reForge's own model
+manager, so the manager makes room for it, unloads it when another model needs the VRAM and loads it back
+for sampling, like any other model. While a sampling pass runs on an engine, the PyTorch UNet stays in RAM
+(its patches still apply, it just isn't loaded)."""
 
 import contextlib
 import math
@@ -45,6 +46,7 @@ class TrtModel:
     def __init__(self, record: store.Record):
         mm = common.mm()
         self.record = record
+        self.hacks = record.speed_hacks  # read once: it checks the disk, and model_size() is called often
         self.model = TensorRTUNet()
         self.load_device = mm.get_torch_device()
         self.offload_device = torch.device("cpu")
@@ -61,7 +63,7 @@ class TrtModel:
 
             arena = Arena()
             self.engine = Engine(self.record.plan, arena)
-            if self.record.speed_hacks:
+            if self.hacks:
                 self.shallow = Engine(self.record.shallow_plan, arena)
         return self.engine
 
@@ -74,8 +76,7 @@ class TrtModel:
         return self.shallow is not None and self.shallow.loaded
 
     def model_size(self):
-        hacks = self.record.speed_hacks
-        return self.measured or self.record.weight_bytes + (hacks["weight_bytes"] if hacks and self.want_shallow else 0)
+        return self.measured or self.record.weight_bytes + (self.hacks["weight_bytes"] if self.hacks and self.want_shallow else 0)
 
     def loaded_size(self):
         return self.model_size() if self.loaded else 0
@@ -369,7 +370,7 @@ class Pass:
                     _unload(other)
             self._hold(None)
             model.weights = self.weights
-            model.want_shallow = model.want_shallow or (self.schedule is not None and record.speed_hacks is not None and not model.shallow_failed)
+            model.want_shallow = model.want_shallow or (self.schedule is not None and model.hacks is not None and not model.shallow_failed)
             with torch.inference_mode(), _keeping(self.patcher):
                 common.mm().load_models_gpu([model])
             self.model = model
@@ -377,7 +378,7 @@ class Pass:
             # the engine would mean reloading it on the next step, the UNet would lose its patches.
             self._hold(_keeping(model, self.patcher))
         _last_used[self.arch_id] = record.key
-        if self.schedule is not None and record.speed_hacks and not model.shallow_loaded and not model.shallow_failed:
+        if self.schedule is not None and model.hacks and not model.shallow_loaded and not model.shallow_failed:
             model.want_shallow = True
             try:
                 with torch.inference_mode():

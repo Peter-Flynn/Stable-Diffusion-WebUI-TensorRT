@@ -6,9 +6,10 @@ its last output block (the "deep" feature), and a shallow engine of only its out
 that feature. On most evaluations only the shallow engine runs, on the deep feature of the last full one.
 
 AdaptiveDiffusion (Ye et al., 2024): while the sampler's latents move smoothly (their third-order
-difference is small next to the previous step's first-order one), the noise prediction barely changes, so a step can
-reuse the last one. Here that test decides when a due full evaluation can wait: on SDXL a shallow call
-costs a few percent of a full one, so it's no slower than reusing the prediction, and closer to it.
+difference is small next to the previous step's first-order one), the noise prediction barely changes,
+so a step can reuse the last one. Here that test decides when a due full evaluation can wait: on SDXL a
+shallow call costs a few percent of a full one, so it's no slower than reusing the prediction, and
+closer to it.
 
 A pass's first evaluations, where its composition and colors settle, and its last ones run in full; full
 evaluations only wait in its second half. Passes of fewer sampler steps than MIN_STEPS (e.g. few-step
