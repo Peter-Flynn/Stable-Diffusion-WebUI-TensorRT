@@ -312,7 +312,8 @@ class Engine:
         return self.activation_bytes()
 
     def infer(self, feed: dict, profile: int, stream: int) -> dict:
-        self._prepare(profile, {name: tuple(t.shape) for name, t in feed.items()}, stream)
+        """Runs on the inputs in `feed` that the engine takes (e.g. SDXL's shallow UNet takes no prompt)."""
+        self._prepare(profile, {name: tuple(feed[name].shape) for name, is_input, _ in self.io if is_input}, stream)
         outputs = {}
         for name, is_input, dtype in self.io:
             if is_input:
