@@ -2,9 +2,10 @@
 
 An architecture has an engine per profile, or one merged engine holding them all (store.py), and a sampling
 pass loads the one for its sizes; only one is in VRAM at a time. Each is a model of reForge's own model
-manager, so the manager makes room for it, unloads it when another model needs the VRAM and loads it back
-for sampling, like any other model. While a sampling pass runs on an engine, the PyTorch UNet stays in RAM
-(its patches still apply, it just isn't loaded)."""
+manager, so the manager makes room for it and loads it back for sampling like any other model, but evicts
+it only as a last resort (_wrap_free_memory): bringing an engine back means refitting every weight. While a
+sampling pass runs on an engine, the PyTorch UNet stays in RAM (its patches still apply, it just isn't
+loaded)."""
 
 import contextlib
 import math
@@ -19,6 +20,7 @@ from modules import sd_unet
 
 from . import arch as arch_mod
 from . import common, profiles, speed, store
+from . import weights as weights_mod
 from .common import inference_mode, log, notify
 from .weights import EffectiveWeights
 
@@ -175,10 +177,12 @@ class TrtModel:
             if not changed:
                 continue
             self.applied[role] = {}
+            weights.prepare(changed)
+            reused = weights.reused
             torch.cuda.current_stream().synchronize()  # no inference in flight while the weights change
             seconds = engine.refit(changed, weights.tensor)
             self.applied[role] = wanted
-            refit = {**seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
+            refit = {**seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed), "reused": weights.reused - reused}
             total = refit if total is None else {k: total[k] + refit[k] for k in refit}
         if total is not None and not quiet:
             log(f"Refitted {total['count']} weights in {time.time() - start:.1f}s: {_refit_times(total)}")
@@ -187,8 +191,9 @@ class TrtModel:
 
 def _refit_times(refit: dict) -> str:
     patched = f", {refit['patched']} with LoRAs" if refit["patched"] else ""
+    reused = f", {refit['reused']} computed before (kept in RAM)" if refit.get("reused") else ""
     staged = f" ({common.gib(refit['staged'])} of the weights from VRAM)" if refit.get("staged") else ""
-    return f"{refit['count']} weights {refit['weights']:.1f}s{patched}, TensorRT refit {refit['tensorrt']:.1f}s{staged}"
+    return f"{refit['count']} weights {refit['weights']:.1f}s{patched}{reused}, TensorRT refit {refit['tensorrt']:.1f}s{staged}"
 
 
 def _loaded_entries(*models):
@@ -219,6 +224,7 @@ def release_all():
         _unload(model)
     _models.clear()
     _last_used.clear()
+    weights_mod.clear_computed()
     common.mm().soft_empty_cache(force=True)
 
 
@@ -329,11 +335,61 @@ def _keeping(*models):
         mm.free_memory = original
 
 
+_evicting = 0  # > 0 while loads may evict engines like any other model (see _evictable)
+
+
+@contextlib.contextmanager
+def _evictable():
+    """Loads in here evict engines the way reForge evicts any model: a pass on PyTorch's UNet doesn't use
+    them, and unloading every model means them too."""
+    global _evicting
+    _evicting += 1
+    try:
+        yield
+    finally:
+        _evicting -= 1
+
+
+def _wrap_free_memory(original):
+    """reForge makes room for a load by evicting models until its estimate of what the load needs fits. An
+    engine is the costliest model to bring back (every weight refitted, where PyTorch's UNet is copied
+    back), so it's evicted last, and only if that makes the estimate fit: a worst-case estimate that nothing
+    could meet (e.g. the VAE decode's, at large sizes or in FP32) no longer takes it along. The load makes do
+    with what's free, as it does anyway when the estimate isn't met (reForge's VAE decode loads the VAE
+    partially, and decodes in tiles if it runs out)."""
+
+    def free_memory(memory_required, device, keep_loaded=[]):
+        mm = common.mm()
+        engines = []
+        if not _evicting and not getattr(mm, "DISABLE_SMART_MEMORY", False):
+            engines = [lm for lm in mm.current_loaded_models if isinstance(lm.model, TrtModel) and lm.device == device and lm not in keep_loaded]
+        if not engines:
+            return original(memory_required, device, keep_loaded)
+        unloaded = original(memory_required, device, list(keep_loaded) + engines)
+        short = memory_required - mm.get_free_memory(device)
+        if 0 < short <= sum(lm.model_loaded_memory() for lm in engines):
+            unloaded += original(memory_required, device, keep_loaded)
+        return unloaded
+
+    free_memory._trt_original = original
+    return free_memory
+
+
+def _wrap_unload_all(original):
+    def unload_all_models(*args, **kwargs):
+        with _evictable():
+            return original(*args, **kwargs)
+
+    unload_all_models._trt_original = original
+    return unload_all_models
+
+
 @inference_mode
 def _load_torch_unet(patcher, shape):
     estimate = patcher.model_options.get("memory_peak_estimation_modifier", patcher.memory_required)
     required = estimate(list(shape)) + getattr(patcher, "extra_preserved_memory_during_sampling", 0)
-    common.mm().load_models_gpu([patcher], memory_required=required)
+    with _evictable():
+        common.mm().load_models_gpu([patcher], memory_required=required)
 
 
 class Pass:
@@ -637,8 +693,9 @@ def _wrap_prepare(original):
         global _pass
         end_pass()
         records, hacks = _engine_records(unet, x)
-        if records is None:
-            return original(unet, x, *args, **kwargs)
+        if records is None:  # PyTorch's UNet: engines can make room for it as usual
+            with _evictable():
+                return original(unet, x, *args, **kwargs)
         _pass = _begin(records, hacks, unet, x, lambda u, v: original(u, v, *args, **kwargs))
 
     sampling_prepare._trt_original = original
@@ -696,6 +753,8 @@ def install_hooks():
         openaimodel.UNetModel.forward = _wrap_forward(openaimodel.UNetModel.forward)
     _rebind(forge_sampler, "sampling_prepare", _wrap_prepare)
     _rebind(forge_sampler, "sampling_cleanup", _wrap_cleanup)
+    _rebind(common.mm(), "free_memory", _wrap_free_memory)
+    _rebind(common.mm(), "unload_all_models", _wrap_unload_all)
     try:  # Speed Hacks only: the engines run without it
         from modules import sd_samplers_cfg_denoiser
 
@@ -727,10 +786,11 @@ def new_generation(p=None):
     end_pass()  # a generation that failed mid-pass never cleaned up
     common.new_generation()
     _generation = weakref.ref(p) if p is not None else None
-    if setting() not in (AUTOMATIC, SPEED_HACKS):  # SD Unet is None: give their VRAM back
+    if setting() not in (AUTOMATIC, SPEED_HACKS):  # SD Unet is None: give their VRAM back, and the RAM
         for model in list(_models.values()):
             if model.loaded:
                 _unload(model)
+        weights_mod.clear_computed()
     try:
         install_hooks()
     except Exception as e:

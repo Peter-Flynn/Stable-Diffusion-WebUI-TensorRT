@@ -257,6 +257,10 @@ class Engine:
                 torch.cuda.current_stream().synchronize()  # the copies to VRAM are done before TensorRT reads them
                 seconds["weights"] += time.perf_counter() - start
                 start = time.perf_counter()
+            # Computing LoRA weights on the GPU leaves their FP32 temporaries in PyTorch's cache, taking what
+            # STAGING_RESERVE left free from TensorRT, which allocates its refit memory from the driver
+            # (without this, the refit can fail in myelin's mapNewAllocation). The staged copies stay.
+            torch.cuda.empty_cache()
             try:
                 ok = refitter.refit_cuda_engine()
             finally:
