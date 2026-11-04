@@ -407,6 +407,8 @@ class Pass:
         self._hold(None)
         if self.model is not None and self.model.loaded:
             self.model.engine.release_activations()
+        if self.schedule is not None:  # its deep features' VRAM, for PyTorch or whatever runs next
+            self.schedule.release()
 
     def _hint_batching(self):
         """reForge decides how many conds (cond and uncond) to batch into one UNet call by the PyTorch

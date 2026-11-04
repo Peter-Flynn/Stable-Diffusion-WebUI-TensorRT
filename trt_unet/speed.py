@@ -6,7 +6,7 @@ its last output block (the "deep" feature), and a shallow engine of only its out
 that feature. On most evaluations only the shallow engine runs, on the deep feature of the last full one.
 
 AdaptiveDiffusion (Ye et al., 2024): while the sampler's latents move smoothly (their third-order
-difference is small next to the first-order one), the noise prediction barely changes, so a step can
+difference is small next to the previous step's first-order one), the noise prediction barely changes, so a step can
 reuse the last one. Here that test decides when a due full evaluation can wait: on SDXL a shallow call
 costs a few percent of a full one, so it's no slower than reusing the prediction, and closer to it.
 
@@ -133,10 +133,10 @@ class Schedule:
     def _smooth(self) -> bool:
         if len(self.latents) < 4:
             return False
-        x3, x2, x1, x0 = self.latents  # oldest first
-        first = x0 - x1
-        third = first - 2 * (x1 - x2) + (x2 - x3)
-        norms = torch.stack([third.float().norm(), first.float().norm()]).tolist()
+        x3, x2, x1, x0 = self.latents  # oldest first: the paper's x_{i+2}, x_{i+1}, x_i, x_{i-1}
+        previous = x1 - x2  # its threshold is relative to this first-order difference (Eq. 4), not the newest
+        third = (x0 - x1) - 2 * previous + (x2 - x3)
+        norms = torch.stack([third.float().norm(), previous.float().norm()]).tolist()
         return norms[0] <= SMOOTHNESS * norms[1]
 
     def call(self, shape) -> tuple:
@@ -155,3 +155,8 @@ class Schedule:
 
     def keep(self, slot: int, shape, deep):
         self.deep[(slot, tuple(shape))] = (deep, self.index)
+
+    def release(self):
+        """Drops the deep features and latents; the counts stay, for the pass's log."""
+        self.deep.clear()
+        self.latents = []
