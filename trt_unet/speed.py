@@ -10,8 +10,9 @@ difference is small next to the previous step's first-order one), the noise pred
 reuse the last one. Here that test decides when a due full evaluation can wait: on SDXL a shallow call
 costs a few percent of a full one, so it's no slower than reusing the prediction, and closer to it.
 
-The first and last evaluations of a pass always run in full, and passes of fewer sampler steps than
-MIN_STEPS (e.g. few-step LoRAs, whose samplers may evaluate twice per step) don't use any of it."""
+A pass's first evaluations, where its composition and colors settle, and its last ones run in full; full
+evaluations only wait in its second half. Passes of fewer sampler steps than MIN_STEPS (e.g. few-step
+LoRAs, whose samplers may evaluate twice per step) don't use any of it."""
 
 import torch
 
@@ -19,8 +20,9 @@ BRANCH = 0  # the shallow part: the input blocks up to this one and the output b
 INTERVAL = 3  # a full evaluation every 3 at least...
 MAX_STRETCH = 2  # ...or up to this many later while the sampler's trajectory is smooth
 SMOOTHNESS = 0.01  # AdaptiveDiffusion's threshold (its SD 1.5 and SDXL setting)
-WARMUP = 2  # evaluations run in full at the start of a pass
-TAIL = 0.1  # the share of a pass's evaluations run in full at its end
+WARMUP = 0.2  # the share of a pass's evaluations run in full at its start, where its composition settles
+TAIL = 0.1  # ...and at its end
+STRETCH_FROM = 0.5  # the share of a pass after which full evaluations may wait
 MIN_STEPS = 12
 MAX_AGE = INTERVAL - 1 + MAX_STRETCH  # evaluations a deep feature is used for after its own
 
@@ -120,12 +122,12 @@ class Schedule:
     def _decide(self, index, total, steps) -> str:
         if not total or not steps or steps < MIN_STEPS:
             return "full"
-        if index < WARMUP or index >= total - max(1, round(TAIL * total)) or self.last_full is None:
+        if index < round(WARMUP * total) or index >= total - max(1, round(TAIL * total)) or self.last_full is None:
             return "full"
         if index - self.last_full < INTERVAL:
             return "shallow"
         # AdaptiveDiffusion's test compares consecutive steps, so not for samplers that evaluate more than once per step
-        if self.stretched < MAX_STRETCH and total == steps and self._smooth():
+        if index >= STRETCH_FROM * total and self.stretched < MAX_STRETCH and total == steps and self._smooth():
             self.stretched += 1
             return "shallow"
         return "full"

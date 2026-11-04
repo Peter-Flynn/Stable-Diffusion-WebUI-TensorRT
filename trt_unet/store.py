@@ -145,6 +145,12 @@ class Record:
         return self.speed_hacks is None and "speed_hacks_error" not in self.meta
 
     @property
+    def retry_speed_hacks(self) -> bool:
+        """Its Speed Hacks part failed to build, and building again retries it, once: a failure that
+        repeats likely always will."""
+        return self.speed_hacks is None and "speed_hacks_error" in self.meta and not self.meta.get("speed_hacks_retried")
+
+    @property
     def label(self) -> str:
         """For people: "engine for profile 2", "merged engine (3 profiles)"."""
         n = len(self.indexes)

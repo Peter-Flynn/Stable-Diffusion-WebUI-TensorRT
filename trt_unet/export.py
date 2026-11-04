@@ -401,6 +401,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
     shutil.rmtree(folder, ignore_errors=True)
     os.makedirs(folder)
     records, result, warnings, hack_errors = [], {"ok": True}, 0, []
+    before = {r.engine_key: r for r in store.engines(arch.id)}  # what these builds replace
     try:
         if progress:
             progress(0.0, "Exporting the UNet graphs")
@@ -485,6 +486,8 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 meta["speed_hacks"] = hacks
             else:
                 meta["speed_hacks_error"] = hack_error  # built since Speed Hacks, without them: not outdated
+                replaced = before.get(store.merged_key([p for _, p in group]) if merged else store.profile_key(group[0][1]))
+                meta["speed_hacks_retried"] = replaced is not None and "speed_hacks_error" in replaced.meta
             records.append(store.save(arch, job["plan"], meta, shallow_plan))
             log(f"Built {records[-1].describe()} in {time.time() - start:.0f}s")
         return {**result, "records": records, "memory_warnings": warnings, "hack_errors": hack_errors}

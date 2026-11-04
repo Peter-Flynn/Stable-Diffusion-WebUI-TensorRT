@@ -548,7 +548,8 @@ def _engine_records(patcher, x):
         if outdated:
             notify(f"{outdated} of the {arch.label} engines were built before Speed Hacks, and run without them; build them again in the TensorRT tab.")
         if failed:
-            notify(f"Speed Hacks couldn't be built for {failed} of the {arch.label} engines (the build's console output says why), so they run without them.")
+            retry = " Building them again in the TensorRT tab retries once." if any(r.retry_speed_hacks for r in records) else ""
+            notify(f"Speed Hacks couldn't be built for {failed} of the {arch.label} engines (the build's console output says why), so they run without them.{retry}")
     return records, hacks
 
 

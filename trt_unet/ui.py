@@ -32,7 +32,7 @@ HELP = """
 
 **SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engines of the loaded checkpoint's architecture, `Speed Hacks` uses them with Speed Hacks, `None` always uses PyTorch.
 
-**Speed Hacks** run most denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). Passes of 12 steps or more should run roughly 2x faster (an estimate, not yet measured), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
+**Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and, late in a pass, wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). The first 20% and last 10% of steps run in full, so composition and detail stay close. Passes of 12 steps or more should run roughly 1.7x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
 """
 
 
@@ -155,7 +155,7 @@ def _plan(draft, records, mode):
     profiles that have no engine; merged, all of them unless the merged engine holds just these."""
     keys = _keys(draft)
     wanted = store.wanted_keys([Profile.from_dict(d) for d in draft], mode) if draft else set()
-    built = {r.engine_key for r in records if not r.outdated}  # an engine from before Speed Hacks is built again
+    built = {r.engine_key for r in records if not r.outdated and not r.retry_speed_hacks}  # built again: from before Speed Hacks, or retrying them
     if mode == store.MERGED:
         todo = list(range(len(draft))) if draft and not wanted <= built else []
     else:
@@ -204,7 +204,8 @@ def _status(sd_model, arch, records, asking=False) -> str:
     if outdated:
         lines.append(f"**{_n(len(outdated), 'engine')} {'was' if len(outdated) == 1 else 'were'} built before Speed Hacks:** build again to add them.")
     if failed:
-        lines.append(f"Speed Hacks couldn't be built for {_n(len(failed), 'engine')} (`{failed[0].meta['speed_hacks_error']}`); they run without them.")
+        retry = "building again retries once" if any(r.retry_speed_hacks for r in failed) else "to try again, delete them and build again"
+        lines.append(f"Speed Hacks couldn't be built for {_n(len(failed), 'engine')} (`{failed[0].meta['speed_hacks_error']}`), so they run without them; {retry}.")
     return "\n\n".join(lines)
 
 
@@ -217,7 +218,7 @@ def _draft_view(draft: list, records, mode) -> str:
     rows = ["| # | Width | Height | Batch size | Prompt tokens | Engine |", "|:-:|:-:|:-:|:-:|:-:|:-:|"]
     for i, (d, key) in enumerate(zip(draft, _keys(draft))):
         p = Profile.from_dict(d)
-        again = (keys or {key}) <= exists  # built before Speed Hacks
+        again = (keys or {key}) <= exists  # built before Speed Hacks, or retrying them
         state = ("**to rebuild** (Speed Hacks)" if again else "**to build**") if i in todo else "built"
         rows.append(f"| {i + 1} | {_span(p.width)} | {_span(p.height)} | {_span(p.batch)} | {_span(p.tokens)} | {state} |")
     rows.append("\n*Ranges show min-max (optimal).*")
@@ -417,7 +418,8 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
         if any(r.meta.get("stripped") is False for r in result["records"]):
             message += " (TensorRT couldn't leave the weights out of some of them, so their files are as large as the UNet.)"
         if result.get("hack_errors"):
-            message += f"\n\nSpeed Hacks couldn't be built (`{result['hack_errors'][-1]}`), so these engines run without them. The console has the details."
+            retry = "Building again retries once." if any(r.retry_speed_hacks for r in result["records"]) else "That failed before too; to try again, delete the engines and build again."
+            message += f"\n\nSpeed Hacks couldn't be built (`{result['hack_errors'][-1]}`), so these engines run without them. The console has the details. {retry}"
     else:
         done = "The engines are unchanged." if merged else f"{_n(built, 'engine')} of {todo} built; the other engines are unchanged."
         if result.get("error") == "cancelled":
