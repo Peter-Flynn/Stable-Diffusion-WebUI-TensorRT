@@ -16,12 +16,13 @@ import sys
 import threading
 import time
 import traceback
+import types
 import warnings
 
 import torch
 import torch.nn.functional as F
 
-from . import common, store
+from . import common, speed, store
 from .arch import Arch, unet_config
 from .common import gib, log
 
@@ -160,9 +161,21 @@ def _weightless_graph(onnx_path: str, input_names, agree_with) -> dict:
     return shapes
 
 
+def _as_full(unet, x, timesteps, context, y=None):
+    return speed.full_forward(unet, x, timesteps, context, y)
+
+
+def _as_shallow(unet, x, timesteps, context, *rest):
+    y, deep = rest if len(rest) == 2 else (None, rest[0])
+    return speed.shallow_forward(unet, x, timesteps, context, y, deep)
+
+
 @common.inference_mode
 def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float16) -> dict:
-    """Writes folder/unet.onnx; returns {weight name: shape in the checkpoint}."""
+    """Writes folder/unet.onnx, the UNet, which also outputs its deep feature, and folder/shallow.onnx, its
+    outermost blocks, which take that feature (speed.py). Returns {"unet": {weight name: shape in the
+    checkpoint}, "shallow": the same for the shallow graph, or None if it couldn't be exported, "deep":
+    {"channels", "scale": the latent's size over the feature's, "branch"}}."""
     device = device or common.mm().get_torch_device()
     unet = _fresh_unet(unet_config(patcher), device, dtype)
     names = [n for n in INPUTS if n != "y" or arch.adm_channels]
@@ -173,29 +186,58 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
     ]
     if arch.adm_channels:
         inputs.append(torch.randn(2, arch.adm_channels, dtype=dtype, device=device))
-    path = os.path.join(folder, "unet.onnx")
-    kwargs = dict(
-        export_params=False,
-        opset_version=17,
-        do_constant_folding=False,
-        input_names=names,
-        output_names=["latent"],
-        dynamic_axes={k: v for k, v in DYNAMIC_AXES.items() if k in names or k == "latent"},
-    )
+    paths = {"unet": os.path.join(folder, "unet.onnx"), "shallow": os.path.join(folder, "shallow.onnx")}
+    common_kwargs = dict(export_params=False, opset_version=17, do_constant_folding=False)
     if "dynamo" in inspect.signature(torch.onnx.export).parameters:
-        kwargs["dynamo"] = False
-    log(f"Exporting the {arch.name} UNet graph...")
+        common_kwargs["dynamo"] = False
+    axes = {k: v for k, v in DYNAMIC_AXES.items() if k in names or k == "latent"}
+    log(f"Exporting the {arch.name} UNet graphs...")
+    shallow = True
     with _traceable_attention(), warnings.catch_warnings():
         # The values it warns about (shape checks, the head size) are fixed for an architecture.
         warnings.simplefilter("ignore", torch.jit.TracerWarning)
-        torch.onnx.export(unet, tuple(inputs), path, **kwargs)
+        try:
+            deep = speed.full_forward(unet, *inputs)[1]
+            scale = inputs[0].shape[2] // deep.shape[2]
+            axes["deep"] = {0: "batch", 2: "height", 3: "width"} if scale == 1 else {0: "batch", 2: "deep_height", 3: "deep_width"}
+            info = {"channels": int(deep.shape[1]), "scale": int(scale), "branch": speed.BRANCH}
+            unet.forward = types.MethodType(_as_full, unet)  # the parameters keep their names
+            torch.onnx.export(unet, tuple(inputs), paths["unet"], input_names=names, output_names=["latent", "deep"], dynamic_axes=axes, **common_kwargs)
+        except Exception as e:  # the UNet as reForge runs it, without Speed Hacks
+            traceback.print_exc()
+            log(f"Could not export the UNet with its deep feature ({e}); exporting it without Speed Hacks.")
+            shallow, deep, info = False, None, None
+            with contextlib.suppress(AttributeError):
+                del unet.forward
+            axes.pop("deep", None)
+            torch.onnx.export(unet, tuple(inputs), paths["unet"], input_names=names, output_names=["latent"], dynamic_axes=axes, **common_kwargs)
+        try:
+            if shallow:
+                unet.forward = types.MethodType(_as_shallow, unet)
+                torch.onnx.export(
+                    unet, (*inputs, deep), paths["shallow"], input_names=names + ["deep"], output_names=["latent"], dynamic_axes=axes, **common_kwargs
+                )
+        except Exception as e:
+            traceback.print_exc()
+            log(f"Could not export the shallow UNet graph ({e}); the engines will be built without Speed Hacks.")
+            shallow = False
+        finally:
+            with contextlib.suppress(AttributeError):
+                del unet.forward
     exported = {k: list(v.shape) for k, v in unet.state_dict(keep_vars=True).items()}
-    del unet, inputs
+    del unet, inputs, deep
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     loaded = {k: list(v.shape) for k, v in patcher.model.diffusion_model.state_dict(keep_vars=True).items()}
-    return _weightless_graph(path, names, (exported, loaded))
+    result = {"unet": _weightless_graph(paths["unet"], names, (exported, loaded)), "shallow": None, "deep": info}
+    if shallow:
+        try:
+            result["shallow"] = _weightless_graph(paths["shallow"], names + ["deep"], (exported, loaded))
+        except Exception as e:
+            traceback.print_exc()
+            log(f"Could not prepare the shallow UNet graph ({e}); the engines will be built without Speed Hacks.")
+    return result
 
 
 def _builder_env() -> dict:
@@ -325,11 +367,30 @@ def run_builder(job_path: str, progress=None) -> dict:
     return result
 
 
+def _build_plan(job: dict, folder: str, step) -> dict:
+    """Runs the builder on a job, again without stripping the weights if TensorRT can't strip them."""
+    for strip in (True, False):
+        with open(os.path.join(folder, "job.json"), "w", encoding="utf-8") as f:
+            json.dump({**job, "strip": strip}, f)
+        result = run_builder(os.path.join(folder, "job.json"), step)
+        result["stripped"] = strip
+        if not result.get("retry_without_strip"):
+            return result
+        # Without stripping, the plan holds placeholder weights (GBs) but runs the same way.
+        log("Building a weight-stripped engine failed; building one that stores placeholder weights instead.")
+    return result
+
+
+SHALLOW_SHARE = 0.15  # of each engine's build progress, for its shallow engine
+
+
 def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=None, mode=store.PER_PROFILE) -> dict:
-    """Exports the UNet graph once and builds the engines for the (index, Profile)s in `todo`, each in a
+    """Exports the UNet graphs once and builds the engines for the (index, Profile)s in `todo`, each in a
     builder process of its own: per-profile, an engine for each, one at a time, so a build only ever holds
-    one profile; merged, one engine holding them all. Returns the last builder result, with "records": the
-    engines saved, those before a failure or cancel included."""
+    one profile; merged, one engine holding them all. Each engine gets a shallow engine for Speed Hacks
+    (speed.py) beside it; if that one can't be built, the engine is kept without it. Returns the last
+    builder result, with "records": the engines saved, those before a failure or cancel included, and
+    "hack_errors": why shallow engines couldn't be built."""
     from . import runtime
 
     common.trt_version()  # installed and new enough
@@ -339,11 +400,12 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
     folder = store.work_dir(arch)
     shutil.rmtree(folder, ignore_errors=True)
     os.makedirs(folder)
-    records, result, warnings = [], {"ok": True}, 0
+    records, result, warnings, hack_errors = [], {"ok": True}, 0, []
     try:
         if progress:
-            progress(0.0, "Exporting the UNet graph")
-        shapes = export_onnx(arch, patcher, folder)
+            progress(0.0, "Exporting the UNet graphs")
+        graphs = export_onnx(arch, patcher, folder)
+        shapes = graphs["unet"]
         merged = mode == store.MERGED
         groups = ([todo] if todo else []) if merged else [[item] for item in todo]  # the profiles of each engine
         for n, group in enumerate(groups):
@@ -355,10 +417,12 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 what, detail = f"merged engine ({len(group)} profiles)", "; ".join(p.describe() for _, p in group)
             else:
                 what, detail = f"engine for profile {group[0][0] + 1}", f"{group[0][1].describe()} ({n + 1} of {len(groups)})"
-            step = None
+            step = shallow_step = None
             if progress:
                 title = (f"Merged engine, {len(group)} profiles" if merged else f"Profile {group[0][0] + 1} ({n + 1} of {len(groups)} to build)")
-                step = lambda f, t, n=n, title=title: progress((n + f) / len(groups), f"{title}: {t}")
+                share = 1 - SHALLOW_SHARE if graphs["shallow"] is not None else 1
+                step = lambda f, t, n=n, title=title, share=share: progress((n + share * f) / len(groups), f"{title}: {t}")
+                shallow_step = lambda f, t, n=n, title=title: progress((n + 1 - SHALLOW_SHARE + SHALLOW_SHARE * f) / len(groups), f"{title}, Speed Hacks part: {t}")
             unet_shapes = [p.unet_shapes(arch.in_channels, arch.context_dim, arch.adm_channels) for _, p in group]
             job = {
                 "onnx": os.path.join(folder, "unet.onnx"),
@@ -369,18 +433,39 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 "optimization_level": optimization_level,
             }
             log(f"Building the {arch.label} {what}, {detail}; the first build takes several minutes.")
-            for strip in (True, False):
-                with open(os.path.join(folder, "job.json"), "w", encoding="utf-8") as f:
-                    json.dump({**job, "strip": strip}, f)
-                result = run_builder(os.path.join(folder, "job.json"), step)
-                result["stripped"] = strip
-                if not result.get("retry_without_strip"):
-                    break
-                # Without stripping, the plan holds placeholder weights (GBs) but runs the same way.
-                log("Building a weight-stripped engine failed; building one that stores placeholder weights instead.")
+            result = _build_plan(job, folder, step)
             warnings += result.get("memory_warnings") or 0
             if not result["ok"]:
                 break
+            hacks, shallow_plan = None, None
+            if graphs["shallow"] is not None:
+                shallow_job = {
+                    **job,
+                    "onnx": os.path.join(folder, "shallow.onnx"),
+                    "plan": os.path.join(folder, "shallow.plan"),
+                    "weights": sorted(graphs["shallow"]),
+                    "profiles": [speed.shallow_shapes(s, graphs["deep"]) for s in unet_shapes],
+                }
+                log(f"Building its Speed Hacks part, the shallow UNet ({len(shallow_job['weights'])} of {len(job['weights'])} weights).")
+                shallow = _build_plan(shallow_job, folder, shallow_step)
+                warnings += shallow.get("memory_warnings") or 0
+                if shallow.get("error") == "cancelled" or CANCEL.is_set():
+                    result = {"ok": False, "error": "cancelled"}
+                    break
+                if shallow["ok"]:
+                    shallow_plan = shallow_job["plan"]
+                    hacks = {
+                        "deep": graphs["deep"],
+                        "shapes": shallow_job["profiles"],
+                        "weights": shallow_job["weights"],
+                        "weight_bytes": sum(math.prod(graphs["shallow"][w]) * 2 for w in shallow_job["weights"]),
+                        "stripped": shallow["stripped"],
+                    }
+                else:
+                    hack_errors.append(str(shallow.get("error")))
+                    log(f"Building the Speed Hacks part failed ({shallow.get('error')}); keeping the engine without it.")
+            elif not CANCEL.is_set():
+                hack_errors.append("the shallow UNet graph couldn't be exported")
             if merged:
                 meta = {"mode": store.MERGED, "profiles": [p.to_dict() for _, p in group], "indexes": [i for i, _ in group], "shapes": unet_shapes}
             else:
@@ -394,8 +479,12 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 "gpu_name": torch.cuda.get_device_name(),
                 "created": time.strftime("%Y-%m-%d %H:%M"),
             })
-            records.append(store.save(arch, job["plan"], meta))
+            if hacks:
+                meta["speed_hacks"] = hacks
+            elif hack_errors:
+                meta["speed_hacks_error"] = hack_errors[-1]  # built since Speed Hacks, without them: not outdated
+            records.append(store.save(arch, job["plan"], meta, shallow_plan))
             log(f"Built {records[-1].describe()} in {time.time() - start:.0f}s")
-        return {**result, "records": records, "memory_warnings": warnings}
+        return {**result, "records": records, "memory_warnings": warnings, "hack_errors": hack_errors}
     finally:
         shutil.rmtree(folder, ignore_errors=True)

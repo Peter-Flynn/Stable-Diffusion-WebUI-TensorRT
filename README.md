@@ -38,8 +38,15 @@ a generation's sizes need is loaded. A *merged engine* holds every profile of an
 loads another engine, but it takes every profile's share of TensorRT's memory at once, and its build takes them all
 at once: it needs at least 24 GB of VRAM and 64 GB of RAM. The mode can only change while there are no engines.
 
-The engines are used while **SD Unet** (in Settings → Stable Diffusion) is on `Automatic`, the default. Set it to
-`None` to use PyTorch.
+**SD Unet** (in Settings → Stable Diffusion) decides how generations run: `Automatic`, the default, uses the
+engines; `Speed Hacks` uses them with Speed Hacks; `None` uses PyTorch.
+
+**Speed Hacks.** Every engine comes with a small engine of just the UNet's outermost blocks. With Speed Hacks, most
+denoising steps run on it, reusing the deep features the full UNet computed a step or two before
+([DeepCache](https://github.com/horseee/DeepCache)), and full steps wait longer while the image changes smoothly
+([AdaptiveDiffusion](https://jiakangyuan.github.io/AdaptiveDiffusion-project-page)). Passes of 12 steps or more should run
+roughly twice as fast (estimated, not yet measured); images are a little less precise, so a seed gives a somewhat
+different image than without them. Fewer steps (e.g. with few-step LoRAs) run as usual.
 
 > [!NOTE]
 > An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build again;

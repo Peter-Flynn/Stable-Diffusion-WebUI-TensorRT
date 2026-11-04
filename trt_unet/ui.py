@@ -30,7 +30,9 @@ HELP = """
 
 **Building** makes the engines match the profiles: per-profile, it builds the profiles that have no engine yet, one at a time, and deletes the engines of profiles that are gone; merged, it builds the engine again whenever the profiles change.
 
-**SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engine of the loaded checkpoint's architecture, `None` always uses PyTorch.
+**SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engines of the loaded checkpoint's architecture, `Speed Hacks` uses them with Speed Hacks, `None` always uses PyTorch.
+
+**Speed Hacks** run most denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). Passes of 12 steps or more should run roughly 2x faster (an estimate, not yet measured), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
 """
 
 
@@ -153,7 +155,7 @@ def _plan(draft, records, mode):
     profiles that have no engine; merged, all of them unless the merged engine holds just these."""
     keys = _keys(draft)
     wanted = store.wanted_keys([Profile.from_dict(d) for d in draft], mode) if draft else set()
-    built = {r.engine_key for r in records}
+    built = {r.engine_key for r in records if not r.outdated}  # an engine from before Speed Hacks is built again
     if mode == store.MERGED:
         todo = list(range(len(draft))) if draft and not wanted <= built else []
     else:
@@ -191,10 +193,18 @@ def _status(sd_model, arch, records, asking=False) -> str:
     else:
         lines.append(f"**Engines:** {_n(held, 'profile')}, last built {created}; the one in use takes about {common.gib(records[0].weight_bytes)} of VRAM.")
     setting = getattr(shared.opts, "sd_unet", "Automatic")
-    if setting in ("Automatic", f"[TRT] {arch.label}"):
-        lines.append(f"`SD Unet` is `{setting}`, so every {arch.name} checkpoint runs on them.")
+    if setting == "Automatic":
+        lines.append(f"`SD Unet` is `Automatic`, so every {arch.name} checkpoint runs on them. `Speed Hacks` runs them faster, a little less precisely.")
+    elif setting == "Speed Hacks":
+        lines.append(f"`SD Unet` is `Speed Hacks`, so every {arch.name} checkpoint runs on them, with Speed Hacks.")
     else:
-        lines.append(f"**`SD Unet` is `{setting}`, so generations don't use these engines.** Set it to `Automatic` in Settings, Stable Diffusion.")
+        lines.append(f"**`SD Unet` is `{setting}`, so generations don't use these engines.** Set it to `Automatic` or `Speed Hacks` in Settings, Stable Diffusion.")
+    outdated = [r for r in records if r.outdated]
+    failed = [r for r in records if r.speed_hacks is None and not r.outdated]
+    if outdated:
+        lines.append(f"**{_n(len(outdated), 'engine')} {'was' if len(outdated) == 1 else 'were'} built before Speed Hacks:** build again to add them.")
+    if failed:
+        lines.append(f"Speed Hacks couldn't be built for {_n(len(failed), 'engine')} (`{failed[0].meta['speed_hacks_error']}`); they run without them.")
     return "\n\n".join(lines)
 
 
@@ -202,10 +212,14 @@ def _draft_view(draft: list, records, mode) -> str:
     if not draft:
         return "*No profiles. Add at least one to build an engine.*"
     todo, extra = _plan(draft, records, mode)
+    exists = {r.engine_key for r in records}
+    keys = store.wanted_keys([Profile.from_dict(d) for d in draft], mode) if mode == store.MERGED else None
     rows = ["| # | Width | Height | Batch size | Prompt tokens | Engine |", "|:-:|:-:|:-:|:-:|:-:|:-:|"]
-    for i, d in enumerate(draft):
+    for i, (d, key) in enumerate(zip(draft, _keys(draft))):
         p = Profile.from_dict(d)
-        rows.append(f"| {i + 1} | {_span(p.width)} | {_span(p.height)} | {_span(p.batch)} | {_span(p.tokens)} | {'**to build**' if i in todo else 'built'} |")
+        again = (keys or {key}) <= exists  # built before Speed Hacks
+        state = ("**to rebuild** (Speed Hacks)" if again else "**to build**") if i in todo else "built"
+        rows.append(f"| {i + 1} | {_span(p.width)} | {_span(p.height)} | {_span(p.batch)} | {_span(p.tokens)} | {state} |")
     rows.append("\n*Ranges show min-max (optimal).*")
     if mode == store.MERGED:
         rows.append("*One merged engine holds every profile: changing them builds it again.*")
@@ -323,7 +337,7 @@ def _refresh_unet_list():
     from . import runtime
 
     runtime.release_all()
-    if hasattr(sd_unet.current_unet, "option") and isinstance(sd_unet.current_unet.option, runtime.TrtUnetOption):
+    if hasattr(sd_unet.current_unet, "option") and isinstance(sd_unet.current_unet.option, runtime.SpeedHacksOption):
         sd_unet.current_unet = sd_unet.current_unet_option = None
     sd_unet.list_unets()
 
@@ -402,6 +416,8 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
             message += f". Every {arch.name} checkpoint runs on them with `SD Unet` set to `Automatic`."
         if any(r.meta.get("stripped") is False for r in result["records"]):
             message += " (TensorRT couldn't leave the weights out of some of them, so their files are as large as the UNet.)"
+        if result.get("hack_errors"):
+            message += f"\n\nSpeed Hacks couldn't be built (`{result['hack_errors'][-1]}`), so these engines run without them. The console has the details."
     else:
         done = "The engines are unchanged." if merged else f"{_n(built, 'engine')} of {todo} built; the other engines are unchanged."
         if result.get("error") == "cancelled":
@@ -480,31 +496,6 @@ def delete_engine(choice, draft, draft_arch):
     return refresh(draft, draft_arch)
 
 
-_sd_unet = {"dropdowns": [], "sync": None}  # SD Unet's dropdown (Settings or Quicksettings) and the tab's sync button
-
-
-def _sd_unet_update():
-    from modules import shared_items
-
-    return gr.update(choices=shared_items.sd_unet_items(), value=shared.opts.sd_unet)
-
-
-def _connect(dropdown):
-    _sd_unet["sync"].click(_sd_unet_update, None, dropdown, queue=False)
-
-
-def on_before_ui():
-    _sd_unet.update(dropdowns=[], sync=None)
-
-
-def on_after_component(component, **kwargs):
-    """reForge makes SD Unet's dropdown in Settings before the extension tabs, or in Quicksettings after them."""
-    if kwargs.get("elem_id") == "setting_sd_unet":
-        _sd_unet["dropdowns"].append(component)
-        if _sd_unet["sync"] is not None:
-            _connect(component)
-
-
 def on_ui_tabs():
     presets = _preset_values()
     first = [v for f in FIELDS for v in getattr(default_profiles(2816)[0], f)]
@@ -551,12 +542,6 @@ def on_ui_tabs():
                 delete_button = gr.Button("Delete engines", variant="stop", size="sm", visible=False, elem_id="trt_delete")
                 with gr.Accordion("How it works", open=False):
                     gr.Markdown(HELP)
-        _sd_unet["sync"] = gr.Button(visible=False, elem_id="trt_sd_unet_sync")
-        for dropdown in _sd_unet["dropdowns"]:
-            _connect(dropdown)
-
-        # SD Unet's dropdown shows the engines (and the setting) of when the page loaded: update it.
-        refresh_sd_unet = {JS: "() => { gradioApp().getElementById('trt_sd_unet_sync')?.click(); }"}
         draft_outputs = [draft, table, selector, build_button]
         mode_outputs = [mode_title, mode_radio, mode_help, mode_confirm, main]
         outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, cancel_button, *mode_outputs]
@@ -577,10 +562,10 @@ def on_ui_tabs():
         # The build's progress shows once, in its result.
         build_button.click(_build_started, None, [build_button, cancel_button, result, mode_radio], queue=False, **quiet).then(
             build, [draft, draft_arch, level], [result, draft]
-        ).then(refresh, [draft, draft_arch], outputs, **quiet).then(None, None, None, **refresh_sd_unet)
+        ).then(refresh, [draft, draft_arch], outputs, **quiet)
         cancel_button.click(cancel_build, None, None, queue=False)
         delete_button.click(
             delete_engine, [engine_choice, draft, draft_arch], outputs, **quiet,
             **{JS: "(choice, ...rest) => [choice && confirm('Delete the engines of ' + choice + '? Building them again takes a while.') ? choice : null, ...rest.slice(0, 2)]"},
-        ).then(None, None, None, **refresh_sd_unet)
+        )
     return [(tab, "TensorRT", "tensorrt")]

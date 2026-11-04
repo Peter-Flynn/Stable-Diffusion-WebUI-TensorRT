@@ -1,4 +1,5 @@
-"""Engines on disk: models/Unet-trt/<arch id>/<gpu>-<trt>-<key>.plan, with a .json describing it. In
+"""Engines on disk: models/Unet-trt/<arch id>/<gpu>-<trt>-<key>.plan, with a .json describing it and, for
+Speed Hacks (speed.py), the shallow UNet's engine as <...>.shallow.plan beside it. In
 per-profile mode an architecture has an engine per profile (the key is the profile's); in merged mode, one
 engine holding all of its profiles (the key is "merged-" and the profiles'). Plans hold no weights, so
 they're small; weights come from whatever checkpoint is loaded. The mode is for every engine: it can only
@@ -18,6 +19,7 @@ from .profiles import Profile
 
 FORMAT = 2  # an engine holds one profile, or (with "mode": "merged") several
 PER_PROFILE, MERGED = "per_profile", "merged"
+SHALLOW = ".shallow.plan"
 MODES = (PER_PROFILE, MERGED)
 
 
@@ -126,6 +128,23 @@ class Record:
         return merged_key(self.profiles) if self.merged else profile_key(self.profiles[0])
 
     @property
+    def shallow_plan(self):
+        name = (self.meta.get("speed_hacks") or {}).get("plan")
+        return os.path.join(os.path.dirname(self.plan), name) if name else None
+
+    @property
+    def speed_hacks(self):
+        """{"deep": the deep feature's channels and scale, "shapes": each profile's shallow UNet input shapes,
+        "weights", "weight_bytes", ...}, or None if it was built without them (or before them)."""
+        hacks = self.meta.get("speed_hacks")
+        return hacks if hacks and os.path.isfile(self.shallow_plan) else None
+
+    @property
+    def outdated(self) -> bool:
+        """Built before Speed Hacks: building again adds them. (One whose Speed Hacks part failed to build isn't.)"""
+        return self.speed_hacks is None and "speed_hacks_error" not in self.meta
+
+    @property
     def label(self) -> str:
         """For people: "engine for profile 2", "merged engine (3 profiles)"."""
         n = len(self.indexes)
@@ -161,10 +180,11 @@ class Record:
 
     @property
     def disk_bytes(self) -> int:
-        try:
-            return os.path.getsize(self.plan)
-        except OSError:
-            return 0
+        total = 0
+        for path in (self.plan, self.shallow_plan):
+            with contextlib.suppress(OSError, TypeError):
+                total += os.path.getsize(path)
+        return total
 
     def describe(self) -> str:
         what = f"merged, {len(self.indexes)} profiles" if self.merged else self.profiles[0].describe()
@@ -181,6 +201,10 @@ def _read(meta_path: str):
             if len(record.profiles) != len(record.indexes) or len(record.profile_shapes) != len(record.indexes) or not record.indexes:
                 raise ValueError("its profiles, their shapes and their indexes don't match")
             record.arch  # complete
+            hacks = meta.get("speed_hacks")
+            if hacks and len(hacks.get("shapes") or []) != len(record.indexes):
+                common.log(f"Ignoring the Speed Hacks part of {meta_path}: its shapes don't match its profiles")
+                meta.pop("speed_hacks")
             return record
     except Exception as e:
         common.log(f"Ignoring {meta_path}: {e}")
@@ -215,12 +239,19 @@ def _write_meta(base: str, meta: dict):
     os.replace(base + ".json.tmp", base + ".json")
 
 
-def save(arch: Arch, plan_tmp: str, meta: dict) -> Record:
+def save(arch: Arch, plan_tmp: str, meta: dict, shallow_tmp: str = None) -> Record:
     """meta has the mode and, per-profile, the profile (as a dict) and its index, or, merged, the profiles
-    and their indexes, among the rest."""
+    and their indexes, among the rest; with `shallow_tmp`, the shallow engine's "speed_hacks"."""
     record = Record("", {"format": FORMAT, "arch": arch.to_dict(), **meta})
     base = f"{_prefix(arch.id)}-{record.engine_key}"
     os.makedirs(os.path.dirname(base), exist_ok=True)
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(base + SHALLOW)  # an older build's
+    if shallow_tmp:
+        os.replace(shallow_tmp, base + SHALLOW)
+        record.meta["speed_hacks"] = {**record.meta["speed_hacks"], "plan": os.path.basename(base) + SHALLOW}
+    else:
+        record.meta.pop("speed_hacks", None)
     os.replace(plan_tmp, base + ".plan")
     _write_meta(base, record.meta)
     return Record(base + ".plan", record.meta)
@@ -240,6 +271,8 @@ def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
     prefix = _prefix(arch_id)
     deleted = 0
     for path in glob.glob(glob.escape(prefix) + ".plan") + glob.glob(glob.escape(prefix) + "-*.plan"):
+        if path.endswith(SHALLOW):  # goes with its engine
+            continue
         base = path[: -len(".plan")]
         key = base[len(prefix) + 1:] if base != prefix else None
         if key in wanted:
@@ -249,7 +282,7 @@ def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
                 if indexes != record.indexes:
                     _write_meta(base, record.renumbered(indexes))
             continue
-        for stale in (path, base + ".json"):
+        for stale in (path, base + ".json", base + SHALLOW):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stale)
         deleted += 1
@@ -259,7 +292,7 @@ def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
 def delete(group: list):
     """Deletes these engines (Records)."""
     for record in group:
-        for path in (record.plan, record.plan[: -len(".plan")] + ".json"):
+        for path in (record.plan, record.plan[: -len(".plan")] + ".json", record.plan[: -len(".plan")] + SHALLOW):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(path)
     for folder in {os.path.dirname(r.plan) for r in group}:

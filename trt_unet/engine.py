@@ -110,17 +110,39 @@ def other_tensorrt(maps="/proc/self/maps") -> str:
     )
 
 
+class Arena:
+    """Activation memory from PyTorch's allocator, shared by engines that never run at the same time (an
+    engine and its shallow partner): it only grows until it's released, and each engine binds it again
+    when it was reallocated."""
+
+    def __init__(self):
+        self.memory, self.version = None, 0
+
+    def get(self, size: int):
+        if self.memory is None or self.memory.numel() < size:
+            self.release()  # a new version even if the allocation fails: nothing may stay bound to the old one
+            self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=DEVICE)
+            self.version += 1
+        return self.memory
+
+    def release(self):
+        if self.memory is not None:
+            self.memory = None
+            self.version += 1
+
+
 class Engine:
-    def __init__(self, plan_path: str):
+    def __init__(self, plan_path: str, arena: Arena = None):
         self.plan_path = plan_path
+        self.arena = arena or Arena()
         self.engine = self.context = None
         self._reset_context_state()
 
     def _reset_context_state(self):
         self.profile = None
         self.shapes = {}
-        self.memory = None
         self.memory_bound = False
+        self.bound_version = None
 
     @property
     def loaded(self) -> bool:
@@ -170,6 +192,7 @@ class Engine:
         self.context = None  # before its engine
         self.engine = None
         self._reset_context_state()
+        self.arena.release()
 
     def refit(self, names, tensor_for) -> dict:
         """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name, device)`, from
@@ -274,13 +297,10 @@ class Engine:
 
     def _prepare(self, profile: int, shapes: dict, stream: int):
         self._set_shapes(profile, shapes, stream)
-        if not self.memory_bound:
-            size = self.activation_bytes()
-            if self.memory is None or self.memory.numel() < size or self.memory.numel() > 2 * size:
-                self.memory = None
-                self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=DEVICE)
-            self.context.set_device_memory(self.memory.data_ptr(), self.memory.numel())
-            self.memory_bound = True
+        if not self.memory_bound or self.bound_version != self.arena.version or self.arena.memory is None:
+            memory = self.arena.get(self.activation_bytes())
+            self.context.set_device_memory(memory.data_ptr(), memory.numel())
+            self.memory_bound, self.bound_version = True, self.arena.version
 
     def activation_bytes(self) -> int:
         """For the profile and input shapes set on the context."""
@@ -307,5 +327,6 @@ class Engine:
         return outputs
 
     def release_activations(self):
-        self.memory = None
+        """Releases the arena, for every engine sharing it."""
+        self.arena.release()
         self.memory_bound = False

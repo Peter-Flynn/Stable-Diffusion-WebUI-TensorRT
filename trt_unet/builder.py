@@ -170,10 +170,12 @@ def build(job, logger, progress, strip=True):
     del data  # TensorRT has its own copy; the file can be large (it keeps compiled kernels from every build)
     config.set_timing_cache(cache, ignore_mismatch=True)
 
+    present = {network.get_input(i).name for i in range(network.num_inputs)}  # e.g. SDXL's shallow UNet takes no prompt
     for shapes in job["profiles"]:
         profile = builder.create_optimization_profile()
         for name, (lo, opt, hi) in shapes.items():
-            profile.set_shape(name, min=lo, opt=opt, max=hi)
+            if name in present:
+                profile.set_shape(name, min=lo, opt=opt, max=hi)
         config.add_optimization_profile(profile)
 
     plan = builder.build_serialized_network(network, config)

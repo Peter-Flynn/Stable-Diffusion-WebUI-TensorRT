@@ -10,13 +10,14 @@ import math
 import sys
 import time
 import traceback
+import weakref
 
 import torch
 
 from modules import sd_unet
 
 from . import arch as arch_mod
-from . import common, profiles, store
+from . import common, profiles, speed, store
 from .common import inference_mode, log, notify
 from .weights import EffectiveWeights
 
@@ -35,7 +36,9 @@ class TensorRTUNet:
 
 
 class TrtModel:
-    """An engine as reForge's model manager sees a model (the parts of ModelPatcher it uses)."""
+    """An engine as reForge's model manager sees a model (the parts of ModelPatcher it uses), with its
+    shallow partner for Speed Hacks (speed.py), loaded only for passes that use them. The two share their
+    activation memory, since they never run at once."""
 
     parent = None
 
@@ -45,24 +48,33 @@ class TrtModel:
         self.model = TensorRTUNet()
         self.load_device = mm.get_torch_device()
         self.offload_device = torch.device("cpu")
-        self.engine = None
-        self.weights = None  # EffectiveWeights the engine should run with
-        self.applied = {}  # weight name -> signature of what's in the engine
+        self.engine = self.shallow = None
+        self.want_shallow = False  # load the shallow engine with this one
+        self.weights = None  # EffectiveWeights the engines should run with
+        self.applied = {}  # "unet" / "shallow" -> {weight name: signature of what's in that engine}
         self.measured = 0
 
-    def _engine(self):
+    def _engines(self):
         if self.engine is None:
-            from .engine import Engine
+            from .engine import Arena, Engine
 
-            self.engine = Engine(self.record.plan)
+            arena = Arena()
+            self.engine = Engine(self.record.plan, arena)
+            if self.record.speed_hacks:
+                self.shallow = Engine(self.record.shallow_plan, arena)
         return self.engine
 
     @property
     def loaded(self) -> bool:
         return self.engine is not None and self.engine.loaded
 
+    @property
+    def shallow_loaded(self) -> bool:
+        return self.shallow is not None and self.shallow.loaded
+
     def model_size(self):
-        return self.measured or self.record.weight_bytes
+        hacks = self.record.speed_hacks
+        return self.measured or self.record.weight_bytes + (hacks["weight_bytes"] if hacks and self.want_shallow else 0)
 
     def loaded_size(self):
         return self.model_size() if self.loaded else 0
@@ -91,51 +103,83 @@ class TrtModel:
                 raise RuntimeError("no checkpoint to take the engine's weights from")
             self.weights = EffectiveWeights(patcher)
         start, free, reserved = time.time(), torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
-        engine = self._engine()
+        engine = self._engines()
         plan_seconds = engine.load()
+        if self.want_shallow and self.shallow is not None:
+            try:
+                plan_seconds += self.shallow.load()
+            except Exception as e:  # the engine runs without it
+                log(f"Could not load the Speed Hacks part of the {self.record.label} ({e}); running without it.")
+                self.shallow.unload()
+                self.want_shallow = False
         try:
             self.applied = {}
             refit = self.sync(quiet=True)
         except Exception:
-            engine.unload()
+            self.detach()
             raise
         # TensorRT's own allocations, not what PyTorch cached meanwhile (e.g. computing LoRA weights)
         used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
         self.measured = max(self.measured, used)
+        with_shallow = " with its Speed Hacks part" if self.shallow_loaded else ""
         log(
-            f"Loaded the {self.record.arch.label} {self.record.label} ({common.gib(self.model_size())}) in {time.time() - start:.1f}s: "
+            f"Loaded the {self.record.arch.label} {self.record.label}{with_shallow} ({common.gib(self.model_size())}) in {time.time() - start:.1f}s: "
             f"plan {plan_seconds:.1f}s, " + (_refit_times(refit) if refit else "no weights to refit")
         )
         return self.model_size()
+
+    def load_shallow(self):
+        """The shallow engine, for an engine loaded without it."""
+        if not self.loaded or self.shallow is None or self.shallow.loaded:
+            return
+        start, free, reserved = time.time(), torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
+        try:
+            self.shallow.load()
+            self.applied.pop("shallow", None)
+            self.sync(quiet=True)
+        except Exception:
+            self.shallow.unload()
+            raise
+        used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
+        self.measured += max(used, 0)
+        log(f"Loaded the Speed Hacks part of the {self.record.arch.label} {self.record.label} in {time.time() - start:.1f}s")
 
     def partially_unload(self, device, memory_to_free=0):
         return 0
 
     def detach(self, unpatch_all=True):
         if unpatch_all and self.loaded:
+            if self.shallow is not None:
+                self.shallow.unload()
             self.engine.unload()
             self.applied = {}
         return self.model
 
     def sync(self, quiet=False):
-        """Refits the weights whose source changed: all of them for a new engine or checkpoint, the
-        patched ones when LoRAs change. Returns what _refit_times reports, or None if nothing changed."""
-        engine, weights = self.engine, self.weights
+        """Refits the weights whose source changed, in each loaded engine: all of them for a new engine or
+        checkpoint, the patched ones when LoRAs change. Returns what _refit_times reports, or None if
+        nothing changed."""
+        weights = self.weights
         weights.refresh()
-        # The UNet's weights; anything else refittable keeps what the plan holds.
-        wanted = {name: weights.signature(name) for name in engine.weight_names if weights.has(name)}
-        changed = [name for name in wanted if self.applied.get(name) != wanted[name]]
-        if not changed:
-            return None
-        start = time.time()
-        self.applied = {}
-        torch.cuda.current_stream().synchronize()  # no inference in flight while the weights change
-        seconds = engine.refit(changed, weights.tensor)
-        self.applied = wanted
-        refit = {**seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
-        if not quiet:
-            log(f"Refitted {len(changed)} weights in {time.time() - start:.1f}s: {_refit_times(refit)}")
-        return refit
+        total, start = None, time.time()
+        for role, engine in (("unet", self.engine), ("shallow", self.shallow)):
+            if engine is None or not engine.loaded:
+                continue
+            # The UNet's weights; anything else refittable keeps what the plan holds.
+            wanted = {name: weights.signature(name) for name in engine.weight_names if weights.has(name)}
+            applied = self.applied.get(role, {})
+            changed = [name for name in wanted if applied.get(name) != wanted[name]]
+            if not changed:
+                continue
+            self.applied[role] = {}
+            torch.cuda.current_stream().synchronize()  # no inference in flight while the weights change
+            seconds = engine.refit(changed, weights.tensor)
+            self.applied[role] = wanted
+            refit = {**seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
+            total = refit if total is None else {k: total[k] + refit[k] for k in refit}
+        if total is not None and not quiet:
+            log(f"Refitted {total['count']} weights in {time.time() - start:.1f}s: {_refit_times(total)}")
+        return total
 
 
 def _refit_times(refit: dict) -> str:
@@ -184,69 +228,50 @@ def model_for(record: store.Record) -> TrtModel:
     return model
 
 
-class TrtUnetOption(sd_unet.SdUnetOption):
-    """An architecture's engines."""
+AUTOMATIC, SPEED_HACKS = "Automatic", "Speed Hacks"
 
-    def __init__(self, arch):
-        self.arch = arch
-        self.label = f"[TRT] {arch.label}"
 
-    @property
-    def model_name(self):
-        """The loaded checkpoint if it has this architecture: what "Automatic" in SD Unet looks for."""
-        try:
-            sd_model = arch_mod.loaded_model()
-            arch = arch_mod.detect(arch_mod.unet_patcher(sd_model)) if sd_model is not None else None
-            info = getattr(sd_model, "sd_checkpoint_info", None)
-            return getattr(info, "model_name", None) if arch is not None and arch.id == self.arch.id else None
-        except Exception as e:  # reForge asks every option at the start of each generation
-            log(f"Could not check the loaded model's architecture: {e}")
-            return None
+def setting() -> str:
+    """SD Unet: "Automatic" runs the loaded checkpoint's architecture's engines, "Speed Hacks" runs them with
+    Speed Hacks (speed.py), anything else (reForge's "None") runs PyTorch."""
+    try:
+        from modules import shared
+
+        return str(shared.opts.sd_unet)
+    except Exception:
+        return AUTOMATIC
+
+
+class SpeedHacksOption(sd_unet.SdUnetOption):
+    """SD Unet's "Speed Hacks" entry. "Automatic" needs none: the engines run whenever it's chosen."""
+
+    label = SPEED_HACKS
+    model_name = None  # never what "Automatic" picks
 
     def create_unet(self):
         return TrtUnet(self)
 
 
 class TrtUnet(sd_unet.SdUnet):
-    def __init__(self, option: TrtUnetOption):
+    def __init__(self, option: SpeedHacksOption):
         super().__init__()
         self.option = option
 
     def forward(self, *args, **kwargs):
         raise RuntimeError("TensorRT engines run through the UNet's own forward")
 
-    def deactivate(self):
-        for model in list(_models.values()):
-            if model.record.arch.id == self.option.arch.id:
-                _unload(model)
-
 
 def list_unets(options: list):
-    ours = [TrtUnetOption(arch) for arch in {r.arch.id: r.arch for r in store.records() if r.loadable}.values()]
-    options.extend(ours)
-    try:  # SD Unet naming an engine that's gone (deleted, or built for another TensorRT or GPU) would select nothing
+    options.append(SpeedHacksOption())
+    try:  # an engine per architecture had an entry of its own before ("[TRT] SDXL (...)")
         from modules import shared
 
         saved = shared.opts.data.get("sd_unet")
-        if isinstance(saved, str) and saved.startswith("[TRT] ") and saved not in {o.label for o in ours}:
-            shared.opts.data["sd_unet"] = "Automatic"
-            log(f"SD Unet was set to {saved}, an engine that can't be used anymore; it's Automatic now.")
+        if isinstance(saved, str) and saved.startswith("[TRT] "):
+            shared.opts.data["sd_unet"] = AUTOMATIC
+            log(f"SD Unet was set to {saved}; engines don't have entries of their own anymore, so it's {AUTOMATIC} now.")
     except Exception:
         pass
-
-
-def _explicit_choice() -> bool:
-    try:
-        from modules import shared
-
-        return str(shared.opts.sd_unet).startswith("[TRT] ")
-    except Exception:
-        return True
-
-
-def _selected_arch():
-    unet = sd_unet.current_unet
-    return unet.option.arch if isinstance(unet, TrtUnet) else None
 
 
 def _unsupported(patcher) -> str:
@@ -311,11 +336,13 @@ def _load_torch_unet(patcher, shape):
 class Pass:
     """One sampling pass on an architecture's engines: each UNet call runs in the profile that fits it best,
     on the engine holding it, loaded (in place of another) when it isn't. A merged engine holds every
-    profile, so it only ever changes profiles. On anything no engine can run, the rest of the pass falls
-    back to PyTorch, with the UNet loaded the way reForge would have."""
+    profile, so it only ever changes profiles. With Speed Hacks, each evaluation's UNet calls run on the
+    engine or its shallow partner as `schedule` says (speed.py). On anything no engine can run, the rest of
+    the pass falls back to PyTorch, with the UNet loaded the way reForge would have."""
 
-    def __init__(self, records: list, patcher, x):
+    def __init__(self, records: list, patcher, x, hacks: bool = False):
         self.records, self.patcher = records, patcher
+        self.schedule = speed.Schedule() if hacks else None
         self.slots = store.slots(records)  # (record, optimization profile in it), in the profiles' order
         self.model = None
         self.weights = EffectiveWeights(patcher)
@@ -340,6 +367,7 @@ class Pass:
                     _unload(other)
             self._hold(None)
             model.weights = self.weights
+            model.want_shallow = model.want_shallow or (self.schedule is not None and record.speed_hacks is not None)
             with torch.inference_mode(), _keeping(self.patcher):
                 common.mm().load_models_gpu([model])
             self.model = model
@@ -347,6 +375,13 @@ class Pass:
             # the engine would mean reloading it on the next step, the UNet would lose its patches.
             self._hold(_keeping(model, self.patcher))
         _last_used[self.arch_id] = record.key
+        if self.schedule is not None and record.speed_hacks and not model.shallow_loaded:
+            model.want_shallow = True
+            try:
+                with torch.inference_mode():
+                    model.load_shallow()
+            except Exception as e:  # the pass runs in full
+                log(f"Could not load the Speed Hacks part of the {record.label} ({e}); running without it.")
         model.sync()
         return model
 
@@ -389,6 +424,10 @@ class Pass:
     def end(self):
         """Undoes what the pass changed; the engine stays loaded for the next one."""
         self._restore()
+        hacks = self.schedule
+        if hacks is not None and hacks.shallow_calls:
+            log(f"Speed Hacks: {hacks.shallow_calls} of {hacks.shallow_calls + hacks.full_calls} UNet calls ran on the shallow engine.")
+            _note_speed_hacks()
         for model in _models.values():
             if model.weights is self.weights:
                 model.weights = None  # don't keep this checkpoint alive
@@ -433,14 +472,17 @@ class Pass:
                     traceback.print_exc()
                 self.fall_back(f"Could not load the {record.label} ({e})")
         stream = torch.cuda.current_stream().cuda_stream
+        slot = deep = None
+        if self.schedule is not None and self.model.shallow_loaded:
+            slot, deep = self.schedule.call(feed["sample"].shape)
         try:
-            out = self._infer(feed, profile, stream)
+            out = self._infer(feed, profile, stream, slot, deep)
         except torch.cuda.OutOfMemoryError:
             self.model.engine.release_activations()
             common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
             common.mm().soft_empty_cache(force=True)
             try:
-                out = self._infer(feed, profile, stream)
+                out = self._infer(feed, profile, stream, slot, deep)
             except torch.cuda.OutOfMemoryError:
                 self.fall_back("Out of VRAM running the engine")
         if not self.checked:
@@ -449,9 +491,16 @@ class Pass:
                 self.fall_back("The engine produced NaN/Inf values")
         return out[:b].to(x.dtype)
 
-    def _infer(self, feed, profile, stream):
+    def _infer(self, feed, profile, stream, slot=None, deep=None):
+        """The engine's output, or with a deep feature, its shallow partner's. The engine's deep feature is
+        kept for the call's slot."""
         try:
-            return self.model.engine.infer(feed, profile, stream)["latent"]
+            if deep is not None:
+                return self.model.shallow.infer({**feed, "deep": deep}, profile, stream)["latent"]
+            outputs = self.model.engine.infer(feed, profile, stream)
+            if slot is not None and "deep" in outputs:
+                self.schedule.keep(slot, feed["sample"].shape, outputs["deep"])
+            return outputs["latent"]
         except torch.cuda.OutOfMemoryError:
             raise
         except Exception as e:
@@ -460,28 +509,31 @@ class Pass:
 
 
 def _engine_records(patcher, x):
-    """The engines to run this pass on, or None for PyTorch."""
-    selected = _selected_arch()
-    if selected is None:
-        return None
+    """(the engines to run this pass on, whether with Speed Hacks), or (None, False) for PyTorch."""
+    chosen = setting()
+    if chosen not in (AUTOMATIC, SPEED_HACKS):
+        return None, False
     arch = arch_mod.detect(patcher)
-    if arch is None or arch.id != selected.id:  # e.g. a refiner: with SD Unet on Automatic, that's expected
-        if _explicit_choice():
-            notify(f"The selected engines are for {selected.label}, not {arch.label if arch else 'this model'}; using PyTorch.")
-        return None
+    records = store.engines(arch.id) if arch is not None else []
+    if not records:  # e.g. a refiner of another architecture: with SD Unet on Automatic, that's expected
+        if chosen == SPEED_HACKS:
+            notify(f"There are no TensorRT engines for {arch.label if arch else 'this model'}; using PyTorch. Build them in the TensorRT tab.")
+        return None, False
     reason = _unsupported(patcher)
     if reason:
         notify(f"TensorRT engines can't apply {reason}; using PyTorch.")
-        return None
-    records = store.engines(arch.id)
+        return None, False
     b, _, h, w = x.shape
     if not profiles.covers_size([s for r in records for s in r.profile_shapes], h, w, b):
         notify(f"No profile of the {arch.label} engines covers {w * 8}x{h * 8} at batch size {b}; using PyTorch for this pass. Add one in the TensorRT tab.")
-        return None
-    return records
+        return None, False
+    hacks = chosen == SPEED_HACKS and any(r.speed_hacks for r in records)
+    if chosen == SPEED_HACKS and not all(r.speed_hacks for r in records):
+        notify(f"Some of the {arch.label} engines were built without Speed Hacks, and run without them; build them again in the TensorRT tab.")
+    return records, hacks
 
 
-def _begin(records, patcher, x, prepare):
+def _begin(records, hacks, patcher, x, prepare):
     """sampling_prepare for a pass on the engines: the Pass, or None if it fell back to PyTorch. Loads the
     engine for the likeliest sizes (cond and uncond batched, the shortest prompts) now, the others when needed."""
 
@@ -494,7 +546,7 @@ def _begin(records, patcher, x, prepare):
             prepare(patcher, x)
         finally:
             mm.vram_state, mm.free_memory = state
-        p = Pass(records, patcher, x)
+        p = Pass(records, patcher, x, hacks)
         try:
             b, _, h, w = x.shape
             prefer = p.preferred()
@@ -563,10 +615,10 @@ def _wrap_prepare(original):
     def sampling_prepare(unet, x, *args, **kwargs):
         global _pass
         end_pass()
-        records = _engine_records(unet, x)
+        records, hacks = _engine_records(unet, x)
         if records is None:
             return original(unet, x, *args, **kwargs)
-        _pass = _begin(records, unet, x, lambda u, v: original(u, v, *args, **kwargs))
+        _pass = _begin(records, hacks, unet, x, lambda u, v: original(u, v, *args, **kwargs))
 
     sampling_prepare._trt_original = original
     return sampling_prepare
@@ -579,6 +631,26 @@ def _wrap_cleanup(original):
 
     sampling_cleanup._trt_original = original
     return sampling_cleanup
+
+
+def _wrap_denoiser(original):
+    """reForge's CFG denoiser runs one evaluation of the sampler (its UNet calls for every cond): tells the
+    pass's Speed Hacks schedule which one, out of how many, at which latent."""
+
+    def forward(self, x, *args, **kwargs):
+        p = _pass
+        if p is not None and p.schedule is not None and p.fallback is None:
+            try:
+                from modules import shared
+
+                p.schedule.begin(int(self.step), self.total_steps, shared.state.sampling_steps, x)
+            except Exception as e:
+                log(f"Speed Hacks stopped for this pass: {e}")
+                p.schedule = None
+        return original(self, x, *args, **kwargs)
+
+    forward._trt_original = original
+    return forward
 
 
 def _rebind(owner, name, wrap):
@@ -603,6 +675,14 @@ def install_hooks():
         openaimodel.UNetModel.forward = _wrap_forward(openaimodel.UNetModel.forward)
     _rebind(forge_sampler, "sampling_prepare", _wrap_prepare)
     _rebind(forge_sampler, "sampling_cleanup", _wrap_cleanup)
+    try:  # Speed Hacks only: the engines run without it
+        from modules import sd_samplers_cfg_denoiser
+
+        denoiser = sd_samplers_cfg_denoiser.CFGDenoiser
+        if not hasattr(denoiser.forward, "_trt_original"):
+            denoiser.forward = _wrap_denoiser(denoiser.forward)
+    except Exception as e:
+        log(f"Could not hook reForge's CFG denoiser, so Speed Hacks run every evaluation in full: {e}")
 
 
 def new_batch():
@@ -612,9 +692,24 @@ def new_batch():
     _last_used.clear()
 
 
-def new_generation():
+_generation = None  # weakref to the generation's processing object, for its infotext
+
+
+def _note_speed_hacks():
+    p = _generation() if _generation is not None else None
+    if p is not None:
+        p.extra_generation_params["TensorRT"] = SPEED_HACKS
+
+
+def new_generation(p=None):
+    global _generation
     end_pass()  # a generation that failed mid-pass never cleaned up
     common.new_generation()
+    _generation = weakref.ref(p) if p is not None else None
+    if setting() not in (AUTOMATIC, SPEED_HACKS):  # SD Unet is None: give their VRAM back
+        for model in list(_models.values()):
+            if model.loaded:
+                _unload(model)
     try:
         install_hooks()
     except Exception as e:
