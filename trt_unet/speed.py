@@ -11,9 +11,10 @@ so a step can reuse the last one. Here that test decides when a due full evaluat
 shallow call costs a few percent of a full one, so it's no slower than reusing the prediction, and
 closer to it.
 
-A pass's first evaluations, where its composition and colors settle, and its last ones run in full; full
-evaluations only wait in its second half. Passes of fewer sampler steps than MIN_STEPS (e.g. few-step
-LoRAs, whose samplers may evaluate twice per step) don't use any of it."""
+A pass's first evaluations (WARMUP of them), where its composition and colors settle, and its last ones
+(TAIL), where fine detail does, run in full; both shares are settings (runtime.py). Full evaluations only
+wait in a pass's second half. Passes of fewer sampler steps than MIN_STEPS (e.g. few-step LoRAs, whose
+samplers may evaluate twice per step) don't use any of it."""
 
 import torch
 
@@ -21,8 +22,8 @@ BRANCH = 0  # the shallow part: the input blocks up to this one and the output b
 INTERVAL = 3  # a full evaluation every 3 at least...
 MAX_STRETCH = 2  # ...or up to this many later while the sampler's trajectory is smooth
 SMOOTHNESS = 0.01  # AdaptiveDiffusion's threshold (its SD 1.5 and SDXL setting)
-WARMUP = 0.2  # the share of a pass's evaluations run in full at its start, where its composition settles
-TAIL = 0.1  # ...and at its end
+WARMUP = 0.3  # the share of a pass's evaluations run in full at its start, by default
+TAIL = 0.05  # ...and at its end (its last one always)
 STRETCH_FROM = 0.5  # the share of a pass after which full evaluations may wait
 MIN_STEPS = 12
 MAX_AGE = INTERVAL - 1 + MAX_STRETCH  # evaluations a deep feature is used for after its own
@@ -98,7 +99,8 @@ class Schedule:
     several UNet calls: cond and uncond, or more), whether its UNet calls run in full or shallow, and keeps
     each call's deep feature. A UNet call that has no deep feature of its shape to use runs in full."""
 
-    def __init__(self):
+    def __init__(self, warmup: float = WARMUP, tail: float = TAIL):
+        self.warmup, self.tail = warmup, tail
         self.index = None  # the evaluation running; None until the denoiser says (without it, all run in full)
         self.decision = "full"
         self.last_full = None  # the last evaluation decided full
@@ -123,7 +125,7 @@ class Schedule:
     def _decide(self, index, total, steps) -> str:
         if not total or not steps or steps < MIN_STEPS:
             return "full"
-        if index < round(WARMUP * total) or index >= total - max(1, round(TAIL * total)) or self.last_full is None:
+        if index < round(self.warmup * total) or index >= total - max(1, round(self.tail * total)) or self.last_full is None:
             return "full"
         if index - self.last_full < INTERVAL:
             return "shallow"

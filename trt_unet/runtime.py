@@ -251,6 +251,24 @@ def setting() -> str:
         return AUTOMATIC
 
 
+# Settings (Stable Diffusion, TensorRT; ui.py adds them): the percentage of a pass's steps that Speed Hacks
+# run in full at its start and at its end.
+FULL_START, FULL_END = "trt_speed_hacks_full_start", "trt_speed_hacks_full_end"
+
+
+def speed_settings() -> tuple:
+    """(share at the start, share at the end), as speed.Schedule takes them."""
+    from modules import shared
+
+    def share(key, default):
+        try:
+            return min(max(float(getattr(shared.opts, key)) / 100, 0.0), 1.0)
+        except Exception:  # not registered (e.g. a settings UI that failed to load)
+            return default
+
+    return share(FULL_START, speed.WARMUP), share(FULL_END, speed.TAIL)
+
+
 class SpeedHacksOption(sd_unet.SdUnetOption):
     """SD Unet's "Speed Hacks" entry. "Automatic" needs none: the engines run whenever it's chosen."""
 
@@ -401,7 +419,7 @@ class Pass:
 
     def __init__(self, records: list, patcher, x, hacks: bool = False):
         self.records, self.patcher = records, patcher
-        self.schedule = speed.Schedule() if hacks else None
+        self.schedule = speed.Schedule(*speed_settings()) if hacks else None
         self.slots = store.slots(records)  # (record, optimization profile in it), in the profiles' order
         self.model = None
         self.weights = EffectiveWeights(patcher)

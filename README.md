@@ -44,10 +44,11 @@ engines; `Speed Hacks` uses them with Speed Hacks; `None` uses PyTorch.
 **Speed Hacks.** Every engine comes with a small engine of just the UNet's outermost blocks. With Speed Hacks, about
 half of the denoising steps run on it, reusing the deep features the full UNet computed a step or two before
 ([DeepCache](https://github.com/horseee/DeepCache)), and late in a pass, full steps wait longer while the image changes
-smoothly ([AdaptiveDiffusion](https://jiakangyuan.github.io/AdaptiveDiffusion-project-page)). The first 20% and last 10%
-of steps run in full, where composition and fine detail settle. Passes of 12 steps or more should run roughly 1.7x as
-fast as on the engines alone (estimated); images are a little less precise, so a seed gives a somewhat different image
-than without them. Fewer steps (e.g. with few-step LoRAs) run as usual.
+smoothly ([AdaptiveDiffusion](https://jiakangyuan.github.io/AdaptiveDiffusion-project-page)). The first 30% and last 5%
+of steps run in full, where composition and fine detail settle; both shares are in Settings → Stable Diffusion →
+TensorRT. Passes of 12 steps or more should run roughly 1.6x as fast as on the engines alone (estimated); images are a
+little less precise, so a seed gives a somewhat different image than without them. Fewer steps (e.g. with few-step
+LoRAs) run as usual.
 
 > [!NOTE]
 > An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build again;

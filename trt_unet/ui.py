@@ -32,7 +32,7 @@ HELP = """
 
 **SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engines of the loaded checkpoint's architecture, `Speed Hacks` uses them with Speed Hacks, `None` always uses PyTorch.
 
-**Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and, late in a pass, wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). The first 20% and last 10% of steps run in full, so composition and detail stay close. Passes of 12 steps or more should run roughly 1.7x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
+**Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and, late in a pass, wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). The first 30% and last 5% of steps run in full, so composition and detail stay close (both shares are in Settings, Stable Diffusion, TensorRT). Passes of 12 steps or more should run roughly 1.6x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
 """
 
 
@@ -496,6 +496,19 @@ def delete_engine(choice, draft, draft_arch):
             sd_unet.list_unets()
         common.log(f"Deleted the {len(group)} engines of {choice}")
     return refresh(draft, draft_arch)
+
+
+def on_ui_settings():
+    """Speed Hacks' full steps, in Settings, Stable Diffusion, TensorRT."""
+    from . import runtime, speed
+
+    section, slider = ("tensorrt", "TensorRT"), {"minimum": 0, "maximum": 100, "step": 1}
+    shared.opts.add_option(runtime.FULL_START, shared.OptionInfo(
+        round(speed.WARMUP * 100), "Speed Hacks: share of steps at the start that run in full (%)", gr.Slider, slider, section=section, category_id="sd",
+    ).info("where composition and colors settle; more keeps images closer to running without Speed Hacks, less runs faster"))
+    shared.opts.add_option(runtime.FULL_END, shared.OptionInfo(
+        round(speed.TAIL * 100), "Speed Hacks: share of steps at the end that run in full (%)", gr.Slider, slider, section=section, category_id="sd",
+    ).info("where fine detail settles; the last step always runs in full"))
 
 
 def on_ui_tabs():

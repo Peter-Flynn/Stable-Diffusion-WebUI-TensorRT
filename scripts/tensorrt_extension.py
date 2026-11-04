@@ -23,3 +23,4 @@ except Exception as e:
     print(f"[TensorRT] This extension needs reForge: {e}", flush=True)
 script_callbacks.on_list_unets(runtime.list_unets)
 script_callbacks.on_ui_tabs(ui.on_ui_tabs)
+script_callbacks.on_ui_settings(ui.on_ui_settings)
