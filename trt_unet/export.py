@@ -2,6 +2,7 @@
 weights are placeholders, then build it in builder.py's process."""
 
 import contextlib
+import copy
 import gc
 import inspect
 import json
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import warnings
 
 import torch
@@ -97,28 +99,54 @@ def _fresh_unet(config: dict, device, dtype=torch.float16):
     return unet
 
 
-def _placeholder_weights(onnx_path: str, input_names) -> dict:
-    """Turns the exported weight inputs into initializers that read a small file of zeros, so the graph
+def _weightless_graph(onnx_path: str, input_names, agree_with) -> dict:
+    """Checks the exported weights' shapes against each {name: shape} in `agree_with`, tidies the graph
+    (graph.py), and turns the weight inputs into initializers that read a small file of zeros, so the graph
     stays small: TensorRT only needs their shapes, the checkpoint provides the values. TensorRT tells
     weights apart by their memory (the parser maps the file once), so each starts at its own offset;
-    their ranges overlap, so the file is about as large as the largest weight."""
+    their ranges overlap, so the file is about as large as the largest weight. Returns {weight name:
+    shape in the checkpoint}."""
     import onnx
+
+    from . import graph as graph_mod
 
     model = onnx.load(onnx_path)
     graph = model.graph
     used = {name for node in graph.node for name in node.input}
-    weights = [i for i in graph.input if i.name not in input_names]
+    shapes = {}
+    for value in list(graph.input):
+        if value.name in input_names:
+            continue
+        if value.name in used:
+            shapes[value.name] = [d.dim_value for d in value.type.tensor_type.shape.dim]
+        else:
+            graph.input.remove(value)
+    wrong = [k for k, s in shapes.items() if any(other.get(k) != s for other in agree_with)]
+    if wrong:
+        raise RuntimeError(f"{len(wrong)} exported weights don't match the loaded UNet (e.g. {wrong[0]})")
+    start = time.time()
+    try:
+        tidied = copy.deepcopy(model)  # small: the weights aren't in it yet
+        before, after = graph_mod.tidy(tidied, shapes)
+        model, graph = tidied, tidied.graph
+        log(f"Tidied the graph from {before} to {after} nodes in {time.time() - start:.0f}s")
+    except Exception as e:  # the graph as exported runs the same, with more layers
+        traceback.print_exc()
+        log(f"Could not tidy the graph ({e}); building from it as exported.")
+    used = {name for node in graph.node for name in node.input}
+    for value in [i for i in graph.input if i.name in shapes and i.name not in used]:  # TensorRT couldn't mark it refittable
+        graph.input.remove(value)
+        del shapes[value.name]
+
     sizes = {onnx.TensorProto.FLOAT16: 2, onnx.TensorProto.BFLOAT16: 2, onnx.TensorProto.FLOAT: 4, onnx.TensorProto.INT64: 8}
     data_name = os.path.basename(onnx_path) + ".zeros"
-    shapes, end = {}, 0
-    for value in weights:
+    end = 0
+    for index, value in enumerate([i for i in graph.input if i.name in shapes]):
         graph.input.remove(value)
-        if value.name not in used:
-            continue
         t = value.type.tensor_type
-        dims = [d.dim_value for d in t.shape.dim]
+        dims = [d.dim_value for d in t.shape.dim]  # as the graph takes it: GroupNorm's unsqueezed
         nbytes = math.prod(dims) * sizes[t.elem_type]
-        offset = len(shapes) * PLACEHOLDER_STRIDE
+        offset = index * PLACEHOLDER_STRIDE
         end = max(end, offset + nbytes)
         init = graph.initializer.add()
         init.name, init.data_type, init.data_location = value.name, t.elem_type, onnx.TensorProto.EXTERNAL
@@ -126,7 +154,6 @@ def _placeholder_weights(onnx_path: str, input_names) -> dict:
         for key, val in (("location", data_name), ("offset", str(offset)), ("length", str(nbytes))):
             entry = init.external_data.add()
             entry.key, entry.value = key, val
-        shapes[value.name] = dims
     with open(os.path.join(os.path.dirname(onnx_path), data_name), "wb") as f:
         f.truncate(end)
     onnx.save(model, onnx_path)
@@ -135,7 +162,7 @@ def _placeholder_weights(onnx_path: str, input_names) -> dict:
 
 @common.inference_mode
 def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float16) -> dict:
-    """Writes folder/unet.onnx; returns {weight name: shape}."""
+    """Writes folder/unet.onnx; returns {weight name: shape in the checkpoint}."""
     device = device or common.mm().get_torch_device()
     unet = _fresh_unet(unet_config(patcher), device, dtype)
     names = [n for n in INPUTS if n != "y" or arch.adm_channels]
@@ -162,17 +189,13 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
         # The values it warns about (shape checks, the head size) are fixed for an architecture.
         warnings.simplefilter("ignore", torch.jit.TracerWarning)
         torch.onnx.export(unet, tuple(inputs), path, **kwargs)
-    expected = {k: list(v.shape) for k, v in unet.state_dict(keep_vars=True).items()}
+    exported = {k: list(v.shape) for k, v in unet.state_dict(keep_vars=True).items()}
     del unet, inputs
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    shapes = _placeholder_weights(path, names)
     loaded = {k: list(v.shape) for k, v in patcher.model.diffusion_model.state_dict(keep_vars=True).items()}
-    wrong = [k for k, s in shapes.items() if expected.get(k) != s or loaded.get(k) != s]
-    if wrong:
-        raise RuntimeError(f"{len(wrong)} exported weights don't match the loaded UNet (e.g. {wrong[0]})")
-    return shapes
+    return _weightless_graph(path, names, (exported, loaded))
 
 
 def _builder_env() -> dict:
