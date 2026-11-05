@@ -15,6 +15,7 @@ from tqdm import tqdm
 PROGRESS = "@@trt-progress "
 RESULT = "@@trt-result "
 _MEMORY_HINTS = ("insufficient memory", "memory is insufficient", "could not be allocated", "out of memory")
+_ALLOCATION_FAILED = ("outofmemory (requested size",)  # TensorRT 11's error for a kernel's memory it then does without
 
 
 def log(message):
@@ -22,8 +23,9 @@ def log(message):
 
 
 class Logger(trt.ILogger):
-    """Errors, each warning once, and the number of out-of-memory warnings TensorRT gives when it has to
-    skip kernels (with the first one): a build can give a great many."""
+    """Errors, each warning once, and the number of out-of-memory messages TensorRT gives when it has to
+    skip kernels (with the first one): a build can give a great many. TensorRT 11 gives them as errors
+    ("Error Code 2: OutOfMemory (Requested size was ...)"), though the build goes on without those kernels."""
 
     def __init__(self):
         trt.ILogger.__init__(self)
@@ -34,7 +36,11 @@ class Logger(trt.ILogger):
         level = int(severity)
         if level > int(trt.ILogger.Severity.WARNING):
             return
-        if any(h in msg.lower() for h in _MEMORY_HINTS) and level == int(trt.ILogger.Severity.WARNING):
+        lower = msg.lower()
+        skipped = any(h in lower for h in _MEMORY_HINTS) and level == int(trt.ILogger.Severity.WARNING)
+        if skipped or any(h in lower for h in _ALLOCATION_FAILED):
+            if not self.memory_warnings:
+                print(f"[TensorRT] Some kernels need more VRAM than is free at the profiles' largest sizes, so TensorRT skips them ({msg})", flush=True)
             self.memory_warnings += 1
             self.memory_example = self.memory_example or msg
         elif level <= int(trt.ILogger.Severity.ERROR):
@@ -180,7 +186,8 @@ def build(job, logger, progress, strip=True):
 
     plan = builder.build_serialized_network(network, config)
     if plan is None:
-        raise NoEngine("TensorRT returned no engine" + (f": {logger.errors[-1]}" if logger.errors else ""))
+        said = logger.errors[-1] if logger.errors else logger.memory_example  # e.g. nothing fit in the VRAM free
+        raise NoEngine("TensorRT returned no engine" + (f": {said}" if said else ""))
     with open(job["plan"], "wb") as f:
         f.write(memoryview(plan))
     del plan

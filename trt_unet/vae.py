@@ -16,6 +16,7 @@ Engines live in models/Unet-trt/<UNet architecture id>/vae/, built with that arc
 for the sizes its profiles cover."""
 
 import contextlib
+import gc
 import glob
 import hashlib
 import inspect
@@ -109,6 +110,27 @@ def label(name: str) -> str:
 
 
 TENSOR_LIMIT = 2**31 - 1  # elements a tensor can hold in TensorRT's kernels (its Myelin backend)
+RUNNING = 2  # a decode holds about this many of its largest tensor at once (it, and what's made from it)
+RESERVE = 2**30  # of the GPU's VRAM, for the CUDA context and the engines' weights
+
+
+def _vram():
+    """The GPU's total VRAM, or None if it can't tell."""
+    try:
+        return int(torch.cuda.get_device_properties(common.mm().get_torch_device()).total_memory)
+    except Exception:
+        return None
+
+
+def _limit(dtype=None, vram=None) -> tuple:
+    """(the most elements the decoder's largest tensor may have, why): TensorRT's limit, or less if a
+    decode that large wouldn't fit in the GPU's VRAM even alone (so the engines needn't go that far)."""
+    limit, why = TENSOR_LIMIT, "TensorRT can't hold a larger decode's largest tensor (2^31 elements)"
+    if dtype is not None and vram:
+        fits = int((vram - RESERVE) / (RUNNING * torch.tensor([], dtype=dtype).element_size()))
+        if fits < limit:
+            limit, why = fits, f"a larger decode wouldn't fit in this GPU's {common.gib(vram)} in {label(dtype_name(dtype))}, even alone"
+    return limit, why
 
 
 def largest_tensor(cfg: dict, b: int, h: int, w: int) -> int:
@@ -125,19 +147,21 @@ def largest_tensor(cfg: dict, b: int, h: int, w: int) -> int:
     return worst
 
 
-def shapes_for(profiles: list, cfg: dict) -> dict:
+def shapes_for(profiles: list, cfg: dict, dtype=None, vram=None) -> dict:
     """The engines' input shapes for the sizes a list of profiles covers: from the smallest to the largest
     of them, optimal at the first profile's optimal size, one image at a time up to the largest batch.
-    Capped so the largest tensor fits TensorRT (TENSOR_LIMIT): the size first (scaled down, keeping its
-    aspect), then the batch at that size. Larger decodes run on PyTorch."""
+    Capped so the largest tensor fits (_limit: TensorRT's limit, and with the precision and the GPU's
+    VRAM, what could decode at all): the size first (scaled down, keeping its aspect), then the batch at
+    that size. Larger decodes run on PyTorch."""
+    limit = _limit(dtype, vram)[0]
     lo_h, lo_w = min(p.height[0] for p in profiles) // 8, min(p.width[0] for p in profiles) // 8
     hi_h, hi_w = max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8
-    if largest_tensor(cfg, 1, hi_h, hi_w) > TENSOR_LIMIT:
-        scale = math.sqrt(TENSOR_LIMIT / largest_tensor(cfg, 1, hi_h, hi_w))
+    if largest_tensor(cfg, 1, hi_h, hi_w) > limit:
+        scale = math.sqrt(limit / largest_tensor(cfg, 1, hi_h, hi_w))
         hi_h, hi_w = max(1, int(hi_h * scale)), max(1, int(hi_w * scale))
-        while largest_tensor(cfg, 1, hi_h, hi_w) > TENSOR_LIMIT:
+        while largest_tensor(cfg, 1, hi_h, hi_w) > limit and max(hi_h, hi_w) > 1:
             hi_h, hi_w = (hi_h - 1, hi_w) if hi_h >= hi_w else (hi_h, hi_w - 1)
-    batch = max(1, min(MAX_BATCH, max(p.batch[2] for p in profiles), TENSOR_LIMIT // largest_tensor(cfg, 1, hi_h, hi_w)))
+    batch = max(1, min(MAX_BATCH, max(p.batch[2] for p in profiles), limit // largest_tensor(cfg, 1, hi_h, hi_w)))
     lo_h, lo_w = min(lo_h, hi_h), min(lo_w, hi_w)
     opt_h, opt_w = min(max(profiles[0].height[1] // 8, lo_h), hi_h), min(max(profiles[0].width[1] // 8, lo_w), hi_w)
     zc, c = cfg["latent_channels"], cfg["mid_channels"]
@@ -259,7 +283,7 @@ def needs_build(arch, profiles: list, vae=None) -> str:
         return ""
     try:
         cfg, wanted, dtype = config(vae), digest(vae), dtype_name(vae.vae_dtype)
-        shapes = shapes_for(profiles, cfg)
+        shapes = shapes_for(profiles, cfg, vae.vae_dtype, _vram())
         if any(r.meta.get("digest") == wanted and r.meta.get("dtype") == dtype and _covers(r.meta["shapes"], shapes) for r in records(arch.id)):
             return ""
     except Exception as e:
@@ -362,27 +386,28 @@ def export_onnx(vae, work: str, dtype, device) -> dict:
 def build(arch, profiles: list, work: str, optimization_level=None, progress=None, vae=None):
     """Builds the decoder engines for these profiles' sizes, for the loaded VAE's decoder and precision, and
     deletes this GPU's and TensorRT version's other decoder engines for the architecture. Returns (the
-    Record, None) or (None, why it failed)."""
+    Record or None, why it failed or None, how many kernels TensorRT skipped for want of VRAM)."""
     from . import export
 
     vae = vae if vae is not None else loaded_vae()
     reason = "no VAE is loaded" if vae is None else unsupported(vae)
     if reason:
-        return None, reason
+        return None, reason, 0
+    skipped = 0
     try:
         dtype = vae.vae_dtype
-        cfg = config(vae)
-        shapes = shapes_for(profiles, cfg)
+        cfg, vram = config(vae), _vram()
+        shapes = shapes_for(profiles, cfg, dtype, vram)
         b, _, h, w = shapes[PRE]["latent"][2]
         wanted_h, wanted_w = max(p.height[2] for p in profiles), max(p.width[2] for p in profiles)
         if (h * 8, w * 8) != (wanted_h, wanted_w):
-            log(
-                f"The VAE decoder engines go up to {w * 8}x{h * 8} ({b} at a time), not the profiles' {wanted_w}x{wanted_h}: TensorRT "
-                "can't hold a larger decode's largest tensor (2^31 elements). Larger decodes run on PyTorch."
-            )
+            log(f"The VAE decoder engines go up to {w * 8}x{h * 8} ({b} at a time), not the profiles' {wanted_w}x{wanted_h}: {_limit(dtype, vram)[1]}. Larger decodes run on PyTorch.")
         if progress:
             progress(0.0, "exporting the graphs")
         graphs = export_onnx(vae, work, dtype, common.mm().get_torch_device())
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # the trace's VRAM back to the driver, for the builder's process
         stripped = {}
         for n, part in enumerate((PRE, POST)):
             step = (lambda f, t, n=n, part=part: progress((n + f) / 2, f"{part} engine: {t}")) if progress else None
@@ -395,8 +420,9 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                 "optimization_level": optimization_level,
             }
             result = export._build_plan(job, work, step)
+            skipped += result.get("memory_warnings") or 0
             if not result["ok"]:
-                return None, str(result.get("error"))
+                return None, str(result.get("error")), skipped
             stripped[part] = result["stripped"]
         key = hashlib.sha1(json.dumps([digest(vae), dtype_name(dtype), shapes], sort_keys=True).encode()).hexdigest()[:10]
         size = torch.tensor([], dtype=dtype).element_size()
@@ -425,10 +451,10 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         with open(base + ".json.tmp", "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=1)
         os.replace(base + ".json.tmp", base + ".json")
-        return Record(base, meta), None
+        return Record(base, meta), None, skipped
     except Exception as e:
         traceback.print_exc()
-        return None, str(e)
+        return None, str(e), skipped
 
 
 # --- Decoding

@@ -502,7 +502,8 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             start = time.time()
             log(f"Building the {arch.label} engines for {vae_part}.")
             step = (lambda f, t: progress((len(groups) + f) / total, f"VAE decoder: {t}")) if progress else None
-            vae_record, vae_error = vae_mod.build(arch, profiles, folder, optimization_level, step)
+            vae_record, vae_error, skipped = vae_mod.build(arch, profiles, folder, optimization_level, step)
+            warnings += skipped
             if vae_record is not None:
                 log(f"Built the VAE decoder engines in {time.time() - start:.0f}s")
             elif vae_error == "cancelled" or CANCEL.is_set():
