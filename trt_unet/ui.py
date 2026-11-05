@@ -33,7 +33,7 @@ HELP = """
 
 **SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engines of the loaded checkpoint's architecture, `Speed Hacks` uses them with Speed Hacks, `None` always uses PyTorch.
 
-**The VAE decoder** gets engines too, built with the UNet's for the sizes its profiles cover, in the precision reForge runs the VAE in (BF16 where the GPU has it, FP32 below, or what a `--vae-in-*` flag says at build time), so any VAE of the architecture decodes on them. Each decode runs on them when they fit in the VRAM free, as many images at a time as fit, and on PyTorch otherwise.
+**The VAE decoder** gets engines too, built with the UNet's for the sizes its profiles cover, in the precision reForge runs the VAE in (BF16 where the GPU has it, FP32 below, or what a `--vae-in-*` flag says at build time), so any VAE of the architecture decodes on them. Each decode runs on them when they fit in the VRAM free, as many images at a time as fit. Larger ones (a Hires. fix's, or beside a UNet engine) run in strips on engines of their own, with what doesn't fit in VRAM held in RAM: the same image, a bit slower. PyTorch decodes the rest.
 
 **Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and, late in a pass, wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). The first 30% and last 5% of steps run in full, so composition and detail stay close (both shares are in Settings, Stable Diffusion, TensorRT). Passes of 12 steps or more should run roughly 1.6x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
 """
@@ -462,10 +462,16 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
                     "time (to switch, delete every engine)."
                 )
     if result.get("vae") is not None:
+        vae_record = result["vae"]
         message += (
-            f"\n\nBuilt the VAE decoder's engines, in {vae_mod.label(result['vae'].meta['dtype'])}, for decodes up to {result['vae'].reach()}: "
+            f"\n\nBuilt the VAE decoder's engines, in {vae_mod.label(vae_record.meta['dtype'])}, for decodes up to {vae_record.reach()}: "
+            "decodes run on them whenever they fit in the VRAM free, else in strips, with what doesn't fit held in RAM."
+            if vae_record.strips else
+            f"\n\nBuilt the VAE decoder's engines, in {vae_mod.label(vae_record.meta['dtype'])}, for decodes up to {vae_record.reach()}: "
             "decodes run on them whenever they fit in the VRAM free."
         )
+        if vae_record.meta.get("strips_error"):
+            message += f" Its engines for decoding in strips couldn't be built (`{vae_record.meta['strips_error']}`), so larger decodes run on PyTorch."
     elif result.get("vae_error") and result["vae_error"] != "cancelled":
         message += f"\n\nThe VAE decoder's engines couldn't be built (`{result['vae_error']}`), so it decodes on PyTorch. The console has the details."
     if result.get("memory_warnings"):

@@ -10,7 +10,8 @@ it would hold its whole score matrix (about 17 GB in FP32 at 2048x2048); reForge
 kernels hold a fraction of that.
 
 Each decode takes the fastest way that fits in the VRAM free, decided before it starts: the engines, as
-many images at a time as fit, else reForge's own decode. The engines never take a UNet engine's VRAM.
+many images at a time as fit; else the post part in strips (strips.py) on engines of its own, holding in
+RAM what doesn't fit in VRAM; else reForge's own decode. The engines never take a UNet engine's VRAM.
 
 Engines live in models/Unet-trt/<UNet architecture id>/vae/, built with that architecture's UNet engines
 for the sizes its profiles cover."""
@@ -31,7 +32,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from . import common, store
+from . import common, store, strips
 from .common import log, notify
 
 FORMAT = 1
@@ -179,12 +180,14 @@ def _why(cause: str, dtype, vram) -> str:
 def shapes_for(profiles: list, cfg: dict, dtype=None, vram=None, share: float = 1.0) -> dict:
     """The engines' input shapes for the sizes a list of profiles covers: from the smallest to the largest
     of them, optimal at the first profile's optimal size, one image at a time up to the largest batch.
-    Capped so a decode fits TensorRT's limit for a tensor and, with the precision and the GPU's VRAM, so
-    it could run at all (_budget, `share` of it): the size first (scaled down, keeping its aspect), then
-    the batch at that size. Larger decodes run on PyTorch."""
+    The post engine's are capped so a decode fits TensorRT's limit for a tensor and, with the precision
+    and the GPU's VRAM, so it could run at all (_budget, `share` of it): the size first (scaled down,
+    keeping its aspect), then the batch at that size; larger decodes run in strips. The pre engine (at
+    the latents' size, small) takes every size, for those."""
     budget = _budget(dtype, vram, share)
     lo_h, lo_w = min(p.height[0] for p in profiles) // 8, min(p.width[0] for p in profiles) // 8
     hi_h, hi_w = max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8
+    full_h, full_w = hi_h, hi_w
     over = _excess(cfg, 1, hi_h, hi_w, budget)[0]
     if over > 1:
         scale = math.sqrt(1 / over) if over < math.inf else 0
@@ -195,11 +198,23 @@ def shapes_for(profiles: list, cfg: dict, dtype=None, vram=None, share: float = 
     if budget is not None:
         fits = min(fits, int(budget / (peak(cfg, 1, hi_h, hi_w) * PLANNED)))
     batch = max(1, min(MAX_BATCH, max(p.batch[2] for p in profiles), fits))
-    lo_h, lo_w = min(lo_h, hi_h), min(lo_w, hi_w)
-    opt_h, opt_w = min(max(profiles[0].height[1] // 8, lo_h), hi_h), min(max(profiles[0].width[1] // 8, lo_w), hi_w)
     zc, c = cfg["latent_channels"], cfg["mid_channels"]
-    side = lambda ch: [[1, ch, lo_h, lo_w], [1, ch, opt_h, opt_w], [batch, ch, hi_h, hi_w]]  # noqa: E731
-    return {PRE: {"latent": side(zc)}, POST: {"x": side(c), "attention": side(c)}}
+
+    def side(ch, hi_h, hi_w):
+        low_h, low_w = min(lo_h, hi_h), min(lo_w, hi_w)
+        opt_h, opt_w = min(max(profiles[0].height[1] // 8, low_h), hi_h), min(max(profiles[0].width[1] // 8, low_w), hi_w)
+        return [[1, ch, low_h, low_w], [1, ch, opt_h, opt_w], [batch, ch, hi_h, hi_w]]
+
+    return {PRE: {"latent": side(zc, full_h, full_w)}, POST: {"x": side(c, hi_h, hi_w), "attention": side(c, hi_h, hi_w)}}
+
+
+def strip_shapes(profiles: list, found: list) -> dict:
+    """{kind name: its engine's shapes} for the stripped decode of the sizes a list of profiles covers (of
+    any height: only a strip's rows go through an engine at once)."""
+    lo_w = min(p.width[0] for p in profiles) // 8
+    hi = (max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8)
+    opt = (profiles[0].height[1] // 8, profiles[0].width[1] // 8)
+    return {name: strips.kind_shapes(kind, scales, lo_w, opt, hi) for name, (kind, scales) in strips.kinds(found).items()}
 
 
 def _covers(outer: dict, inner: dict) -> bool:
@@ -246,18 +261,46 @@ class Record:
         except Exception:
             return False
 
-    def covers(self, b: int, c: int, h: int, w: int) -> bool:
+    def strip_plan(self, kind: str) -> str:
+        return f"{self.base}.strip-{kind}.plan"
+
+    @property
+    def strips(self) -> dict:
+        """{kind name: {"kind", "shapes", "weights", "stripped"}}: the stripped decode's engines."""
+        return self.meta.get("strips") or {}
+
+    def _pre_covers(self, c: int, h: int, w: int) -> bool:
         lo, _, hi = self.meta["shapes"][PRE]["latent"]
         return c == lo[1] and lo[2] <= h <= hi[2] and lo[3] <= w <= hi[3]
 
+    def covers(self, b: int, c: int, h: int, w: int) -> bool:
+        """Whether the post engine decodes latents of h x w (as many at a time as max_batch)."""
+        lo, _, hi = self.meta["shapes"][POST]["x"]
+        return self._pre_covers(c, h, w) and lo[2] <= h <= hi[2] and lo[3] <= w <= hi[3]
+
+    def strips_cover(self, found: list, c: int, h: int, w: int) -> bool:
+        """Whether the stripped decode of these stages runs latents of h x w on these engines."""
+        kinds = self.strips
+        if not kinds or not self._pre_covers(c, h, w):
+            return False
+        for s in found:
+            entry = kinds.get(s.kind.name)
+            if entry is None or strips.engine_rows(entry["shapes"], s.kind, w * s.scale) < (2 if s.kind.op == strips.UP else 1):
+                return False
+        return True
+
     @property
     def max_batch(self) -> int:
-        return int(self.meta["shapes"][PRE]["latent"][2][0])
+        return int(self.meta["shapes"][POST]["x"][2][0])
 
     def reach(self) -> str:
-        """For people: "2888x2888, 1 at a time"."""
-        b, _, h, w = self.meta["shapes"][PRE]["latent"][2]
-        return f"{w * 8}x{h * 8}, {b} at a time"
+        """For people: "1824x1824, 1 at a time, and in strips up to 2944x2944"."""
+        b, _, h, w = self.meta["shapes"][POST]["x"][2]
+        text = f"{w * 8}x{h * 8}, {b} at a time"
+        if self.strips:
+            _, _, ph, pw = self.meta["shapes"][PRE]["latent"][2]
+            text += f", and in strips up to {pw * 8}x{ph * 8}"
+        return text
 
 
 def records(arch_id: str) -> list:
@@ -269,6 +312,8 @@ def records(arch_id: str) -> list:
                 meta = json.load(f)
             r = Record(path[: -len(".json")], meta)
             if meta.get("vae_format") == FORMAT and r.loadable and all(os.path.isfile(r.plan(p)) for p in (PRE, POST)):
+                if not all(os.path.isfile(r.strip_plan(k)) for k in r.strips):
+                    meta["strips"] = {}  # decodes on the post engine only; the tab asks to build them again
                 found.append(r)
         except Exception as e:
             log(f"Ignoring {path}: {e}")
@@ -288,7 +333,7 @@ def record_for(arch_id: str, vae):
 
 
 def _remove(base: str):
-    for path in (base + ".json", f"{base}.{PRE}.plan", f"{base}.{POST}.plan"):
+    for path in [base + ".json", f"{base}.{PRE}.plan", f"{base}.{POST}.plan"] + glob.glob(glob.escape(base) + ".strip-*.plan"):
         with contextlib.suppress(FileNotFoundError):
             os.remove(path)
 
@@ -317,12 +362,42 @@ def needs_build(arch, profiles: list, vae=None) -> str:
     try:
         cfg, wanted, dtype = config(vae), digest(vae), dtype_name(vae.vae_dtype)
         shapes = shapes_for(profiles, cfg, vae.vae_dtype, _vram())
-        if any(r.meta.get("digest") == wanted and r.meta.get("dtype") == dtype and _covers(r.meta.get("asked", r.meta["shapes"]), shapes) for r in records(arch.id)):
+        strip_wanted = _strips_wanted(vae, profiles, cfg)
+        if any(r.meta.get("digest") == wanted and r.meta.get("dtype") == dtype and not _missing(r, shapes, strip_wanted) for r in records(arch.id)):
             return ""
     except Exception as e:
         log(f"Could not check the VAE decoder engines: {e}")
         return ""
     return f"the VAE decoder, in {label(dtype)}"
+
+
+def _strips_wanted(vae, profiles: list, cfg: dict) -> dict:
+    """The stripped decode's kinds and their shapes for the profiles ({} if it can't run for this VAE)."""
+    try:
+        found = strips.stages(vae.first_stage_model, cfg["padding"])
+    except (ValueError, KeyError, AttributeError, StopIteration):
+        return {}
+    return {} if strips.supported(found) else strip_shapes(profiles, found)
+
+
+def _missing(record: Record, shapes: dict, strip_wanted: dict) -> list:
+    """The parts (PRE, POST, kind names) a record lacks for these shapes. A post engine that had to be built
+    smaller than asked counts as built (its "asked"), and so do kinds whose build failed for these shapes."""
+    meta = record.meta
+    out = []
+    if not _covers(meta["shapes"], {PRE: shapes[PRE]}):
+        out.append(PRE)
+    if not _covers(meta.get("asked", meta["shapes"]), {POST: shapes[POST]}):
+        out.append(POST)
+    failed = meta.get("strips_asked") if meta.get("strips_error") else None
+    for name, kind_shapes in strip_wanted.items():
+        have = record.strips.get(name)
+        if have is not None and _covers({name: have["shapes"]}, {name: kind_shapes}):
+            continue
+        if failed and name in failed and _covers({name: failed[name]}, {name: kind_shapes}):
+            continue
+        out.append(name)
+    return out
 
 
 # --- Export and build
@@ -416,10 +491,52 @@ def export_onnx(vae, work: str, dtype, device) -> dict:
     return result
 
 
+@common.inference_mode
+def export_strips(vae, work: str, dtype, device, names) -> dict:
+    """Writes work/strip-<kind>.onnx for the stripped decode's kinds named; returns {kind name: {weight name:
+    shape}}. Each from a stage of that kind in a fresh decoder of the VAE's layout."""
+    from . import export
+
+    cfg = config(vae)
+    module = fresh(cfg, device, dtype)
+    for t in module.state_dict(keep_vars=True).values():  # random, as in export_onnx
+        if t.is_floating_point():
+            t.normal_(0, 0.02)
+    found = strips.stages(module, cfg["padding"])
+    loaded = vae.first_stage_model.state_dict(keep_vars=True)
+    kwargs = dict(export_params=False, opset_version=17, do_constant_folding=False)
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        kwargs["dynamo"] = False
+    result = {}
+    for name in names:
+        stage = next(s for s in found if s.kind.name == name)
+        kind, part = stage.kind, strips.StageModule(stage, module)
+        path = os.path.join(work, f"strip-{name}.onnx")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", torch.jit.TracerWarning)
+            torch.onnx.export(
+                part, strips.example_inputs(kind, dtype, device), path, input_names=list(kind.inputs()),
+                output_names=list(kind.outputs()), dynamic_axes=strips.dynamic_axes(kind), **kwargs,
+            )
+        own = {k: list(v.shape) for k, v in part.state_dict(keep_vars=True).items()}
+        theirs = {k: list(loaded[stage.weights[k]].shape) for k in own}
+        result[name] = export._weightless_graph(path, kind.inputs(), (own, theirs), quiet=True)
+    del module, found
+    log(f"Exported {len(names)} graphs for decoding in strips.")
+    return result
+
+
+def _weight_bytes(vae, names, dtype) -> int:
+    state = vae.first_stage_model.state_dict(keep_vars=True)
+    return sum(state[n].numel() for n in names if n in state) * torch.tensor([], dtype=dtype).element_size()
+
+
 def build(arch, profiles: list, work: str, optimization_level=None, progress=None, vae=None):
-    """Builds the decoder engines for these profiles' sizes, for the loaded VAE's decoder and precision, and
-    deletes this GPU's and TensorRT version's other decoder engines for the architecture. Returns (the
-    Record or None, why it failed or None, how many kernels TensorRT skipped for want of VRAM)."""
+    """Builds the decoder engines these profiles' sizes lack, for the loaded VAE's decoder and precision:
+    the pre and post engines and the stripped decode's (strips.py), keeping what this GPU's and TensorRT
+    version's engines for the architecture have that covers them, and deleting the rest. Returns (the
+    Record or None, why it failed or None, how many kernels TensorRT skipped for want of VRAM). If only the
+    stripped decode's engines fail, the record has the others (and says why in "strips_error")."""
     from . import export
 
     vae = vae if vae is not None else loaded_vae()
@@ -429,47 +546,93 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
     skipped = 0
     try:
         dtype = vae.vae_dtype
-        cfg, vram = config(vae), _vram()
+        cfg, vram, device = config(vae), _vram(), common.mm().get_torch_device()
         asked = shapes_for(profiles, cfg, dtype, vram)
-        wanted_h, wanted_w = max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8
-        b, _, h, w = asked[PRE]["latent"][2]
-        if (h, w) != (wanted_h, wanted_w):
-            cause = _excess(cfg, 1, wanted_h, wanted_w, _budget(dtype, vram))[1]
-            log(f"The VAE decoder engines go up to {w * 8}x{h * 8} ({b} at a time), not the profiles' {wanted_w * 8}x{wanted_h * 8}: {_why(cause, dtype, vram)}. Larger decodes run on PyTorch.")
+        strip_wanted = _strips_wanted(vae, profiles, cfg)
+        old = next((r for r in records(arch.id) if r.meta.get("digest") == digest(vae) and r.meta.get("dtype") == dtype_name(dtype)), None)
+        todo = _missing(old, asked, strip_wanted) if old is not None else [PRE, POST] + list(strip_wanted)
+        if old is not None and old.meta.get("strips_error"):  # building anyway: try those again
+            todo += [k for k in strip_wanted if k not in old.strips and k not in todo]
+        kinds_todo = [k for k in todo if k not in (PRE, POST)]
+        shapes = {PRE: asked[PRE], POST: asked[POST]}
+        post_asked = asked[POST]
+        if old is not None:
+            if PRE not in todo:
+                shapes[PRE] = old.meta["shapes"][PRE]
+            if POST not in todo:
+                shapes[POST], post_asked = old.meta["shapes"][POST], old.meta.get("asked", old.meta["shapes"])[POST]
+        if POST in todo:
+            wanted_h, wanted_w = max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8
+            b, _, h, w = asked[POST]["x"][2]
+            if (h, w) != (wanted_h, wanted_w):
+                cause = _excess(cfg, 1, wanted_h, wanted_w, _budget(dtype, vram))[1]
+                further = " and further in strips" if strip_wanted else "; larger decodes run on PyTorch"
+                log(f"The VAE decoder's post engine goes up to {w * 8}x{h * 8} ({b} at a time), not the profiles' {wanted_w * 8}x{wanted_h * 8}: {_why(cause, dtype, vram)}. It decodes up to there{further}.")
+        if old is not None and todo != [PRE, POST] + list(strip_wanted):
+            log(f"Keeping the VAE decoder engines' parts that cover these sizes; building {len(todo)} of them.")
         if progress:
             progress(0.0, "exporting the graphs")
-        graphs = export_onnx(vae, work, dtype, common.mm().get_torch_device())
+        graphs = {}
+        if PRE in todo or POST in todo:
+            graphs.update(export_onnx(vae, work, dtype, device))
+        if kinds_todo:
+            graphs.update(export_strips(vae, work, dtype, device, kinds_todo))
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()  # the trace's VRAM back to the driver, for the builder's process
-        shapes, stripped, tries = asked, {}, 0
-        n = 0
-        while n < 2:  # the post engine first: it's the one TensorRT may find no kernels for, at the largest size
-            part = (POST, PRE)[n]
-            step = (lambda f, t, n=n, part=part: progress((n + f) / 2, f"{part} engine: {t}")) if progress else None
-            job = {
-                "onnx": os.path.join(work, f"vae_{part}.onnx"),
-                "plan": os.path.join(work, f"vae_{part}.plan"),
+        built, done, tries = {}, 0, 0
+
+        def job(part, plan_shapes):
+            onnx_name = f"strip-{part}" if part in kinds_todo else f"vae_{part}"
+            return {
+                "onnx": os.path.join(work, f"{onnx_name}.onnx"),
+                "plan": os.path.join(work, f"{onnx_name}.plan"),
                 "weights": sorted(graphs[part]),
-                "profiles": [shapes[part]],
+                "profiles": [plan_shapes],
                 "timing_cache": store.timing_cache_path(),
                 "optimization_level": optimization_level,
             }
-            result = export._build_plan(job, work, step)
+
+        def step(what):
+            n = done
+            return (lambda f, t: progress((n + f) / max(1, len(todo)), f"{what}: {t}")) if progress else None
+
+        parts = [p for p in (POST, PRE) if p in todo]  # the post engine first: TensorRT may find no kernels for it
+        while parts:
+            part = parts[0]
+            result = export._build_plan(job(part, shapes[part]), work, step(f"{part} engine"))
             warned = result.get("memory_warnings") or 0
             skipped += warned
             if not result["ok"]:
-                smaller = shapes_for(profiles, cfg, dtype, vram, RETRY_SHARE) if dtype is not None and vram else shapes
-                if part != POST or tries or not warned or smaller == shapes:
+                smaller = shapes_for(profiles, cfg, dtype, vram, RETRY_SHARE) if dtype is not None and vram else asked
+                if part != POST or tries or not warned or smaller[POST] == shapes[POST]:
                     return None, str(result.get("error")), skipped
-                tries, shapes = 1, smaller
-                b, _, h, w = shapes[PRE]["latent"][2]
+                tries, shapes[POST] = 1, smaller[POST]
+                b, _, h, w = shapes[POST]["x"][2]
                 log(f"TensorRT found no kernels with the VRAM to spare at the largest size; trying again up to {w * 8}x{h * 8} ({b} at a time).")
                 continue
-            stripped[part] = result["stripped"]
-            n += 1
-        key = hashlib.sha1(json.dumps([digest(vae), dtype_name(dtype), shapes], sort_keys=True).encode()).hexdigest()[:10]
-        size = torch.tensor([], dtype=dtype).element_size()
+            built[part] = result
+            parts.pop(0)
+            done += 1
+        strips_error = None
+        strip_meta = {k: v for k, v in old.strips.items() if k in strip_wanted and k not in todo} if old is not None else {}
+        for i, name in enumerate(kinds_todo):
+            if export.CANCEL.is_set():
+                return None, "cancelled", skipped
+            result = export._build_plan(job(name, strip_wanted[name]), work, step(f"engine {i + 1} of {len(kinds_todo)} for decoding in strips"))
+            skipped += result.get("memory_warnings") or 0
+            if not result["ok"]:
+                strips_error = str(result.get("error"))
+                log(f"Building the VAE decoder's engines for decoding in strips failed ({strips_error}); larger decodes run on PyTorch.")
+                break
+            built[name] = result
+            strip_meta[name] = {"shapes": strip_wanted[name], "weights": sorted(graphs[name]), "stripped": result["stripped"]}
+            done += 1
+        if strips_error:
+            strip_meta = {}  # a stripped decode needs every kind
+        key = hashlib.sha1(json.dumps([digest(vae), dtype_name(dtype), shapes, sorted((k, v["shapes"]) for k, v in strip_meta.items())], sort_keys=True).encode()).hexdigest()[:10]
+        found = strips.stages(vae.first_stage_model, cfg["padding"]) if strip_meta else []
+        weights = {part: sorted(graphs[part]) if part in built else old.meta["weights"][part] for part in (PRE, POST)}
         meta = {
             "vae_format": FORMAT,
             "key": key,
@@ -478,25 +641,40 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             "dtype": dtype_name(dtype),
             "config": cfg,
             "shapes": shapes,
-            "asked": asked,  # what they were built for: the shapes, unless TensorRT had to go smaller
-            "weights": {part: sorted(graphs[part]) for part in (PRE, POST)},
-            "weight_bytes": sum(math.prod(s) * size for part in (PRE, POST) for s in graphs[part].values()),
-            "stripped": stripped,
+            "asked": {PRE: shapes[PRE], POST: post_asked},  # what they were built for: the shapes, unless TensorRT had to go smaller
+            "weights": weights,
+            "weight_bytes": _weight_bytes(vae, weights[PRE] + weights[POST], dtype),
+            "stripped": {part: built[part]["stripped"] if part in built else old.meta["stripped"][part] for part in (PRE, POST)},
+            "strips": strip_meta,
+            "strip_bytes": sum(_weight_bytes(vae, [s.weights[n] for n in strip_meta[s.kind.name]["weights"]], dtype) for s in found),
             "trt": common.trt_version(),
             "gpu": common.gpu_tag(),
             "gpu_name": torch.cuda.get_device_name(),
             "created": time.strftime("%Y-%m-%d %H:%M"),
         }
+        if strips_error:
+            meta["strips_error"], meta["strips_asked"] = strips_error, strip_wanted
         os.makedirs(folder(arch.id), exist_ok=True)
         base = f"{_prefix(arch.id)}-{key}"
-        for path in glob.glob(glob.escape(_prefix(arch.id)) + "-*.json"):  # what these replace
-            _remove(path[: -len(".json")])
+        new = Record(base, meta)
         for part in (PRE, POST):
-            os.replace(os.path.join(work, f"vae_{part}.plan"), f"{base}.{part}.plan")
+            source = os.path.join(work, f"vae_{part}.plan") if part in built else old.plan(part)
+            if source != new.plan(part):
+                os.replace(source, new.plan(part))
+        for name in strip_meta:
+            source = os.path.join(work, f"strip-{name}.plan") if name in built else old.strip_plan(name)
+            if source != new.strip_plan(name):
+                os.replace(source, new.strip_plan(name))
+        for path in glob.glob(glob.escape(_prefix(arch.id)) + "-*.json"):  # what these replace
+            if path[: -len(".json")] != base:
+                _remove(path[: -len(".json")])
+        for path in glob.glob(glob.escape(base) + ".strip-*.plan"):  # this record's own, from before, it no longer has
+            if path[len(base) + len(".strip-"): -len(".plan")] not in strip_meta:
+                os.remove(path)
         with open(base + ".json.tmp", "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=1)
         os.replace(base + ".json.tmp", base + ".json")
-        return Record(base, meta), None, skipped
+        return new, None, skipped
     except Exception as e:
         traceback.print_exc()
         return None, str(e), skipped
@@ -523,18 +701,21 @@ class VaeModel:
         self.model = TensorRTVAE()
         self.load_device = mm.get_torch_device()
         self.offload_device = torch.device("cpu")
-        arena = Arena()
-        self.engines = {part: Engine(record.plan(part), arena) for part in (PRE, POST)}
+        self.arena = Arena()
+        self.engines = {part: Engine(record.plan(part), self.arena) for part in (PRE, POST)}
         self.vae = self.key = None  # the VAE to refit from, and its weights' key
         self.applied = None  # the key of the weights in the engines
         self.measured = 0
+        self.stages = self.strip_engines = None  # the stripped decode's, loaded when one first runs
+        self.strips_applied = None
 
     @property
     def loaded(self) -> bool:
         return all(e.loaded for e in self.engines.values())
 
     def model_size(self):
-        return max(self.measured, int(self.record.meta["weight_bytes"]))  # what the driver showed can be less
+        size = max(self.measured, int(self.record.meta["weight_bytes"]))  # what the driver showed can be less
+        return size + (int(self.record.meta.get("strip_bytes") or 0) if self.strip_engines is not None else 0)
 
     def loaded_size(self):
         return self.model_size() if self.loaded else 0
@@ -581,7 +762,46 @@ class VaeModel:
             for e in self.engines.values():
                 e.unload()
             self.applied = None
+        if unpatch_all:
+            for e in self.strip_engines or ():
+                e.unload()
+            self.stages = self.strip_engines = self.strips_applied = None
         return self.model
+
+    def load_strips(self, found: list):
+        """Loads an engine for each stage of the stripped decode (its kind's plan) and refits them."""
+        from .engine import Engine
+
+        if self.strip_engines is not None and [s.kind for s in self.stages] == [s.kind for s in found]:
+            self.stages = found  # this VAE's (the same layout)
+            return self.sync_strips()
+        for e in self.strip_engines or ():
+            e.unload()
+        start, engines = time.time(), []
+        try:
+            for s in found:
+                e = Engine(self.record.strip_plan(s.kind.name), self.arena)
+                e.load()
+                engines.append(e)
+            self.stages, self.strip_engines, self.strips_applied = found, engines, None
+            self.sync_strips(quiet=True)
+        except Exception:
+            for e in engines:
+                e.unload()
+            self.stages = self.strip_engines = self.strips_applied = None
+            raise
+        log(f"Loaded the VAE decoder engines for decoding in strips ({len(found)} stages, {len(self.record.strips)} kinds) in {time.time() - start:.1f}s")
+
+    def sync_strips(self, quiet=False):
+        if self.strips_applied == self.key:
+            return
+        start, state = time.time(), self.vae.first_stage_model.state_dict(keep_vars=True)
+        torch.cuda.current_stream().synchronize()
+        for s, e in zip(self.stages, self.strip_engines):
+            e.refit([n for n in e.weight_names if n in s.weights], lambda name, device, s=s: state[s.weights[name]].data.to(device))
+        if not quiet:
+            log(f"Refitted the VAE decoder engines for decoding in strips in {time.time() - start:.1f}s")
+        self.strips_applied = self.key
 
     def sync(self, quiet=False):
         """Refits both engines from self.vae unless they hold its weights already."""
@@ -596,7 +816,7 @@ class VaeModel:
         self.applied = self.key
 
     def release(self):
-        self.engines[PRE].release_activations()
+        self.arena.release()
 
     def need(self, n: int, h: int, w: int) -> tuple:
         """(VRAM a decode of n latents of h x w takes on the engines, their activation memory): their
@@ -657,27 +877,42 @@ def release_all():
     for model in list(_models.values()):
         _unload(model)
     _models.clear()
+    with contextlib.suppress(Exception):  # the pinned RAM that decodes in strips held their tensors in
+        torch._C._host_emptyCache()
 
 
-def _fit(model: VaeModel, b: int, h: int, w: int) -> int:
-    """The most latents a decode on the engines can take at once in the VRAM free, after other models make
-    room (the caller keeps the UNet engines), or 0 if not even one fits. Sizes their activation memory for
-    it, so it's allocated once."""
+def _fit(model: VaeModel, b: int, h: int, w: int) -> tuple:
+    """(The most latents a decode on the pre and post engines can take at once in the VRAM free, after
+    other models make room (the caller keeps the UNet engines), or 0 if not even one fits; the VRAM one
+    takes; what's free.) Sizes their activation memory for it, so it's allocated once."""
     mm = common.mm()
     model.release()
     top = min(b, model.record.max_batch)
     free = mm.get_free_memory(model.load_device)
     fits = next((n for n in range(top, 0, -1) if model.need(n, h, w)[0] <= free), 0)
+    need = model.need(max(1, fits), h, w)[0]
     if not fits:
-        need = model.need(1, h, w)[0]
-        mm.free_memory(need, model.load_device, keep_loaded=[lm for lm in mm.current_loaded_models if lm.model is model])
+        mm.free_memory(need, model.load_device, keep_loaded=_own(model))
         free = mm.get_free_memory(model.load_device)
         fits = 1 if need <= free else 0
         if not fits:
-            log(f"The VAE decoder engines need {common.gib(need)} of VRAM for {w * 8}x{h * 8}, {common.gib(free)} is free: decoding on PyTorch.")
-            return 0
-    model.engines[PRE].arena.get(model.need(fits, h, w)[1])
-    return fits
+            return 0, need, free
+    model.arena.get(model.need(fits, h, w)[1])
+    return fits, need, free
+
+
+def _own(model: VaeModel) -> list:
+    mm = common.mm()
+    return [lm for lm in mm.current_loaded_models if lm.model is model]
+
+
+_copy_streams = {}
+
+
+def _copy_stream(device):
+    if device not in _copy_streams:
+        _copy_streams[device] = torch.cuda.Stream(device=device)
+    return _copy_streams[device]
 
 
 def decode(vae, samples_in):
@@ -697,7 +932,16 @@ def decode(vae, samples_in):
             log("The VAE decoder has no engines for this architecture yet: build in the TensorRT tab to add them.")
         return None
     b, c, h, w = samples_in.shape
-    if not record.covers(b, c, h, w):
+    found = None
+    if record.strips:
+        try:
+            found = strips.stages(vae.first_stage_model, record.meta["config"]["padding"])
+            if strips.supported(found) or not record.strips_cover(found, c, h, w):
+                found = None
+        except (ValueError, KeyError, AttributeError, StopIteration):
+            found = None
+    whole = record.covers(b, c, h, w)
+    if not whole and found is None:
         return None
     if dtype_name(vae.vae_dtype) != record.meta["dtype"] and record.base not in _told:
         _told.add(record.base)
@@ -709,14 +953,26 @@ def decode(vae, samples_in):
         with torch.inference_mode():
             mm.load_models_gpu([model])
             model.sync()
-            n = _fit(model, b, h, w)
-            if not n:
+            n, need, free = _fit(model, b, h, w) if whole else (0, 0, 0)
+            if n:
+                start = time.time()
+                pixels = _run(model, vae, samples_in, n)  # ends with a copy to the CPU, so the time is the decode's
+                if pixels is not None:
+                    at_once = f", {n} at a time" if n < b else ""
+                    log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} on the VAE decoder engines in {time.time() - start:.2f}s{at_once}")
+                return pixels
+            if found is None:
+                log(f"The VAE decoder engines need {common.gib(need)} of VRAM for {w * 8}x{h * 8}, {common.gib(free)} is free: decoding on PyTorch.")
                 return None
+            if not whole:  # the post engine doesn't reach this size: what the strips can have
+                mm.free_memory(_vram() or 2**62, model.load_device, keep_loaded=_own(model))
+            model.release()
+            model.load_strips(found)
             start = time.time()
-            pixels = _run(model, vae, samples_in, n)  # ends with a copy to the CPU, so the time is the decode's
+            pixels, held = _run_strips(model, vae, samples_in, found)
             if pixels is not None:
-                at_once = f", {n} at a time" if n < b else ""
-                log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} on the VAE decoder engines in {time.time() - start:.2f}s{at_once}")
+                in_ram = f"; {held} of its {len(found)} stages' outputs held in RAM" if held else ""
+                log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} in strips on the VAE decoder engines in {time.time() - start:.2f}s{in_ram}")
             return pixels
     except torch.cuda.OutOfMemoryError:
         log("Ran out of VRAM decoding on the VAE engines; decoding on PyTorch.")
@@ -747,3 +1003,43 @@ def _run(model: VaeModel, vae, samples_in, n: int):
         pixels[start:start + n] = vae.process_output(image.to(vae.output_device).float())
         del image
     return pixels.to(vae.output_device).movedim(1, -1)
+
+
+def _run_strips(model: VaeModel, vae, samples_in, found: list):
+    """(The images, decoded one at a time with the post part in strips, or None; how many stages' outputs
+    went to RAM for the first.)"""
+    dtype, device = model.record.dtype, model.load_device
+    mm = common.mm()
+    attention = vae.first_stage_model.decoder.mid.attn_1.optimized_attention
+    stream = torch.cuda.current_stream().cuda_stream
+    to_latent = getattr(vae, "_to_vae_latent", lambda t: t)
+    entries = model.record.strips
+    runners = [strips.EngineRunner(e, entries[s.kind.name]["shapes"], s.kind) for s, e in zip(found, model.strip_engines)]
+    decoder = strips.Decode(found, runners, strips.norms(vae.first_stage_model, found, device), dtype, device, _copy_stream(device))
+    b, _, h, w = samples_in.shape
+    pixels = plan = None
+    held = 0
+    for i in range(b):
+        z = to_latent(samples_in[i:i + 1]).to(device=device, dtype=dtype)
+        mid = model.engines[PRE].infer({"latent": z}, 0, stream)
+        del z
+        x = mid.pop("x")
+        attended = attention(mid.pop("q"), mid.pop("k"), mid.pop("v"))
+        del mid
+        model.release()  # the pre engine's activations: the strips size their own
+        if plan is None:
+            plan = decoder.plan(h, w, mm.get_free_memory(device))
+            if plan is None:
+                log(f"Not even a strip of the VAE decoder fits in the VRAM free for {w * 8}x{h * 8}: decoding on PyTorch.")
+                return None, 0
+        image = decoder.run(x, attended, plan)
+        del x, attended
+        if pixels is None:
+            held = sum(plan.host)
+            if not torch.isfinite(image).all():
+                notify(f"The VAE decoder engines produced NaN/Inf values in {label(model.record.meta['dtype'])}; decoding on PyTorch")
+                return None, 0
+            pixels = torch.empty((b,) + tuple(image.shape[1:]), device=vae.output_device)
+        pixels[i:i + 1] = vae.process_output(image.to(vae.output_device).float())
+        del image
+    return pixels.to(vae.output_device).movedim(1, -1), held

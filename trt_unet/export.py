@@ -100,7 +100,7 @@ def _fresh_unet(config: dict, device, dtype=torch.float16):
     return unet
 
 
-def _weightless_graph(onnx_path: str, input_names, agree_with) -> dict:
+def _weightless_graph(onnx_path: str, input_names, agree_with, quiet: bool = False) -> dict:
     """Checks the exported weights' shapes against each {name: shape} in `agree_with`, tidies the graph
     (graph.py), and turns the weight inputs into initializers that read a small file of zeros, so the graph
     stays small: TensorRT only needs their shapes, the checkpoint provides the values. TensorRT tells
@@ -130,7 +130,8 @@ def _weightless_graph(onnx_path: str, input_names, agree_with) -> dict:
         tidied = copy.deepcopy(model)  # small: the weights aren't in it yet
         before, after = graph_mod.tidy(tidied, shapes)
         model, graph = tidied, tidied.graph
-        log(f"Tidied the graph from {before} to {after} nodes in {time.time() - start:.0f}s")
+        if not quiet:
+            log(f"Tidied the graph from {before} to {after} nodes in {time.time() - start:.0f}s")
     except Exception as e:  # the graph as exported runs the same, with more layers
         traceback.print_exc()
         log(f"Could not tidy the graph ({e}); building from it as exported.")
