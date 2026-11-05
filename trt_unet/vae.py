@@ -108,13 +108,38 @@ def label(name: str) -> str:
     return {"bfloat16": "BF16", "float32": "FP32", "float16": "FP16"}.get(name, name)
 
 
+TENSOR_LIMIT = 2**31 - 1  # elements a tensor can hold in TensorRT's kernels (its Myelin backend)
+
+
+def largest_tensor(cfg: dict, b: int, h: int, w: int) -> int:
+    """Elements in the decoder's largest tensor for b latents of h x w (padded by a row and column on each
+    side, as a conv's padding may hold them): at each resolution, the most channels there, those of the
+    blocks or of what's upsampled into them. For SD and SDXL VAEs, the 256 channels upsampled to full size."""
+    ch, mult = cfg["ch"], cfg["ch_mult"]
+    levels = len(mult)
+    worst = b * cfg["latent_channels"] * (h + 2) * (w + 2)
+    for i in range(levels):
+        scale = 2 ** (levels - 1 - i)  # level i's size, in latents
+        channels = max(ch * mult[i], ch * mult[i + 1] if i + 1 < levels else cfg["mid_channels"])
+        worst = max(worst, b * channels * (h * scale + 2) * (w * scale + 2))
+    return worst
+
+
 def shapes_for(profiles: list, cfg: dict) -> dict:
     """The engines' input shapes for the sizes a list of profiles covers: from the smallest to the largest
-    of them, optimal at the first profile's optimal size, one image at a time up to the largest batch."""
+    of them, optimal at the first profile's optimal size, one image at a time up to the largest batch.
+    Capped so the largest tensor fits TensorRT (TENSOR_LIMIT): the size first (scaled down, keeping its
+    aspect), then the batch at that size. Larger decodes run on PyTorch."""
     lo_h, lo_w = min(p.height[0] for p in profiles) // 8, min(p.width[0] for p in profiles) // 8
     hi_h, hi_w = max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8
-    opt_h, opt_w = profiles[0].height[1] // 8, profiles[0].width[1] // 8
-    batch = min(MAX_BATCH, max(p.batch[2] for p in profiles))
+    if largest_tensor(cfg, 1, hi_h, hi_w) > TENSOR_LIMIT:
+        scale = math.sqrt(TENSOR_LIMIT / largest_tensor(cfg, 1, hi_h, hi_w))
+        hi_h, hi_w = max(1, int(hi_h * scale)), max(1, int(hi_w * scale))
+        while largest_tensor(cfg, 1, hi_h, hi_w) > TENSOR_LIMIT:
+            hi_h, hi_w = (hi_h - 1, hi_w) if hi_h >= hi_w else (hi_h, hi_w - 1)
+    batch = max(1, min(MAX_BATCH, max(p.batch[2] for p in profiles), TENSOR_LIMIT // largest_tensor(cfg, 1, hi_h, hi_w)))
+    lo_h, lo_w = min(lo_h, hi_h), min(lo_w, hi_w)
+    opt_h, opt_w = min(max(profiles[0].height[1] // 8, lo_h), hi_h), min(max(profiles[0].width[1] // 8, lo_w), hi_w)
     zc, c = cfg["latent_channels"], cfg["mid_channels"]
     side = lambda ch: [[1, ch, lo_h, lo_w], [1, ch, opt_h, opt_w], [batch, ch, hi_h, hi_w]]  # noqa: E731
     return {PRE: {"latent": side(zc)}, POST: {"x": side(c), "attention": side(c)}}
@@ -171,6 +196,11 @@ class Record:
     @property
     def max_batch(self) -> int:
         return int(self.meta["shapes"][PRE]["latent"][2][0])
+
+    def reach(self) -> str:
+        """For people: "2888x2888, 1 at a time"."""
+        b, _, h, w = self.meta["shapes"][PRE]["latent"][2]
+        return f"{w * 8}x{h * 8}, {b} at a time"
 
 
 def records(arch_id: str) -> list:
@@ -343,6 +373,13 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         dtype = vae.vae_dtype
         cfg = config(vae)
         shapes = shapes_for(profiles, cfg)
+        b, _, h, w = shapes[PRE]["latent"][2]
+        wanted_h, wanted_w = max(p.height[2] for p in profiles), max(p.width[2] for p in profiles)
+        if (h * 8, w * 8) != (wanted_h, wanted_w):
+            log(
+                f"The VAE decoder engines go up to {w * 8}x{h * 8} ({b} at a time), not the profiles' {wanted_w}x{wanted_h}: TensorRT "
+                "can't hold a larger decode's largest tensor (2^31 elements). Larger decodes run on PyTorch."
+            )
         if progress:
             progress(0.0, "exporting the graphs")
         graphs = export_onnx(vae, work, dtype, common.mm().get_torch_device())

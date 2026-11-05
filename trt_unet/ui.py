@@ -462,7 +462,10 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
                     "time (to switch, delete every engine)."
                 )
     if result.get("vae") is not None:
-        message += f"\n\nBuilt the VAE decoder's engines, in {vae_mod.label(result['vae'].meta['dtype'])}: decodes run on them whenever they fit in the VRAM free."
+        message += (
+            f"\n\nBuilt the VAE decoder's engines, in {vae_mod.label(result['vae'].meta['dtype'])}, for decodes up to {result['vae'].reach()}: "
+            "decodes run on them whenever they fit in the VRAM free."
+        )
     elif result.get("vae_error") and result["vae_error"] != "cancelled":
         message += f"\n\nThe VAE decoder's engines couldn't be built (`{result['vae_error']}`), so it decodes on PyTorch. The console has the details."
     if result.get("memory_warnings"):
