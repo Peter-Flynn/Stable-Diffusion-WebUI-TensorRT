@@ -14,7 +14,7 @@ pinned RAM, copied in and out while the engine works on the strip before.
 Stages with the same layout share an engine plan ("kind"), each loaded with its own weights."""
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn.functional as F
@@ -380,291 +380,396 @@ def _runs(rows: list):
     return runs, zeros
 
 
-def _vram_now(held: int) -> dict:
-    try:
-        return {"free": torch.cuda.mem_get_info()[0], "allocated": torch.cuda.memory_allocated(), "reserved": torch.cuda.memory_reserved(), "held": held}
-    except Exception:
-        return {"held": held}
+ALIGN = 256  # bytes: where each tensor in a slab starts
 
 
-class Held:
-    """A tensor held between stages, rows first (rows, channels, width): in VRAM or in (pinned) RAM."""
+def _align(n: int) -> int:
+    return -(-int(n) // ALIGN) * ALIGN
 
-    def __init__(self, rows: int, channels: int, width: int, dtype, device, host: bool):
-        self.host = host
-        if host:
-            try:
-                self.t = torch.empty((rows, channels, width), dtype=dtype, pin_memory=torch.device(device).type == "cuda")
-            except RuntimeError:  # not enough RAM to pin: copies wait for the CPU
-                self.t = torch.empty((rows, channels, width), dtype=dtype)
-        else:
-            self.t = torch.empty((rows, channels, width), dtype=dtype, device=device)
 
-    @property
-    def nbytes(self) -> int:
-        return self.t.numel() * self.t.element_size()
-
-    @classmethod
-    def of(cls, nchw):
-        held = cls.__new__(cls)
-        held.host, held.t = False, nchw[0].permute(1, 0, 2).contiguous()
-        return held
+def _layout(events: list, sizes: dict) -> tuple:
+    """First-fit offsets in one slab for tensors allocated and freed in the order of `events` ([(key, what)]:
+    True to allocate, False to free, or the key of a tensor whose memory it takes over): ({key: offset},
+    the slab's size, the keys live when it reached that size)."""
+    live, offsets, peak, at_peak = {}, {}, 0, []
+    for key, what in events:
+        if what is False:
+            live.pop(key, None)
+            continue
+        if what is not True:
+            live[key] = live.pop(what)
+            offsets[key] = live[key][0]
+            continue
+        size, offset = _align(sizes[key]), 0
+        for start, length in sorted(live.values()):
+            if start - offset >= size:
+                break
+            offset = max(offset, start + length)
+        live[key] = (offset, size)
+        offsets[key] = offset
+        if offset + size > peak:
+            peak, at_peak = offset + size, list(live)
+    return offsets, peak, at_peak
 
 
 @dataclass
 class Plan:
-    """How a stripped decode runs: each stage's rows per strip, and how much VRAM the held tensors may take."""
+    """How a stripped decode runs, decided before it starts so it never runs out of VRAM: each stage's rows
+    per strip; which tensors between stages are held in RAM; where each is in its slab (one in VRAM, one in
+    pinned RAM); each stage's working tensors' bytes; the engines' activations at most."""
 
     rows: list
-    work: int  # VRAM for the strips' working tensors and the engines' activations, at most
-    held: int  # VRAM for held tensors (less once VRAM ran short)
-    host: list = field(default_factory=list)  # whether each stage's output went to RAM, decided as it runs
-    short: list = field(default_factory=list)  # the stages that ran out of VRAM (and ran again with less)
-    when: dict = field(default_factory=dict)  # the VRAM then, the first time: driver's free, PyTorch's allocated and reserved, held
+    host: set
+    offsets: dict
+    device_bytes: int
+    host_bytes: int
+    io: list
+    act: int
+    moved: int = 0  # bytes copied between RAM and VRAM, counted as the decode runs
+
+    @property
+    def vram(self) -> int:
+        return self.device_bytes + max(self.io) + self.act
+
+
+_pinned = {"tensor": None, "registered": False}
+
+
+def _host_slab(nbytes: int):
+    """Pinned RAM of at least nbytes, kept for the next decode (release_pinned frees it)."""
+    t = _pinned["tensor"]
+    if t is not None and t.numel() >= nbytes:
+        return t
+    release_pinned()
+    t = torch.empty(max(nbytes, 1), dtype=torch.uint8)
+    try:  # registered rather than PyTorch's pinned allocator, which rounds up to a power of two
+        if int(torch.cuda.cudart().cudaHostRegister(t.data_ptr(), t.numel(), 0)) == 0:
+            _pinned.update(tensor=t, registered=True)
+            return t
+    except Exception:
+        pass
+    try:
+        t = torch.empty(max(nbytes, 1), dtype=torch.uint8, pin_memory=True)
+    except RuntimeError:  # not enough RAM to pin: copies wait for the CPU
+        pass
+    _pinned.update(tensor=t, registered=False)
+    return t
+
+
+def release_pinned():
+    t = _pinned["tensor"]
+    if t is not None and _pinned["registered"]:
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaHostUnregister(t.data_ptr())
+        except Exception:
+            pass
+    _pinned.update(tensor=None, registered=False)
+
+
+class Held:
+    """A tensor held between stages, rows first (rows, channels, width), in a slab in VRAM or in RAM."""
+
+    def __init__(self, t, host: bool):
+        self.t, self.host = t, host
 
 
 class Decode:
-    """One image's post part in strips. `runners[i]` runs stage i: runner(feed) -> outputs,
-    runner.activation(shapes) -> bytes, runner.rows(width) -> its most output rows at that width (0: none)."""
+    """One image's post part in strips. `runners[i]` runs stage i: runner(feed, outputs, last) -> outputs
+    (the strip's output written to outputs["out"]; `last`: the shorter last strip), runner.activation(shapes)
+    -> bytes, runner.rows(width) -> its most output rows at that width (0: none). `cache` keeps the
+    engines' activation sizes ({(kind, rows, width): bytes}) between decodes."""
 
-    def __init__(self, found: list, runners: list, norm_params: dict, dtype, device, copy_stream=None):
+    def __init__(self, found: list, runners: list, norm_params: dict, dtype, device, copy_stream=None, arena=None, cache=None):
         self.stages, self.runners, self.norms = found, runners, norm_params
-        self.dtype, self.device, self.copy_stream = dtype, torch.device(device), copy_stream
+        self.dtype, self.device, self.copy_stream, self.arena = dtype, torch.device(device), copy_stream, arena
         self.size = torch.tensor([], dtype=dtype).element_size()
+        self.cache = cache if cache is not None else {}
+        self.last_use = {}
+        for n, st in enumerate(found):
+            for key in (st.src, st.res):
+                if key is not None:
+                    self.last_use[key] = n
 
     def geometry(self, stage: Stage, h: int, w: int) -> tuple:
         """(output rows, output width, input rows) for latents of h x w."""
         return h * stage.scale, w * stage.scale, h * stage.in_scale
 
-    def work(self, n: int, rows: int, h: int, w: int) -> int:
-        """VRAM a strip of `rows` output rows of stage n takes: its engine's activations and its tensors
-        (input, residual and output, each up to three times: staged, rearranged and in flight)."""
-        stage, runner = self.stages[n], self.runners[n]
-        out_rows, width, _ = self.geometry(stage, h, w)
-        shapes = feed_shapes(stage.kind, rows, width)
-        io = sum(math.prod(shapes[name]) for name in ("x", "res") if name in shapes) + stage.kind.cout * rows * width
-        return int(runner.activation(shapes)) + 3 * io * self.size
+    def _shapes(self, h: int, w: int) -> dict:
+        """{held tensor: its shape, rows first}."""
+        c = self.stages[0].kind.cin
+        shapes = {-2: (h, c, w), -1: (h, c, w)}
+        for n, st in enumerate(self.stages):
+            rows, width, _ = self.geometry(st, h, w)
+            shapes[n] = (rows, st.kind.cout, width)
+        return shapes
 
-    def plan(self, h: int, w: int, free: int):
-        """Each stage's strip rows for latents of h x w with `free` bytes of VRAM (the latent-size tensors
-        already in it), or None if a stage can't run: as many rows as its engine takes, fewer if they don't
-        fit; the VRAM the strips don't take holds what it can of the tensors between stages."""
-        caps = []
-        for n, stage in enumerate(self.stages):
-            out_rows, width, _ = self.geometry(stage, h, w)
+    def _in_place(self) -> set:
+        """The stages whose output can take over their residual's memory as they go: its last use, read
+        without a halo, a row of the output no larger than one of it (so a strip's output only overwrites
+        rows of it already read)."""
+        out = set()
+        for n, st in enumerate(self.stages):
+            if st.res is not None and self.last_use[st.res] == n and st.kind.cout <= st.kind.res:
+                out.add(n)
+        return out
+
+    def _events(self, in_place: set) -> list:
+        events = [(-2, True), (-1, True)]
+        for n, st in enumerate(self.stages):
+            events.append((n, st.res if n in in_place else True))
+            events += [(key, False) for key in (st.src, st.res) if key is not None and self.last_use[key] == n and not (n in in_place and key == st.res)]
+        return events
+
+    def _activation(self, n: int, rows: int, width: int) -> int:
+        kind = self.stages[n].kind
+        key = (kind.name, rows, width)
+        if key not in self.cache:
+            self.cache[key] = int(self.runners[n].activation(feed_shapes(kind, rows, width)))
+        return self.cache[key]
+
+    def _io(self, n: int, rows: int, width: int, host: set) -> int:
+        """Bytes of a stage's working tensors: its input, residual and output for a strip (and two strips'
+        worth of staging for those held in RAM), and the rows to keep."""
+        st = self.stages[n]
+        shapes = feed_shapes(st.kind, rows, width)
+        x, out = math.prod(shapes["x"]) * self.size, st.kind.cout * rows * width * self.size
+        res = math.prod(shapes["res"]) * self.size if "res" in shapes else 0
+        total = _align(x) + _align(res) + _align(out) + _align(shapes["x"][2] * self.size)
+        total += 2 * _align(x) if st.src in host else 0
+        total += 2 * _align(res) if st.res is not None and st.res in host else 0
+        return total + (2 * _align(out) if n in host else 0)
+
+    def plan(self, h: int, w: int, free: int, force_host: bool = False):
+        """The Plan for latents of h x w in `free` bytes of VRAM, or None if not even the smallest strips
+        fit: everything in VRAM with strips as large as fit (down to an 8th of what the engines take); else
+        the tensors held at the VRAM's peak moved to RAM, the largest first, until it fits."""
+        caps, widths = [], []
+        for n, st in enumerate(self.stages):
+            out_rows, width, _ = self.geometry(st, h, w)
             cap = min(out_rows, self.runners[n].rows(width))
-            if stage.kind.op == UP:
+            if st.kind.op == UP:
                 cap -= cap % 2
-            if cap < (2 if stage.kind.op == UP else 1):
+            if cap < (2 if st.kind.op == UP else 1):
                 return None
             caps.append(cap)
-        budget = free - HEADROOM - free // 16
-        rows = list(caps)
-        worst = max(self.work(n, r, h, w) for n, r in enumerate(rows))
-        if worst > budget:
+            widths.append(width)
+        budget = free - HEADROOM - free // 32
+        shapes = self._shapes(h, w)
+        sizes = {k: math.prod(v) * self.size for k, v in shapes.items()}
+        in_place = self._in_place()
+
+        def attempt(div: int, host: set):
+            rows = []
             for n, cap in enumerate(caps):
-                lo, hi, step = (2, cap, 2) if self.stages[n].kind.op == UP else (1, cap, 1)
-                if self.work(n, lo, h, w) > budget:
-                    return None
-                while hi - lo > step:  # the most rows that fit
-                    mid = (lo + hi) // 2
-                    mid -= mid % step
-                    lo, hi = (mid, hi) if self.work(n, mid, h, w) <= budget else (lo, mid)
-                rows[n] = hi if self.work(n, hi, h, w) <= budget else lo
-            worst = max(self.work(n, r, h, w) for n, r in enumerate(rows))
-        return Plan(rows, worst, max(0, budget - worst))
+                step = 2 if self.stages[n].kind.op == UP else 1
+                rows.append(max(step, cap // div // step * step))
+            act = max(self._activation(n, r, widths[n]) for n, r in enumerate(rows))
+            io = [self._io(n, r, widths[n], host) for n, r in enumerate(rows)]
+            events = self._events({n for n in in_place if (n in host) == (self.stages[n].res in host)})
+            offsets, peak, at_peak = _layout([e for e in events if e[0] not in host], sizes)
+            return rows, act, io, offsets, peak, at_peak
 
-    def run(self, x, attention, plan: Plan, force_host: bool = False):
-        """The image (1, out channels, H, W) for the mid block's input x and its attention's output (each
-        (1, channels, h, w), in VRAM). A stage that runs out of VRAM runs again with less in it: its output
-        in RAM, then its inputs, then fewer rows per strip; and the stages after it hold no more in VRAM."""
-        h, w = x.shape[2], x.shape[3]
-        plan.host, plan.short = [], []
-        held = {-2: Held.of(x), -1: Held.of(attention)}
-        stats = {}
-        self.in_vram = 0  # bytes of held tensors in VRAM, past the latent-size ones (which `free` counted)
-        last_use = {}
-        for n, s in enumerate(self.stages):
-            last_use[s.src] = n
-            if s.res is not None:
-                last_use[s.res] = n
-        image = None
-        for n, stage in enumerate(self.stages):
-            out_rows, width, _ = self.geometry(stage, h, w)
-            nbytes = out_rows * stage.kind.cout * width * self.size
-            host = force_host or self.in_vram + nbytes > plan.held
-            out = None
+        def done(rows, act, io, offsets, peak, host):
+            events = self._events({n for n in in_place if (n in host) == (self.stages[n].res in host)})
+            host_offsets, host_bytes, _ = _layout([e for e in events if e[0] in host], sizes)
+            return Plan(rows, set(host), {**offsets, **host_offsets}, peak, host_bytes, io, act)
+
+        if force_host:
+            host = set(range(len(self.stages)))
+            rows, act, io, offsets, peak, _ = attempt(1, host)
+            return done(rows, act, io, offsets, peak, host)
+        for div in (1, 2, 4, 8):
+            rows, act, io, offsets, peak, _ = attempt(div, set())
+            if peak + max(io) + act <= budget:
+                return done(rows, act, io, offsets, peak, set())
+        for div in (1, 2, 4, 8):
+            host = set()
             while True:
-                short = False
-                try:
-                    if out is None:
-                        out = Held(out_rows, stage.kind.cout, width, self.dtype, self.device, host)
-                        self.in_vram += 0 if host else nbytes
-                    stats[n] = self._sweep(n, stage, held[stage.src], held.get(stage.res), out, stats.get(stage.src), plan.rows[n])
+                rows, act, io, offsets, peak, at_peak = attempt(div, host)
+                if peak + max(io) + act <= budget:
+                    return done(rows, act, io, offsets, peak, host)
+                movable = [k for k in at_peak if k >= 0 and k not in host]
+                if not movable:
                     break
-                except torch.cuda.OutOfMemoryError:
-                    short = True
-                if short:  # out of the except block: its traceback no longer holds the strip's tensors
-                    self._settle()
-                    if not plan.short:
-                        plan.when = _vram_now(self.in_vram)
-                    plan.short.append(n)
-                    if not host:  # its output to RAM
-                        if out is not None:
-                            self.in_vram -= nbytes
-                        out, host = None, True
-                    elif not self._spill(held, stage):  # else an input to RAM, else fewer rows
-                        step = 2 if stage.kind.op == UP else 1
-                        if plan.rows[n] <= step:
-                            raise torch.cuda.OutOfMemoryError(f"Not even a strip of {step} rows of the VAE decoder's stage {n} fits in the VRAM free")
-                        plan.rows[n] = max(step, plan.rows[n] // 2 // step * step)
-                    plan.held = min(plan.held, self.in_vram)
-                    torch.cuda.empty_cache()
-            plan.host.append(out.host)
-            for buf in {stage.src, stage.res} - {None}:
-                if last_use.get(buf) == n:
-                    gone = held.pop(buf)
-                    if not gone.host and buf >= 0:
-                        self.in_vram -= gone.nbytes
-                    stats.pop(buf, None)
-            held[n] = out
-            if stage.kind.op == OUT:
-                image = out
+                host.add(max(movable, key=sizes.get))
+        return None
+
+    def run(self, x, attention, plan: Plan):
+        """The image (1, out channels, H, W) for the mid block's input x and its attention's output (each
+        (1, channels, h, w), in VRAM)."""
+        h, w = x.shape[2], x.shape[3]
+        shapes = self._shapes(h, w)
+        slab = torch.empty(max(plan.device_bytes, 1), dtype=torch.uint8, device=self.device)
+        ram = _host_slab(plan.host_bytes) if plan.host else None
+        io = torch.empty(max(max(plan.io), 1), dtype=torch.uint8, device=self.device)
+        if self.arena is not None:
+            self.arena.get(plan.act)  # once, at its largest: every engine binds it as is
+        held = {}
+        for key, shape in shapes.items():
+            host = key in plan.host
+            base, offset = (ram, plan.offsets[key]) if host else (slab, plan.offsets[key])
+            nbytes = math.prod(shape) * self.size
+            held[key] = Held(base[offset:offset + nbytes].view(self.dtype).view(shape), host)
+        held[-2].t.copy_(x[0].permute(1, 0, 2))
+        held[-1].t.copy_(attention[0].permute(1, 0, 2))
+        plan.moved = 0
+        stats = {}
+        for n, stage in enumerate(self.stages):
+            stats[n] = self._sweep(n, stage, held, stats.get(stage.src), plan, io)
+            for key in (stage.src, stage.res):
+                if key is not None and self.last_use[key] == n:
+                    stats.pop(key, None)
+        image = held[len(self.stages) - 1].t
         if self.copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self.copy_stream)
-        return image.t.to(self.device).permute(1, 0, 2).unsqueeze(0).contiguous()
+        return image.to(self.device).permute(1, 0, 2).unsqueeze(0).contiguous()
 
-    def _settle(self):
-        """After running out of VRAM mid-sweep: the copies queued finish before anything is freed or moved."""
-        if self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
-
-    def _spill(self, held: dict, stage: Stage) -> bool:
-        """Moves the largest of a stage's inputs in VRAM to RAM; whether there was one."""
-        keys = [k for k in (stage.src, stage.res) if k is not None and not held[k].host]
-        if not keys:
-            return False
-        key = max(keys, key=lambda k: held[k].nbytes)
-        old = held[key]
-        new = Held(*old.t.shape, self.dtype, self.device, True)
-        new.t.copy_(old.t)
-        held[key] = new
-        if key >= 0:
-            self.in_vram -= old.nbytes
-        return True
-
-    def _sweep(self, n: int, stage: Stage, src: Held, res, out: Held, src_stats, rows: int):
+    def _sweep(self, n: int, stage: Stage, held: dict, src_stats, plan: Plan, io):
         kind, runner = stage.kind, self.runners[n]
+        src, out = held[stage.src], held[n]
+        res = held[stage.res] if stage.res is not None else None
         out_rows, width = out.t.shape[0], out.t.shape[2]
+        rows = plan.rows[n]
+        shapes = feed_shapes(kind, rows, width)
+        c_in, rows_in, w_in = shapes["x"][1], shapes["x"][2], shapes["x"][3]
+        offset = [0]
+
+        def take(elements):  # a flat view of the working slab
+            nbytes = elements * self.size
+            view = io[offset[0]:offset[0] + nbytes].view(self.dtype)
+            offset[0] += _align(nbytes)
+            return view
+
+        x_flat = take(c_in * rows_in * w_in)
+        res_flat = take(kind.res * rows * width) if res is not None else None
+        out_flat = take(kind.cout * rows * width)
+        keep_flat = take(rows_in)
+        x_stage = [take(c_in * rows_in * w_in) for _ in range(2)] if src.host else None
+        res_stage = [take(kind.res * rows * width) for _ in range(2)] if res is not None and res.host else None
+        out_stage = [take(kind.cout * rows * width) for _ in range(2)] if out.host else None
         fixed = {}
         if stage.norm:
             center, scale, shift = src_stats.affine(self.norms[stage.norm])
             fixed = {"center": center, "scale": scale, "shift": shift}
         stats = Stats() if kind.groups else None
         per_group = kind.cout // kind.groups * width if kind.groups else 0
-        copying = self.copy_stream is not None and (src.host or (res is not None and res.host) or out.host)
-        pipe = _Pipe(self, src, res, out, rows, copying)
         strips = [(a, min(a + rows, out_rows)) for a in range(0, out_rows, rows)]
-        pipe.load(stage, strips, 0)
+        copy = self.copy_stream if (x_stage or res_stage or out_stage) else None
+        compute = torch.cuda.current_stream(self.device) if copy is not None else None
+        if copy is not None:
+            copy.wait_stream(compute)  # the working slab's last users (the stage before) are done
+        loaded, consumed, stored = {}, [None, None], [None, None]
+
+        def load(k):  # what's in RAM, into staging on the copy stream (a strip ahead)
+            a, b = strips[k]
+            slot = k % 2
+            parts = []
+            if x_stage:
+                parts.append(("x", src, source_rows(stage, a, b, src.t.shape[0]), x_stage[slot]))
+            if res_stage:
+                parts.append(("res", res, list(range(a, b)), res_stage[slot]))
+            context = torch.cuda.stream(copy) if copy is not None else _nothing()
+            with context:
+                if copy is not None and consumed[slot] is not None:
+                    copy.wait_event(consumed[slot])  # the strip two back is done with this staging
+                views = {}
+                for name, held_t, want, flat in parts:
+                    view = flat[:len(want) * held_t.t[0].numel()].view((len(want),) + tuple(held_t.t.shape[1:]))
+                    runs, zeros = _runs(want)
+                    for d, start, length in runs:
+                        view[d:d + length].copy_(held_t.t[start:start + length], non_blocking=True)
+                        plan.moved += length * held_t.t[0].numel() * self.size
+                    for i in zeros:
+                        view[i].zero_()
+                    views[name] = view
+                event = None
+                if copy is not None:
+                    event = torch.cuda.Event()
+                    event.record(copy)
+            loaded[k] = (views, event)
+
+        def gather(dst, held_t, want):  # rows of a tensor in VRAM, straight into the strip's input
+            runs, zeros = _runs(want)
+            for d, start, length in runs:
+                dst[0, :, d:d + length, :].copy_(held_t.t[start:start + length].permute(1, 0, 2))
+            for i in zeros:
+                dst[0, :, i, :].zero_()
+
+        if x_stage or res_stage:
+            load(0)
         for k, (a, b) in enumerate(strips):
-            feed = pipe.inputs(k)
-            if k + 1 < len(strips):
-                pipe.load(stage, strips, k + 1)  # its copies run while this strip computes
+            r = b - a
+            sh = feed_shapes(kind, r, width)
+            want = source_rows(stage, a, b, src.t.shape[0])
+            x = x_flat[:math.prod(sh["x"])].view(sh["x"])
+            staged = {}
+            if x_stage or res_stage:
+                if k + 1 < len(strips):
+                    load(k + 1)  # its copies run while this strip computes
+                staged, event = loaded.pop(k)
+                if event is not None:
+                    compute.wait_event(event)
+            if "x" in staged:
+                x[0].copy_(staged["x"].permute(1, 0, 2))
+            else:
+                gather(x, src, want)
+            feed = {"x": x}
+            if res is not None:
+                rv = res_flat[:math.prod(sh["res"])].view(sh["res"])
+                if "res" in staged:
+                    rv[0].copy_(staged["res"].permute(1, 0, 2))
+                else:
+                    gather(rv, res, list(range(a, b)))
+                feed["res"] = rv
+            if staged and compute is not None:
+                done = torch.cuda.Event()
+                done.record(compute)
+                consumed[k % 2] = done
             if "keep" in kind.inputs():
-                keep = [1.0 if r is not None or stage.pad != "zeros" else 0.0 for r in source_rows(stage, a, b, src.t.shape[0])]
-                feed["keep"] = torch.tensor(keep, dtype=self.dtype).view(1, 1, -1, 1).to(self.device, non_blocking=True)
+                keep = keep_flat[:len(want)].view(1, 1, -1, 1)
+                keep.fill_(1)
+                if stage.pad == "zeros":
+                    for i, row in enumerate(want):
+                        if row is None:
+                            keep[:, :, i].zero_()
+                feed["keep"] = keep
             feed.update(fixed)
-            result = runner(feed)
-            del feed
+            result_out = out_flat[:kind.cout * r * width].view(1, kind.cout, r, width)
+            result = runner(feed, {"out": result_out}, r != rows)
             if stats is not None:
-                stats.add(per_group * (b - a), result["mean"], result["m2"])
-            pipe.store(k, a, b, result["out"])
-            del result
-        pipe.finish()
+                stats.add(per_group * r, result["mean"], result["m2"])
+            rows_first = result_out[0].permute(1, 0, 2)
+            if out_stage is None:
+                out.t[a:b].copy_(rows_first)
+                continue
+            slot = k % 2
+            staging = out_stage[slot][:r * kind.cout * width].view(r, kind.cout, width)
+            if compute is not None and stored[slot] is not None:
+                compute.wait_event(stored[slot])  # its last copy out is done
+            staging.copy_(rows_first)
+            plan.moved += staging.numel() * self.size
+            if copy is None:
+                out.t[a:b].copy_(staging)
+                continue
+            ready = torch.cuda.Event()
+            ready.record(compute)
+            with torch.cuda.stream(copy):
+                copy.wait_event(ready)
+                out.t[a:b].copy_(staging, non_blocking=True)
+                stored[slot] = torch.cuda.Event()
+                stored[slot].record(copy)
+        if copy is not None:
+            compute.wait_stream(copy)
         return stats
 
 
-class _Pipe:
-    """A sweep's copies: inputs gathered (from VRAM, or copied in from RAM on the copy stream, a strip
-    ahead), outputs put back (to RAM on the copy stream, while the next strip computes)."""
+class _nothing:
+    def __enter__(self):
+        return self
 
-    def __init__(self, decode: Decode, src: Held, res, out: Held, rows: int, copying: bool):
-        self.d, self.src, self.res, self.out = decode, src, res, out
-        self.copying = copying
-        self.loaded = {}  # strip -> (its inputs: staged in VRAM, or (Held, rows) to gather; the copies' event)
-        self.stored = [None, None]  # the events of the last two strips' copies out to RAM
-
-    def _gather(self, held: Held, rows: list):
-        """The rows (None: zeros) of a held tensor, rows first, in VRAM."""
-        t = held.t
-        staged = torch.empty((len(rows),) + tuple(t.shape[1:]), dtype=t.dtype, device=self.d.device)
-        runs, zeros = _runs(rows)
-        for dst, start, length in runs:
-            staged[dst:dst + length].copy_(t[start:start + length], non_blocking=True)
-        for i in zeros:
-            staged[i].zero_()
-        return staged
-
-    def load(self, stage: Stage, strips: list, k: int):
-        a, b = strips[k]
-        want = {"x": (self.src, source_rows(stage, a, b, self.src.t.shape[0]))}
-        if self.res is not None:
-            want["res"] = (self.res, list(range(a, b)))
-        if not self.copying or not any(held.host for held, _ in want.values()):
-            self.loaded[k] = (want, None)
-            return
-        # From RAM on the copy stream: the caching allocator keeps each staged copy until the compute
-        # stream is done with it (record_stream)
-        compute, copy = torch.cuda.current_stream(self.d.device), self.d.copy_stream
-        parts = dict(want)
-        with torch.cuda.stream(copy):
-            for name, (held, rows) in want.items():
-                if held.host:
-                    parts[name] = self._gather(held, rows)
-                    parts[name].record_stream(compute)
-            event = torch.cuda.Event()
-            event.record(copy)
-        self.loaded[k] = (parts, event)
-
-    def inputs(self, k: int) -> dict:
-        parts, event = self.loaded.pop(k)
-        if event is not None:
-            torch.cuda.current_stream(self.d.device).wait_event(event)
-        feed = {}
-        for name, part in parts.items():
-            if isinstance(part, tuple):  # in VRAM (or no copy stream): gathered here
-                part = self._gather(*part)
-            feed[name] = part.permute(1, 0, 2).unsqueeze(0).contiguous()
-        return feed
-
-    def store(self, k: int, a: int, b: int, result):
-        rows_first = result[0].permute(1, 0, 2)
-        if not self.out.host:
-            self.out.t[a:b].copy_(rows_first)
-            return
-        if not self.copying:
-            self.out.t[a:b].copy_(rows_first.to("cpu") if self.d.device.type != "cpu" else rows_first)
-            return
-        compute, copy = torch.cuda.current_stream(self.d.device), self.d.copy_stream
-        slot = k % 2
-        if self.stored[slot] is not None:
-            compute.wait_event(self.stored[slot])  # at most two strips' outputs waiting to go out
-        staged = rows_first.contiguous()
-        ready = torch.cuda.Event()
-        ready.record(compute)
-        with torch.cuda.stream(copy):
-            copy.wait_event(ready)
-            self.out.t[a:b].copy_(staged, non_blocking=True)
-            staged.record_stream(copy)
-            done = torch.cuda.Event()
-            done.record(copy)
-        self.stored[slot] = done
-
-    def finish(self):
-        if self.copying:
-            torch.cuda.current_stream(self.d.device).wait_stream(self.d.copy_stream)
-        self.stored = [None, None]
-        self.loaded.clear()
+    def __exit__(self, *exc):
+        return False
 
 
 class TorchRunner:
@@ -673,11 +778,13 @@ class TorchRunner:
     def __init__(self, module: StageModule):
         self.module = module
 
-    def __call__(self, feed: dict) -> dict:
+    def __call__(self, feed: dict, outputs: dict, last: bool = False) -> dict:
         kind = self.module.kind
         with torch.no_grad():
-            result = self.module(*[feed[n] for n in kind.inputs()])
-        return dict(zip(kind.outputs(), result))
+            result = dict(zip(kind.outputs(), self.module(*[feed[n] for n in kind.inputs()])))
+        outputs["out"].copy_(result["out"])
+        result["out"] = outputs["out"]
+        return result
 
     def activation(self, shapes: dict) -> int:
         return 0
@@ -687,19 +794,21 @@ class TorchRunner:
 
 
 class EngineRunner:
-    """A stage on its kind's engine (engine.py's Engine), loaded with the stage's weights."""
+    """A stage on its kind's engine (engine.py's Engine), loaded with the stage's weights: one execution
+    context for its strips, another for the shorter last one, so neither changes shapes from one decode of
+    a size to the next; and the kind's probe for activation sizes."""
 
-    def __init__(self, engine, shapes: dict, kind: Kind):
-        self.engine, self.shapes, self.kind = engine, shapes, kind
+    def __init__(self, engine, last, probe, shapes: dict, kind: Kind):
+        self.engine, self.last, self.probe, self.shapes, self.kind = engine, last, probe, shapes, kind
 
     def _stream(self) -> int:
         return torch.cuda.current_stream().cuda_stream
 
-    def __call__(self, feed: dict) -> dict:
-        return self.engine.infer(feed, 0, self._stream())
+    def __call__(self, feed: dict, outputs: dict, last: bool = False) -> dict:
+        return (self.last if last else self.engine).infer(feed, 0, self._stream(), outputs)
 
     def activation(self, shapes: dict) -> int:
-        return self.engine.estimate_activation_bytes(0, {n: tuple(s) for n, s in shapes.items()}, self._stream())
+        return self.probe.estimate_activation_bytes(0, {n: tuple(s) for n, s in shapes.items()}, self._stream())
 
     def rows(self, width: int) -> int:
         return engine_rows(self.shapes, self.kind, width)

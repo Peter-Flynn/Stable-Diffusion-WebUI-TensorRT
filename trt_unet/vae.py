@@ -707,7 +707,9 @@ class VaeModel:
         self.applied = None  # the key of the weights in the engines
         self.measured = 0
         self.stages = self.strip_engines = None  # the stripped decode's, loaded when one first runs
+        self.strip_lasts = self.probes = None  # their contexts for last strips; each kind's for activation sizes
         self.strips_applied = None
+        self.activations = {}  # (kind, rows, width) -> the activation memory its engine needs
 
     @property
     def loaded(self) -> bool:
@@ -763,10 +765,14 @@ class VaeModel:
                 e.unload()
             self.applied = None
         if unpatch_all:
-            for e in self.strip_engines or ():
-                e.unload()
-            self.stages = self.strip_engines = self.strips_applied = None
+            self._unload_strips()
         return self.model
+
+    def _unload_strips(self):
+        for e in list((self.probes or {}).values()) + list(self.strip_lasts or ()) + list(self.strip_engines or ()):
+            e.unload()  # the contexts on an engine before it
+        self.stages = self.strip_engines = self.strip_lasts = self.probes = self.strips_applied = None
+        self.activations = {}
 
     def load_strips(self, found: list):
         """Loads an engine for each stage of the stripped decode (its kind's plan) and refits them."""
@@ -775,8 +781,7 @@ class VaeModel:
         if self.strip_engines is not None and [s.kind for s in self.stages] == [s.kind for s in found]:
             self.stages = found  # this VAE's (the same layout)
             return self.sync_strips()
-        for e in self.strip_engines or ():
-            e.unload()
+        self._unload_strips()
         start, engines = time.time(), []
         try:
             for s in found:
@@ -784,11 +789,14 @@ class VaeModel:
                 e.load()
                 engines.append(e)
             self.stages, self.strip_engines, self.strips_applied = found, engines, None
+            self.strip_lasts = [e.twin() for e in engines]
+            self.probes = {}
+            for s, e in zip(found, engines):
+                self.probes.setdefault(s.kind.name, e.twin())
             self.sync_strips(quiet=True)
         except Exception:
-            for e in engines:
-                e.unload()
-            self.stages = self.strip_engines = self.strips_applied = None
+            self.strip_engines = engines
+            self._unload_strips()
             raise
         log(f"Loaded the VAE decoder engines for decoding in strips ({len(found)} stages, {len(self.record.strips)} kinds) in {time.time() - start:.1f}s")
 
@@ -877,8 +885,7 @@ def release_all():
     for model in list(_models.values()):
         _unload(model)
     _models.clear()
-    with contextlib.suppress(Exception):  # the pinned RAM that decodes in strips held their tensors in
-        torch._C._host_emptyCache()
+    strips.release_pinned()  # the RAM that decodes in strips held their tensors in
 
 
 def _fit(model: VaeModel, b: int, h: int, w: int) -> tuple:
@@ -969,10 +976,9 @@ def decode(vae, samples_in):
             model.release()
             model.load_strips(found)
             start = time.time()
-            pixels, held = _run_strips(model, vae, samples_in, found)
+            pixels, report = _run_strips(model, vae, samples_in, found)
             if pixels is not None:
-                in_ram = f"; {held} of its {len(found)} stages' outputs held in RAM" if held else ""
-                log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} in strips on the VAE decoder engines in {time.time() - start:.2f}s{in_ram}")
+                log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} in strips on the VAE decoder engines in {time.time() - start:.2f}s ({report})")
             return pixels
     except torch.cuda.OutOfMemoryError as e:
         frame = traceback.extract_tb(e.__traceback__)[-1]
@@ -1013,19 +1019,23 @@ def _run(model: VaeModel, vae, samples_in, n: int):
 
 
 def _run_strips(model: VaeModel, vae, samples_in, found: list):
-    """(The images, decoded one at a time with the post part in strips, or None; how many stages' outputs
-    went to RAM for the first.)"""
+    """(The images, decoded one at a time with the post part in strips, or None; how it went for the first,
+    for the log.)"""
     dtype, device = model.record.dtype, model.load_device
     mm = common.mm()
     attention = vae.first_stage_model.decoder.mid.attn_1.optimized_attention
     stream = torch.cuda.current_stream().cuda_stream
     to_latent = getattr(vae, "_to_vae_latent", lambda t: t)
     entries = model.record.strips
-    runners = [strips.EngineRunner(e, entries[s.kind.name]["shapes"], s.kind) for s, e in zip(found, model.strip_engines)]
-    decoder = strips.Decode(found, runners, strips.norms(vae.first_stage_model, found, device), dtype, device, _copy_stream(device))
+    runners = [
+        strips.EngineRunner(e, last, model.probes[s.kind.name], entries[s.kind.name]["shapes"], s.kind)
+        for s, e, last in zip(found, model.strip_engines, model.strip_lasts)
+    ]
+    norm_params = strips.norms(vae.first_stage_model, found, device)
+    decoder = strips.Decode(found, runners, norm_params, dtype, device, _copy_stream(device), model.arena, model.activations)
     b, _, h, w = samples_in.shape
     pixels = plan = None
-    held = 0
+    report = ""
     for i in range(b):
         z = to_latent(samples_in[i:i + 1]).to(device=device, dtype=dtype)
         mid = model.engines[PRE].infer({"latent": z}, 0, stream)
@@ -1035,28 +1045,31 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list):
         del mid
         model.release()  # the pre engine's activations: the strips size their own
         if plan is None:
-            # Once to create the engines' execution contexts (VRAM of their own), then with what's free after
-            decoder.plan(h, w, mm.get_free_memory(device))
-            torch.cuda.empty_cache()  # PyTorch's cached blocks back to the driver: the held tensors are large
-            plan = decoder.plan(h, w, mm.get_free_memory(device))
+            start = time.time()
+            torch.cuda.empty_cache()  # PyTorch's cached blocks back to the driver: what's free is what's free
+            free = mm.get_free_memory(device)
+            plan = decoder.plan(h, w, free)
             if plan is None:
-                log(f"Not even a strip of the VAE decoder fits in the VRAM free for {w * 8}x{h * 8}: decoding on PyTorch.")
-                return None, 0
-        image = decoder.run(x, attended, plan)
+                log(f"Not even a strip of the VAE decoder fits in the {common.gib(free)} of VRAM free for {w * 8}x{h * 8}: decoding on PyTorch.")
+                return None, ""
+            planned = time.time() - start
+        try:
+            image = decoder.run(x, attended, plan)
+        except torch.cuda.OutOfMemoryError:  # not as planned: once more, planning for 3/4 of that
+            torch.cuda.empty_cache()
+            log(f"The VAE decoder's strips didn't fit in the {common.gib(plan.vram)} of VRAM planned; planning for less.")
+            plan = decoder.plan(h, w, (mm.get_free_memory(device) * 3) // 4)
+            if plan is None:
+                return None, ""
+            image = decoder.run(x, attended, plan)
         del x, attended
-        if plan.short:
-            when = plan.when
-            vram = f"{common.gib(when['free'])} free, {common.gib(when['allocated'])} of PyTorch's {common.gib(when['reserved'])} in use, " if "free" in when else ""
-            log(
-                f"The VAE decoder's strips ran short of VRAM {len(plan.short)} time{'s' if len(plan.short) > 1 else ''} (first at stage {plan.short[0] + 1} of {len(found)}, "
-                f"{found[plan.short[0]].kind.name}: {vram}{common.gib(when['held'])} held there; planned {common.gib(plan.work)} for strips), and held more in RAM."
-            )
         if pixels is None:
-            held = sum(plan.host)
+            in_ram = f", {len(plan.host)} of its {len(found)} stages' outputs in RAM ({common.gib(plan.moved)} copied)" if plan.host else ""
+            report = f"{common.gib(plan.vram)} of VRAM{in_ram}; planned in {planned * 1000:.0f} ms"
             if not torch.isfinite(image).all():
                 notify(f"The VAE decoder engines produced NaN/Inf values in {label(model.record.meta['dtype'])}; decoding on PyTorch")
-                return None, 0
+                return None, ""
             pixels = torch.empty((b,) + tuple(image.shape[1:]), device=vae.output_device)
         pixels[i:i + 1] = vae.process_output(image.to(vae.output_device).float())
         del image
-    return pixels.to(vae.output_device).movedim(1, -1), held
+    return pixels.to(vae.output_device).movedim(1, -1), report

@@ -143,6 +143,13 @@ class Engine:
         self.shapes = {}
         self.memory_bound = False
         self.bound_version = None
+        self.size = None  # the activation memory the shapes set need
+
+    def twin(self):
+        """Another execution context on the same engine (and weights), with shapes of its own."""
+        other = Engine(self.plan_path, self.arena)
+        other.engine, other.io, other.weight_names = self.engine, self.io, self.weight_names
+        return other
 
     @property
     def loaded(self) -> bool:
@@ -287,14 +294,14 @@ class Engine:
         accepted, so a failure here makes the next call set everything again."""
         self._context()
         if profile != self.profile:
-            self.profile, self.shapes, self.memory_bound = None, {}, False
+            self.profile, self.shapes, self.memory_bound, self.size = None, {}, False, None
             if not self.context.set_optimization_profile_async(profile, stream):
                 raise RuntimeError(f"Could not select optimization profile {profile}")
             self.profile = profile
         for name, shape in shapes.items():
             if self.shapes.get(name) != shape:
                 self.shapes.pop(name, None)
-                self.memory_bound = False
+                self.memory_bound, self.size = False, None
                 if not self.context.set_input_shape(name, shape):
                     raise RuntimeError(f"Input {name} {shape} is outside profile {profile}")
                 self.shapes[name] = shape
@@ -307,16 +314,19 @@ class Engine:
             self.memory_bound, self.bound_version = True, self.arena.version
 
     def activation_bytes(self) -> int:
-        """For the profile and input shapes set on the context."""
-        size = int(self.context.update_device_memory_size_for_shapes())  # 0 if it can't tell
-        return size if size > 0 else int(self.engine.get_device_memory_size_for_profile_v2(self.profile))
+        """For the profile and input shapes set on the context (asked of TensorRT once per shapes set)."""
+        if self.size is None:
+            size = int(self.context.update_device_memory_size_for_shapes())  # 0 if it can't tell
+            self.size = size if size > 0 else int(self.engine.get_device_memory_size_for_profile_v2(self.profile))
+        return self.size
 
     def estimate_activation_bytes(self, profile: int, shapes: dict, stream: int) -> int:
         self._set_shapes(profile, shapes, stream)
         return self.activation_bytes()
 
-    def infer(self, feed: dict, profile: int, stream: int) -> dict:
-        """Runs on the inputs in `feed` that the engine takes (e.g. SDXL's shallow UNet takes no prompt)."""
+    def infer(self, feed: dict, profile: int, stream: int, into: dict = None) -> dict:
+        """Runs on the inputs in `feed` that the engine takes (e.g. SDXL's shallow UNet takes no prompt);
+        outputs go into the tensors in `into` that have their shape and type, else new ones."""
         self._prepare(profile, {name: tuple(feed[name].shape) for name, is_input, _ in self.io if is_input}, stream)
         outputs = {}
         for name, is_input, dtype in self.io:
@@ -325,7 +335,12 @@ class Engine:
                 if t.dtype != dtype or t.device.type != torch.device(DEVICE).type or not t.is_contiguous():
                     t = feed[name] = t.to(device=DEVICE, dtype=dtype).contiguous()
             else:
-                t = outputs[name] = torch.empty(tuple(self.context.get_tensor_shape(name)), dtype=dtype, device=DEVICE)
+                shape = tuple(self.context.get_tensor_shape(name))
+                given = (into or {}).get(name)
+                if given is not None and tuple(given.shape) == shape and given.dtype == dtype and given.is_contiguous():
+                    t = outputs[name] = given
+                else:
+                    t = outputs[name] = torch.empty(shape, dtype=dtype, device=DEVICE)
             self.context.set_tensor_address(name, t.data_ptr())
         if not self.context.execute_async_v3(stream):
             raise RuntimeError("TensorRT inference failed")
