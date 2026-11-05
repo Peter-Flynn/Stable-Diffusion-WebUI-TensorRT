@@ -110,8 +110,8 @@ def label(name: str) -> str:
 
 
 TENSOR_LIMIT = 2**31 - 1  # elements a tensor can hold in TensorRT's kernels (its Myelin backend)
-RUNNING = 2  # a decode holds about this many of its largest tensor at once (it, and what's made from it)
-RESERVE = 2**30  # of the GPU's VRAM, for the CUDA context and the engines' weights
+RESERVE = 2**30  # of the GPU's VRAM, for the CUDA context, the engines' weights and their kernels' scratch
+RETRY_SHARE = 0.75  # of that budget, for a second try when TensorRT finds no kernel that fits the largest size
 
 
 def _vram():
@@ -122,46 +122,78 @@ def _vram():
         return None
 
 
-def _limit(dtype=None, vram=None) -> tuple:
-    """(the most elements the decoder's largest tensor may have, why): TensorRT's limit, or less if a
-    decode that large wouldn't fit in the GPU's VRAM even alone (so the engines needn't go that far)."""
-    limit, why = TENSOR_LIMIT, "TensorRT can't hold a larger decode's largest tensor (2^31 elements)"
-    if dtype is not None and vram:
-        fits = int((vram - RESERVE) / (RUNNING * torch.tensor([], dtype=dtype).element_size()))
-        if fits < limit:
-            limit, why = fits, f"a larger decode wouldn't fit in this GPU's {common.gib(vram)} in {label(dtype_name(dtype))}, even alone"
-    return limit, why
+def _budget(dtype=None, vram=None, share: float = 1.0):
+    """Elements a decode may hold at once on this GPU in this precision (None if it can't tell): its VRAM
+    less RESERVE, or a share of that."""
+    if dtype is None or not vram:
+        return None
+    return max(0, int((vram - RESERVE) * share / torch.tensor([], dtype=dtype).element_size()))
+
+
+def _levels(cfg: dict, h: int, w: int):
+    """(channels coming in, channels of the blocks, pixels padded by a row and column on each side, as a
+    conv's padding may hold them) at each of the decoder's resolutions, for latents of h x w."""
+    ch, mult = cfg["ch"], cfg["ch_mult"]
+    for i in range(len(mult)):
+        scale = 2 ** (len(mult) - 1 - i)  # level i's size, in latents
+        incoming = ch * mult[i + 1] if i + 1 < len(mult) else cfg["mid_channels"]
+        yield incoming, ch * mult[i], (h * scale + 2) * (w * scale + 2)
 
 
 def largest_tensor(cfg: dict, b: int, h: int, w: int) -> int:
-    """Elements in the decoder's largest tensor for b latents of h x w (padded by a row and column on each
-    side, as a conv's padding may hold them): at each resolution, the most channels there, those of the
-    blocks or of what's upsampled into them. For SD and SDXL VAEs, the 256 channels upsampled to full size."""
-    ch, mult = cfg["ch"], cfg["ch_mult"]
-    levels = len(mult)
+    """Elements in the decoder's largest tensor for b latents of h x w: at each resolution, the most
+    channels there, those of the blocks or of what's upsampled into them. For SD and SDXL VAEs, the 256
+    channels upsampled to full size."""
     worst = b * cfg["latent_channels"] * (h + 2) * (w + 2)
-    for i in range(levels):
-        scale = 2 ** (levels - 1 - i)  # level i's size, in latents
-        channels = max(ch * mult[i], ch * mult[i + 1] if i + 1 < levels else cfg["mid_channels"])
-        worst = max(worst, b * channels * (h * scale + 2) * (w * scale + 2))
-    return worst
+    return max([worst] + [b * max(incoming, own) * pixels for incoming, own, pixels in _levels(cfg, h, w)])
 
 
-def shapes_for(profiles: list, cfg: dict, dtype=None, vram=None) -> dict:
+def peak(cfg: dict, b: int, h: int, w: int) -> int:
+    """Elements a decode of b latents of h x w holds at once, at its worst: at each resolution, the first
+    block's input (kept for its shortcut) with its normalized copy and its first conv's output, or with two
+    of the block's own; three of the later blocks' own; or the upsampling's input, its output and its conv's.
+    For SD and SDXL VAEs, 256 + 256 + 128 channels at full size: 2.5 times the largest tensor."""
+    return max(
+        b * max(2 * incoming + own, incoming + 2 * own, 3 * own, 2 * incoming + incoming // 4) * pixels
+        for incoming, own, pixels in _levels(cfg, h, w)
+    )
+
+
+def _excess(cfg: dict, b: int, h: int, w: int, budget) -> tuple:
+    """(how far over a decode of b latents of h x w is, as a ratio of elements (<= 1 if it fits), why):
+    over TensorRT's limit for a tensor, or over the VRAM budget."""
+    tensor = largest_tensor(cfg, b, h, w) / TENSOR_LIMIT
+    memory = peak(cfg, b, h, w) / budget if budget else 0.0
+    if budget is not None and budget <= 0:
+        memory = math.inf
+    return max(tensor, memory), "tensor" if tensor >= memory else "memory"
+
+
+def _why(cause: str, dtype, vram) -> str:
+    if cause == "tensor":
+        return "TensorRT can't hold a larger decode's largest tensor (2^31 elements)"
+    return f"a larger decode wouldn't fit in this GPU's {common.gib(vram)} in {label(dtype_name(dtype))}, even alone"
+
+
+def shapes_for(profiles: list, cfg: dict, dtype=None, vram=None, share: float = 1.0) -> dict:
     """The engines' input shapes for the sizes a list of profiles covers: from the smallest to the largest
     of them, optimal at the first profile's optimal size, one image at a time up to the largest batch.
-    Capped so the largest tensor fits (_limit: TensorRT's limit, and with the precision and the GPU's
-    VRAM, what could decode at all): the size first (scaled down, keeping its aspect), then the batch at
-    that size. Larger decodes run on PyTorch."""
-    limit = _limit(dtype, vram)[0]
+    Capped so a decode fits TensorRT's limit for a tensor and, with the precision and the GPU's VRAM, so
+    it could run at all (_budget, `share` of it): the size first (scaled down, keeping its aspect), then
+    the batch at that size. Larger decodes run on PyTorch."""
+    budget = _budget(dtype, vram, share)
     lo_h, lo_w = min(p.height[0] for p in profiles) // 8, min(p.width[0] for p in profiles) // 8
     hi_h, hi_w = max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8
-    if largest_tensor(cfg, 1, hi_h, hi_w) > limit:
-        scale = math.sqrt(limit / largest_tensor(cfg, 1, hi_h, hi_w))
+    over = _excess(cfg, 1, hi_h, hi_w, budget)[0]
+    if over > 1:
+        scale = math.sqrt(1 / over) if over < math.inf else 0
         hi_h, hi_w = max(1, int(hi_h * scale)), max(1, int(hi_w * scale))
-        while largest_tensor(cfg, 1, hi_h, hi_w) > limit and max(hi_h, hi_w) > 1:
+        while _excess(cfg, 1, hi_h, hi_w, budget)[0] > 1 and max(hi_h, hi_w) > 1:
             hi_h, hi_w = (hi_h - 1, hi_w) if hi_h >= hi_w else (hi_h, hi_w - 1)
-    batch = max(1, min(MAX_BATCH, max(p.batch[2] for p in profiles), limit // largest_tensor(cfg, 1, hi_h, hi_w)))
+    fits = TENSOR_LIMIT // largest_tensor(cfg, 1, hi_h, hi_w)
+    if budget is not None:
+        fits = min(fits, budget // peak(cfg, 1, hi_h, hi_w))
+    batch = max(1, min(MAX_BATCH, max(p.batch[2] for p in profiles), fits))
     lo_h, lo_w = min(lo_h, hi_h), min(lo_w, hi_w)
     opt_h, opt_w = min(max(profiles[0].height[1] // 8, lo_h), hi_h), min(max(profiles[0].width[1] // 8, lo_w), hi_w)
     zc, c = cfg["latent_channels"], cfg["mid_channels"]
@@ -284,7 +316,7 @@ def needs_build(arch, profiles: list, vae=None) -> str:
     try:
         cfg, wanted, dtype = config(vae), digest(vae), dtype_name(vae.vae_dtype)
         shapes = shapes_for(profiles, cfg, vae.vae_dtype, _vram())
-        if any(r.meta.get("digest") == wanted and r.meta.get("dtype") == dtype and _covers(r.meta["shapes"], shapes) for r in records(arch.id)):
+        if any(r.meta.get("digest") == wanted and r.meta.get("dtype") == dtype and _covers(r.meta.get("asked", r.meta["shapes"]), shapes) for r in records(arch.id)):
             return ""
     except Exception as e:
         log(f"Could not check the VAE decoder engines: {e}")
@@ -397,19 +429,22 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
     try:
         dtype = vae.vae_dtype
         cfg, vram = config(vae), _vram()
-        shapes = shapes_for(profiles, cfg, dtype, vram)
-        b, _, h, w = shapes[PRE]["latent"][2]
-        wanted_h, wanted_w = max(p.height[2] for p in profiles), max(p.width[2] for p in profiles)
-        if (h * 8, w * 8) != (wanted_h, wanted_w):
-            log(f"The VAE decoder engines go up to {w * 8}x{h * 8} ({b} at a time), not the profiles' {wanted_w}x{wanted_h}: {_limit(dtype, vram)[1]}. Larger decodes run on PyTorch.")
+        asked = shapes_for(profiles, cfg, dtype, vram)
+        wanted_h, wanted_w = max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8
+        b, _, h, w = asked[PRE]["latent"][2]
+        if (h, w) != (wanted_h, wanted_w):
+            cause = _excess(cfg, 1, wanted_h, wanted_w, _budget(dtype, vram))[1]
+            log(f"The VAE decoder engines go up to {w * 8}x{h * 8} ({b} at a time), not the profiles' {wanted_w * 8}x{wanted_h * 8}: {_why(cause, dtype, vram)}. Larger decodes run on PyTorch.")
         if progress:
             progress(0.0, "exporting the graphs")
         graphs = export_onnx(vae, work, dtype, common.mm().get_torch_device())
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()  # the trace's VRAM back to the driver, for the builder's process
-        stripped = {}
-        for n, part in enumerate((PRE, POST)):
+        shapes, stripped, tries = asked, {}, 0
+        n = 0
+        while n < 2:  # the post engine first: it's the one TensorRT may find no kernels for, at the largest size
+            part = (POST, PRE)[n]
             step = (lambda f, t, n=n, part=part: progress((n + f) / 2, f"{part} engine: {t}")) if progress else None
             job = {
                 "onnx": os.path.join(work, f"vae_{part}.onnx"),
@@ -420,10 +455,18 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                 "optimization_level": optimization_level,
             }
             result = export._build_plan(job, work, step)
-            skipped += result.get("memory_warnings") or 0
+            warned = result.get("memory_warnings") or 0
+            skipped += warned
             if not result["ok"]:
-                return None, str(result.get("error")), skipped
+                smaller = shapes_for(profiles, cfg, dtype, vram, RETRY_SHARE) if dtype is not None and vram else shapes
+                if part != POST or tries or not warned or smaller == shapes:
+                    return None, str(result.get("error")), skipped
+                tries, shapes = 1, smaller
+                b, _, h, w = shapes[PRE]["latent"][2]
+                log(f"TensorRT found no kernels with the VRAM to spare at the largest size; trying again up to {w * 8}x{h * 8} ({b} at a time).")
+                continue
             stripped[part] = result["stripped"]
+            n += 1
         key = hashlib.sha1(json.dumps([digest(vae), dtype_name(dtype), shapes], sort_keys=True).encode()).hexdigest()[:10]
         size = torch.tensor([], dtype=dtype).element_size()
         meta = {
@@ -434,6 +477,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             "dtype": dtype_name(dtype),
             "config": cfg,
             "shapes": shapes,
+            "asked": asked,  # what they were built for: the shapes, unless TensorRT had to go smaller
             "weights": {part: sorted(graphs[part]) for part in (PRE, POST)},
             "weight_bytes": sum(math.prod(s) * size for part in (PRE, POST) for s in graphs[part].values()),
             "stripped": stripped,
