@@ -112,6 +112,7 @@ def label(name: str) -> str:
 TENSOR_LIMIT = 2**31 - 1  # elements a tensor can hold in TensorRT's kernels (its Myelin backend)
 RESERVE = 2**30  # of the GPU's VRAM, for the CUDA context, the engines' weights and their kernels' scratch
 RETRY_SHARE = 0.75  # of that budget, for a second try when TensorRT finds no kernel that fits the largest size
+PLANNED = 1.2  # TensorRT's activation memory for a decode, as a multiple of peak() (4.32 GiB for 1472x1024 in FP32, TensorRT 11.4)
 
 
 def _vram():
@@ -163,7 +164,7 @@ def _excess(cfg: dict, b: int, h: int, w: int, budget) -> tuple:
     """(how far over a decode of b latents of h x w is, as a ratio of elements (<= 1 if it fits), why):
     over TensorRT's limit for a tensor, or over the VRAM budget."""
     tensor = largest_tensor(cfg, b, h, w) / TENSOR_LIMIT
-    memory = peak(cfg, b, h, w) / budget if budget else 0.0
+    memory = peak(cfg, b, h, w) * PLANNED / budget if budget else 0.0
     if budget is not None and budget <= 0:
         memory = math.inf
     return max(tensor, memory), "tensor" if tensor >= memory else "memory"
@@ -192,7 +193,7 @@ def shapes_for(profiles: list, cfg: dict, dtype=None, vram=None, share: float = 
             hi_h, hi_w = (hi_h - 1, hi_w) if hi_h >= hi_w else (hi_h, hi_w - 1)
     fits = TENSOR_LIMIT // largest_tensor(cfg, 1, hi_h, hi_w)
     if budget is not None:
-        fits = min(fits, budget // peak(cfg, 1, hi_h, hi_w))
+        fits = min(fits, int(budget / (peak(cfg, 1, hi_h, hi_w) * PLANNED)))
     batch = max(1, min(MAX_BATCH, max(p.batch[2] for p in profiles), fits))
     lo_h, lo_w = min(lo_h, hi_h), min(lo_w, hi_w)
     opt_h, opt_w = min(max(profiles[0].height[1] // 8, lo_h), hi_h), min(max(profiles[0].width[1] // 8, lo_w), hi_w)
@@ -533,7 +534,7 @@ class VaeModel:
         return all(e.loaded for e in self.engines.values())
 
     def model_size(self):
-        return self.measured or int(self.record.meta["weight_bytes"])
+        return max(self.measured, int(self.record.meta["weight_bytes"]))  # what the driver showed can be less
 
     def loaded_size(self):
         return self.model_size() if self.loaded else 0
