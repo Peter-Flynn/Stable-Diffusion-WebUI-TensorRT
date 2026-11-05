@@ -128,8 +128,10 @@ class TrtModel:
         used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
         self.measured = max(self.measured, used)
         with_shallow = " with its Speed Hacks part" if self.shallow_loaded else ""
+        weights = self.record.weight_bytes + (self.hacks["weight_bytes"] if self.hacks and self.shallow_loaded else 0)
+        beyond = f"; {common.gib(used - weights)} beyond the weights" if used > weights + 2**20 else ""
         log(
-            f"Loaded the {self.record.arch.label} {self.record.label}{with_shallow} ({common.gib(self.model_size())}) in {time.time() - start:.1f}s: "
+            f"Loaded the {self.record.arch.label} {self.record.label}{with_shallow} ({common.gib(self.model_size())}{beyond}) in {time.time() - start:.1f}s: "
             f"plan {plan_seconds:.1f}s, " + (_refit_times(refit) if refit else "no weights to refit")
         )
         return self.model_size()

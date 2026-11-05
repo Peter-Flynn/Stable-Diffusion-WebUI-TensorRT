@@ -708,6 +708,7 @@ class VaeModel:
         self.probes = {}  # kind name -> a context for activation sizes
         self.strips_applied = None  # the key of the weights in the stage engines
         self.activations = {}  # (kind, rows, width) -> the activation memory its engine needs
+        self.stage_vram = 0  # what loading the stage engines took from the driver (their weights and the rest)
 
     @property
     def loaded(self) -> bool:
@@ -754,7 +755,7 @@ class VaeModel:
             raise
         used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
         self.measured = max(self.measured, used)
-        log(f"Loaded the VAE decoder engines ({common.gib(self.model_size())}, {label(self.record.meta['dtype'])}) in {time.time() - start:.1f}s")
+        log(f"Loaded the VAE decoder engines ({common.gib(self.model_size())}, {label(self.record.meta['dtype'])}{_beyond(used, int(self.record.meta['weight_bytes']))}) in {time.time() - start:.1f}s")
         return self.model_size()
 
     def detach(self, unpatch_all=True):
@@ -769,13 +770,14 @@ class VaeModel:
     def _unload_strips(self):
         for e in list(self.probes.values()) + [e[1] for e in self.stage_engines.values()] + [e[0] for e in self.stage_engines.values()]:
             e.unload()  # the contexts on an engine before it
-        self.stage_engines, self.probes, self.strips_applied, self.activations = {}, {}, None, {}
+        self.stage_engines, self.probes, self.strips_applied, self.activations, self.stage_vram = {}, {}, None, {}, 0
 
     def stage_engine(self, stage) -> tuple:
         """(The engine for a stage of the stripped decode, loaded with its weights; a context for its last strips.)"""
         from .engine import Engine
 
         if stage.identity not in self.stage_engines:
+            free, reserved = _driver_free()
             e = Engine(self.record.strip_plan(stage.kind.name), self.arena)
             e.load()
             try:
@@ -785,6 +787,9 @@ class VaeModel:
                 raise
             nbytes = _weight_bytes(self.vae, stage.weights.values(), self.record.dtype)
             self.stage_engines[stage.identity] = (e, e.twin(), stage.weights, nbytes)
+            if free is not None:
+                now, now_reserved = _driver_free()
+                self.stage_vram += max(0, free - now - (now_reserved - reserved))
         return self.stage_engines[stage.identity][:2]
 
     def probe(self, stage):
@@ -1062,7 +1067,7 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list):
             if not torch.isfinite(image).all():
                 notify(f"The VAE decoder engines produced NaN/Inf values in {label(model.record.meta['dtype'])}; decoding on PyTorch")
                 return None, ""
-            report = _strips_report(plan, planned)
+            report = _strips_report(plan, planned, model)
             pixels = torch.empty((b,) + tuple(image.shape[1:]), device=vae.output_device)
         pixels[i:i + 1] = vae.process_output(image.to(vae.output_device).float())
         del image
@@ -1086,9 +1091,27 @@ def _plan_strips(decoder, mm, device, h: int, w: int):
     return plan
 
 
-def _strips_report(plan, planned: float) -> str:
-    """For the log: the VRAM, the blocks' ways, RAM, planning and the stages' time on the GPU."""
+def _driver_free() -> tuple:
+    """(The driver's free VRAM, PyTorch's reserved), or (None, None)."""
+    try:
+        return torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
+    except Exception:
+        return None, None
+
+
+def _beyond(used: int, weights: int) -> str:
+    """For the log: what loading engines took from the driver beyond their weights (kernels and the rest),
+    when the driver showed more."""
+    return f"; {common.gib(used - weights)} beyond the weights" if used > weights + 2**20 else ""
+
+
+def _strips_report(plan, planned: float, model=None) -> str:
+    """For the log: the VRAM, the blocks' ways, RAM, planning and the stages' time on the GPU, and what the
+    stage engines took (beyond their weights: kernels and the rest)."""
     parts = [f"{common.gib(plan.vram)} of VRAM"]
+    if model is not None and model.stage_engines:
+        weights = sum(e[3] for e in model.stage_engines.values())
+        parts.append(f"{len(model.stage_engines)} stage engines in {common.gib(max(model.stage_vram, weights))}{_beyond(model.stage_vram, weights)}")
     if plan.describe():
         parts.append(plan.describe())
     if plan.host:
