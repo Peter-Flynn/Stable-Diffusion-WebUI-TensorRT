@@ -974,8 +974,15 @@ def decode(vae, samples_in):
                 in_ram = f"; {held} of its {len(found)} stages' outputs held in RAM" if held else ""
                 log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} in strips on the VAE decoder engines in {time.time() - start:.2f}s{in_ram}")
             return pixels
-    except torch.cuda.OutOfMemoryError:
-        log("Ran out of VRAM decoding on the VAE engines; decoding on PyTorch.")
+    except torch.cuda.OutOfMemoryError as e:
+        frame = traceback.extract_tb(e.__traceback__)[-1]
+        where = f"{os.path.basename(frame.filename)}:{frame.lineno}, {frame.name}"
+        del e
+        try:
+            vram = f"; {common.gib(torch.cuda.mem_get_info()[0])} free, {common.gib(torch.cuda.memory_allocated())} of PyTorch's {common.gib(torch.cuda.memory_reserved())} in use"
+        except Exception:
+            vram = ""
+        log(f"Ran out of VRAM decoding on the VAE engines ({where}{vram}); decoding on PyTorch.")
         return None
     finally:
         model.release()
@@ -1028,12 +1035,22 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list):
         del mid
         model.release()  # the pre engine's activations: the strips size their own
         if plan is None:
+            # Once to create the engines' execution contexts (VRAM of their own), then with what's free after
+            decoder.plan(h, w, mm.get_free_memory(device))
+            torch.cuda.empty_cache()  # PyTorch's cached blocks back to the driver: the held tensors are large
             plan = decoder.plan(h, w, mm.get_free_memory(device))
             if plan is None:
                 log(f"Not even a strip of the VAE decoder fits in the VRAM free for {w * 8}x{h * 8}: decoding on PyTorch.")
                 return None, 0
         image = decoder.run(x, attended, plan)
         del x, attended
+        if plan.short:
+            when = plan.when
+            vram = f"{common.gib(when['free'])} free, {common.gib(when['allocated'])} of PyTorch's {common.gib(when['reserved'])} in use, " if "free" in when else ""
+            log(
+                f"The VAE decoder's strips ran short of VRAM {len(plan.short)} time{'s' if len(plan.short) > 1 else ''} (first at stage {plan.short[0] + 1} of {len(found)}, "
+                f"{found[plan.short[0]].kind.name}: {vram}{common.gib(when['held'])} held there; planned {common.gib(plan.work)} for strips), and held more in RAM."
+            )
         if pixels is None:
             held = sum(plan.host)
             if not torch.isfinite(image).all():

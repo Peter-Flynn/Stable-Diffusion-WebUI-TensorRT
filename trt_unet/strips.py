@@ -28,7 +28,7 @@ INPUTS = {
     PROJ: ("x", "res"),
 }
 PADDINGS = ("zeros", "reflect", "replicate", "circular")
-HEADROOM = 256 * 2**20  # VRAM left free during a decode
+HEADROOM = 256 * 2**20  # VRAM left free during a decode, and a 16th of what's free
 
 
 @dataclass(frozen=True)
@@ -380,6 +380,13 @@ def _runs(rows: list):
     return runs, zeros
 
 
+def _vram_now(held: int) -> dict:
+    try:
+        return {"free": torch.cuda.mem_get_info()[0], "allocated": torch.cuda.memory_allocated(), "reserved": torch.cuda.memory_reserved(), "held": held}
+    except Exception:
+        return {"held": held}
+
+
 class Held:
     """A tensor held between stages, rows first (rows, channels, width): in VRAM or in (pinned) RAM."""
 
@@ -410,8 +417,10 @@ class Plan:
 
     rows: list
     work: int  # VRAM for the strips' working tensors and the engines' activations, at most
-    held: int  # VRAM for held tensors
-    host: list = field(default_factory=list)  # where each stage's output goes, decided as it runs
+    held: int  # VRAM for held tensors (less once VRAM ran short)
+    host: list = field(default_factory=list)  # whether each stage's output went to RAM, decided as it runs
+    short: list = field(default_factory=list)  # the stages that ran out of VRAM (and ran again with less)
+    when: dict = field(default_factory=dict)  # the VRAM then, the first time: driver's free, PyTorch's allocated and reserved, held
 
 
 class Decode:
@@ -449,7 +458,7 @@ class Decode:
             if cap < (2 if stage.kind.op == UP else 1):
                 return None
             caps.append(cap)
-        budget = free - HEADROOM
+        budget = free - HEADROOM - free // 16
         rows = list(caps)
         worst = max(self.work(n, r, h, w) for n, r in enumerate(rows))
         if worst > budget:
@@ -467,12 +476,13 @@ class Decode:
 
     def run(self, x, attention, plan: Plan, force_host: bool = False):
         """The image (1, out channels, H, W) for the mid block's input x and its attention's output (each
-        (1, channels, h, w), in VRAM)."""
+        (1, channels, h, w), in VRAM). A stage that runs out of VRAM runs again with less in it: its output
+        in RAM, then its inputs, then fewer rows per strip; and the stages after it hold no more in VRAM."""
         h, w = x.shape[2], x.shape[3]
-        plan.host = []
+        plan.host, plan.short = [], []
         held = {-2: Held.of(x), -1: Held.of(attention)}
         stats = {}
-        device_bytes = 0  # of held tensors past the latent-size ones (which `free` counted)
+        self.in_vram = 0  # bytes of held tensors in VRAM, past the latent-size ones (which `free` counted)
         last_use = {}
         for n, s in enumerate(self.stages):
             last_use[s.src] = n
@@ -482,17 +492,40 @@ class Decode:
         for n, stage in enumerate(self.stages):
             out_rows, width, _ = self.geometry(stage, h, w)
             nbytes = out_rows * stage.kind.cout * width * self.size
-            host = force_host or device_bytes + nbytes > plan.held
-            out = Held(out_rows, stage.kind.cout, width, self.dtype, self.device, host)
-            plan.host.append(host)
-            if not host:
-                device_bytes += nbytes
-            stats[n] = self._sweep(n, stage, held[stage.src], held.get(stage.res), out, stats.get(stage.src), plan.rows[n])
+            host = force_host or self.in_vram + nbytes > plan.held
+            out = None
+            while True:
+                short = False
+                try:
+                    if out is None:
+                        out = Held(out_rows, stage.kind.cout, width, self.dtype, self.device, host)
+                        self.in_vram += 0 if host else nbytes
+                    stats[n] = self._sweep(n, stage, held[stage.src], held.get(stage.res), out, stats.get(stage.src), plan.rows[n])
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    short = True
+                if short:  # out of the except block: its traceback no longer holds the strip's tensors
+                    self._settle()
+                    if not plan.short:
+                        plan.when = _vram_now(self.in_vram)
+                    plan.short.append(n)
+                    if not host:  # its output to RAM
+                        if out is not None:
+                            self.in_vram -= nbytes
+                        out, host = None, True
+                    elif not self._spill(held, stage):  # else an input to RAM, else fewer rows
+                        step = 2 if stage.kind.op == UP else 1
+                        if plan.rows[n] <= step:
+                            raise torch.cuda.OutOfMemoryError(f"Not even a strip of {step} rows of the VAE decoder's stage {n} fits in the VRAM free")
+                        plan.rows[n] = max(step, plan.rows[n] // 2 // step * step)
+                    plan.held = min(plan.held, self.in_vram)
+                    torch.cuda.empty_cache()
+            plan.host.append(out.host)
             for buf in {stage.src, stage.res} - {None}:
                 if last_use.get(buf) == n:
                     gone = held.pop(buf)
-                    if not gone.host:
-                        device_bytes -= gone.nbytes
+                    if not gone.host and buf >= 0:
+                        self.in_vram -= gone.nbytes
                     stats.pop(buf, None)
             held[n] = out
             if stage.kind.op == OUT:
@@ -500,6 +533,25 @@ class Decode:
         if self.copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self.copy_stream)
         return image.t.to(self.device).permute(1, 0, 2).unsqueeze(0).contiguous()
+
+    def _settle(self):
+        """After running out of VRAM mid-sweep: the copies queued finish before anything is freed or moved."""
+        if self.copy_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.copy_stream)
+
+    def _spill(self, held: dict, stage: Stage) -> bool:
+        """Moves the largest of a stage's inputs in VRAM to RAM; whether there was one."""
+        keys = [k for k in (stage.src, stage.res) if k is not None and not held[k].host]
+        if not keys:
+            return False
+        key = max(keys, key=lambda k: held[k].nbytes)
+        old = held[key]
+        new = Held(*old.t.shape, self.dtype, self.device, True)
+        new.t.copy_(old.t)
+        held[key] = new
+        if key >= 0:
+            self.in_vram -= old.nbytes
+        return True
 
     def _sweep(self, n: int, stage: Stage, src: Held, res, out: Held, src_stats, rows: int):
         kind, runner = stage.kind, self.runners[n]
