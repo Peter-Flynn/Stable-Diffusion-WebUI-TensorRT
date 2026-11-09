@@ -1,7 +1,18 @@
 """Decoding latents on TensorRT: the VAE's decoder as weightless engines like the UNet's, refitted from
-whichever VAE is loaded, in the precision reForge itself picks for that VAE when they're built: BF16 where
-the GPU has it, FP32 below, or what a --vae-in-* flag asks for. So the engines overflow only where
-PyTorch would, whatever the VAE.
+whichever VAE is loaded, in the precision reForge itself picks for that VAE when they're built (BF16
+where the GPU has it, or what a --vae-in-* flag asks for), except where it picks FP32 only for want of
+BF16: there the engines run in FP16, at half the VRAM and on the GPU's tensor cores.
+
+VAEs overflow in FP16 (SDXL's makes values past its 65504), which is why reForge avoids it. The engines
+don't, whatever the VAE, because of where the decoder's nonlinearities are: every one (SiLU, the
+attention's softmax) comes right after a GroupNorm, and a GroupNorm's output doesn't depend on its
+input's scale. So everything between two GroupNorms is linear, and can run multiplied by any constant
+as long as what's added along the way (the convs' biases) is multiplied too. FP16 engines run it
+multiplied by a power of two, 2^-EXPONENT, which costs floating point nothing: the latent and each
+resnet block's conv inputs are multiplied by it (an input of the graphs, "scale"), the biases added to
+scaled tensors are refitted multiplied by it, GroupNorms compute in FP32, and the image comes out as it
+is, its last GroupNorm having taken the scale out. Should a decode still produce NaN/Inf, the exponent
+goes up for that VAE and the decode runs again.
 
 The decoder runs in three parts: a "pre" engine up to its mid-block attention's queries, keys and values;
 that attention on PyTorch, with reForge's own implementation; and a "post" engine for the rest. The
@@ -39,6 +50,13 @@ FORMAT = 1
 PRE, POST = "pre", "post"
 HEADROOM = 256 * 2**20
 MAX_BATCH = 16  # images per engine call, at most
+# FP16 engines scale the decoder by 2^-EXPONENT. FP16 holds magnitudes up to 2^16 in steps no finer than
+# 2^-24, so a tensor keeps FP16's precision scaled down until its typical value nears 2^-13 (measured: a
+# decoder whose tensors are around 0.5 decodes as closely scaled by anything from 1 to 2^-12). At 6,
+# tensors the VAE makes as large as 4 million fit, and ones as small as 0.01 keep their precision. A
+# decode that overflows anyway raises it by EXPONENT_STEP for that VAE, up to EXPONENT_MAX; past that the
+# VAE decodes on PyTorch.
+EXPONENT, EXPONENT_STEP, EXPONENT_MAX = 6, 3, 12
 
 
 # --- Which VAEs
@@ -103,6 +121,36 @@ def digest(vae) -> str:
 
 def dtype_name(dtype) -> str:
     return str(dtype).replace("torch.", "")
+
+
+def engine_dtype(vae):
+    """The precision the engines run a VAE's decoder in: reForge's for it, or FP16 (scaled, so it can't
+    overflow) where reForge fell back to FP32 without being asked to and the GPU runs FP16 well."""
+    dtype = vae.vae_dtype
+    if dtype == torch.float32:
+        try:
+            mm = common.mm()
+            if not getattr(mm.args, "vae_in_fp32", False) and mm.should_use_fp16(mm.get_torch_device()):
+                return torch.float16
+        except Exception:
+            pass
+    return dtype
+
+
+def scaled(dtype) -> bool:
+    """Whether engines in this precision run the decoder scaled: FP16's range is the one VAEs outgrow (BF16
+    and FP32 share one 2^127 wide)."""
+    return dtype == torch.float16
+
+
+_SCALED_BIASES = ("post_quant_conv.bias", "decoder.conv_in.bias", "decoder.mid.attn_1.proj_out.bias")
+_SCALED_ENDINGS = (".conv1.bias", ".conv2.bias", ".nin_shortcut.bias", ".conv_shortcut.bias", ".upsample.conv.bias")
+
+
+def scaled_bias(name: str) -> bool:
+    """Whether a decoder weight is a bias added to a scaled tensor (so it's refitted scaled): all the convs'
+    but the last one's and the attention's queries', keys' and values', whose inputs a GroupNorm made."""
+    return name in _SCALED_BIASES or name.endswith(_SCALED_ENDINGS)
 
 
 def label(name: str) -> str:
@@ -255,6 +303,11 @@ class Record:
         return getattr(torch, self.meta["dtype"])
 
     @property
+    def scaled(self) -> bool:
+        """Whether the engines run the decoder scaled (FP16 ones do: their graphs take the scale)."""
+        return bool(self.meta.get("scaled"))
+
+    @property
     def loadable(self) -> bool:
         try:
             return self.meta["gpu"] == common.gpu_tag() and common.trt_tag(self.meta["trt"]) == common.trt_tag()
@@ -329,7 +382,8 @@ def record_for(arch_id: str, vae):
     except Exception as e:
         log(f"Could not look up the VAE decoder engines: {e}")
         return None
-    return next((r for r in matching if r.dtype == getattr(vae, "vae_dtype", None)), matching[0] if matching else None)
+    wanted = engine_dtype(vae)
+    return next((r for r in matching if r.dtype == wanted and r.scaled == scaled(wanted)), matching[0] if matching else None)
 
 
 def _remove(base: str):
@@ -360,15 +414,21 @@ def needs_build(arch, profiles: list, vae=None) -> str:
     if arch is None or not profiles or vae is None or unsupported(vae) or not available():
         return ""
     try:
-        cfg, wanted, dtype = config(vae), digest(vae), dtype_name(vae.vae_dtype)
-        shapes = shapes_for(profiles, cfg, vae.vae_dtype, _vram())
+        cfg, dtype = config(vae), engine_dtype(vae)
+        shapes = shapes_for(profiles, cfg, dtype, _vram())
         strip_wanted = _strips_wanted(vae, profiles, cfg)
-        if any(r.meta.get("digest") == wanted and r.meta.get("dtype") == dtype and not _missing(r, shapes, strip_wanted) for r in records(arch.id)):
+        if any(not _missing(r, shapes, strip_wanted) for r in _matching(arch.id, vae, dtype)):
             return ""
     except Exception as e:
         log(f"Could not check the VAE decoder engines: {e}")
         return ""
-    return f"the VAE decoder, in {label(dtype)}"
+    return f"the VAE decoder, in {label(dtype_name(dtype))}"
+
+
+def _matching(arch_id: str, vae, dtype) -> list:
+    """The records for this VAE's decoder in this precision (and scaled, if that precision is)."""
+    wanted, name = digest(vae), dtype_name(dtype)
+    return [r for r in records(arch_id) if r.meta.get("digest") == wanted and r.meta.get("dtype") == name and r.scaled == scaled(dtype)]
 
 
 def _strips_wanted(vae, profiles: list, cfg: dict) -> dict:
@@ -403,15 +463,46 @@ def _missing(record: Record, shapes: dict, strip_wanted: dict) -> list:
 # --- Export and build
 
 
-class _Pre(torch.nn.Module):
-    """The decoder up to its mid-block attention: (that attention's input, its queries, keys, values)."""
+class _Scale:
+    """The scale a scaled decoder's blocks multiply by: the graph's input, while it's traced."""
 
-    def __init__(self, fsm):
+    value = None
+
+
+def scale_decoder(module) -> _Scale:
+    """Makes a decoder (vae.fresh's, or a stand-in) compute scaled, for tracing: each resnet block's convs
+    take their input times the scale (the returned holder's value), and every GroupNorm computes in FP32
+    (its weights too) on its input divided by the scale. FP32 has the range for the values as the VAE
+    makes them, their squares included, and so the GroupNorm's epsilon is added to the variance it was
+    meant for (to a scaled one, it would be thousands of times too large). With _Pre and _Post multiplying
+    what comes in, and the biases refitted scaled (scaled_bias), the decoder's tensors between GroupNorms
+    are all scaled alike."""
+    holder = _Scale()
+    for m in module.modules():
+        if isinstance(m, torch.nn.GroupNorm):
+            m.float()
+            m.forward = (lambda inner: lambda x: inner(x.float() / holder.value.float()).to(x.dtype))(m.forward)
+        elif all(hasattr(m, part) for part in ("norm1", "conv1", "norm2", "conv2")):
+            for conv in (m.conv1, m.conv2):
+                conv.forward = (lambda inner: lambda x: inner(x * holder.value))(conv.forward)
+    return holder
+
+
+class _Pre(torch.nn.Module):
+    """The decoder up to its mid-block attention: (that attention's input, its queries, keys, values).
+    With a scale's holder (scale_decoder), it takes the scale too, and the attention's input comes out
+    scaled."""
+
+    def __init__(self, fsm, holder: _Scale = None):
         super().__init__()
         self.post_quant_conv = getattr(fsm, "post_quant_conv", None)
         self.decoder = fsm.decoder
+        self.holder = holder
 
-    def forward(self, latent):
+    def forward(self, latent, scale=None):
+        if self.holder is not None:
+            self.holder.value = scale
+            latent = latent * scale
         z = self.post_quant_conv(latent) if self.post_quant_conv is not None else latent
         d = self.decoder
         x = d.mid.block_1(d.conv_in(z), None)
@@ -421,13 +512,18 @@ class _Pre(torch.nn.Module):
 
 
 class _Post(torch.nn.Module):
-    """The rest of the decoder, from the mid-block attention's input and output: the image."""
+    """The rest of the decoder, from the mid-block attention's input and output: the image. With a scale's
+    holder, it takes the scale too, and the attention's input scaled (its output as it is)."""
 
-    def __init__(self, fsm):
+    def __init__(self, fsm, holder: _Scale = None):
         super().__init__()
         self.decoder = fsm.decoder
+        self.holder = holder
 
-    def forward(self, x, attention):
+    def forward(self, x, attention, scale=None):
+        if self.holder is not None:
+            self.holder.value = scale
+            attention = attention * scale
         d = self.decoder
         h = d.mid.block_2(x + d.mid.attn_1.proj_out(attention), None)
         for i_level in reversed(range(d.num_resolutions)):
@@ -459,24 +555,28 @@ def fresh(cfg: dict, device, dtype):
 
 @common.inference_mode
 def export_onnx(vae, work: str, dtype, device) -> dict:
-    """Writes work/vae_pre.onnx and work/vae_post.onnx; returns {part: {weight name: shape}, "config"}."""
+    """Writes work/vae_pre.onnx and work/vae_post.onnx (scaled, in FP16); returns {part: {weight name:
+    shape}, "config"}."""
     from . import export
 
     cfg = config(vae)
     module = fresh(cfg, device, dtype)
+    holder = scale_decoder(module) if scaled(dtype) else None
     for t in module.state_dict(keep_vars=True).values():  # random: tracing doesn't depend on the weights, and
         if t.is_floating_point():  # distinct values keep the exporter from merging identical ones (GroupNorm's)
             t.normal_(0, 0.02)
-    parts = {PRE: _Pre(module), POST: _Post(module)}
+    parts = {PRE: _Pre(module, holder), POST: _Post(module, holder)}
     latent = torch.randn(1, cfg["latent_channels"], 32, 32, dtype=dtype, device=device)
-    x, _, _, _ = parts[PRE](latent)
+    scale = (torch.full((1, 1, 1, 1), 2.0**-EXPONENT, dtype=dtype, device=device),) if holder is not None else ()
+    more = ["scale"] if holder is not None else []
+    x, _, _, _ = parts[PRE](latent, *scale)
     kwargs = dict(export_params=False, opset_version=17, do_constant_folding=False)
     if "dynamo" in inspect.signature(torch.onnx.export).parameters:
         kwargs["dynamo"] = False
     lat_axes = {0: "batch", 2: "height", 3: "width"}
     specs = {
-        PRE: ((latent,), ["latent"], ["x", "q", "k", "v"], {n: lat_axes for n in ("latent", "x", "q", "k", "v")}),
-        POST: ((x, torch.randn_like(x)), ["x", "attention"], ["image"], {"x": lat_axes, "attention": lat_axes, "image": {0: "batch", 2: "image_height", 3: "image_width"}}),
+        PRE: ((latent, *scale), ["latent"] + more, ["x", "q", "k", "v"], {n: lat_axes for n in ("latent", "x", "q", "k", "v")}),
+        POST: ((x, torch.randn_like(x), *scale), ["x", "attention"] + more, ["image"], {"x": lat_axes, "attention": lat_axes, "image": {0: "batch", 2: "image_height", 3: "image_width"}}),
     }
     exported = {k: list(v.shape) for k, v in module.state_dict(keep_vars=True).items()}
     loaded = {k: list(v.shape) for k, v in vae.first_stage_model.state_dict(keep_vars=True).items() if _relevant(k)}
@@ -545,11 +645,11 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         return None, reason, 0
     skipped = 0
     try:
-        dtype = vae.vae_dtype
+        dtype = engine_dtype(vae)
         cfg, vram, device = config(vae), _vram(), common.mm().get_torch_device()
         asked = shapes_for(profiles, cfg, dtype, vram)
         strip_wanted = _strips_wanted(vae, profiles, cfg)
-        old = next((r for r in records(arch.id) if r.meta.get("digest") == digest(vae) and r.meta.get("dtype") == dtype_name(dtype)), None)
+        old = next(iter(_matching(arch.id, vae, dtype)), None)
         todo = _missing(old, asked, strip_wanted) if old is not None else [PRE, POST] + list(strip_wanted)
         if old is not None and old.meta.get("strips_error"):  # building anyway: try those again
             todo += [k for k in strip_wanted if k not in old.strips and k not in todo]
@@ -630,7 +730,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             done += 1
         if strips_error:
             strip_meta = {}  # a stripped decode needs every kind
-        key = hashlib.sha1(json.dumps([digest(vae), dtype_name(dtype), shapes, sorted((k, v["shapes"]) for k, v in strip_meta.items())], sort_keys=True).encode()).hexdigest()[:10]
+        key = hashlib.sha1(json.dumps([digest(vae), dtype_name(dtype), scaled(dtype), shapes, sorted((k, v["shapes"]) for k, v in strip_meta.items())], sort_keys=True).encode()).hexdigest()[:10]
         weights = {part: sorted(graphs[part]) if part in built else old.meta["weights"][part] for part in (PRE, POST)}
         meta = {
             "vae_format": FORMAT,
@@ -638,6 +738,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             "arch_id": arch.id,
             "digest": digest(vae),
             "dtype": dtype_name(dtype),
+            "scaled": scaled(dtype),
             "config": cfg,
             "shapes": shapes,
             "asked": {PRE: shapes[PRE], POST: post_asked},  # what they were built for: the shapes, unless TensorRT had to go smaller
@@ -713,6 +814,32 @@ class VaeModel:
     @property
     def loaded(self) -> bool:
         return all(e.loaded for e in self.engines.values())
+
+    @property
+    def exponent(self) -> int:
+        """What scaled engines scale this VAE's decoder by, as 2^-exponent (0: they aren't scaled)."""
+        return (_exponents.get(self.key) or EXPONENT) if self.record.scaled else 0
+
+    @property
+    def scale(self) -> float:
+        return 2.0 ** -self.exponent
+
+    def scale_input(self) -> dict:
+        """The engines' "scale" input, if they take one."""
+        if not self.record.scaled:
+            return {}
+        return {"scale": torch.full((1, 1, 1, 1), self.scale, dtype=self.record.dtype, device=self.load_device)}
+
+    def _weights(self):
+        """(name, device) -> the VAE's weight as the engines take it: the biases added to scaled tensors,
+        scaled."""
+        state, scale = self.vae.first_stage_model.state_dict(keep_vars=True), self.scale
+
+        def get(name, device):
+            t = state[name].data.to(device)
+            return t.float() * scale if scale != 1.0 and scaled_bias(name) else t
+
+        return state, get
 
     def model_size(self):
         size = max(self.measured, int(self.record.meta["weight_bytes"]))  # what the driver showed can be less
@@ -803,12 +930,14 @@ class VaeModel:
         return strips.EngineRunner(lambda: self.stage_engine(stage), lambda: self.probe(stage), shapes, stage.kind)
 
     def _refit_stage(self, engine, weights: dict):
-        state = self.vae.first_stage_model.state_dict(keep_vars=True)
-        engine.refit([n for n in engine.weight_names if n in weights], lambda name, device: state[weights[name]].data.to(device))
+        _, get = self._weights()
+        engine.refit([n for n in engine.weight_names if n in weights], lambda name, device: get(weights[name], device))
 
     def sync_strips(self):
-        """Refits the stage engines loaded from another VAE's weights (those loaded later get this one's)."""
-        if self.strips_applied == self.key:
+        """Refits the stage engines loaded with another VAE's weights, or scaled otherwise (those loaded
+        later get what's current)."""
+        wanted = (self.key, self.exponent)
+        if self.strips_applied == wanted:
             return
         if self.stage_engines:
             start = time.time()
@@ -816,19 +945,21 @@ class VaeModel:
             for e, _, weights, _ in self.stage_engines.values():
                 self._refit_stage(e, weights)
             log(f"Refitted the VAE decoder's {len(self.stage_engines)} engines for decoding in strips in {time.time() - start:.1f}s")
-        self.strips_applied = self.key
+        self.strips_applied = wanted
 
     def sync(self, quiet=False):
-        """Refits both engines from self.vae unless they hold its weights already."""
-        if self.applied == self.key:
+        """Refits both engines from self.vae unless they hold its weights already, scaled as now."""
+        wanted = (self.key, self.exponent)
+        if self.applied == wanted:
             return
-        start, state = time.time(), self.vae.first_stage_model.state_dict(keep_vars=True)
+        start = time.time()
+        state, get = self._weights()
         torch.cuda.current_stream().synchronize()
         for e in self.engines.values():
-            e.refit([n for n in e.weight_names if n in state], lambda name, device: state[name].data.to(device))
+            e.refit([n for n in e.weight_names if n in state], get)
         if not quiet:
             log(f"Refitted the VAE decoder engines in {time.time() - start:.1f}s")
-        self.applied = self.key
+        self.applied = wanted
 
     def release(self):
         self.arena.release()
@@ -845,11 +976,17 @@ class VaeModel:
             self.engines[POST].estimate_activation_bytes(0, {"x": (n, c, h, w), "attention": (n, c, h, w)}, stream),
         )
         lat, image = n * c * h * w * size, n * cfg["out_ch"] * 64 * h * w * size
-        return max(act + 5 * lat, 8 * lat, act + 2 * lat + image) + HEADROOM, act
+        attending = lat * (3 if self.record.scaled else 1)  # in FP32 beside scaled engines, and their copies
+        return max(act + 5 * attending, 8 * attending, act + 2 * lat + image) + HEADROOM, act
 
 
 _models = {}  # Record.base -> VaeModel
 _told = set()  # what was logged once already: records with another precision, architectures without engines
+_exponents = {}  # the key of a VAE's decoder's weights -> its exponent, where a decode outgrew EXPONENT (None: every one)
+
+
+class _Overflow(Exception):
+    """A scaled decode produced NaN/Inf: its scale wasn't small enough for this VAE."""
 _weights_key = None  # (the VAE's model, the generation, the key of its decoder's weights)
 
 
@@ -957,36 +1094,28 @@ def decode(vae, samples_in):
     whole = record.covers(b, c, h, w)
     if not whole and found is None:
         return None
-    if dtype_name(vae.vae_dtype) != record.meta["dtype"] and record.base not in _told:
+    wanted = engine_dtype(vae)
+    if (record.dtype != wanted or record.scaled != scaled(wanted)) and record.base not in _told:
         _told.add(record.base)
-        log(f"The VAE decoder engines were built in {label(record.meta['dtype'])}; the VAE now runs in {label(dtype_name(vae.vae_dtype))}. Build again to match.")
+        how = "" if record.scaled or not scaled(record.dtype) else ", where it can overflow"
+        log(f"The VAE decoder engines were built in {label(record.meta['dtype'])}{how}; they'd now be built in {label(dtype_name(wanted))}. Build again to match.")
     model = model_for(record)
     model.vae, model.key = vae, _key(vae)
-    mm = common.mm()
     try:
-        with torch.inference_mode():
-            mm.load_models_gpu([model])
-            model.sync()
-            n, need, free = _fit(model, b, h, w) if whole else (0, 0, 0)
-            if n:
-                start = time.time()
-                pixels = _run(model, vae, samples_in, n)  # ends with a copy to the CPU, so the time is the decode's
-                if pixels is not None:
-                    at_once = f", {n} at a time" if n < b else ""
-                    log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} on the VAE decoder engines in {time.time() - start:.2f}s{at_once}")
-                return pixels
-            if found is None:
-                log(f"The VAE decoder engines need {common.gib(need)} of VRAM for {w * 8}x{h * 8}, {common.gib(free)} is free: decoding on PyTorch.")
-                return None
-            if not whole:  # the post engine doesn't reach this size: what the strips can have
-                mm.free_memory(_vram() or 2**62, model.load_device, keep_loaded=_own(model))
-            model.release()
-            model.sync_strips()
-            start = time.time()
-            pixels, report = _run_strips(model, vae, samples_in, found)
-            if pixels is not None:
-                log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} in strips on the VAE decoder engines in {time.time() - start:.2f}s ({report})")
-            return pixels
+        if record.scaled and _exponents.get(model.key, EXPONENT) is None:
+            return None  # no scale kept this VAE's decoder finite: said when found out
+        while True:
+            try:
+                with torch.inference_mode():
+                    return _decode(model, vae, samples_in, whole, found)
+            except _Overflow:
+                exponent = model.exponent
+                if exponent + EXPONENT_STEP > EXPONENT_MAX:
+                    _exponents[model.key] = None
+                    notify(f"The VAE decoder engines produced NaN/Inf values in FP16 even scaled by 2^-{exponent}; this VAE decodes on PyTorch")
+                    return None
+                _exponents[model.key] = exponent + EXPONENT_STEP
+                log(f"This VAE's decoder outgrew FP16 scaled by 2^-{exponent}: decoding again scaled by 2^-{exponent + EXPONENT_STEP}, as it will from now on.")
     except torch.cuda.OutOfMemoryError as e:
         frame = traceback.extract_tb(e.__traceback__)[-1]
         where = f"{os.path.basename(frame.filename)}:{frame.lineno}, {frame.name}"
@@ -1002,23 +1131,77 @@ def decode(vae, samples_in):
         model.vae = None  # don't keep this VAE alive
 
 
+def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
+    """One try at a decode: on the pre and post engines if they fit, else in strips (`found`, the stages),
+    else None. Raises _Overflow if a scaled decode's values outgrew its scale."""
+    mm = common.mm()
+    b, _, h, w = samples_in.shape
+    how = f"{label(model.record.meta['dtype'])}" + (f", scaled by 2^-{model.exponent}" if model.record.scaled else "")
+    mm.load_models_gpu([model])
+    model.sync()
+    n, need, free = _fit(model, b, h, w) if whole else (0, 0, 0)
+    if n:
+        start = time.time()
+        pixels = _run(model, vae, samples_in, n)  # ends with a copy to the CPU, so the time is the decode's
+        if pixels is not None:
+            at_once = f", {n} at a time" if n < b else ""
+            log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} on the VAE decoder engines in {time.time() - start:.2f}s ({how}{at_once})")
+        return pixels
+    if found is None:
+        log(f"The VAE decoder engines need {common.gib(need)} of VRAM for {w * 8}x{h * 8}, {common.gib(free)} is free: decoding on PyTorch.")
+        return None
+    if not whole:  # the post engine doesn't reach this size: what the strips can have
+        mm.free_memory(_vram() or 2**62, model.load_device, keep_loaded=_own(model))
+    model.release()
+    model.sync_strips()
+    start = time.time()
+    pixels, report = _run_strips(model, vae, samples_in, found)
+    if pixels is not None:
+        log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} in strips on the VAE decoder engines in {time.time() - start:.2f}s ({how}; {report})")
+    return pixels
+
+
+def _attend(model: VaeModel, vae, mid: dict):
+    """The mid block's attention on what the pre engine made of its input (popped from `mid`), on PyTorch
+    with reForge's own implementation, as PyTorch decodes. Beside scaled engines in FP32: its scores are
+    products of what a GroupNorm made, which no scale keeps in FP16, and at the latent's size it costs
+    little."""
+    attention = vae.first_stage_model.decoder.mid.attn_1.optimized_attention
+    q, k, v = mid.pop("q"), mid.pop("k"), mid.pop("v")
+    if model.record.scaled:
+        return attention(q.float(), k.float(), v.float()).to(model.record.dtype)
+    return attention(q, k, v)
+
+
+def _check(model: VaeModel, image, first: bool) -> bool:
+    """Whether a decoded image is usable. A scaled decode that isn't finite outgrew its scale (_Overflow);
+    others are checked once per decode, as PyTorch's would be as wrong."""
+    if model.record.scaled:
+        if not torch.isfinite(image).all():
+            raise _Overflow()
+        return True
+    if first and not torch.isfinite(image).all():
+        notify(f"The VAE decoder engines produced NaN/Inf values in {label(model.record.meta['dtype'])}; decoding on PyTorch")
+        return False
+    return True
+
+
 def _run(model: VaeModel, vae, samples_in, n: int):
     dtype, device = model.record.dtype, model.load_device
-    attention = vae.first_stage_model.decoder.mid.attn_1.optimized_attention  # reForge's own, as PyTorch decodes
     stream = torch.cuda.current_stream().cuda_stream
     to_latent = getattr(vae, "_to_vae_latent", lambda t: t)  # SD and SDXL VAEs: as is
+    scale = model.scale_input()
     pixels = None
     for start in range(0, samples_in.shape[0], n):
         z = to_latent(samples_in[start:start + n]).to(device=device, dtype=dtype)
-        mid = model.engines[PRE].infer({"latent": z}, 0, stream)
+        mid = model.engines[PRE].infer({"latent": z, **scale}, 0, stream)
         del z
-        h = attention(mid.pop("q"), mid.pop("k"), mid.pop("v"))
-        image = model.engines[POST].infer({"x": mid.pop("x"), "attention": h}, 0, stream)["image"]
+        h = _attend(model, vae, mid)
+        image = model.engines[POST].infer({"x": mid.pop("x"), "attention": h, **scale}, 0, stream)["image"]
         del h
+        if not _check(model, image, pixels is None):
+            return None
         if pixels is None:
-            if not torch.isfinite(image).all():
-                notify(f"The VAE decoder engines produced NaN/Inf values in {label(model.record.meta['dtype'])}; decoding on PyTorch")
-                return None
             pixels = torch.empty((samples_in.shape[0],) + tuple(image.shape[1:]), device=vae.output_device)
         pixels[start:start + n] = vae.process_output(image.to(vae.output_device).float())
         del image
@@ -1030,20 +1213,22 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list):
     for the log.)"""
     dtype, device = model.record.dtype, model.load_device
     mm = common.mm()
-    attention = vae.first_stage_model.decoder.mid.attn_1.optimized_attention
     stream = torch.cuda.current_stream().cuda_stream
     to_latent = getattr(vae, "_to_vae_latent", lambda t: t)
     fsm, padding = vae.first_stage_model, model.record.meta["config"]["padding"]
-    decoder = strips.Decode(fsm, padding, model.runner_for, dtype, device, _copy_stream(device), model.arena, model.activations, set(model.record.strips))
+    decoder = strips.Decode(
+        fsm, padding, model.runner_for, dtype, device, _copy_stream(device), model.arena, model.activations, set(model.record.strips), model.scale,
+    )
+    scale = model.scale_input()
     b, _, h, w = samples_in.shape
     pixels = plan = None
     report = ""
     for i in range(b):
         z = to_latent(samples_in[i:i + 1]).to(device=device, dtype=dtype)
-        mid = model.engines[PRE].infer({"latent": z}, 0, stream)
+        mid = model.engines[PRE].infer({"latent": z, **scale}, 0, stream)
         del z
         x = mid.pop("x")
-        attended = attention(mid.pop("q"), mid.pop("k"), mid.pop("v"))
+        attended = _attend(model, vae, mid)
         del mid
         model.release()  # the pre engine's activations: the strips size their own
         if plan is None:
@@ -1063,10 +1248,9 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list):
                 return None, ""
             image = decoder.run(x, attended, plan)
         del x, attended
+        if not _check(model, image, pixels is None):
+            return None, ""
         if pixels is None:
-            if not torch.isfinite(image).all():
-                notify(f"The VAE decoder engines produced NaN/Inf values in {label(model.record.meta['dtype'])}; decoding on PyTorch")
-                return None, ""
             report = _strips_report(plan, planned, model)
             pixels = torch.empty((b,) + tuple(image.shape[1:]), device=vae.output_device)
         pixels[i:i + 1] = vae.process_output(image.to(vae.output_device).float())

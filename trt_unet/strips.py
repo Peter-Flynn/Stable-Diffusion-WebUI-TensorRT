@@ -19,7 +19,12 @@ fits in the VRAM free:
 What can't be held in VRAM even so goes to pinned RAM, copied in and out while the engine works on the
 strip before.
 
-Stages with the same layout share an engine plan ("kind"), each loaded with its own weights."""
+Stages with the same layout share an engine plan ("kind"), each loaded with its own weights.
+
+In FP16 the decoder runs scaled by a power of two (vae.py says why and how): the tensors between its
+GroupNorms are that much smaller than the VAE makes them. Here that takes three things: each conv's input
+is multiplied by the scale where rows are kept or zeroed anyway ("keep"), the attention's output is
+scaled as it comes in, and a GroupNorm's epsilon is scaled with the variance it's added to."""
 
 import math
 import time
@@ -37,6 +42,7 @@ PADDINGS = ("zeros", "reflect", "replicate", "circular")
 CHAINED = ("zeros", "circular")  # paddings the kinds with several 3x3 convs in a row take
 STORE, RECOMPUTE, FUSED = "store", "recompute", "fused"
 HEADROOM = 256 * 2**20  # VRAM left free during a decode, and a 32nd of what's free
+MARGIN = 1.1  # over the model of an engine's activation memory, until a decode shows what it takes
 
 
 @dataclass(frozen=True)
@@ -422,12 +428,13 @@ class Stats:
         self.m2 = self.m2 + m2 + delta.square() * (self.n * count / n)
         self.n = n
 
-    def affine(self, norm) -> tuple:
+    def affine(self, norm, scaled: float = 1.0) -> tuple:
         """(center, scale, shift), each (1, channels, 1, 1) in FP32, that apply the GroupNorm `norm` (whose
-        weight and bias are given in FP64) as (x - center) * scale + shift."""
+        weight and bias are given in FP64) as (x - center) * scale + shift. `scaled`: what the tensor was
+        multiplied by, so the epsilon keeps its size beside the variance."""
         weight, bias, eps, groups = norm
         per = weight.numel() // groups
-        rstd = torch.rsqrt(self.m2 / self.n + eps)
+        rstd = torch.rsqrt(self.m2 / self.n + eps * scaled * scaled)
         center = self.mean.repeat_interleave(per, dim=1)
         scale = weight.view(1, -1) * rstd.repeat_interleave(per, dim=1)
         shift = bias.view(1, -1).expand_as(scale)
@@ -507,6 +514,11 @@ def _runs(rows: list):
         runs.append((i, rows[i], j - i))
         i = j
     return runs, zeros
+
+
+def _elements(kind: Kind, rows: int, width: int) -> int:
+    """A strip's size, for the model of its engine's activation memory: its rows with their halo, across."""
+    return (rows + 2 * kind.halo) * width
 
 
 ALIGN = 256  # bytes: where each tensor in a slab starts
@@ -647,12 +659,14 @@ class Plan:
 class Decode:
     """One image's post part in strips, for a first stage model. `runner_for(stage)` gives what runs a
     stage: runner(feed, outputs, last) -> outputs (the strip's output written to outputs["out"]; `last`: the
-    shorter last strip), runner.activation(shapes) -> bytes, runner.rows(width) -> its most output rows at
-    that width (0: none). `cache` keeps the engines' activation sizes ({(kind, rows, width): bytes})."""
+    shorter last strip), runner.rows(width) -> its most output rows at that width (0: none), and for its
+    activation memory runner.points() -> the smallest and largest strips it takes (None: no memory to plan
+    for), runner.activation(shapes) -> bytes, runner.took() -> bytes when it last ran. `cache` keeps what's learnt of the engines' activation sizes between decodes ({kind: its model})."""
 
-    def __init__(self, fsm, padding: dict, runner_for, dtype, device, copy_stream=None, arena=None, cache=None, available=None):
+    def __init__(self, fsm, padding: dict, runner_for, dtype, device, copy_stream=None, arena=None, cache=None, available=None, scale: float = 1.0):
         self.fsm, self.padding, self.runner_for = fsm, padding, runner_for
         self.dtype, self.device, self.copy_stream, self.arena = dtype, torch.device(device), copy_stream, arena
+        self.scale = scale  # what the tensors between GroupNorms are multiplied by (the engines' biases too)
         self.size = torch.tensor([], dtype=dtype).element_size()
         self.cache = cache if cache is not None else {}
         self.ways = choices(fsm, padding)
@@ -722,10 +736,32 @@ class Decode:
         return events
 
     def _activation(self, runner, kind: Kind, rows: int, width: int) -> int:
-        key = (kind.name, rows, width)
-        if key not in self.cache:
-            self.cache[key] = int(runner.activation(feed_shapes(kind, rows, width)))
-        return self.cache[key]
+        """The activation memory a strip of this kind takes, from a model of its engine: linear in the
+        strip's size, between the smallest and the largest strips it takes. TensorRT is asked for those two
+        once per kind (each ask takes milliseconds, and planning weighs hundreds of shapes); a decode then
+        raises the model by what an engine took beyond it (_learn)."""
+        model = self.cache.get(kind.name)
+        if model is None:
+            points = runner.points()
+            if not points:
+                model = [0.0, 0.0, 1.0]
+            else:
+                (e0, a0), (e1, a1) = ((_elements(kind, r, w), int(runner.activation(feed_shapes(kind, r, w)))) for r, w in points)
+                slope = (a1 - a0) / (e1 - e0) if e1 > e0 else 0.0
+                model = [a0 - slope * e0, slope, MARGIN]
+            self.cache[kind.name] = model
+        base, slope, factor = model
+        return int(max(0.0, base + slope * _elements(kind, rows, width)) * factor)
+
+    def _learn(self, plan: Plan, h: int, w: int):
+        """After a decode: where an engine took more activation memory than its kind's model has, the model
+        is raised to that."""
+        for n, st in enumerate(plan.stages):
+            took, model = plan.runners[n].took(), self.cache.get(st.kind.name)
+            if took and model:
+                modelled = max(1.0, model[0] + model[1] * _elements(st.kind, plan.rows[n], self.geometry(st, h, w)[1]))
+                if took > modelled * model[2]:
+                    model[2] = took / modelled * 1.02
 
     def _io(self, st: Stage, n: int, rows: int, width: int, host: set, lag: int) -> int:
         """Bytes of a stage's working tensors: its input, residual and output for a strip (the output twice
@@ -852,8 +888,10 @@ class Decode:
             base = ram if key in plan.host else slab
             offset, nbytes = plan.offsets[key], math.prod(shape) * self.size
             held[key] = Held(base[offset:offset + nbytes].view(self.dtype).view(shape), key in plan.host)
-        held[-2].t.copy_(x[0].permute(1, 0, 2))
+        held[-2].t.copy_(x[0].permute(1, 0, 2))  # scaled already, by the engine before
         held[-1].t.copy_(attention[0].permute(1, 0, 2))
+        if self.scale != 1.0:
+            held[-1].t.mul_(self.scale)
         plan.moved, plan.times = 0, {}
         stats_last = {}
         for n, st in enumerate(found):
@@ -872,6 +910,7 @@ class Decode:
                 if stats_last[key] == n:
                     stats.pop(key, None)
         image = held[len(found) - 1].t
+        self._learn(plan, h, w)
         if self.copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self.copy_stream)
         return image.to(self.device).permute(1, 0, 2).unsqueeze(0).contiguous()
@@ -904,7 +943,7 @@ class Decode:
         fixed = {}
         for i, (name, key) in enumerate(stage.norms):
             suffix = "2" if i else ""
-            center, scale, shift = stats[key].affine(self.norms[name])
+            center, scale, shift = stats[key].affine(self.norms[name], self.scale)
             fixed.update({f"center{suffix}": center, f"scale{suffix}": scale, f"shift{suffix}": shift})
         result_stats = Stats() if kind.groups else None
         per_group = kind.cout // kind.groups * width if kind.groups else 0
@@ -1009,7 +1048,7 @@ class Decode:
             for name, flat in keep_flats.items():
                 keep_list = _keep_rows(stage, a, b, out_rows, second=name == "keep2")
                 keep = flat[:len(keep_list)].view(1, 1, -1, 1)
-                keep.fill_(1)
+                keep.fill_(1.0 if kind.op == OUT else self.scale)  # the image itself isn't scaled
                 for i, inside in enumerate(keep_list):
                     if not inside:
                         keep[:, :, i].zero_()
@@ -1065,6 +1104,12 @@ class TorchRunner:
     def activation(self, shapes: dict) -> int:
         return 0
 
+    def points(self):
+        return None
+
+    def took(self):
+        return None
+
     def rows(self, width: int) -> int:
         return max_rows(self.module.kind, width)
 
@@ -1088,6 +1133,16 @@ class EngineRunner:
 
     def activation(self, shapes: dict) -> int:
         return self.probe().estimate_activation_bytes(0, {n: tuple(s) for n, s in shapes.items()}, self._stream())
+
+    def points(self) -> list:
+        """The smallest and the largest strips the engine takes: [(output rows, output width)]."""
+        lo, _, hi = self.shapes["x"]
+        across = 2 if self.kind.op in UPSAMPLING else 1
+        return [(min_rows(self.kind), lo[3] * across), (engine_rows(self.shapes, self.kind, hi[3] * across), hi[3] * across)]
+
+    def took(self):
+        """The activation memory its strips took when it last ran (None before)."""
+        return self.engines[0].size if self.engines is not None else None
 
     def rows(self, width: int) -> int:
         return engine_rows(self.shapes, self.kind, width)
