@@ -170,7 +170,9 @@ class EffectiveWeights:
             self.reused += 1
             return kept[1].to(device)
         _computed.pop(name, None)  # not kept alongside the new one
-        weight = base.to(common.mm().get_torch_device(), torch.float32, copy=True)
+        # To the GPU as stored, to FP32 there: one call for both would convert on the CPU first (slowly, from
+        # FP16) and copy twice the bytes over. A copy either way: converting and patching change it in place.
+        weight = base.to(common.mm().get_torch_device()).to(torch.float32, copy=True)
         if convert is not None:
             weight = convert(weight, inplace=True)
         if patches:
