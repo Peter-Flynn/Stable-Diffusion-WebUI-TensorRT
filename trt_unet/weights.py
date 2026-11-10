@@ -1,9 +1,7 @@
 """The weights an engine runs with: those PyTorch would use for the same UNet patcher, i.e. the loaded
-checkpoint's with the patcher's patches (LoRAs, LyCORIS, ...) applied the way reForge applies them.
-
-Weights that have to be computed (patched or converted) stay in RAM once computed (_computed), so an engine
-that loads again (after reForge evicted it, or another profile's engine for a Hires. fix) is refitted from
-them instead of computing them again."""
+checkpoint's with the patcher's patches (LoRAs, LyCORIS, ...) applied the way reForge applies them. Each
+has a signature that says what it's made from, so an engine is only refitted with the ones that changed
+(and an engine kept in RAM with its weights, refits.py, is only brought back for the same ones)."""
 
 import hashlib
 import weakref
@@ -13,18 +11,6 @@ import torch
 from . import common
 
 PREFIX = "diffusion_model."
-# weight name -> (key, the computed FP16 weight in RAM): the latest of each. The key is of the tensors' contents
-# it was computed from (see EffectiveWeights.key) rather than naming them: extensions can change a UNet's weights
-# in place, so only their contents say whether the computed weight is still the one PyTorch would use.
-_computed = {}
-
-
-def clear_computed():
-    _computed.clear()
-
-
-def computed_bytes() -> int:
-    return sum(t.numel() * t.element_size() for _, t in _computed.values())
 
 
 class _Same:
@@ -92,18 +78,11 @@ class EffectiveWeights:
         }
         self.refresh()
         self.base_version = (_Same(self.module), self._fingerprint())
-        self.reused = 0  # computed weights taken from RAM
-        for name in [n for n in _computed if not self.computed(n)]:  # no longer patched or converted
-            del _computed[name]
 
     def refresh(self):
         """Loading and unloading replace the module's parameters: read them again before a refit."""
         self.params = self.module.state_dict(keep_vars=True)
         self.backup = getattr(self.patcher, "backup", {}) or {}
-        self._hashes = {}
-        self._layers = {}
-        for n in self.params:
-            self._layers.setdefault(n.rpartition(".")[0], []).append(n)
 
     def has(self, name: str) -> bool:
         return name in self.params or PREFIX + name in self.backup
@@ -125,51 +104,20 @@ class EffectiveWeights:
     def is_patched(self, name: str) -> bool:
         return bool(self.patches.get(PREFIX + name))
 
-    def computed(self, name: str) -> bool:
-        """Whether the weight PyTorch runs with is computed from the stored one: patched or converted."""
-        return self.is_patched(name) or name in self.converters
-
     def signature(self, name: str):
+        """What the weight is made from: the checkpoint in the module, and the weight's patches (by
+        identity). Equal for as long as PyTorch would run the same weight."""
         patches = self.patches.get(PREFIX + name)
         return self.base_version, _identity(patches) if patches else None
 
-    def _hash(self, name: str) -> bytes:
-        """A hash of what every tensor of the weight's layer holds (its own and e.g. an FP8 scale a
-        conversion uses), unpatched: their names, types, shapes and checksums."""
-        h = hashlib.sha1()
-        for n in sorted(self._layers.get(name.rpartition(".")[0], [name])):
-            t = self.base(n)
-            h.update(f"{n} {t.dtype} {tuple(t.shape)} {checksum(t)};".encode())
-        return h.digest()
-
-    def prepare(self, names):
-        """Hashes the layers of the computed weights among `names`, ahead of a refit that asks for them one
-        at a time."""
-        for n in names:
-            if self.computed(n) and n not in self._hashes:
-                self._hashes[n] = self._hash(n)
-
-    def key(self, name: str):
-        """What a computed weight is computed from: its layer's contents and its patches (by identity)."""
-        if name not in self._hashes:
-            self._hashes[name] = self._hash(name)
-        patches = self.patches.get(PREFIX + name)
-        return self._hashes[name], _identity(patches) if patches else None
-
     def tensor(self, name: str, device="cpu") -> torch.Tensor:
         """The weight PyTorch runs with, on `device`: as stored, or, if it's converted or patched, computed
-        in FP32 on the GPU (converted, then patched, like reForge does) and kept in FP16, in RAM too."""
+        in FP32 on the GPU (converted, then patched, like reForge does), in FP16."""
         base = self.base(name)
         patches = self.patches.get(PREFIX + name)
         convert = self.converters.get(name)
         if not patches and convert is None:
             return base.to(device)
-        key = self.key(name)
-        kept = _computed.get(name)
-        if kept is not None and kept[0] == key:
-            self.reused += 1
-            return kept[1].to(device)
-        _computed.pop(name, None)  # not kept alongside the new one
         # To the GPU as stored, to FP32 there: one call for both would convert on the CPU first (slowly, from
         # FP16) and copy twice the bytes over. A copy either way: converting and patching change it in place.
         weight = base.to(common.mm().get_torch_device()).to(torch.float32, copy=True)
@@ -181,7 +129,4 @@ class EffectiveWeights:
             except ImportError:
                 calculate = self.patcher.calculate_weight
             weight = calculate(patches, weight, PREFIX + name)
-        weight = weight.to(torch.float16)
-        host = weight.to("cpu")
-        _computed[name] = (key, host)
-        return host if torch.device(device).type == "cpu" else weight.to(device)
+        return weight.to(torch.float16).to(device)

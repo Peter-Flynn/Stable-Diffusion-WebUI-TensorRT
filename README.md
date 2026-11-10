@@ -31,7 +31,9 @@ PyTorch instead, with a notice.
 2. Load a checkpoint and open the **TensorRT** tab. The first time, it asks for the engine mode (below). Click
    **Build engines**; the first build takes a few minutes.
 3. Generate. Every checkpoint with the same architecture now uses the engines. One is loaded at a time: each
-   batch runs on the one that fits it best, and its Hires. fix stays on it if it covers the larger size.
+   batch runs on the one that fits it best, and its Hires. fix stays on it if it covers the larger size. An engine
+   that makes way for another is kept in RAM with its weights while RAM allows, so it comes back for the same
+   checkpoint and LoRAs without loading them into it again.
 
 **Engine modes.** *Per-profile engines*, the default, are an engine per profile, built one at a time; only the one
 a generation's sizes need is loaded. A *merged engine* holds every profile of an architecture, so no pass ever

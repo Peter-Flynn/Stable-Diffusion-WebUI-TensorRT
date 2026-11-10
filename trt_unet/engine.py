@@ -1,5 +1,6 @@
-"""A deserialized TensorRT engine: weights refitted from PyTorch tensors, several optimization profiles in
-one execution context, and activation memory from PyTorch's allocator sized for the shapes in use."""
+"""A deserialized TensorRT engine: weights refitted from PyTorch tensors (or the engine brought back as it
+was serialized with them), several optimization profiles in one execution context, and activation memory
+from PyTorch's allocator sized for the shapes in use."""
 
 import ctypes
 import os
@@ -155,12 +156,15 @@ class Engine:
     def loaded(self) -> bool:
         return self.engine is not None
 
-    def load(self) -> float:
-        """Returns the seconds it took."""
+    def load(self, serialized=None) -> float:
+        """Loads the plan, which holds no weights (refit puts them in), or `serialized`: the engine as
+        serialize() gave it, with the weights it had then. Returns the seconds it took."""
         start = time.perf_counter()
         LOGGER.clear()
-        with open(self.plan_path, "rb") as f:
-            plan = f.read()
+        plan = serialized
+        if plan is None:
+            with open(self.plan_path, "rb") as f:
+                plan = f.read()
         self.engine = runtime().deserialize_cuda_engine(plan)
         if self.engine is None:
             said = " | ".join(LOGGER.messages) or "nothing"
@@ -170,8 +174,9 @@ class Engine:
             except Exception as e:
                 vram = f"free VRAM unknown ({e})"
             other = other_tensorrt()
+            what = self.plan_path if serialized is None else f"{self.plan_path} as kept in RAM with its weights"
             raise RuntimeError(
-                f"TensorRT {trt.__version__} could not load {self.plan_path} ({len(plan)} bytes; {vram}). TensorRT said: {said}"
+                f"TensorRT {trt.__version__} could not load {what} ({memoryview(plan).nbytes} bytes; {vram}). TensorRT said: {said}"
                 + (f". {other}" if other else "")
             )
         self.io = []
@@ -200,6 +205,19 @@ class Engine:
         self.engine = None
         self._reset_context_state()
         self.arena.release()
+
+    def serialize(self):
+        """The engine with the weights it holds now, still refittable: what load() takes in place of the plan
+        to bring it back as it is, with nothing to refit. TensorRT's own host memory (a buffer), about as
+        large as the weights."""
+        config = self.engine.create_serialization_config()
+        config.clear_flag(trt.SerializationFlag.EXCLUDE_WEIGHTS)  # set for a plan built without its weights
+        config.set_flag(trt.SerializationFlag.INCLUDE_REFIT)  # else the weights could never change again
+        LOGGER.clear()
+        serialized = self.engine.serialize_with_config(config)
+        if serialized is None:
+            raise RuntimeError("TensorRT could not serialize the engine" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
+        return serialized
 
     def refit(self, names, tensor_for) -> dict:
         """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name, device)`, from

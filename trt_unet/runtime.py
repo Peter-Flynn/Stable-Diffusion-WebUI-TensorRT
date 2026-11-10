@@ -3,9 +3,10 @@
 An architecture has an engine per profile, or one merged engine holding them all (store.py), and a sampling
 pass loads the one for its sizes; only one is in VRAM at a time. Each is a model of reForge's own model
 manager, so the manager makes room for it and loads it back for sampling like any other model, but evicts
-it only as a last resort (_wrap_free_memory): bringing an engine back means refitting every weight. While a
-sampling pass runs on an engine, the PyTorch UNet stays in RAM (its patches still apply, it just isn't
-loaded)."""
+it only as a last resort (_wrap_free_memory): an engine comes back without its weights. One that's unloaded
+is kept in RAM as it is, weights and all, while RAM allows (refits.py), and comes back from there for the
+same weights; otherwise every weight is refitted. While a sampling pass runs on an engine, the PyTorch UNet
+stays in RAM (its patches still apply, it just isn't loaded)."""
 
 import contextlib
 import math
@@ -20,9 +21,8 @@ import torch
 from modules import sd_unet
 
 from . import arch as arch_mod
-from . import common, profiles, speed, store
+from . import common, profiles, refits, speed, store
 from . import vae as vae_mod
-from . import weights as weights_mod
 from .common import inference_mode, log, notify
 from .weights import EffectiveWeights
 
@@ -60,6 +60,7 @@ class TrtModel:
         self.weights = None  # EffectiveWeights the engines should run with
         self.applied = {}  # "unet" / "shallow" -> {weight name: signature of what's in that engine}
         self.measured = 0
+        self.keep = True  # whether unloading keeps the engines in RAM as they are (refits.py)
 
     def _engines(self):
         if self.engine is None:
@@ -110,19 +111,25 @@ class TrtModel:
             self.weights = EffectiveWeights(patcher)
         start, free, reserved = time.time(), torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
         engine = self._engines()
-        plan_seconds = engine.load()
+        kept = self._kept()
+        self.applied = {}
+        plan_seconds = self._load("unet", engine, kept)
+        kept = kept if "unet" in self.applied else None
         if self.want_shallow and self.shallow is not None:
             try:
-                plan_seconds += self.shallow.load()
+                plan_seconds += self._load("shallow", self.shallow, kept)
             except Exception as e:  # the engine runs without it
                 log(f"Could not load the Speed Hacks part of the {self.record.label} ({e}); running without it.")
                 self.shallow.unload()
                 self.want_shallow, self.shallow_failed = False, True
         try:
-            self.applied = {}
-            refit = self.sync(quiet=True)
+            refit = self.sync(quiet=True)  # what isn't in them yet: everything, unless they came as they were kept
         except Exception:
-            self.detach()
+            self.keep = False  # not as they are now
+            try:
+                self.detach()
+            finally:
+                self.keep = True
             raise
         # TensorRT's own allocations, not what PyTorch cached meanwhile (e.g. computing LoRA weights)
         used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
@@ -130,11 +137,83 @@ class TrtModel:
         with_shallow = " with its Speed Hacks part" if self.shallow_loaded else ""
         weights = self.record.weight_bytes + (self.hacks["weight_bytes"] if self.hacks and self.shallow_loaded else 0)
         beyond = f"; {common.gib(used - weights)} beyond the weights" if used > weights + 2**20 else ""
+        source = f"as kept in RAM with its weights {plan_seconds:.1f}s" if kept else f"plan {plan_seconds:.1f}s"
         log(
             f"Loaded the {self.record.arch.label} {self.record.label}{with_shallow} ({common.gib(self.model_size())}{beyond}) in {time.time() - start:.1f}s: "
-            f"plan {plan_seconds:.1f}s, " + (_refit_times(refit) if refit else "no weights to refit")
+            f"{source}, " + (_refit_times(refit) if refit else "no weights to refit")
         )
         return self.model_size()
+
+    def _load(self, role: str, engine, kept) -> float:
+        """Loads one of the engines: as kept in RAM with its weights, if it is (what it holds then goes to
+        `applied`, so nothing is refitted), else its plan, without weights. Returns the seconds it took."""
+        blob = kept.blobs.get(role) if kept is not None else None
+        self.applied.pop(role, None)
+        if blob is not None:
+            try:
+                seconds = engine.load(blob)
+                self.applied[role] = dict(kept.signatures[role])
+                return seconds
+            except Exception as e:
+                log(f"Could not load the {self.record.label} as kept in RAM ({e}); loading its plan and refitting it.")
+                refits.drop(self.record.key, role)
+                engine.unload()
+        return engine.load()
+
+    def _kept(self):
+        """This engine as kept in RAM (refits.Kept), if what's kept holds the weights wanted now. One kept
+        for other weights is dropped: the engine will be kept again, as it is then, when it's next unloaded."""
+        entry = refits.get(self.record.key)
+        if entry is None:
+            return None
+        wanted = self.weights.signature
+        if "unet" in entry.blobs and all(wanted(name) == sig for sigs in entry.signatures.values() for name, sig in sigs.items()):
+            return entry
+        refits.drop(self.record.key)
+        return None
+
+    def _keep(self):
+        """Before the engines unload: they go to RAM as they are, weights and all (refits.py), unless they're
+        kept with these weights already, the weights aren't the loaded checkpoint's anymore, or RAM is short."""
+        loaded = {role: e for role, e in (("unet", self.engine), ("shallow", self.shallow)) if e is not None and e.loaded and self.applied.get(role)}
+        if "unet" not in loaded or not self._current():
+            return
+        key, label = self.record.key, f"{self.record.arch.label} {self.record.label}"
+        entry = refits.get(key)
+        if entry is not None and entry.signatures.get("unet") != self.applied["unet"]:
+            refits.drop(key)
+            entry = None
+        todo = [role for role in loaded if entry is None or entry.signatures.get(role) != self.applied[role]]
+        if not todo:
+            return
+        sizes = {"unet": self.record.weight_bytes, "shallow": self.hacks["weight_bytes"] if self.hacks else 0}
+        if not refits.room(sum(sizes[role] for role in todo), key):
+            log(f"Not keeping the {label} in RAM with its weights: too little RAM is available. Loading it again will refit it.")
+            return
+        start = time.time()
+        torch.cuda.current_stream().synchronize()  # no inference in flight
+        blobs = dict(entry.blobs) if entry is not None else {}
+        signatures = dict(entry.signatures) if entry is not None else {}
+        for role in todo:
+            blobs[role], signatures[role] = loaded[role].serialize(), dict(self.applied[role])
+        kept = refits.Kept(signatures, blobs, label, self._source())
+        refits.put(key, kept)
+        count, total = refits.held()
+        log(f"Kept the {label} in RAM with its weights ({common.gib(kept.nbytes)}) in {time.time() - start:.1f}s; {count} kept, {common.gib(total)}.")
+
+    def _source(self):
+        """() -> the UNet module the engine's weights are from, or None once it's gone: its signatures' weak
+        reference to it."""
+        return next(iter(self.applied["unet"].values()))[0][0].ref
+
+    def _current(self) -> bool:
+        """Whether the weights in the engine are the loaded checkpoint's UNet's (another checkpoint's
+        would never be asked for again)."""
+        try:
+            module = self._source()()
+            return module is not None and module is arch_mod.unet_patcher().model.diffusion_model
+        except Exception:
+            return False
 
     def load_shallow(self):
         """The shallow engine, for an engine loaded without it."""
@@ -142,8 +221,7 @@ class TrtModel:
             return
         start, free, reserved = time.time(), torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
         try:
-            self.shallow.load()
-            self.applied.pop("shallow", None)
+            self._load("shallow", self.shallow, self._kept() if self.weights is not None else None)
             self.sync(quiet=True)
         except Exception:
             self.shallow.unload()
@@ -158,6 +236,11 @@ class TrtModel:
 
     def detach(self, unpatch_all=True):
         if unpatch_all and self.loaded:
+            if self.keep:
+                try:
+                    self._keep()
+                except Exception as e:  # unloads all the same: loading again refits
+                    log(f"Could not keep the {self.record.label} in RAM with its weights: {e}")
             if self.shallow is not None:
                 self.shallow.unload()
             self.engine.unload()
@@ -181,12 +264,11 @@ class TrtModel:
             if not changed:
                 continue
             self.applied[role] = {}
-            weights.prepare(changed)
-            reused = weights.reused
+            refits.drop(self.record.key, role)  # what's kept in RAM of it holds other weights than it will now
             torch.cuda.current_stream().synchronize()  # no inference in flight while the weights change
             seconds = engine.refit(changed, weights.tensor)
             self.applied[role] = wanted
-            refit = {**seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed), "reused": weights.reused - reused}
+            refit = {**seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
             total = refit if total is None else {k: total[k] + refit[k] for k in refit}
         if total is not None and not quiet:
             log(f"Refitted {total['count']} weights in {time.time() - start:.1f}s: {_refit_times(total)}")
@@ -195,9 +277,8 @@ class TrtModel:
 
 def _refit_times(refit: dict) -> str:
     patched = f", {refit['patched']} with LoRAs" if refit["patched"] else ""
-    reused = f", {refit['reused']} computed before (kept in RAM)" if refit.get("reused") else ""
     staged = f" ({common.gib(refit['staged'])} of the weights from VRAM)" if refit.get("staged") else ""
-    return f"{refit['count']} weights {refit['weights']:.1f}s{patched}{reused}, TensorRT refit {refit['tensorrt']:.1f}s{staged}"
+    return f"{refit['count']} weights {refit['weights']:.1f}s{patched}, TensorRT refit {refit['tensorrt']:.1f}s{staged}"
 
 
 def _loaded_entries(*models):
@@ -206,12 +287,18 @@ def _loaded_entries(*models):
 
 
 @inference_mode
-def _unload(model: TrtModel):
+def _unload(model: TrtModel, keep: bool = True):
+    """Unloads an engine: kept in RAM as it is, to come back without a refit (refits.py), unless `keep` is
+    False (it's being cleared out, not making room)."""
     mm = common.mm()
-    for i in reversed(range(len(mm.current_loaded_models))):
-        if mm.current_loaded_models[i].model is model:
-            mm.current_loaded_models.pop(i).model_unload()
-    model.detach()
+    model.keep = keep
+    try:
+        for i in reversed(range(len(mm.current_loaded_models))):
+            if mm.current_loaded_models[i].model is model:
+                mm.current_loaded_models.pop(i).model_unload()
+        model.detach()
+    finally:
+        model.keep = True
 
 
 def end_pass():
@@ -225,19 +312,20 @@ def end_pass():
 def release_all():
     end_pass()  # a generation that failed mid-pass left its hooks in place
     for model in list(_models.values()):
-        _unload(model)
+        _unload(model, keep=False)
     _models.clear()
     _last_used.clear()
     vae_mod.release_all()
-    weights_mod.clear_computed()
+    refits.clear()
     common.mm().soft_empty_cache(force=True)
 
 
 def model_for(record: store.Record) -> TrtModel:
     model = _models.get(record.key)
     if model is None or model.record.meta != record.meta:
-        if model is not None:
-            _unload(model)
+        if model is not None:  # built again
+            _unload(model, keep=False)
+            refits.drop(record.key)
         model = _models[record.key] = TrtModel(record)
     return model
 
@@ -865,9 +953,11 @@ def new_generation(p=None):
     if setting() not in (AUTOMATIC, SPEED_HACKS):  # SD Unet is None: give their VRAM back, and the RAM
         for model in list(_models.values()):
             if model.loaded:
-                _unload(model)
+                _unload(model, keep=False)
         vae_mod.release_all()
-        weights_mod.clear_computed()
+        refits.clear()
+    else:
+        refits.trim()
     try:
         install_hooks()
     except Exception as e:
