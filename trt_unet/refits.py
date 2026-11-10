@@ -111,19 +111,24 @@ def held() -> tuple:
 
 def room(nbytes: int, key: str = None) -> bool:
     """Whether RAM allows keeping `nbytes` more, once the least recently used engines (other than `key`'s)
-    are dropped if that's what it takes."""
+    are dropped if that's what it takes. If dropping them all wouldn't make room, none is dropped."""
     memory = _memory()
     if memory is None:
         return False  # no telling when it would run low
     available, reserve = memory
+    dropped = 0
     with _lock:
         others = [k for k in _kept if k != key]
+        if available + sum(_kept[k].nbytes for k in others) - nbytes < reserve:
+            return False
         while available - nbytes < reserve and others:
             entry = _kept.pop(others.pop(0))
             available += entry.nbytes
+            dropped += 1
             log(f"Dropped the {entry.label} kept in RAM ({gib(entry.nbytes)}) to make room for another.")
             del entry
-    _give_back()
+    if dropped:
+        _give_back()
     return available - nbytes >= reserve
 
 

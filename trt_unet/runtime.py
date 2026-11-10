@@ -557,8 +557,9 @@ class Pass:
 
     def preferred(self) -> set:
         """The profiles of the engine this batch's earlier passes ran on, which this pass stays on while it
-        fits, even if another engine's profile suits the sizes better: loading another means refitting
-        every weight. A merged engine holds them all, so it changes to whichever fits best."""
+        fits, even if another engine's profile suits the sizes better: loading another means bringing all
+        its weights to VRAM (from RAM as it was kept, or by refitting them). A merged engine holds them all,
+        so it changes to whichever fits best."""
         key = _last_used.get(self.arch_id)
         return {i for i, (r, _) in enumerate(self.slots) if r.key == key}
 

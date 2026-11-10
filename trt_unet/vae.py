@@ -1847,11 +1847,11 @@ def _tile_size(model: VaeModel, vae, h: int, w: int) -> int:
     """The tile size for an encode of h x w in tiles: the largest of TILES whose tiles the engines take in
     the VRAM free (0 if none). Sizes their activation memory for it."""
     model.release()
-    hi = model.record.encoder["shapes"][ENCODE_PRE]["image"][2]
+    lo, _, hi = model.record.encoder["shapes"][ENCODE_PRE]["image"]
     free = common.mm().get_free_memory(model.load_device)
     for tile in TILES:
         shapes = _tile_shapes(tile, h, w)
-        if all(th <= hi[2] and tw <= hi[3] and model.need_encode(1, th, tw)[0] <= free for th, tw in shapes):
+        if all(lo[2] <= th <= hi[2] and lo[3] <= tw <= hi[3] and model.need_encode(1, th, tw)[0] <= free for th, tw in shapes):
             model.arena.get(max(model.need_encode(1, th, tw)[1] for th, tw in shapes))
             return tile
     return 0
