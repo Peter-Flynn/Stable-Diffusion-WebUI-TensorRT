@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, field, replace
 import torch
 import torch.nn.functional as F
 
-STRIP_ELEMENTS = 32 * 2**20  # the most elements in a strip of a stage's largest tensor: what kinds are built for
+STRIP_BYTES = 128 * 2**20  # the most a strip of a stage's largest tensor takes: what kinds are built for
 CONV, UP, PROJ, OUT, BLOCK, UPCONV, UPBLOCK = "conv", "up", "proj", "out", "block", "upconv", "upblock"
 CONVS = {PROJ: 0, CONV: 1, OUT: 1, UP: 1, BLOCK: 2, UPCONV: 2, UPBLOCK: 3}  # 3x3 convs in a row: the rows of halo
 UPSAMPLING = (UP, UPCONV, UPBLOCK)
@@ -365,22 +365,23 @@ def min_rows(kind: Kind) -> int:
     return 2 if kind.op == BLOCK else kind.step
 
 
-def max_rows(kind: Kind, width: int) -> int:
-    """The most output rows a strip of this kind can have at this output width, by STRIP_ELEMENTS."""
+def max_rows(kind: Kind, width: int, itemsize: int = 4) -> int:
+    """The most output rows a strip of this kind can have at this output width, by STRIP_BYTES in a
+    precision of `itemsize` bytes."""
     channels = max(kind.cin, kind.cout, kind.res)
-    rows = max(1, STRIP_ELEMENTS // max(1, channels * width))
+    rows = max(1, STRIP_BYTES // itemsize // max(1, channels * width))
     return max(min_rows(kind), rows - rows % kind.step)
 
 
-def kind_shapes(kind: Kind, scales: list, lo_w: int, opt: tuple, hi: tuple) -> dict:
+def kind_shapes(kind: Kind, scales: list, lo_w: int, opt: tuple, hi: tuple, itemsize: int = 4) -> dict:
     """The engine's profile ({input: [min, opt, max]}) for strips of its stages' outputs at these scales,
     for latents from lo_w wide to hi = (h, w), optimal at opt = (h, w): any number of rows up to a strip's
-    (STRIP_ELEMENTS at the widest), across any width in that range."""
+    (STRIP_BYTES at the widest, in a precision of `itemsize` bytes), across any width in that range."""
     hi_scale, lo_scale = max(scales), min(scales)
     lo_width, hi_width = lo_w * lo_scale, hi[1] * hi_scale
-    hi_rows = max(min(hi[0] * s, max_rows(kind, hi[1] * s)) for s in scales)
+    hi_rows = max(min(hi[0] * s, max_rows(kind, hi[1] * s, itemsize)) for s in scales)
     opt_width = opt[1] * hi_scale
-    opt_rows = min(opt[0] * hi_scale, max_rows(kind, opt_width))
+    opt_rows = min(opt[0] * hi_scale, max_rows(kind, opt_width, itemsize))
     lo_rows = min_rows(kind)
     hi_rows, opt_rows = max(hi_rows, lo_rows), max(min(opt_rows, hi_rows), lo_rows)
     hi_rows, opt_rows = hi_rows - hi_rows % kind.step, opt_rows - opt_rows % kind.step

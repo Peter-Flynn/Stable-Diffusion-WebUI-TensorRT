@@ -256,13 +256,14 @@ def shapes_for(profiles: list, cfg: dict, dtype=None, vram=None, share: float = 
     return {PRE: {"latent": side(zc, full_h, full_w)}, POST: {"x": side(c, hi_h, hi_w), "attention": side(c, hi_h, hi_w)}}
 
 
-def strip_shapes(profiles: list, found: list) -> dict:
-    """{kind name: its engine's shapes} for the stripped decode of the sizes a list of profiles covers (of
-    any height: only a strip's rows go through an engine at once)."""
+def strip_shapes(profiles: list, found: list, dtype=torch.float32) -> dict:
+    """{kind name: its engine's shapes} for the stripped decode, in this precision, of the sizes a list of
+    profiles covers (of any height: only a strip's rows go through an engine at once)."""
     lo_w = min(p.width[0] for p in profiles) // 8
     hi = (max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8)
     opt = (profiles[0].height[1] // 8, profiles[0].width[1] // 8)
-    return {name: strips.kind_shapes(kind, scales, lo_w, opt, hi) for name, (kind, scales) in strips.kinds(found).items()}
+    itemsize = torch.tensor([], dtype=dtype).element_size()
+    return {name: strips.kind_shapes(kind, scales, lo_w, opt, hi, itemsize) for name, (kind, scales) in strips.kinds(found).items()}
 
 
 def _covers(outer: dict, inner: dict) -> bool:
@@ -416,7 +417,7 @@ def needs_build(arch, profiles: list, vae=None) -> str:
     try:
         cfg, dtype = config(vae), engine_dtype(vae)
         shapes = shapes_for(profiles, cfg, dtype, _vram())
-        strip_wanted = _strips_wanted(vae, profiles, cfg)
+        strip_wanted = _strips_wanted(vae, profiles, cfg, dtype)
         if any(not _missing(r, shapes, strip_wanted) for r in _matching(arch.id, vae, dtype)):
             return ""
     except Exception as e:
@@ -431,13 +432,13 @@ def _matching(arch_id: str, vae, dtype) -> list:
     return [r for r in records(arch_id) if r.meta.get("digest") == wanted and r.meta.get("dtype") == name and r.scaled == scaled(dtype)]
 
 
-def _strips_wanted(vae, profiles: list, cfg: dict) -> dict:
+def _strips_wanted(vae, profiles: list, cfg: dict, dtype) -> dict:
     """The stripped decode's kinds and their shapes for the profiles ({} if it can't run for this VAE)."""
     try:
         lists = strips.every_way(vae.first_stage_model, cfg["padding"])
     except (ValueError, KeyError, AttributeError, StopIteration):
         return {}
-    return {} if any(strips.supported(found) for found in lists) else strip_shapes(profiles, lists)
+    return {} if any(strips.supported(found) for found in lists) else strip_shapes(profiles, lists, dtype)
 
 
 def _missing(record: Record, shapes: dict, strip_wanted: dict) -> list:
@@ -648,7 +649,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         dtype = engine_dtype(vae)
         cfg, vram, device = config(vae), _vram(), common.mm().get_torch_device()
         asked = shapes_for(profiles, cfg, dtype, vram)
-        strip_wanted = _strips_wanted(vae, profiles, cfg)
+        strip_wanted = _strips_wanted(vae, profiles, cfg, dtype)
         old = next(iter(_matching(arch.id, vae, dtype)), None)
         todo = _missing(old, asked, strip_wanted) if old is not None else [PRE, POST] + list(strip_wanted)
         if old is not None and old.meta.get("strips_error"):  # building anyway: try those again
@@ -1157,7 +1158,8 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
     start = time.time()
     pixels, report = _run_strips(model, vae, samples_in, found)
     if pixels is not None:
-        log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} in strips on the VAE decoder engines in {time.time() - start:.2f}s ({how}; {report})")
+        why = f"whole it needs {common.gib(need)}, {common.gib(free)} was free; " if whole else ""
+        log(f"Decoded {b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8} in strips on the VAE decoder engines in {time.time() - start:.2f}s ({how}; {why}{report})")
     return pixels
 
 
