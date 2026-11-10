@@ -657,16 +657,11 @@ def _missing(record: Record, shapes: dict, strip_wanted: dict, enc_wanted: dict 
 # --- Export and build
 
 
-NORM_LOTS = 8  # a scaled GroupNorm computes its largest tensors' groups in this many lots
-
-
 class _Scale:
     """What a scaled decoder or encoder computes with: the scale its blocks multiply by (the graph's input,
-    while it's traced), and the most elements per image its GroupNorms have taken (so the trace knows the
-    large ones: run it once before)."""
+    while it's traced)."""
 
     value = None
-    largest = 0
 
 
 def _scaled_norm(norm, holder: _Scale):
@@ -675,26 +670,15 @@ def _scaled_norm(norm, holder: _Scale):
     squares included, and so the GroupNorm's epsilon is added to the variance it was meant for (to a scaled
     one, it would be thousands of times too large).
 
-    Whole, that would hold two FP32 copies of the tensor, twice the tensor each, and an FP16 engine would
-    need about what an FP32 one does. Groups don't depend on each other, so the large tensors go a few
-    groups at a time (NORM_LOTS lots for the largest, fewer for smaller ones): the FP32 copies are of a lot."""
-    per_group = norm.num_channels // norm.num_groups
+    Cast to FP32, normalized, cast back: TensorRT's way to have a normalization accumulate in FP32 in an FP16
+    network, which its builder fuses into the normalization's kernels, so no FP32 copy of the tensor is held."""
 
     def forward(x):
-        size = x[0].numel()
-        holder.largest = max(holder.largest, size)
-        lots = min(NORM_LOTS, norm.num_groups, 2 ** max(0, math.ceil(math.log2(2 * NORM_LOTS * size / holder.largest))))
-        width = math.ceil(norm.num_groups / lots) * per_group  # channels a lot
-        scale = holder.value.float()
-        normed = []
-        for start in range(0, norm.num_channels, width):
-            lot = (x if width >= norm.num_channels else x[:, start:start + width]).float() / scale
-            groups = min(width, norm.num_channels - start) // per_group
-            flat = lot.reshape(lot.shape[0], groups, -1)
-            one, zero = torch.ones(groups, device=x.device), torch.zeros(groups, device=x.device)  # given, the exporter needn't know the reshape's sizes
-            normed.append(torch.nn.functional.instance_norm(flat, weight=one, bias=zero, eps=norm.eps).reshape_as(lot).to(x.dtype))
-        whole = normed[0] if len(normed) == 1 else torch.cat(normed, 1)
-        return whole * norm.weight.unsqueeze(-1).unsqueeze(-1) + norm.bias.unsqueeze(-1).unsqueeze(-1)
+        flat = (x.float() / holder.value.float()).reshape(x.shape[0], norm.num_groups, -1)
+        one = torch.ones(norm.num_groups, device=x.device)  # given, the exporter needn't know the reshape's sizes
+        zero = torch.zeros(norm.num_groups, device=x.device)
+        normed = torch.nn.functional.instance_norm(flat, weight=one, bias=zero, eps=norm.eps).reshape_as(x).to(x.dtype)
+        return normed * norm.weight.unsqueeze(-1).unsqueeze(-1) + norm.bias.unsqueeze(-1).unsqueeze(-1)
 
     return forward
 
@@ -861,8 +845,6 @@ def _export(module, halves: dict, work: str, dtype, device, first, loaded: dict)
     (one, two), parts = list(halves), {part: spec[0](module, holder) for part, spec in halves.items()}
     x = parts[one](first, *scale)[0]
     args = {one: (first, *scale), two: (x, torch.randn_like(x), *scale)}
-    if holder is not None:
-        parts[two](*args[two])  # with the first half's run, every GroupNorm's size: for their lots (_scaled_norm)
     kwargs = dict(export_params=False, opset_version=17, do_constant_folding=False)
     if "dynamo" in inspect.signature(torch.onnx.export).parameters:
         kwargs["dynamo"] = False
