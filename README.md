@@ -50,14 +50,15 @@ TensorRT. Passes of 12 steps or more should run roughly 1.6x as fast as on the e
 little less precise, so a seed gives a somewhat different image than without them. Fewer steps (e.g. with few-step
 LoRAs) run as usual.
 
-**VAE decoding.** The VAE's decoder gets engines too, built along with the UNet's for the same sizes. They run in the
-precision reForge picks for the VAE: BF16 on RTX 30 series and newer, and on older cards FP16 rather than reForge's
-FP32, at half the VRAM and several times the speed (a `--vae-in-*` flag at build time overrides either). VAEs overflow
-FP16, which is why reForge avoids it; the engines run the decoder scaled down by a power of two between its
-normalizations, where that changes nothing but the range, so any VAE of the architecture decodes on them without
-NaNs. A decode runs on them whenever they fit in the VRAM that's free. Larger decodes (a Hires. fix's, or beside a
-UNet engine that leaves too little VRAM) run in horizontal strips on engines built for that: the same image, a little
-slower. PyTorch decodes anything else.
+**The VAE.** Its decoder and its encoder get engines too, built along with the UNet's for the same sizes. They run in
+the precision reForge picks for the VAE: BF16 on RTX 30 series and newer, and on older cards FP16 rather than
+reForge's FP32, at half the VRAM and several times the speed (a `--vae-in-*` flag at build time overrides either).
+VAEs overflow FP16, which is why reForge avoids it; the engines run the VAE scaled down by a power of two between its
+normalizations, where that changes nothing but the range, so any VAE of the architecture runs on them without NaNs.
+A decode runs on them whenever they fit in the VRAM that's free. Larger decodes (a Hires. fix's, or beside a UNet
+engine that leaves too little VRAM) run in horizontal strips on engines built for that: the same image, a little
+slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines when
+they fit, without unloading the UNet engine. PyTorch does anything else.
 
 > [!NOTE]
 > An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build again;

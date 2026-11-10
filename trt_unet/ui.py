@@ -33,7 +33,7 @@ HELP = """
 
 **SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engines of the loaded checkpoint's architecture, `Speed Hacks` uses them with Speed Hacks, `None` always uses PyTorch.
 
-**The VAE decoder** gets engines too, built with the UNet's for the sizes its profiles cover, in the precision reForge runs the VAE in where the GPU has BF16, and in FP16 where reForge falls back to FP32 for want of it: half the VRAM and several times faster (a `--vae-in-*` flag at build time decides otherwise). FP16 engines run the decoder scaled down by a power of two between its normalizations, so no VAE overflows in them, and any VAE of the architecture decodes on them. Each decode runs on them when they fit in the VRAM free, as many images at a time as fit. Larger ones (a Hires. fix's, or beside a UNet engine) run in strips on engines of their own: the same image, a bit slower. PyTorch decodes the rest.
+**The VAE** gets engines too, for its decoder and its encoder, built with the UNet's for the sizes its profiles cover, in the precision reForge runs the VAE in where the GPU has BF16, and in FP16 where reForge falls back to FP32 for want of it: half the VRAM and several times faster (a `--vae-in-*` flag at build time decides otherwise). FP16 engines run the VAE scaled down by a power of two between its normalizations, so no VAE overflows in them, and any VAE of the architecture runs on them. Each decode runs on them when they fit in the VRAM free, as many images at a time as fit. Larger ones (a Hires. fix's, or beside a UNet engine) run in strips on engines of their own: the same image, a bit slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines when they fit, without unloading the UNet engine. PyTorch does the rest.
 
 **Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and, late in a pass, wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). The first 30% and last 5% of steps run in full, so composition and detail stay close (both shares are in Settings, Stable Diffusion, TensorRT). Passes of 12 steps or more should run roughly 1.6x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
 """
@@ -213,11 +213,11 @@ def _status(sd_model, arch, records, asking=False) -> str:
 
 
 def _vae_part(draft) -> str:
-    """What building the draft builds of the VAE decoder's engines (vae.needs_build), "" if nothing."""
+    """What building the draft builds of the VAE's engines (vae.needs_build), "" if nothing."""
     try:
         return vae_mod.needs_build(arch_mod.detect(), [Profile.from_dict(d) for d in draft])
     except Exception as e:
-        common.log(f"Could not check the VAE decoder engines: {e}")
+        common.log(f"Could not check the VAE's engines: {e}")
         return ""
 
 
@@ -230,8 +230,8 @@ def _vae_line(draft) -> str:
     vae = vae_mod.loaded_vae()
     reason = "no VAE is loaded" if vae is None else vae_mod.unsupported(vae)
     if reason:
-        return f"*The VAE decodes on PyTorch: {reason}.*"
-    return "*The VAE decoder's engines are built for these sizes.*"
+        return f"*The VAE runs on PyTorch: {reason}.*"
+    return "*The VAE's engines are built for these sizes.*"
 
 
 def _draft_view(draft: list, records, mode) -> str:
@@ -279,7 +279,7 @@ def _draft_outputs(draft, records, select=None):
     if todo:
         build_label = "Build the merged engine" if mode == store.MERGED else f"Build {_n(len(todo), 'engine')}"
     elif vae_part:
-        build_label = "Build the VAE decoder's engines"
+        build_label = "Build the VAE's engines"
     else:
         build_label = "Update engines" if extra else "Engines up to date"
     return (
@@ -464,16 +464,20 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
     if result.get("vae") is not None:
         vae_record = result["vae"]
         message += (
-            f"\n\nBuilt the VAE decoder's engines, in {vae_mod.label(vae_record.meta['dtype'])}, for decodes up to {vae_record.reach()}: "
+            f"\n\nBuilt the VAE's engines, in {vae_mod.label(vae_record.meta['dtype'])}, for decodes up to {vae_record.reach()}: "
             "decodes run on them whenever they fit in the VRAM free, else in strips, with what doesn't fit held in RAM."
             if vae_record.strips else
-            f"\n\nBuilt the VAE decoder's engines, in {vae_mod.label(vae_record.meta['dtype'])}, for decodes up to {vae_record.reach()}: "
+            f"\n\nBuilt the VAE's engines, in {vae_mod.label(vae_record.meta['dtype'])}, for decodes up to {vae_record.reach()}: "
             "decodes run on them whenever they fit in the VRAM free."
         )
         if vae_record.meta.get("strips_error"):
             message += f" Its engines for decoding in strips couldn't be built (`{vae_record.meta['strips_error']}`), so larger decodes run on PyTorch."
+        if vae_record.encoder is not None:
+            message += f" Its encoder's engines encode images up to {vae_record.encode_reach()}, likewise when they fit."
+        elif vae_record.meta.get("encoder_error"):
+            message += f" Its encoder's engines couldn't be built (`{vae_record.meta['encoder_error']}`), so it encodes on PyTorch."
     elif result.get("vae_error") and result["vae_error"] != "cancelled":
-        message += f"\n\nThe VAE decoder's engines couldn't be built (`{result['vae_error']}`), so it decodes on PyTorch. The console has the details."
+        message += f"\n\nThe VAE's engines couldn't be built (`{result['vae_error']}`), so it runs on PyTorch. The console has the details."
     if result.get("memory_warnings"):
         message += (
             f"\n\nTensorRT skipped {result['memory_warnings']} kernels that need more VRAM than is free at a profile's largest sizes, "

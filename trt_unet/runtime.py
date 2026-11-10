@@ -776,6 +776,26 @@ def _wrap_vae_decode(original):
     return decode
 
 
+def _wrap_vae_encode(original):
+    """Encodes on the VAE encoder's engines likewise (an img2img's image, a Hires. fix's upscaled one), where
+    reForge's own encode would unload the UNet engine for the VRAM it reckons it needs."""
+
+    def encode(self, pixel_samples):
+        if setting() in (AUTOMATIC, SPEED_HACKS) and threading.get_ident() == _generation_thread:
+            try:
+                with _keeping(*[m for m in _models.values() if m.loaded]):
+                    latents = vae_mod.encode(self, pixel_samples)
+                if latents is not None:
+                    return latents
+            except Exception as e:
+                traceback.print_exc()
+                notify(f"The VAE encoder engines failed ({e}); encoding on PyTorch")
+        return original(self, pixel_samples)
+
+    encode._trt_original = original
+    return encode
+
+
 def _rebind(owner, name, wrap):
     """Wraps owner.name, also where modules imported it by name."""
     current = getattr(owner, name)
@@ -800,13 +820,15 @@ def install_hooks():
     _rebind(forge_sampler, "sampling_cleanup", _wrap_cleanup)
     _rebind(common.mm(), "free_memory", _wrap_free_memory)
     _rebind(common.mm(), "unload_all_models", _wrap_unload_all)
-    try:  # the VAE decoder's engines: decodes run on PyTorch without them
+    try:  # the VAE's engines: it decodes and encodes on PyTorch without them
         from ldm_patched.modules import sd as ldm_sd
 
         if not hasattr(ldm_sd.VAE.decode, "_trt_original"):
             ldm_sd.VAE.decode = _wrap_vae_decode(ldm_sd.VAE.decode)
+        if not hasattr(ldm_sd.VAE.encode, "_trt_original"):
+            ldm_sd.VAE.encode = _wrap_vae_encode(ldm_sd.VAE.encode)
     except Exception as e:
-        log(f"Could not hook reForge's VAE, so it decodes on PyTorch: {e}")
+        log(f"Could not hook reForge's VAE, so it decodes and encodes on PyTorch: {e}")
     try:  # Speed Hacks only: the engines run without it
         from modules import sd_samplers_cfg_denoiser
 

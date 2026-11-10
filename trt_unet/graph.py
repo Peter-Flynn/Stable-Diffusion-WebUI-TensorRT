@@ -50,35 +50,38 @@ def _constants(graph) -> dict:
 
 
 def _unsqueezed_weights(graph, weights):
-    """A weight that only feeds an Unsqueeze (GroupNorm's scale and shift) becomes its result: the graph
-    input takes the unsqueezed shape. The values' layout is the same, so the checkpoint's weight goes in
-    as it is (TensorRT counts a weight's values, not its dims)."""
+    """A weight that only feeds an Unsqueeze (GroupNorm's scale and shift), or a chain of them, becomes the
+    result: the graph input takes the unsqueezed shape. The values' layout is the same, so the checkpoint's
+    weight goes in as it is (TensorRT counts a weight's values, not its dims)."""
     inputs = {i.name: i for i in graph.input}
-    users = collections.Counter(name for n in graph.node for name in n.input)
     consts = _constants(graph)
-    gone, renames = [], {}
-    for node in graph.node:
-        name = node.input[0] if node.input else None
-        if name not in weights or users[name] != 1:
-            continue
-        if node.op_type != "Unsqueeze" or len(node.input) != 2 or node.input[1] not in consts:
-            continue
-        dims = inputs[name].type.tensor_type.shape.dim
-        shape = [d.dim_value for d in dims]
-        rank = len(shape) + consts[node.input[1]].size
-        axes = sorted(int(a) % rank for a in consts[node.input[1]].reshape(-1))
-        new = list(shape)
-        for a in axes:
-            new.insert(a, 1)
-        for d in list(dims):
-            dims.remove(d)
-        for n in new:
-            dims.add().dim_value = n
-        renames[node.output[0]] = name
-        gone.append(node)
-    _rename_uses(graph, renames)
-    for node in gone:
-        graph.node.remove(node)
+    while True:
+        users = collections.Counter(name for n in graph.node for name in n.input)
+        gone, renames = [], {}
+        for node in graph.node:
+            name = node.input[0] if node.input else None
+            if name not in weights or users[name] != 1:
+                continue
+            if node.op_type != "Unsqueeze" or len(node.input) != 2 or node.input[1] not in consts:
+                continue
+            dims = inputs[name].type.tensor_type.shape.dim
+            shape = [d.dim_value for d in dims]
+            rank = len(shape) + consts[node.input[1]].size
+            axes = sorted(int(a) % rank for a in consts[node.input[1]].reshape(-1))
+            new = list(shape)
+            for a in axes:
+                new.insert(a, 1)
+            for d in list(dims):
+                dims.remove(d)
+            for n in new:
+                dims.add().dim_value = n
+            renames[node.output[0]] = name
+            gone.append(node)
+        if not gone:
+            return
+        _rename_uses(graph, renames)
+        for node in gone:
+            graph.node.remove(node)
 
 
 def _dims(model) -> dict:

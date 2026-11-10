@@ -389,10 +389,10 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
     """Exports the UNet graphs once and builds the engines for the (index, Profile)s in `todo`, each in a
     builder process of its own: per-profile, an engine for each, one at a time, so a build only ever holds
     one profile; merged, one engine holding them all. Each engine gets a shallow engine for Speed Hacks
-    (speed.py) beside it; if that one can't be built, the engine is kept without it. Then, if the VAE
-    decoder's engines (vae.py) don't cover `profiles` (all of the architecture's), it builds those. Returns
-    the last builder result, with "records": the engines saved, those before a failure or cancel included,
-    "hack_errors": why shallow engines couldn't be built, and "vae": the decoder engines' Record, or
+    (speed.py) beside it; if that one can't be built, the engine is kept without it. Then, if the VAE's
+    engines (vae.py) don't cover `profiles` (all of the architecture's), it builds those. Returns the last
+    builder result, with "records": the engines saved, those before a failure or cancel included,
+    "hack_errors": why shallow engines couldn't be built, and "vae": the VAE engines' Record, or
     "vae_error": why they couldn't be built."""
     from . import runtime
     from . import vae as vae_mod
@@ -502,15 +502,15 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
         if vae_part and result["ok"] and not CANCEL.is_set():
             start = time.time()
             log(f"Building the {arch.label} engines for {vae_part}.")
-            step = (lambda f, t: progress((len(groups) + f) / total, f"VAE decoder: {t}")) if progress else None
+            step = (lambda f, t: progress((len(groups) + f) / total, f"VAE: {t}")) if progress else None
             vae_record, vae_error, skipped = vae_mod.build(arch, profiles, folder, optimization_level, step)
             warnings += skipped
             if vae_record is not None:
-                log(f"Built the VAE decoder engines in {time.time() - start:.0f}s")
+                log(f"Built the VAE's engines in {time.time() - start:.0f}s")
             elif vae_error == "cancelled" or CANCEL.is_set():
                 result = {"ok": False, "error": "cancelled"}
             else:
-                log(f"Building the VAE decoder engines failed ({vae_error}); the VAE decodes on PyTorch.")
+                log(f"Building the VAE's engines failed ({vae_error}); the VAE runs on PyTorch.")
         return {**result, "records": records, "memory_warnings": warnings, "hack_errors": hack_errors, "vae": vae_record, "vae_error": vae_error}
     finally:
         shutil.rmtree(folder, ignore_errors=True)
