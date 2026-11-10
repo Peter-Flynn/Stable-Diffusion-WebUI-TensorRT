@@ -33,7 +33,7 @@ HELP = """
 
 **SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engines of the loaded checkpoint's architecture, `Speed Hacks` uses them with Speed Hacks, `None` always uses PyTorch.
 
-**The VAE** gets engines too, for its decoder and its encoder, built with the UNet's for the sizes its profiles cover, in the precision reForge runs the VAE in where the GPU has BF16, and in FP16 where reForge falls back to FP32 for want of it: half the VRAM and several times faster (a `--vae-in-*` flag at build time decides otherwise). FP16 engines run the VAE scaled down by a power of two between its normalizations, so no VAE overflows in them, and any VAE of the architecture runs on them. Each decode runs on them when they fit in the VRAM free, as many images at a time as fit. Larger ones (a Hires. fix's, or beside a UNet engine) run in strips on engines of their own: the same image, a bit slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines when they fit, without unloading the UNet engine. PyTorch does the rest.
+**The VAE** gets engines too, for its decoder and its encoder, built with the UNet's for the sizes its profiles cover, in the precision reForge runs the VAE in where the GPU has BF16, and in FP16 where reForge falls back to FP32 for want of it: half the VRAM and several times faster (a `--vae-in-*` flag at build time decides otherwise). FP16 engines run the VAE scaled down by a power of two between its normalizations, so no VAE overflows in them, and any VAE of the architecture runs on them. Each decode runs on them when they fit in the VRAM free, as many images at a time as fit. Larger ones (a Hires. fix's, or beside a UNet engine) run in strips on engines of their own: the same image, a bit slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines, whole when that fits in the VRAM free and in tiles when it doesn't, without unloading the UNet engine. PyTorch does the rest.
 
 **Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and, late in a pass, wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). The first 30% and last 5% of steps run in full, so composition and detail stay close (both shares are in Settings, Stable Diffusion, TensorRT). Passes of 12 steps or more should run roughly 1.6x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
 """
@@ -202,6 +202,9 @@ def _status(sd_model, arch, records, asking=False) -> str:
         lines.append(f"`SD Unet` is `Speed Hacks`, so every {arch.name} checkpoint runs on them, with Speed Hacks.")
     else:
         lines.append(f"**`SD Unet` is `{setting}`, so generations don't use these engines.** Set it to `Automatic` or `Speed Hacks` in Settings, Stable Diffusion.")
+    vae_engines = _vae_status(arch)
+    if vae_engines:
+        lines.append(vae_engines)
     outdated = [r for r in records if r.outdated]
     failed = [r for r in records if r.speed_hacks is None and not r.outdated]
     if outdated:
@@ -210,6 +213,22 @@ def _status(sd_model, arch, records, asking=False) -> str:
         retry = "building again retries once" if any(r.retry_speed_hacks for r in failed) else "to try again, delete them and build again"
         lines.append(f"Speed Hacks couldn't be built for {_n(len(failed), 'engine')} (`{failed[0].meta['speed_hacks_error']}`), so they run without them; {retry}.")
     return "\n\n".join(lines)
+
+
+def _vae_status(arch) -> str:
+    """What the loaded VAE's engines run, for the status ("" if it has none)."""
+    try:
+        vae = vae_mod.loaded_vae()
+        record = vae_mod.record_for(arch.id, vae) if vae is not None and not vae_mod.unsupported(vae) else None
+        if record is None:
+            return ""
+        text = f"**VAE engines:** {vae_mod.label(record.meta['dtype'])}; decodes up to {record.reach()}"
+        if record.encoder is not None:
+            text += f"; encodes up to {record.encode_reach()}"
+        return text + "."
+    except Exception as e:
+        common.log(f"Could not describe the VAE's engines: {e}")
+        return ""
 
 
 def _vae_part(draft) -> str:
@@ -221,10 +240,10 @@ def _vae_part(draft) -> str:
         return ""
 
 
-def _vae_line(draft) -> str:
+def _vae_line(part: str) -> str:
+    """The profile table's note on the VAE's engines; `part` is what building builds of them (_vae_part)."""
     if not vae_mod.available():
         return ""
-    part = _vae_part(draft)
     if part:
         return f"**Building also builds the engines for {part}.**"
     vae = vae_mod.loaded_vae()
@@ -234,7 +253,7 @@ def _vae_line(draft) -> str:
     return "*The VAE's engines are built for these sizes.*"
 
 
-def _draft_view(draft: list, records, mode) -> str:
+def _draft_view(draft: list, records, mode, vae_part: str = "") -> str:
     if not draft:
         return "*No profiles. Add at least one to build an engine.*"
     todo, extra = _plan(draft, records, mode)
@@ -255,7 +274,7 @@ def _draft_view(draft: list, records, mode) -> str:
             rows.append(f"**Building deletes the {_n(extra, 'engine')} these profiles don't use.**")
     elif extra:
         rows.append(f"**Building also deletes the {_n(extra, 'engine')} of profiles no longer listed.**")
-    rows.append(_vae_line(draft))
+    rows.append(_vae_line(vae_part))
     return "\n".join(rows)
 
 
@@ -283,7 +302,7 @@ def _draft_outputs(draft, records, select=None):
     else:
         build_label = "Update engines" if extra else "Engines up to date"
     return (
-        _draft_view(draft, records, mode),
+        _draft_view(draft, records, mode, vae_part),
         gr.update(choices=choices, value=selected),
         gr.update(value=build_label, interactive=bool(draft) and bool(todo or extra or vae_part) and not BUILDING.is_set()),
     )
@@ -473,7 +492,7 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
         if vae_record.meta.get("strips_error"):
             message += f" Its engines for decoding in strips couldn't be built (`{vae_record.meta['strips_error']}`), so larger decodes run on PyTorch."
         if vae_record.encoder is not None:
-            message += f" Its encoder's engines encode images up to {vae_record.encode_reach()}, likewise when they fit."
+            message += f" Its encoder's engines encode images up to {vae_record.encode_reach()} whole, likewise when they fit, and in tiles when they don't."
         elif vae_record.meta.get("encoder_error"):
             message += f" Its encoder's engines couldn't be built (`{vae_record.meta['encoder_error']}`), so it encodes on PyTorch."
     elif result.get("vae_error") and result["vae_error"] != "cancelled":

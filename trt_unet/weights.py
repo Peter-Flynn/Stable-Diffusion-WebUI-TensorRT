@@ -7,16 +7,15 @@ them instead of computing them again."""
 
 import hashlib
 import weakref
-from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
 from . import common
 
 PREFIX = "diffusion_model."
-# weight name -> (key, the computed FP16 weight in RAM): the latest of each. The key hashes the tensors it was
-# computed from (see EffectiveWeights.key) rather than naming them: extensions can change a UNet's weights in
-# place, so only their contents say whether the computed weight is still the one PyTorch would use.
+# weight name -> (key, the computed FP16 weight in RAM): the latest of each. The key is of the tensors' contents
+# it was computed from (see EffectiveWeights.key) rather than naming them: extensions can change a UNet's weights
+# in place, so only their contents say whether the computed weight is still the one PyTorch would use.
 _computed = {}
 
 
@@ -58,9 +57,24 @@ def _identity(value):
     return ("object", _Same(value))
 
 
-def _bytes(t: torch.Tensor):
-    """A tensor's values as bytes on the CPU, for hashing (any dtype, FP8 and BF16 included)."""
-    return t.detach().reshape(-1).contiguous().cpu().view(torch.uint8).numpy()
+_BITS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def checksum(t: torch.Tensor) -> int:
+    """The sum of a tensor's bits taken as 64-bit words (wrapping), computed on its own device, for any dtype
+    (FP8 and BF16 included). Exact, so the same wherever and however the tensor is stored, and changed by any
+    change to a value. Many times quicker than hashing its bytes, and a tensor in VRAM isn't copied to RAM
+    for it."""
+    flat = t.detach().reshape(-1)
+    size = flat.element_size()
+    per = 8 // size  # values a word
+    if flat.storage_offset() % per:
+        flat = flat.clone()  # (a view can only start on a word of its storage)
+    whole = flat.numel() // per * per
+    total = flat[:whole].view(torch.int64).sum()
+    if whole < flat.numel():
+        total = total + flat[whole:].view(_BITS[size]).sum(dtype=torch.int64)
+    return int(total)
 
 
 class EffectiveWeights:
@@ -120,22 +134,20 @@ class EffectiveWeights:
         return self.base_version, _identity(patches) if patches else None
 
     def _hash(self, name: str) -> bytes:
-        """A hash of every tensor of the weight's layer (its own and e.g. an FP8 scale a conversion uses),
-        unpatched."""
+        """A hash of what every tensor of the weight's layer holds (its own and e.g. an FP8 scale a
+        conversion uses), unpatched: their names, types, shapes and checksums."""
         h = hashlib.sha1()
         for n in sorted(self._layers.get(name.rpartition(".")[0], [name])):
             t = self.base(n)
-            h.update(f"{n} {t.dtype} {tuple(t.shape)};".encode())
-            h.update(_bytes(t))
+            h.update(f"{n} {t.dtype} {tuple(t.shape)} {checksum(t)};".encode())
         return h.digest()
 
     def prepare(self, names):
-        """Hashes the layers of the computed weights among `names` on every CPU thread, ahead of a refit
-        that asks for them one at a time (hashlib leaves the GIL for large tensors)."""
-        todo = [n for n in names if self.computed(n) and n not in self._hashes]
-        if len(todo) > 1:
-            with ThreadPoolExecutor() as pool:
-                self._hashes.update(zip(todo, pool.map(self._hash, todo)))
+        """Hashes the layers of the computed weights among `names`, ahead of a refit that asks for them one
+        at a time."""
+        for n in names:
+            if self.computed(n) and n not in self._hashes:
+                self._hashes[n] = self._hash(n)
 
     def key(self, name: str):
         """What a computed weight is computed from: its layer's contents and its patches (by identity)."""

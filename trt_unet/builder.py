@@ -151,10 +151,10 @@ def build(job, logger, progress, strip=True):
 
     unmarked = [name for name in job["weights"] if not network.mark_weights_refittable(name)]
     if unmarked:
-        raise RuntimeError(f"{len(unmarked)} UNet weights aren't in the TensorRT network (e.g. {unmarked[0]})")
+        raise RuntimeError(f"{len(unmarked)} of the model's weights aren't in the TensorRT network (e.g. {unmarked[0]})")
 
     config = builder.create_builder_config()
-    config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)  # only the UNet's weights: they come from the checkpoint
+    config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)  # only the model's weights: they come from the checkpoint
     if strip:
         config.set_flag(trt.BuilderFlag.STRIP_PLAN)
     if job.get("optimization_level") is not None:

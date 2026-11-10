@@ -57,8 +57,9 @@ VAEs overflow FP16, which is why reForge avoids it; the engines run the VAE scal
 normalizations, where that changes nothing but the range, so any VAE of the architecture runs on them without NaNs.
 A decode runs on them whenever they fit in the VRAM that's free. Larger decodes (a Hires. fix's, or beside a UNet
 engine that leaves too little VRAM) run in horizontal strips on engines built for that: the same image, a little
-slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines when
-they fit, without unloading the UNet engine. PyTorch does anything else.
+slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines, whole
+when that fits in the free VRAM and in tiles when it doesn't, without unloading the UNet engine. PyTorch does
+anything else.
 
 > [!NOTE]
 > An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build again;

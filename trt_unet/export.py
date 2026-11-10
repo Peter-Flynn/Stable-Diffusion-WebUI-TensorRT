@@ -124,7 +124,7 @@ def _weightless_graph(onnx_path: str, input_names, agree_with, quiet: bool = Fal
             graph.input.remove(value)
     wrong = [k for k, s in shapes.items() if any(other.get(k) != s for other in agree_with)]
     if wrong:
-        raise RuntimeError(f"{len(wrong)} exported weights don't match the loaded UNet (e.g. {wrong[0]})")
+        raise RuntimeError(f"{len(wrong)} exported weights don't match the loaded model's (e.g. {wrong[0]})")
     start = time.time()
     try:
         tidied = copy.deepcopy(model)  # small: the weights aren't in it yet

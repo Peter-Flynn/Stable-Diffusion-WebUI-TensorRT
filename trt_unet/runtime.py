@@ -777,8 +777,8 @@ def _wrap_vae_decode(original):
 
 
 def _wrap_vae_encode(original):
-    """Encodes on the VAE encoder's engines likewise (an img2img's image, a Hires. fix's upscaled one), where
-    reForge's own encode would unload the UNet engine for the VRAM it reckons it needs."""
+    """Encodes on the VAE encoder's engines likewise (an img2img's image, a Hires. fix's upscaled one),
+    keeping the UNet engines loaded; anything they pass on encodes on PyTorch, as reForge would."""
 
     def encode(self, pixel_samples):
         if setting() in (AUTOMATIC, SPEED_HACKS) and threading.get_ident() == _generation_thread:

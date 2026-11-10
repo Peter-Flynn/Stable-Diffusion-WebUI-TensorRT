@@ -27,7 +27,9 @@ RAM what doesn't fit in VRAM; else reForge's own decode. The engines never take 
 The encoder (an img2img's or an inpaint's image, a Hires. fix's upscaled one) runs the same three parts
 the other way round: an "encode-pre" engine from the image down to its mid-block attention's queries,
 keys and values, that attention on PyTorch, and an "encode-post" engine for the rest, whose output
-reForge's own code makes the latent of. An encode that doesn't fit in the VRAM free runs on PyTorch.
+reForge's own code makes the latent of. An encode that doesn't fit in the VRAM free whole runs in tiles,
+the way reForge's own encode does when it runs out of VRAM (its tiling and blending, with the engines
+encoding each tile, in tiles as large as fit); failing that, on PyTorch.
 
 Engines live in models/Unet-trt/<UNet architecture id>/vae/, built with that architecture's UNet engines
 for the sizes its profiles cover."""
@@ -43,7 +45,6 @@ import os
 import time
 import traceback
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import torch
@@ -57,6 +58,9 @@ ENCODE_PRE, ENCODE_POST = "encode-pre", "encode-post"
 ENCODER = (ENCODE_PRE, ENCODE_POST)
 HEADROOM = 256 * 2**20
 MAX_BATCH = 16  # images per engine call, at most
+TILES = (2048, 1536, 1024, 768, 512)  # tile sizes for an encode in tiles: the largest that fits (reForge's own are 512)
+TILE_OVERLAP = 64  # reForge's, in pixels
+SMALLEST = 64  # the encoder engines' smallest image side: no more than the least of a tile reForge's tiling leaves at an edge (its overlap and 8)
 # FP16 engines scale the decoder and the encoder by 2^-EXPONENT. FP16 holds magnitudes up to 2^16 in steps no finer than
 # 2^-24, so a tensor keeps FP16's precision scaled down until its typical value nears 2^-13 (measured: a
 # decoder whose tensors are around 0.5 decodes as closely scaled by anything from 1 to 2^-12). At 6,
@@ -371,10 +375,11 @@ def _encoder_excess(cfg: dict, b: int, h: int, w: int, budget) -> tuple:
 
 def encoder_shapes(profiles: list, cfg: dict, dtype=None, vram=None, share: float = 1.0) -> dict:
     """The encoder engines' input shapes for the sizes a list of profiles covers, as shapes_for: the image
-    from the smallest to the largest of them (capped so an encode fits TensorRT's limit for a tensor and
-    could run at all on this GPU), and what the mid block takes at an 8th of that."""
+    up to the largest of them (capped so an encode fits TensorRT's limit for a tensor and could run at all
+    on this GPU), from SMALLEST, so an encode in tiles can give them any tile; and what the mid block takes
+    at an 8th of that."""
     budget = _budget(dtype, vram, share)
-    lo_h, lo_w = min(p.height[0] for p in profiles) // 8 * 8, min(p.width[0] for p in profiles) // 8 * 8
+    lo_h = lo_w = SMALLEST
     hi_h, hi_w = max(p.height[2] for p in profiles) // 8 * 8, max(p.width[2] for p in profiles) // 8 * 8
     hi_h, hi_w = _shrunk(hi_h, hi_w, lambda h, w: _encoder_excess(cfg, 1, h, w, budget)[0], 8)
     fits = TENSOR_LIMIT // encoder_largest(cfg, 1, hi_h, hi_w)
@@ -457,13 +462,20 @@ class Record:
         or None if the record has none."""
         return self.meta.get("encoder") or None
 
-    def encodes(self, digest: str, c: int, h: int, w: int) -> bool:
-        """Whether the encoder engines encode images of h x w for an encoder of this architecture."""
+    def has_encoder(self, digest: str, c: int) -> bool:
+        """Whether it has engines for an encoder of this architecture, for images of c channels."""
         enc = self.encoder
-        if enc is None or enc.get("digest") != digest:
-            return False
-        lo, _, hi = enc["shapes"][ENCODE_PRE]["image"]
-        return c == lo[1] and lo[2] <= h <= hi[2] and lo[3] <= w <= hi[3]
+        return enc is not None and enc.get("digest") == digest and c == enc["shapes"][ENCODE_PRE]["image"][0][1]
+
+    def encodes(self, h: int, w: int) -> bool:
+        """Whether the encoder engines take images of h x w whole."""
+        lo, _, hi = self.encoder["shapes"][ENCODE_PRE]["image"]
+        return lo[2] <= h <= hi[2] and lo[3] <= w <= hi[3]
+
+    def encodes_tiles(self) -> bool:
+        """Whether they take any tile of an encode in tiles: the smallest are an overlap and 8 pixels."""
+        lo = self.encoder["shapes"][ENCODE_PRE]["image"][0]
+        return max(lo[2], lo[3]) <= TILE_OVERLAP + 8
 
     @property
     def encode_batch(self) -> int:
@@ -1184,6 +1196,7 @@ class VaeModel:
         self.encoder_key = None  # the key of the VAE's encoder's weights
         self.encoder_applied = None  # (the key, the exponent) of the weights in the encoder's engines
         self.encoder_measured = 0
+        self.encode_needs = {}  # (images, height, width) -> need_encode's answer
 
     @property
     def loaded(self) -> bool:
@@ -1279,7 +1292,7 @@ class VaeModel:
             self._unload_strips()
             for e in self.encoders.values():
                 e.unload()
-            self.encoders, self.encoder_applied = {}, None
+            self.encoders, self.encoder_applied, self.encode_needs = {}, None, {}
         return self.model
 
     def encoder_engines(self) -> dict:
@@ -1324,7 +1337,12 @@ class VaeModel:
     def need_encode(self, n: int, h: int, w: int) -> tuple:
         """(VRAM an encode of n images of h x w takes on the engines, their activation memory): their
         activations (one engine at a time), the image, the tensors between them and the attention's own
-        working memory."""
+        working memory. Asked of TensorRT once per size."""
+        if (n, h, w) not in self.encode_needs:
+            self.encode_needs[(n, h, w)] = self._need_encode(n, h, w)
+        return self.encode_needs[(n, h, w)]
+
+    def _need_encode(self, n: int, h: int, w: int) -> tuple:
         cfg, size = self.record.encoder["config"], self.record.dtype.itemsize
         stream = torch.cuda.current_stream().cuda_stream
         c, mid = cfg["mid_channels"], (h // 8, w // 8)
@@ -1432,22 +1450,22 @@ class _Overflow(Exception):
 
 
 _weights_keys = {}  # whether the encoder's -> (the VAE's model, the generation, the key of its decoder's or encoder's weights)
-
-
 def _key(vae, encoder: bool = False) -> str:
-    """A hash of the decoder's weights (or the encoder's), once per generation: a VAE's weights can change
-    in place."""
-    from .weights import _bytes, _Same
+    """A key for the decoder's weights (or the encoder's): their names, types, shapes and checksums. Once
+    per generation: a VAE's weights can change in place. The checksums are computed where the weights are
+    (VRAM, once reForge's own decode or encode has run), so keying them copies nothing to RAM."""
+    from .weights import _Same, checksum
 
     fsm = vae.first_stage_model
     known = _weights_keys.get(encoder)
     if known is not None and known[0] == _Same(fsm) and known[1] == common.generation:
         return known[2]
     state = fsm.state_dict(keep_vars=True)
-    names = sorted(n for n in state if (_encoder_relevant(n) if encoder else _relevant(n)))
-    with ThreadPoolExecutor() as pool:
-        hashes = list(pool.map(lambda n: hashlib.sha1(_bytes(state[n])).digest(), names))
-    key = hashlib.sha1(b"".join(hashes)).hexdigest()
+    h = hashlib.sha1()
+    for name in sorted(n for n in state if (_encoder_relevant(n) if encoder else _relevant(n))):
+        t = state[name].data
+        h.update(f"{name} {t.dtype} {tuple(t.shape)} {checksum(t)};".encode())
+    key = h.hexdigest()
     _weights_keys[encoder] = (_Same(fsm), common.generation, key)
     return key
 
@@ -1737,7 +1755,7 @@ def encode(vae, pixel_samples):
         return None  # (vae.decode says when an architecture has no engines)
     pixels = vae.vae_encode_crop_pixels(pixel_samples).movedim(-1, 1)
     b, c, h, w = pixels.shape
-    if not record.encodes(encoder_digest(vae), c, h, w):
+    if not record.has_encoder(encoder_digest(vae), c) or not (record.encodes(h, w) or _tiles(record, vae)):
         return None
     model = model_for(record)
     model.vae, model.key, model.encoder_key = vae, _key(vae), _key(vae, encoder=True)
@@ -1765,47 +1783,118 @@ def encode(vae, pixel_samples):
         model.vae = None  # don't keep this VAE alive
 
 
+class _Unusable(Exception):
+    """A tile came out NaN/Inf on engines that aren't scaled (said already)."""
+
+
+def _tiles(record: Record, vae) -> bool:
+    """Whether an encode can run in tiles on this record's engines: reForge's tiled encode, with the engines
+    encoding each tile."""
+    return record.encodes_tiles() and callable(getattr(vae, "encode_tiled_", None))
+
+
 def _encode(model: VaeModel, vae, pixels):
-    """One try at an encode of images (b, channels, h, w) in 0..1: on the encoder's engines if it fits in the
-    VRAM free, else None. Raises _Overflow if a scaled encode's values outgrew its scale."""
+    """One try at an encode of images (b, channels, h, w) in 0..1 on the encoder's engines: whole if that
+    fits in the VRAM free, else in tiles, else None. Raises _Overflow if a scaled encode's values outgrew
+    its scale."""
     mm = common.mm()
     b, _, h, w = pixels.shape
-    how = f"{label(model.record.meta['dtype'])}" + (f", scaled by 2^-{model.encoder_exponent}" if model.record.scaled else "")
+    record = model.record
+    how = f"{label(record.meta['dtype'])}" + (f", scaled by 2^-{model.encoder_exponent}" if record.scaled else "")
+    images = f"{b} image{'' if b == 1 else 's'} of {w}x{h}"
     mm.load_models_gpu([model])
     if not model.encoders:  # room for their weights, as the manager makes for a model it loads
-        mm.free_memory(2 * int(model.record.encoder["weight_bytes"]) + HEADROOM, model.load_device, keep_loaded=_own(model))
-    engines = model.encoder_engines()
-    n, need, free = _fit(model, b, h, w, encoding=True)
-    if not n:
-        log(f"The VAE encoder engines need {common.gib(need)} of VRAM for {w}x{h}, {common.gib(free)} is free: encoding on PyTorch.")
-        return None
+        mm.free_memory(2 * int(record.encoder["weight_bytes"]) + HEADROOM, model.load_device, keep_loaded=_own(model))
+    model.encoder_engines()
+    whole = record.encodes(h, w)
+    n, need, free = _fit(model, b, h, w, encoding=True) if whole else (0, 0, 0)
     start = time.time()
-    dtype, device = model.record.dtype, model.load_device
+    if n:
+        samples = None
+        for at in range(0, b, n):
+            latent = _encode_images(model, vae, vae.process_input(pixels[at:at + n]))
+            if latent is None:
+                return None
+            out = latent.to(vae.output_device).float()
+            out = vae._from_vae_latent(out) if hasattr(vae, "_from_vae_latent") else out
+            if samples is None:
+                samples = torch.empty((b,) + tuple(out.shape[1:]), device=vae.output_device)
+            samples[at:at + n] = out
+            del latent, out
+        at_once = f", {n} at a time" if n < b else ""
+        log(f"Encoded {images} on the VAE encoder engines in {time.time() - start:.2f}s ({how}{at_once})")
+        return samples
+    why = f"whole it needs {common.gib(need)}, {common.gib(free)} was free" if whole else "larger than they take whole"
+    tile = _tile_size(model, vae, h, w) if _tiles(record, vae) else 0
+    if not tile:
+        log(f"The VAE encoder engines can't encode {w}x{h} in the VRAM free ({why}; no tiles fit either): encoding on PyTorch.")
+        return None
+    samples = _encode_tiled(model, vae, pixels, tile)
+    if samples is not None:
+        log(f"Encoded {images} in tiles of {tile} on the VAE encoder engines in {time.time() - start:.2f}s ({how}; {why})")
+    return samples
+
+
+def _encode_images(model: VaeModel, vae, image):
+    """The latents (in VRAM, FP32) of images as the encoder takes them (-1..1), on the engines; None if
+    they came out NaN/Inf (said). Raises _Overflow instead if the engines are scaled."""
+    record, engines = model.record, model.encoders
     stream = torch.cuda.current_stream().cuda_stream
     scale = model.scale_input(model.encoder_exponent)
+    image = image.to(device=model.load_device, dtype=record.dtype)
+    mid = engines[ENCODE_PRE].infer({"image": image, **scale}, 0, stream)
+    del image
+    attended = _attend(model, vae, mid, encoding=True)
+    moments = engines[ENCODE_POST].infer({"x": mid.pop("x"), "attention": attended, **scale}, 0, stream)["moments"]
+    del attended, mid
+    if not torch.isfinite(moments).all():
+        if record.scaled:
+            raise _Overflow()
+        notify(f"The VAE encoder engines produced NaN/Inf values in {label(record.meta['dtype'])}; encoding on PyTorch")
+        return None
+    return vae.first_stage_model.regularization(moments.float())[0]  # reForge's own: the distribution's mode
+
+
+def _tile_shapes(tile: int, h: int, w: int) -> set:
+    """The largest tiles (height, width) of reForge's tiled encode of an image of h x w with this tile
+    size: its three passes' (square, wide and tall), no larger than the image."""
+    return {(min(th, h), min(tw, w)) for th, tw in ((tile, tile), (tile // 2, tile * 2), (tile * 2, tile // 2))}
+
+
+def _tile_size(model: VaeModel, vae, h: int, w: int) -> int:
+    """The tile size for an encode of h x w in tiles: the largest of TILES whose tiles the engines take in
+    the VRAM free (0 if none). Sizes their activation memory for it."""
+    model.release()
+    hi = model.record.encoder["shapes"][ENCODE_PRE]["image"][2]
+    free = common.mm().get_free_memory(model.load_device)
+    for tile in TILES:
+        shapes = _tile_shapes(tile, h, w)
+        if all(th <= hi[2] and tw <= hi[3] and model.need_encode(1, th, tw)[0] <= free for th, tw in shapes):
+            model.arena.get(max(model.need_encode(1, th, tw)[1] for th, tw in shapes))
+            return tile
+    return 0
+
+
+def _encode_tiled(model: VaeModel, vae, pixels, tile: int):
+    """The latents of images (b, channels, h, w) in 0..1 as reForge's tiled encode makes them (three passes
+    of overlapping tiles, blended and averaged), with the engines encoding each tile in place of its first
+    stage model; None if a tile came out unusable."""
     fsm = vae.first_stage_model
-    samples = None
-    for at in range(0, b, n):
-        image = vae.process_input(pixels[at:at + n]).to(device=device, dtype=dtype)
-        mid = engines[ENCODE_PRE].infer({"image": image, **scale}, 0, stream)
-        del image
-        attended = _attend(model, vae, mid, encoding=True)
-        moments = engines[ENCODE_POST].infer({"x": mid.pop("x"), "attention": attended, **scale}, 0, stream)["moments"]
-        del attended, mid
-        if not torch.isfinite(moments).all():
-            if model.record.scaled:
-                raise _Overflow()
-            notify(f"The VAE encoder engines produced NaN/Inf values in {label(model.record.meta['dtype'])}; encoding on PyTorch")
-            return None
-        latent = fsm.regularization(moments.float())[0]  # reForge's own: the distribution's mode
-        out = vae._from_vae_latent(latent.to(vae.output_device).float()) if hasattr(vae, "_from_vae_latent") else latent.to(vae.output_device).float()
-        if samples is None:
-            samples = torch.empty((b,) + tuple(out.shape[1:]), device=vae.output_device)
-        samples[at:at + n] = out
-        del moments, latent, out
-    at_once = f", {n} at a time" if n < b else ""
-    log(f"Encoded {b} image{'' if b == 1 else 's'} of {w}x{h} on the VAE encoder engines in {time.time() - start:.2f}s ({how}{at_once})")
-    return samples
+
+    def encode(image):
+        latent = _encode_images(model, vae, image)
+        if latent is None:
+            raise _Unusable()
+        return latent
+
+    fsm.encode = encode  # on the object, over its class's: what reForge's tiling calls for each tile
+    try:
+        return vae.encode_tiled_(pixels, tile_x=tile, tile_y=tile, overlap=TILE_OVERLAP)
+    except _Unusable:
+        return None
+    finally:
+        with contextlib.suppress(AttributeError):
+            del fsm.encode
 
 
 def _driver_free() -> tuple:
