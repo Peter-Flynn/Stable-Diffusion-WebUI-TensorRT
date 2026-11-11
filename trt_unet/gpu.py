@@ -10,8 +10,10 @@ Every allocation is also entered in a ledger under its owner (an engine's model:
 allocations are being made), so a model's size is what it holds, to the byte, and a load's peak is what
 the load took at most. Nothing about memory is estimated from it: it's counted.
 
-TRT_EXTENSION_TORCH_ALLOCATOR=0 leaves TensorRT on its own allocator (the ledger then stays empty, and
-sizes come from the driver's free memory before and after)."""
+TensorRT stays on its own allocator where PyTorch isn't on its native one (reForge's --cuda-malloc: its
+memory is then the driver's pool, with no cache of PyTorch's to share, and its counts of it aren't
+reliable), or with TRT_EXTENSION_TORCH_ALLOCATOR=0. An owner's size then comes from the driver's free
+memory before and after it loads."""
 
 import contextlib
 import ctypes
@@ -33,7 +35,7 @@ _retired = None  # the allocator of a runtime set aside (retire), kept alive wit
 
 
 def _pointer(memory) -> int:
-    """An address TensorRT's bindings hand over: a capsule holding it (or an int, or None)."""
+    """An address TensorRT's bindings hand over: an int (or a capsule holding it, or None)."""
     if memory is None:
         return 0
     if isinstance(memory, int):
@@ -43,21 +45,12 @@ def _pointer(memory) -> int:
     return int(get(memory, None) or 0)
 
 
-def _capsule(address: int):
-    """An address as TensorRT's bindings take it back: a capsule, or None for none."""
-    if not address:
-        return None
-    new = ctypes.pythonapi.PyCapsule_New
-    new.restype, new.argtypes = ctypes.py_object, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-    return new(address, None, None)
-
-
 def _allocate(size: int, alignment: int, stream) -> int:
     global _failures
     if size <= 0:
         return 0
     alignment = max(int(alignment or 1), 1)
-    extra = alignment - 1 if alignment > 512 else 0  # PyTorch's blocks start on 512 bytes
+    extra = alignment - 1  # wherever PyTorch's block starts, an aligned address is in it with `size` after
     try:
         base = torch.cuda.caching_allocator_alloc(size + extra, torch.cuda.current_device(), int(stream) if stream else None)
     except torch.cuda.OutOfMemoryError:
@@ -109,17 +102,18 @@ def _make_allocator():
 
     class TorchAllocator(base):
         """TensorRT's device allocations, from PyTorch's caching allocator (see the module). Addresses go
-        back and forth as capsules, as TensorRT's bindings pass them. Nothing may raise back into TensorRT:
-        a failure is None (a null address) or False, which TensorRT reports."""
+        back as ints, which is what TensorRT's bindings read (whatever their documentation's signatures
+        say: a capsule is "not an int" to them, and the allocation failed). Nothing may raise back into
+        TensorRT: a failure is 0 (a null address) or False, which TensorRT reports."""
 
         def __init__(self):
             base.__init__(self)
 
         def allocate_async(self, size, alignment, flags, stream):
             try:
-                return _capsule(_allocate(size, alignment, stream))
+                return _allocate(size, alignment, stream)
             except Exception:
-                return None
+                return 0
 
         def deallocate_async(self, memory, stream):
             try:
@@ -134,7 +128,7 @@ def _make_allocator():
             return self.deallocate_async(memory, None)
 
         def reallocate(self, address, alignment, new_size):
-            return None  # not resized in place: TensorRT allocates anew
+            return 0  # not resized in place: TensorRT allocates anew
 
     return TorchAllocator()
 
@@ -145,6 +139,13 @@ def attach(runtime) -> bool:
     global _allocator
     if os.environ.get("TRT_EXTENSION_TORCH_ALLOCATOR", "").lower() in ("0", "false", "no"):
         log("TensorRT allocates its own GPU memory (TRT_EXTENSION_TORCH_ALLOCATOR is off).")
+        return False
+    try:
+        backend = torch.cuda.get_allocator_backend()
+    except Exception:
+        backend = "native"
+    if backend != "native":  # the driver's pool (--cuda-malloc): nothing of PyTorch's to share, and its counts are off
+        log(f"TensorRT allocates its own GPU memory (PyTorch's allocator is {backend}).")
         return False
     try:
         allocator = _make_allocator()

@@ -88,10 +88,25 @@ def reserve() -> int:
         return 0
 
 
+def _free_now(device) -> int:
+    """VRAM an allocation could have now: what the driver has free, and what PyTorch holds unused in its
+    cache. reForge counts the same (the driver's free memory, plus PyTorch's reserved less its active),
+    but with --cuda-malloc PyTorch can report less reserved than active, and reForge's count then falls
+    short of what's free by the difference (seen: 1.7 GiB, which had it evict a UNet engine for a decode
+    that fit). reForge's count is used where the device isn't CUDA's."""
+    try:
+        if torch.device(device).type == "cuda":
+            stats = torch.cuda.memory_stats(device)
+            cached = stats.get("reserved_bytes.all.current", 0) - stats.get("active_bytes.all.current", 0)
+            return torch.cuda.mem_get_info(device)[0] + max(0, cached)
+    except Exception:
+        pass
+    return mm().get_free_memory(device)
+
+
 def free(device) -> int:
-    """VRAM free beside the reserve, as reForge counts it (PyTorch's unused cache included, which TensorRT
-    allocates from too)."""
-    return mm().get_free_memory(device) - reserve()
+    """VRAM free beside the reserve (_free_now)."""
+    return _free_now(device) - reserve()
 
 
 def obtainable(device, keep=(), engines: bool = True) -> int:
@@ -105,7 +120,7 @@ def obtainable(device, keep=(), engines: bool = True) -> int:
         if lm.device == device and lm.model is not None and not any(lm.model is k for k in keep)
         and (engines or not getattr(lm.model, "evicted_last", False))
     )
-    return m.get_free_memory(device) + held
+    return _free_now(device) + held
 
 
 def register(model):
@@ -132,15 +147,20 @@ def register(model):
 
 def make_room(nbytes: int, device, keep_loaded=()) -> int:
     """Has reForge's manager evict models (least recently used first; engines last, see runtime.py) until
-    `nbytes` are free beside the reserve. Returns what's free then, beside the reserve."""
+    `nbytes` are free beside the reserve: nothing, if they are already. Returns what's free then, beside
+    the reserve."""
     from . import gpu
 
     m = mm()
-    with torch.inference_mode():  # models unloaded outside it are left unusable (see inference_mode)
-        m.free_memory(nbytes + reserve(), device, keep_loaded=list(keep_loaded))
+    short = nbytes - free(device)
+    if short > 0:
+        with torch.inference_mode():  # models unloaded outside it are left unusable (see inference_mode)
+            # By reForge's own count, which can be short of what's free (_free_now): what it counts free
+            # now, and the shortfall more
+            m.free_memory(m.get_free_memory(device) + short, device, keep_loaded=list(keep_loaded))
     if not gpu.attached():  # TensorRT allocates from the driver: what PyTorch has cached isn't free to it
         torch.cuda.empty_cache()
-    return m.get_free_memory(device) - reserve()
+    return free(device)
 
 
 # --- Memory diagnostics: these only read counters, and change nothing.

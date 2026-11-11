@@ -900,9 +900,9 @@ class Decode:
         plan = Plan(dict(modes), found, runners, rows, set(host), {**offsets, **host_offsets}, peak, host_bytes, in_place, io, act, acts=acts)
         return plan, at, sizes
 
-    def plan(self, h: int, w: int, free: int, force_host: bool = False, force_modes: dict = None):
+    def plan(self, h: int, w: int, free: int, force_host: bool = False, force_modes: dict = None, ram: bool = True):
         """_plan, with what it was planned for noted on it (diagnostics)."""
-        plan = self._plan(h, w, free, force_host, force_modes)
+        plan = self._plan(h, w, free, force_host, force_modes, ram)
         if plan is not None:
             plan.free = plan.budget = free
         return plan
@@ -928,9 +928,9 @@ class Decode:
         ))
         return " | ".join(parts)
 
-    def _plan(self, h: int, w: int, free: int, force_host: bool = False, force_modes: dict = None):
+    def _plan(self, h: int, w: int, free: int, force_host: bool = False, force_modes: dict = None, ram: bool = True):
         """The Plan for latents of h x w in `free` bytes of VRAM, or None if not even the smallest strips
-        fit. The fastest that fits: every block STORE with strips as large as fit (down to an 8th of what the
+        fit (or, if not `ram`, none that holds every tensor in VRAM does). The fastest that fits: every block STORE with strips as large as fit (down to an 8th of what the
         engines take); else, of the tensors held at the VRAM's peak, the largest one a block could do
         without (a first conv's output: that block RECOMPUTE; an upsampling's: the block after it FUSED)
         gone, and so on; else the tensors held at the peak moved to RAM, the largest first. Every size it
@@ -971,6 +971,8 @@ class Decode:
                 break
             _, block, want = max(better)
             modes[block] = want
+        if not ram:
+            return None
         for div in (1, 2, 4, 8):
             host = set()
             while True:
@@ -1005,13 +1007,12 @@ class Decode:
 
     def run(self, x, attention, plan: Plan, timed: bool = False):
         """The image (1, out channels, H, W) for the mid block's input x and its attention's output (each
-        (1, channels, h, w), in VRAM)."""
+        (1, channels, h, w), in VRAM, in any precision, scaled as the decoder runs scaled: by whoever has
+        them in a precision that holds them unscaled)."""
 
         def fill(held):
-            held[-2].t.copy_(x[0].permute(1, 0, 2))  # scaled already, by the engine before
+            held[-2].t.copy_(x[0].permute(1, 0, 2))
             held[-1].t.copy_(attention[0].permute(1, 0, 2))
-            if self.scale != 1.0:
-                held[-1].t.mul_(self.scale)
 
         held, _ = self._run(plan, x.shape[2], x.shape[3], fill, timed)
         return self._out(held[len(plan.stages) - 1].t)

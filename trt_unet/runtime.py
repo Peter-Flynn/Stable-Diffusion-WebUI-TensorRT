@@ -230,8 +230,9 @@ class TrtModel:
         torch.cuda.current_stream().synchronize()  # no inference in flight
         blobs = dict(entry.blobs) if entry is not None else {}
         signatures = dict(entry.signatures) if entry is not None else {}
-        for role in todo:
-            blobs[role], signatures[role] = loaded[role].serialize(), dict(self.applied[role])
+        with refits.keeping():  # the stalls this causes aren't the system running short
+            for role in todo:
+                blobs[role], signatures[role] = loaded[role].serialize(), dict(self.applied[role])
         kept = refits.Kept(signatures, blobs, label, self._source())
         refits.put(key, kept)
         count, total = refits.held()

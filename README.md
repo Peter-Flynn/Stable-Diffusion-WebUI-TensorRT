@@ -52,22 +52,22 @@ TensorRT. Passes of 12 steps or more should run roughly 1.6x as fast as on the e
 little less precise, so a seed gives a somewhat different image than without them. Fewer steps (e.g. with few-step
 LoRAs) run as usual.
 
-**The VAE.** Its decoder and its encoder get engines too, built along with the UNet's for the same sizes. They run in
-the precision reForge picks for the VAE: BF16 on RTX 30 series and newer, and on older cards FP16 rather than
-reForge's FP32, at half the VRAM (a `--vae-in-*` flag at build time overrides either). VAEs overflow FP16, which is
-why reForge avoids it; the engines run the VAE scaled down by a power of two between its normalizations, where that
-changes nothing but the range, so any VAE of the architecture runs on them without NaNs. A decode runs on them whole
-whenever reForge can make room for it, which it does like for any model (a UNet engine goes last, only if that makes
-the room). Larger decodes (a Hires. fix's) run in horizontal strips on engines built for that, with exactly the room
-the fastest plan there can be room for takes: the same image, a little slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled
-one) run on the encoder's engines the same way: whole when there can be room, else in strips. PyTorch does anything
-else.
+**The VAE.** Its decoder and its encoder get engines too, built along with the UNet's for the same sizes. Those that
+take a whole image run in the precision reForge runs the VAE in: BF16 on RTX 30 series and newer, FP32 on older
+cards. Larger decodes (a Hires. fix's) run in horizontal strips on engines built for that, which on those older cards
+run in FP16, at half the VRAM: VAEs overflow FP16, which is why reForge avoids it, but the strips run the VAE scaled
+down by a power of two between its normalizations, where that changes nothing but the range, so any VAE of the
+architecture runs on them without NaNs. A decode takes the first of these there can be room for: whole beside the
+UNet engine; in strips beside it, all in VRAM; whole with the UNet engine evicted; in strips likewise, holding in RAM
+what doesn't fit. Either way it's the same image. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled
+one) run on the encoder's engines the same way. PyTorch does anything else.
 
-**Memory.** Everything TensorRT holds in VRAM comes from PyTorch's allocator, so reForge counts it like any model's,
-and every size used to make room is exact: what each engine held when it last loaded, TensorRT's own activation sizes,
-and the tensors between them. Engine models don't take the room reForge makes for a model by its own estimate either.
-The only margin is reForge's own reserve (`--reserve-vram`). Set
-`TRT_EXTENSION_TORCH_ALLOCATOR=0` to leave TensorRT on its own allocator.
+**Memory.** Every size used to make room is exact: what each engine held when it last loaded, TensorRT's own
+activation sizes, and the tensors between them; free VRAM is the driver's own figure and PyTorch's unused cache.
+Engine models don't take the room reForge makes for a model by its own estimate. The only margin is reForge's own
+reserve (`--reserve-vram`). With PyTorch's native allocator, what TensorRT holds comes from it, so reForge counts it
+like any model's (`TRT_EXTENSION_TORCH_ALLOCATOR=0` leaves TensorRT on its own); with `--cuda-malloc` TensorRT keeps
+its own allocator, and its engines' sizes are measured from the driver's free memory.
 
 > [!NOTE]
 > An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build again;

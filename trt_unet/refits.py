@@ -10,10 +10,15 @@ system can hand over that much without paging anything out (its free memory and 
 as the OS counts them: _supply) and isn't short of memory already, dropping the least recently used ones if
 that's what it takes. While any is kept, the OS's own signal that it's short of memory (_pressure: Linux's
 pressure stall information, Windows' low-memory notification, macOS' memory pressure level) is looked at
-every few seconds, and the least recently used is dropped each time it says so. One whose checkpoint is gone
-is dropped then too, and one kept for other weights than those wanted now when that's found out (a LoRA
-changed: the next unload keeps the engine as it is then)."""
+every few seconds, and the least recently used is dropped each time it says so. On Linux that's tasks
+having waited on memory for a tenth of a 10-second window with none of this module's own doing in it:
+keeping an engine has the kernel reclaim file cache for it, which stalls tasks briefly and is no shortage
+(the cache was counted as there to hand over). One whose checkpoint is gone is dropped then too, and one
+kept for other weights than those wanted now when that's found out (a LoRA changed: the next unload keeps
+the engine as it is then)."""
 
+import collections
+import contextlib
 import ctypes
 import os
 import sys
@@ -24,10 +29,9 @@ from dataclasses import dataclass
 from .common import gib, log
 
 INTERVAL = 2.0  # seconds between looks at the OS's memory pressure, while engines are kept
-# Linux: the share (%) of the time since the last look in which some task waited on memory (or all did) that
-# counts as the system being short of it, from the kernel's stall totals (/proc/pressure/memory)
-PRESSURE_SOME, PRESSURE_FULL = 10.0, 1.0
-RECENT = 10.0  # seconds: a last look older than this is too long ago to compare with; the kernel's 10 s average stands in
+# Linux: the system is short of memory when some task waited on it for PRESSURE_SOME % of a WINDOW of seconds
+# (the kernel's stall total, /proc/pressure/memory) in which this module neither kept nor dropped an engine
+WINDOW, PRESSURE_SOME = 10.0, 10.0
 
 
 @dataclass
@@ -74,29 +78,54 @@ def _supply() -> int:
 
 _swapped = None  # Linux without pressure stall information: pages swapped out, at the last look
 _windows_signal = None  # Windows: the low-memory notification's handle
-_stalls = None  # Linux: (when, {"some": microseconds tasks waited on memory in all, "full": ...}) at the last look
+_stalls = collections.deque()  # Linux: (when, microseconds some task waited on memory in all) at each look, since _settled, the first the base of the window
+_settled = 0.0  # when (time.monotonic) this module last kept or dropped an engine
+_keeping = 0  # engines being kept now
 _stalls_lock = threading.Lock()
 
 
-def _stall_shares() -> tuple:
-    """Linux: ({"some": %, "full": %} of the time some task waited on memory, and all did, since the last
-    look, from the kernel's totals; the span that is, for the log). Without a look in the last RECENT
-    seconds (or within half a second), the kernel's own average over the last 10 s. Raises OSError on a
-    kernel without pressure stall information. Unlike that average, which takes 10 s to forget a spike,
-    this follows what was freed by the next look."""
-    global _stalls
-    with open("/proc/pressure/memory") as f:
-        lines = {parts[0]: dict(kv.split("=") for kv in parts[1:]) for parts in (line.split() for line in f) if parts}
-    now, totals = time.monotonic(), {k: float(v["total"]) for k, v in lines.items()}
+def _settle():
+    """This module kept or dropped an engine: the stalls up to now aren't the system's own."""
+    global _settled
     with _stalls_lock:
-        last = _stalls
-        if last is not None and now - last[0] < 0.5:
-            return {k: float(v["avg10"]) for k, v in lines.items()}, "10 s"
-        _stalls = (now, totals)
-    if last is None or now - last[0] > RECENT:
-        return {k: float(v["avg10"]) for k, v in lines.items()}, "10 s"
-    span = now - last[0]
-    return {k: max(0.0, totals[k] - last[1].get(k, totals[k])) / (span * 1e4) for k in totals}, f"{span:.0f} s"
+        _stalls.clear()
+        _settled = time.monotonic()
+
+
+@contextlib.contextmanager
+def keeping():
+    """While an engine is serialized into RAM: the stalls that causes (the kernel reclaiming file cache for
+    it) aren't weighed, during it or in any window it's in."""
+    global _keeping
+    with _stalls_lock:
+        _keeping += 1
+    try:
+        yield
+    finally:
+        with _stalls_lock:
+            _keeping -= 1
+        _settle()
+
+
+def _stalled():
+    """Linux: (the % of a window in which some task waited on memory, its seconds), or None if there's no
+    window to judge by yet. The window is the last WINDOW seconds of looks since this module last kept or
+    dropped an engine; before there are that many, the kernel's own 10-second average if that has none of
+    it either, else nothing. Raises OSError on a kernel without pressure stall information."""
+    with open("/proc/pressure/memory") as f:
+        some = next(dict(kv.split("=") for kv in line.split()[1:]) for line in f if line.startswith("some"))
+    now, total = time.monotonic(), float(some["total"])
+    with _stalls_lock:
+        if _keeping:
+            return None
+        _stalls.append((now, total))
+        while len(_stalls) > 1 and now - _stalls[1][0] >= WINDOW:  # the newest look that's a window old is the base
+            _stalls.popleft()
+        when, base = _stalls[0]
+        clean = now - _settled
+    if now - when >= WINDOW:
+        return (total - base) / ((now - when) * 1e4), now - when
+    return (float(some["avg10"]), 10.0) if clean >= WINDOW else None
 
 
 def _pressure() -> str:
@@ -105,9 +134,9 @@ def _pressure() -> str:
     try:
         if sys.platform.startswith("linux"):
             try:
-                shares, span = _stall_shares()
-                if shares.get("full", 0.0) >= PRESSURE_FULL or shares.get("some", 0.0) >= PRESSURE_SOME:
-                    return f"tasks waited on memory {shares.get('some', 0.0):.0f}% of the last {span}"
+                verdict = _stalled()
+                if verdict is not None and verdict[0] >= PRESSURE_SOME:
+                    return f"tasks waited on memory {verdict[0]:.0f}% of the last {verdict[1]:.0f} s"
                 return ""
             except OSError:  # a kernel without it: swapping out at all says so
                 with open("/proc/vmstat") as f:
@@ -224,6 +253,7 @@ def room(nbytes: int, key: str = None) -> bool:
             del entry
     if dropped:
         _give_back()
+        _settle()
     return supply >= nbytes
 
 
@@ -236,11 +266,13 @@ def put(key: str, entry: Kept):
         if _watcher is None:
             _watcher = threading.Thread(target=_watch, name="trt-refits", daemon=True)
             _watcher.start()
+    _settle()
 
 
 def trim() -> int:
     """Drops the engines whose checkpoint is gone, and the least recently used one if the system says it's
-    short of memory (once a look: the OS's signal follows what's freed). Returns how many it dropped."""
+    short of memory (one, then a new window: the OS's signal has to follow what was freed). Returns how
+    many it dropped."""
     dropped = 0
     with _lock:
         for key in [k for k, entry in _kept.items() if entry.orphaned]:
@@ -256,6 +288,7 @@ def trim() -> int:
             del entry
     if dropped:
         _give_back()
+        _settle()
     return dropped
 
 

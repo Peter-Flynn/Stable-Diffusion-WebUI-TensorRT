@@ -33,7 +33,7 @@ HELP = """
 
 **SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engines of the loaded checkpoint's architecture, `Speed Hacks` uses them with Speed Hacks, `None` always uses PyTorch.
 
-**The VAE** gets engines too, for its decoder and its encoder, built with the UNet's for the sizes its profiles cover, in the precision reForge runs the VAE in where the GPU has BF16, and in FP16 where reForge falls back to FP32 for want of it: half the VRAM (a `--vae-in-*` flag at build time decides otherwise). FP16 engines run the VAE scaled down by a power of two between its normalizations, so no VAE overflows in them, and any VAE of the architecture runs on them. Each decode runs on them whole when there can be room for it (reForge's manager makes it, a UNet engine going last), several images at a time where that takes no UNet engine's room. Larger ones (a Hires. fix's) run in strips on engines of their own: the same image, a bit slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines the same way, whole or in strips. PyTorch does the rest.
+**The VAE** gets engines too, for its decoder and its encoder, built with the UNet's for the sizes its profiles cover. Those that take a whole image run in the precision reForge runs the VAE in (BF16 where the GPU has it, else FP32). Larger decodes (a Hires. fix's) run in strips on engines of their own, in FP16 on GPUs without BF16: half the VRAM, the VAE scaled down by a power of two between its normalizations so none overflows there. A decode takes the first way there can be room for: whole beside the UNet engine, in strips beside it, then either with the UNet engine evicted. It's the same image either way. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines the same way. PyTorch does the rest.
 
 **Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and, late in a pass, wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). The first 30% and last 5% of steps run in full, so composition and detail stay close (both shares are in Settings, Stable Diffusion, TensorRT). Passes of 12 steps or more should run roughly 1.6x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
 """
@@ -222,7 +222,7 @@ def _vae_status(arch) -> str:
         record = vae_mod.record_for(arch.id, vae) if vae is not None and not vae_mod.unsupported(vae) else None
         if record is None:
             return ""
-        text = f"**VAE engines:** {vae_mod.label(record.meta['dtype'])}; decodes up to {record.reach()}"
+        text = f"**VAE engines:** {vae_mod.precisions(record.dtype, record.strips_dtype)}; decodes up to {record.reach()}"
         if record.encoder is not None:
             text += f"; encodes up to {record.encode_reach()}"
         return text + "."
@@ -483,10 +483,10 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
     if result.get("vae") is not None:
         vae_record = result["vae"]
         message += (
-            f"\n\nBuilt the VAE's engines, in {vae_mod.label(vae_record.meta['dtype'])}, for decodes up to {vae_record.reach()}: "
+            f"\n\nBuilt the VAE's engines, in {vae_mod.precisions(vae_record.dtype, vae_record.strips_dtype)}, for decodes up to {vae_record.reach()}: "
             "decodes run on them whole whenever there can be room, else in strips, with what doesn't fit held in RAM."
             if vae_record.strips else
-            f"\n\nBuilt the VAE's engines, in {vae_mod.label(vae_record.meta['dtype'])}, for decodes up to {vae_record.reach()}: "
+            f"\n\nBuilt the VAE's engines, in {vae_mod.precisions(vae_record.dtype, vae_record.strips_dtype)}, for decodes up to {vae_record.reach()}: "
             "decodes run on them whenever there can be room."
         )
         if vae_record.meta.get("strips_error"):
