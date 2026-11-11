@@ -628,7 +628,7 @@ def needs_build(arch, profiles: list, vae=None) -> str:
     except Exception as e:
         log(f"Could not check the VAE's engines: {e}")
         return ""
-    only_encoder = any(all(part in ENCODER for part in parts) for parts in lacking)
+    only_encoder = any(all(part in ENCODER or part.startswith(ENCODE_STRIP) for part in parts) for parts in lacking)
     what = "VAE encoder" if only_encoder else "VAE decoder and encoder" if enc_wanted else "VAE decoder"
     return f"the {what}, in {label(dtype_name(dtype))}"
 
@@ -665,9 +665,10 @@ def _strips_wanted(vae, profiles: list, cfg: dict, dtype, encoding: bool = False
 
 
 def _missing(record: Record, shapes: dict, strip_wanted: dict, enc_wanted: dict = None) -> list:
-    """The parts (PRE, POST, the ENCODER's two together, kind names) a record lacks for these shapes. A post
-    or encoder engine that had to be built smaller than asked counts as built (its "asked"), and so do the
-    encoder's or the kinds' whose build failed for these shapes."""
+    """The parts (PRE, POST, the ENCODER's two together, the decode in strips' kind names, the encode's
+    prefixed ENCODE_STRIP) a record lacks for these shapes. A post or encoder engine that had to be built
+    smaller than asked counts as built (its "asked"), and so do the encoder's or the kinds' whose build
+    failed for these shapes."""
     meta = record.meta
     out = []
     if not _covers(meta["shapes"], {PRE: shapes[PRE]}):
@@ -677,16 +678,16 @@ def _missing(record: Record, shapes: dict, strip_wanted: dict, enc_wanted: dict 
     if enc_wanted is not None:
         have = record.encoder
         built = have is not None and have.get("digest") == enc_wanted["digest"] and _covers(have.get("asked", have["shapes"]), enc_wanted["shapes"])
-        if built:  # and its strips, or a failed build of them for these shapes
+        tried = meta.get("encoder_asked") if meta.get("encoder_error") else None
+        if built:  # its strips' kinds, unless built or their build failed for these shapes
             kinds = have.get("strips") or {}
             failed = have.get("strips_asked") if have.get("strips_error") else None
-            built = all(
-                (name in kinds and _covers({name: kinds[name]["shapes"]}, {name: wanted}))
-                or (failed and name in failed and _covers({name: failed[name]}, {name: wanted}))
-                for name, wanted in enc_wanted["strips"].items()
-            )
-        tried = meta.get("encoder_asked") if meta.get("encoder_error") else None
-        if not built and not (tried and tried.get("digest") == enc_wanted["digest"] and _covers(tried["shapes"], enc_wanted["shapes"])):
+            out += [
+                ENCODE_STRIP + name for name, wanted in enc_wanted["strips"].items()
+                if not (name in kinds and _covers({name: kinds[name]["shapes"]}, {name: wanted}))
+                and not (failed and name in failed and _covers({name: failed[name]}, {name: wanted}))
+            ]
+        elif not (tried and tried.get("digest") == enc_wanted["digest"] and _covers(tried["shapes"], enc_wanted["shapes"])):
             out += list(ENCODER)
     failed = meta.get("strips_asked") if meta.get("strips_error") else None
     for name, kind_shapes in strip_wanted.items():
@@ -1001,14 +1002,20 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         asked = shapes_for(profiles, cfg, dtype, vram)
         strip_wanted = _strips_wanted(vae, profiles, cfg, dtype)
         enc_wanted = _encoder_wanted(vae, profiles, dtype, vram)
-        everything = [PRE, POST] + (list(ENCODER) if enc_wanted else []) + list(strip_wanted)
+        enc_kinds = [ENCODE_STRIP + k for k in enc_wanted["strips"]] if enc_wanted else []
+        everything = [PRE, POST] + (list(ENCODER) if enc_wanted else []) + enc_kinds + list(strip_wanted)
         old = next(iter(_matching(arch.id, vae, dtype)), None)
         todo = _missing(old, asked, strip_wanted, enc_wanted) if old is not None else list(everything)
         if old is not None and old.meta.get("strips_error"):  # building anyway: try those again
             todo += [k for k in strip_wanted if k not in old.strips and k not in todo]
         if old is not None and old.meta.get("encoder_error") and enc_wanted and ENCODE_PRE not in todo:
             todo += list(ENCODER)
-        kinds_todo = [k for k in todo if k not in (PRE, POST) + ENCODER]
+        if old is not None and enc_wanted and (old.encoder or {}).get("strips_error"):  # likewise
+            todo += [k for k in enc_kinds if k[len(ENCODE_STRIP):] not in old.encoder_strips and k not in todo]
+        if ENCODE_PRE in todo:  # new encoder engines: the kinds for encoding in strips with them, all of them
+            todo += [k for k in enc_kinds if k not in todo]
+        enc_kinds_todo = [k[len(ENCODE_STRIP):] for k in todo if k.startswith(ENCODE_STRIP)]
+        kinds_todo = [k for k in todo if k not in (PRE, POST) + ENCODER and not k.startswith(ENCODE_STRIP)]
         shapes = {PRE: asked[PRE], POST: asked[POST]}
         post_asked = asked[POST]
         if old is not None:
@@ -1028,7 +1035,8 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             b, _, h, w = enc_wanted["shapes"][ENCODE_PRE]["image"][2]
             if (h, w) != (wanted_h, wanted_w):
                 cause = _encoder_excess(enc_wanted["config"], 1, wanted_h, wanted_w, _budget(dtype, vram))[1]
-                log(f"The VAE encoder's engines go up to {w}x{h} ({b} at a time), not the profiles' {wanted_w}x{wanted_h}: {_why(cause, dtype, vram, 'encode')}. Larger encodes run on PyTorch.")
+                further = "in strips" if enc_wanted["strips"] else "on PyTorch"
+                log(f"The VAE encoder's engines go up to {w}x{h} ({b} at a time), not the profiles' {wanted_w}x{wanted_h}: {_why(cause, dtype, vram, 'encode')}. Larger encodes run {further}.")
         if old is not None and sorted(todo) != sorted(everything):
             log(f"Keeping the VAE engines that cover these sizes; building {len(todo)} of {len(everything)}.")
         if progress:
@@ -1038,15 +1046,15 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             graphs.update(export_onnx(vae, work, dtype, device))
         if ENCODE_PRE in todo:
             graphs.update({part: names for part, names in export_encoder_onnx(vae, work, dtype, device).items() if part in ENCODER})
-            if enc_wanted["strips"]:
-                graphs.update(export_strips(vae, work, dtype, device, list(enc_wanted["strips"]), encoding=True))
+        if enc_kinds_todo:
+            graphs.update(export_strips(vae, work, dtype, device, enc_kinds_todo, encoding=True))
         if kinds_todo:
             graphs.update(export_strips(vae, work, dtype, device, kinds_todo))
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()  # the trace's VRAM back to the driver, for the builder's process
         built, done, tries = {}, 0, 0
-        total = len(todo) + (len(enc_wanted["strips"]) if ENCODE_PRE in todo else 0)  # engines to build
+        total = len(todo)  # engines to build
 
         def job(part, plan_shapes):
             onnx_name = f"strip-{part}" if part in kinds_todo else part if part.startswith(ENCODE_STRIP) else f"vae_{part}"
@@ -1131,7 +1139,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                 log(f"TensorRT found no kernels with the VRAM to spare at the largest size; trying again up to {w}x{h} ({b} at a time).")
             if enc_error:
                 done = len([p for p in todo if p in (PRE, POST) + ENCODER])
-                total -= len(enc_wanted["strips"])
+                total -= len(enc_kinds_todo)
                 log(f"Building the VAE encoder's engines failed ({enc_error}); it encodes on PyTorch.")
             else:
                 enc_meta = {
@@ -1144,10 +1152,17 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                     "stripped": {part: built[part]["stripped"] for part in ENCODER},
                     "strips": {},
                 }
-                kinds = enc_wanted["strips"]  # the encode in strips' (a failure leaves encodes whole only)
-                enc_meta["strips"], error = build_kinds(kinds, ENCODE_STRIP, "encoding")
-                if error:
+        if enc_meta is not None:  # the encode in strips' kinds: those kept that are wanted, and those it lacks
+            kinds = enc_wanted["strips"]
+            enc_meta = dict(enc_meta, strips={k: v for k, v in (enc_meta.get("strips") or {}).items() if k in kinds and k not in enc_kinds_todo})
+            if enc_kinds_todo:
+                enc_meta.pop("strips_error", None)
+                enc_meta.pop("strips_asked", None)
+                got, error = build_kinds({k: kinds[k] for k in enc_kinds_todo}, ENCODE_STRIP, "encoding")
+                if error:  # encodes run whole only: one in strips needs every kind
                     enc_meta.update(strips={}, strips_error=error, strips_asked=kinds)
+                else:
+                    enc_meta["strips"].update(got)
         strip_meta = {k: v for k, v in old.strips.items() if k in strip_wanted and k not in todo} if old is not None else {}
         built_kinds, strips_error = build_kinds({name: strip_wanted[name] for name in kinds_todo}, "", "decoding")
         strip_meta.update(built_kinds)
