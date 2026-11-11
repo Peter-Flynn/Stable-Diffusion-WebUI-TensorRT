@@ -24,9 +24,10 @@ from dataclasses import dataclass
 from .common import gib, log
 
 INTERVAL = 2.0  # seconds between looks at the OS's memory pressure, while engines are kept
-# Linux: the share of the last 10 seconds in which some task waited on memory (or all did) that counts as
-# the system being short of it (the kernel's own averages, /proc/pressure/memory)
+# Linux: the share (%) of the time since the last look in which some task waited on memory (or all did) that
+# counts as the system being short of it, from the kernel's stall totals (/proc/pressure/memory)
 PRESSURE_SOME, PRESSURE_FULL = 10.0, 1.0
+RECENT = 10.0  # seconds: a last look older than this is too long ago to compare with; the kernel's 10 s average stands in
 
 
 @dataclass
@@ -77,6 +78,29 @@ def _supply():
 
 _swapped = None  # Linux without pressure stall information: pages swapped out, at the last look
 _windows_signal = None  # Windows: the low-memory notification's handle
+_stalls = None  # Linux: (when, {"some": microseconds tasks waited on memory in all, "full": ...}) at the last look
+_stalls_lock = threading.Lock()
+
+
+def _stall_shares() -> tuple:
+    """Linux: ({"some": %, "full": %} of the time some task waited on memory, and all did, since the last
+    look, from the kernel's totals; the span that is, for the log). Without a look in the last RECENT
+    seconds (or within half a second), the kernel's own average over the last 10 s. Raises OSError on a
+    kernel without pressure stall information. Unlike that average, which takes 10 s to forget a spike,
+    this follows what was freed by the next look."""
+    global _stalls
+    with open("/proc/pressure/memory") as f:
+        lines = {parts[0]: dict(kv.split("=") for kv in parts[1:]) for parts in (line.split() for line in f) if parts}
+    now, totals = time.monotonic(), {k: float(v["total"]) for k, v in lines.items()}
+    with _stalls_lock:
+        last = _stalls
+        if last is not None and now - last[0] < 0.5:
+            return {k: float(v["avg10"]) for k, v in lines.items()}, "10 s"
+        _stalls = (now, totals)
+    if last is None or now - last[0] > RECENT:
+        return {k: float(v["avg10"]) for k, v in lines.items()}, "10 s"
+    span = now - last[0]
+    return {k: max(0.0, totals[k] - last[1].get(k, totals[k])) / (span * 1e4) for k in totals}, f"{span:.0f} s"
 
 
 def _pressure() -> str:
@@ -85,10 +109,9 @@ def _pressure() -> str:
     try:
         if sys.platform.startswith("linux"):
             try:
-                with open("/proc/pressure/memory") as f:
-                    avg = {line.split()[0]: float(line.split()[1].split("=")[1]) for line in f}
-                if avg.get("full", 0.0) >= PRESSURE_FULL or avg.get("some", 0.0) >= PRESSURE_SOME:
-                    return f"tasks waited on memory {avg.get('some', 0.0):.0f}% of the last 10 s"
+                shares, span = _stall_shares()
+                if shares.get("full", 0.0) >= PRESSURE_FULL or shares.get("some", 0.0) >= PRESSURE_SOME:
+                    return f"tasks waited on memory {shares.get('some', 0.0):.0f}% of the last {span}"
                 return ""
             except OSError:  # a kernel without it: swapping out at all says so
                 with open("/proc/vmstat") as f:

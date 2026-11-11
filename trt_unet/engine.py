@@ -71,6 +71,7 @@ class Logger(trt.ILogger):
 
 LOGGER = Logger()
 _runtime = None
+_set_aside = []  # a runtime with PyTorch's allocator that an engine failed to load on (_deserialize), kept alive
 
 
 class _LayerTimes(trt.IProfiler):
@@ -104,6 +105,29 @@ def runtime():
         _runtime = trt.Runtime(LOGGER)
         gpu.attach(_runtime)  # before anything is deserialized
     return _runtime
+
+
+def _deserialize(plan, owner):
+    """The engine in `plan`, or None if TensorRT can't load it. One that fails with PyTorch's allocator before
+    any engine loaded with it, and not for want of VRAM, is tried on a runtime with TensorRT's own allocator:
+    if it loads there, that runtime is used from now on (gpu.retire); if not, the allocator wasn't why."""
+    global _runtime
+    before = gpu.failures()
+    with gpu.owner(owner):
+        engine = runtime().deserialize_cuda_engine(plan)
+    if engine is not None:
+        if gpu.attached():
+            gpu.proven()
+        return engine
+    if not gpu.suspect(before):
+        return None
+    own = trt.Runtime(LOGGER)
+    engine = own.deserialize_cuda_engine(plan)
+    if engine is not None:
+        _set_aside.append(_runtime)
+        _runtime = own
+        gpu.retire()
+    return engine
 
 
 @atexit.register
@@ -206,13 +230,7 @@ class Engine:
         if plan is None:
             with open(self.plan_path, "rb") as f:
                 plan = f.read()
-        with gpu.owner(self.owner):
-            self.engine = runtime().deserialize_cuda_engine(plan)
-        if self.engine is None and gpu.give_back(runtime()):  # the allocator could be why: once more without it
-            LOGGER.clear()
-            self.engine = runtime().deserialize_cuda_engine(plan)
-        if self.engine is not None and gpu.attached():
-            gpu.proven()
+        self.engine = _deserialize(plan, self.owner)
         if self.engine is None:
             said = " | ".join(LOGGER.messages) or "nothing"
             other = other_tensorrt()

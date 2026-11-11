@@ -29,6 +29,7 @@ _peaks = {}  # owner -> the most it held since its peak was reset
 _owners = []  # stack: whose allocations TensorRT is making now (None: nobody's in particular)
 _failures = 0  # allocations PyTorch couldn't satisfy, counted
 _allocator = None
+_retired = None  # the allocator of a runtime set aside (retire), kept alive with it
 
 
 def _pointer(memory) -> int:
@@ -167,18 +168,25 @@ def proven():
     _proven = True
 
 
-def give_back(runtime) -> bool:
-    """When an engine fails to load before any ever loaded with PyTorch's allocator (which could be the
-    reason: TensorRT's bindings taking addresses otherwise than the documentation says): gives TensorRT its
-    own allocator back for good, freeing what the failed load was given. Returns whether it did."""
-    global _allocator
-    if _allocator is None or _proven:
-        return False
-    try:
-        runtime.gpu_allocator = None
-    except Exception as e:
-        log(f"Could not give TensorRT its own allocator back: {e}")
-        return False
+def failures() -> int:
+    """Allocations PyTorch couldn't satisfy, so far."""
+    with _lock:
+        return _failures
+
+
+def suspect(failures_before: int) -> bool:
+    """Whether an engine that just failed to load could have failed for PyTorch's allocator: no engine has
+    loaded with it yet (TensorRT's bindings could be taking addresses otherwise than their documentation
+    says), and none of its allocations failed since `failures_before` (running out of VRAM isn't its doing,
+    and loading again with more room is what fixes that)."""
+    return _allocator is not None and not _proven and failures() == failures_before
+
+
+def retire():
+    """An engine that failed to load with PyTorch's allocator loaded on a runtime with TensorRT's own, which
+    is used from now on (engine.py): what the failed load was given is freed, and the ledger counts from the
+    driver from now on (see loading)."""
+    global _allocator, _retired
     with _lock:
         entries = list(_live.values())
         _live.clear()
@@ -186,9 +194,8 @@ def give_back(runtime) -> bool:
     torch.cuda.synchronize()
     for base, _, _ in entries:
         torch.cuda.caching_allocator_delete(base)
-    _allocator = None
-    log("TensorRT failed to load an engine with PyTorch's allocator, so it allocates its own GPU memory from now on.")
-    return True
+    _retired, _allocator = _allocator, None
+    log("An engine failed to load with PyTorch's allocator and loaded with TensorRT's own, so TensorRT allocates its own GPU memory from now on.")
 
 
 @contextlib.contextmanager
@@ -208,12 +215,6 @@ def held(name) -> int:
     """Bytes `name` holds of TensorRT's allocations now."""
     with _lock:
         return _held.get(name, 0)
-
-
-def total() -> int:
-    """Bytes TensorRT holds, everyone's."""
-    with _lock:
-        return sum(_held.values())
 
 
 @contextlib.contextmanager

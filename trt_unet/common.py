@@ -88,6 +88,12 @@ def reserve() -> int:
         return 0
 
 
+def free(device) -> int:
+    """VRAM free beside the reserve, as reForge counts it (PyTorch's unused cache included, which TensorRT
+    allocates from too)."""
+    return mm().get_free_memory(device) - reserve()
+
+
 def obtainable(device, keep=()) -> int:
     """The most VRAM making room could give: what's free now (PyTorch's unused cache included, which
     TensorRT allocates from too), and what every loaded model but those in `keep` holds."""
@@ -100,12 +106,38 @@ def obtainable(device, keep=()) -> int:
     return m.get_free_memory(device) + held
 
 
+def register(model):
+    """Has reForge's manager hold `model` as loaded and the most recently used, as load_models_gpu does but
+    without the room that makes first by its own estimate (1.3 times the model's size, and at least its
+    minimum for inference, 0.8 GiB beside the reserve): an engine model makes exactly the room it needs as it
+    loads, and as it runs. Raises what loading it raises, holding nothing then."""
+    m = mm()
+    if not hasattr(m, "LoadedModel"):  # a reForge without it: its own way
+        m.load_models_gpu([model])
+        return
+    entry = next((lm for lm in m.current_loaded_models if lm.model is model), None)
+    if entry is not None:
+        m.current_loaded_models.remove(entry)
+        if getattr(entry, "model_finalizer", None) is not None:
+            entry.model_finalizer.detach()  # model_load makes a new one
+            entry.model_finalizer = None
+    else:
+        entry = m.LoadedModel(model)
+    entry.model_load()
+    entry.currently_used = True
+    m.current_loaded_models.insert(0, entry)
+
+
 def make_room(nbytes: int, device, keep_loaded=()) -> int:
     """Has reForge's manager evict models (least recently used first; engines last, see runtime.py) until
     `nbytes` are free beside the reserve. Returns what's free then, beside the reserve."""
+    from . import gpu
+
     m = mm()
     with torch.inference_mode():  # models unloaded outside it are left unusable (see inference_mode)
         m.free_memory(nbytes + reserve(), device, keep_loaded=list(keep_loaded))
+    if not gpu.attached():  # TensorRT allocates from the driver: what PyTorch has cached isn't free to it
+        torch.cuda.empty_cache()
     return m.get_free_memory(device) - reserve()
 
 
@@ -184,11 +216,15 @@ def _ours() -> str:
 
 
 def _ram() -> str:
+    """The RAM the system could hand over without paging anything out, as the engines kept in RAM count it
+    (refits._supply), of all there is."""
     try:
         import psutil
 
-        ram = psutil.virtual_memory()
-        return f"RAM {gib(ram.available)} available of {gib(ram.total)}"
+        from . import refits
+
+        supply = refits._supply()
+        return f"RAM {gib(supply) if supply is not None else 'unreadable'} to spare of {gib(psutil.virtual_memory().total)}"
     except Exception as e:
         return f"RAM unreadable ({type(e).__name__}: {e})"
 

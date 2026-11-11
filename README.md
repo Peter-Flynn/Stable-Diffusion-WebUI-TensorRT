@@ -58,14 +58,15 @@ reForge's FP32, at half the VRAM (a `--vae-in-*` flag at build time overrides ei
 why reForge avoids it; the engines run the VAE scaled down by a power of two between its normalizations, where that
 changes nothing but the range, so any VAE of the architecture runs on them without NaNs. A decode runs on them whole
 whenever reForge can make room for it, which it does like for any model (a UNet engine goes last, only if that makes
-the room). Larger decodes (a Hires. fix's) run in horizontal strips on engines built for that, with all the room
-there can be: the same image, a little slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled
+the room). Larger decodes (a Hires. fix's) run in horizontal strips on engines built for that, with exactly the room
+the fastest plan there can be room for takes: the same image, a little slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled
 one) run on the encoder's engines the same way: whole when there can be room, else in strips. PyTorch does anything
 else.
 
 **Memory.** Everything TensorRT holds in VRAM comes from PyTorch's allocator, so reForge counts it like any model's,
 and every size used to make room is exact: what each engine held when it last loaded, TensorRT's own activation sizes,
-and the tensors between them. The only margin is reForge's own reserve (`--reserve-vram`). Set
+and the tensors between them. Engine models don't take the room reForge makes for a model by its own estimate either.
+The only margin is reForge's own reserve (`--reserve-vram`). Set
 `TRT_EXTENSION_TORCH_ALLOCATOR=0` to leave TensorRT on its own allocator.
 
 > [!NOTE]

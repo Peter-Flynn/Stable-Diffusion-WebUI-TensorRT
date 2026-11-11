@@ -582,7 +582,7 @@ class Pass:
             model.weights = self.weights
             model.want_shallow = model.want_shallow or (self.schedule is not None and model.hacks is not None and not model.shallow_failed)
             with torch.inference_mode(), _keeping(self.patcher):
-                common.mm().load_models_gpu([model])
+                common.register(model)  # it makes exactly its room as it loads
             self.model = model
             # Other loads mid-pass (e.g. a live preview's decoder) unload other models first: unloading
             # the engine would mean reloading it on the next step, the UNet would lose its patches.
