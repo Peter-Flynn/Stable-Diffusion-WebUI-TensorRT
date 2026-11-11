@@ -67,9 +67,6 @@ MAX_BATCH = 16  # images per engine call, at most
 # decode or encode that overflows anyway raises it by EXPONENT_STEP for that VAE's decoder or encoder, up
 # to EXPONENT_MAX; past that, it runs on PyTorch.
 EXPONENT, EXPONENT_STEP, EXPONENT_MAX = 6, 3, 12
-# The scaled graphs' version, in a record's "scaled": 2, each GroupNorm PyTorch's own entirely in FP32. Engines
-# of an older one (True: the GroupNorm's scale and shift after a cast inside its sequence) are built again.
-SCALED = 2
 
 
 # --- Which VAEs
@@ -447,12 +444,7 @@ class Record:
     @property
     def scaled(self) -> bool:
         """Whether the engines run the decoder scaled (FP16 ones do: their graphs take the scale)."""
-        return self.meta.get("scaled") == SCALED
-
-    @property
-    def stale(self) -> bool:
-        """Scaled engines of an older graph: built again rather than run."""
-        return bool(self.meta.get("scaled")) and not self.scaled
+        return bool(self.meta.get("scaled"))
 
     @property
     def loadable(self) -> bool:
@@ -559,11 +551,6 @@ def records(arch_id: str) -> list:
             with open(path, encoding="utf-8") as f:
                 meta = json.load(f)
             r = Record(path[: -len(".json")], meta)
-            if r.stale:
-                if r.base not in _told:
-                    _told.add(r.base)
-                    log("The VAE's FP16 engines were built with an older graph; build again in the TensorRT tab to replace them.")
-                continue
             if meta.get("vae_format") == FORMAT and r.loadable and all(os.path.isfile(r.plan(p)) for p in (PRE, POST)):
                 if not all(os.path.isfile(r.strip_plan(k)) for k in r.strips):
                     meta["strips"] = {}  # decodes on the post engine only; the tab asks to build them again
@@ -711,18 +698,22 @@ class _Scale:
 
 
 def _scaled_norm(norm, holder: _Scale):
-    """A GroupNorm's forward on a scaled tensor: all of it in FP32 (its scale and shift too, `norm` being
-    FP32), on its input divided by the scale, then cast back. FP32 has the range for the values as the VAE
-    makes them, their squares included, and so the GroupNorm's epsilon is added to the variance it was meant
-    for (to a scaled one, it would be thousands of times too large).
+    """A GroupNorm's forward on a scaled tensor: in FP32 on its input divided by the scale, then the scale and
+    shift in the tensor's own precision. FP32 has the range for the values as the VAE makes them, their
+    squares included, and so the GroupNorm's epsilon is added to the variance it was meant for (to a scaled
+    one, it would be thousands of times too large).
 
-    The GroupNorm itself is PyTorch's own: it exports as the sequence the FP32 engines' GroupNorms are
-    (Reshape, InstanceNormalization, Reshape, Mul, Add), with nothing inside it; the casts and the division
-    come before and after."""
+    Cast to FP32, normalized, cast back: TensorRT's way to have a normalization accumulate in FP32 in an FP16
+    network, which its builder fuses into the normalization's kernels, so no FP32 copy of the tensor is held.
+    Keep that sequence as it is: anything else in FP32 between the casts (the scale and shift, say) breaks
+    the fusion, and at a large decode's sizes the FP32 tensors that leaves don't fit (no engine builds)."""
 
     def forward(x):
-        normed = torch.nn.functional.group_norm(x.float() / holder.value.float(), norm.num_groups, norm.weight, norm.bias, norm.eps)
-        return normed.to(x.dtype)
+        flat = (x.float() / holder.value.float()).reshape(x.shape[0], norm.num_groups, -1)
+        one = torch.ones(norm.num_groups, device=x.device)  # given, the exporter needn't know the reshape's sizes
+        zero = torch.zeros(norm.num_groups, device=x.device)
+        normed = torch.nn.functional.instance_norm(flat, weight=one, bias=zero, eps=norm.eps).reshape_as(x).to(x.dtype)
+        return normed * norm.weight.unsqueeze(-1).unsqueeze(-1) + norm.bias.unsqueeze(-1).unsqueeze(-1)
 
     return forward
 
@@ -736,7 +727,6 @@ def scale_decoder(module) -> _Scale:
     holder = _Scale()
     for m in module.modules():
         if isinstance(m, torch.nn.GroupNorm):
-            m.float()  # its scale and shift, as the engines take them (a refit gives them in FP32)
             m.forward = _scaled_norm(m, holder)
         elif all(hasattr(m, part) for part in ("norm1", "conv1", "norm2", "conv2")):
             for conv in (m.conv1, m.conv2):
@@ -1179,7 +1169,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             "arch_id": arch.id,
             "digest": digest(vae),
             "dtype": dtype_name(dtype),
-            "scaled": SCALED if scaled(dtype) else False,
+            "scaled": scaled(dtype),
             "config": cfg,
             "shapes": shapes,
             "asked": {PRE: shapes[PRE], POST: post_asked},  # what they were built for: the shapes, unless TensorRT had to go smaller
