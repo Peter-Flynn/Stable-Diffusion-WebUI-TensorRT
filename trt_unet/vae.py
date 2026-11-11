@@ -27,9 +27,9 @@ RAM what doesn't fit in VRAM; else reForge's own decode. The engines never take 
 The encoder (an img2img's or an inpaint's image, a Hires. fix's upscaled one) runs the same three parts
 the other way round: an "encode-pre" engine from the image down to its mid-block attention's queries,
 keys and values, that attention on PyTorch, and an "encode-post" engine for the rest, whose output
-reForge's own code makes the latent of. An encode that doesn't fit in the VRAM free whole runs in tiles,
-the way reForge's own encode does when it runs out of VRAM (its tiling and blending, with the engines
-encoding each tile, in tiles as large as fit); failing that, on PyTorch.
+reForge's own code makes the latent of. An encode there can't be room for whole runs in strips (strips.py's
+Encode, on engines of its own) up to the mid block's attention, which with its GroupNorm and its queries, keys
+and values runs on PyTorch at the latent's size, then the encode-post engine; failing that, on PyTorch.
 
 Engines live in models/Unet-trt/<UNet architecture id>/vae/, built with that architecture's UNet engines
 for the sizes its profiles cover."""
@@ -56,10 +56,8 @@ FORMAT = 1
 PRE, POST = "pre", "post"
 ENCODE_PRE, ENCODE_POST = "encode-pre", "encode-post"
 ENCODER = (ENCODE_PRE, ENCODE_POST)
+ENCODE_STRIP = "encode-strip-"  # an encode in strips' kind's engine: its ONNX graph's and plan's names start so
 MAX_BATCH = 16  # images per engine call, at most
-TILES = (2048, 1536, 1024, 768, 512)  # tile sizes for an encode in tiles: the largest that fits (reForge's own are 512)
-TILE_OVERLAP = 64  # reForge's, in pixels
-SMALLEST = 64  # the encoder engines' smallest image side: no more than the least of a tile reForge's tiling leaves at an edge (its overlap and 8)
 # FP16 engines scale the decoder and the encoder by 2^-EXPONENT. FP16 holds magnitudes up to 2^16 in steps no finer than
 # 2^-24, so a tensor keeps FP16's precision scaled down until its typical value nears 2^-13 (measured: a
 # decoder whose tensors are around 0.5 decodes as closely scaled by anything from 1 to 2^-12). At 6,
@@ -67,6 +65,9 @@ SMALLEST = 64  # the encoder engines' smallest image side: no more than the leas
 # decode or encode that overflows anyway raises it by EXPONENT_STEP for that VAE's decoder or encoder, up
 # to EXPONENT_MAX; past that, it runs on PyTorch.
 EXPONENT, EXPONENT_STEP, EXPONENT_MAX = 6, 3, 12
+# The scaled graphs' version, in a record's "scaled": 2, each GroupNorm PyTorch's own entirely in FP32. Engines
+# of an older one (True: the GroupNorm's scale and shift after a cast inside its sequence) are built again.
+SCALED = 2
 
 
 # --- Which VAEs
@@ -374,12 +375,13 @@ def _encoder_excess(cfg: dict, b: int, h: int, w: int, budget) -> tuple:
 
 def encoder_shapes(profiles: list, cfg: dict, dtype=None, vram=None, share: float = 1.0) -> dict:
     """The encoder engines' input shapes for the sizes a list of profiles covers, as shapes_for: the image
-    up to the largest of them (capped so an encode fits TensorRT's limit for a tensor and could run at all
-    on this GPU), from SMALLEST, so an encode in tiles can give them any tile; and what the mid block takes
-    at an 8th of that."""
+    from the smallest of them to the largest (capped so an encode fits TensorRT's limit for a tensor and
+    could run at all on this GPU); and what the mid block takes at an 8th of that, up to the largest's
+    whatever the image's cap (an encode in strips gives the post engine that)."""
     budget = _budget(dtype, vram, share)
-    lo_h = lo_w = SMALLEST
+    lo_h, lo_w = min(p.height[0] for p in profiles) // 8 * 8, min(p.width[0] for p in profiles) // 8 * 8
     hi_h, hi_w = max(p.height[2] for p in profiles) // 8 * 8, max(p.width[2] for p in profiles) // 8 * 8
+    full_h, full_w = hi_h, hi_w
     hi_h, hi_w = _shrunk(hi_h, hi_w, lambda h, w: _encoder_excess(cfg, 1, h, w, budget)[0], 8)
     fits = TENSOR_LIMIT // encoder_largest(cfg, 1, hi_h, hi_w)
     if budget is not None:
@@ -388,7 +390,7 @@ def encoder_shapes(profiles: list, cfg: dict, dtype=None, vram=None, share: floa
     lo_h, lo_w = min(lo_h, hi_h), min(lo_w, hi_w)
     opt_h, opt_w = min(max(profiles[0].height[1] // 8 * 8, lo_h), hi_h), min(max(profiles[0].width[1] // 8 * 8, lo_w), hi_w)
     c = cfg["mid_channels"]
-    mid = [[1, c, lo_h // 8, lo_w // 8], [1, c, opt_h // 8, opt_w // 8], [batch, c, hi_h // 8, hi_w // 8]]
+    mid = [[1, c, lo_h // 8, lo_w // 8], [1, c, opt_h // 8, opt_w // 8], [batch, c, full_h // 8, full_w // 8]]
     image = [[1, cfg["in_channels"], lo_h, lo_w], [1, cfg["in_channels"], opt_h, opt_w], [batch, cfg["in_channels"], hi_h, hi_w]]
     return {ENCODE_PRE: {"image": image}, ENCODE_POST: {"x": mid, "attention": [list(shape) for shape in mid]}}
 
@@ -443,7 +445,12 @@ class Record:
     @property
     def scaled(self) -> bool:
         """Whether the engines run the decoder scaled (FP16 ones do: their graphs take the scale)."""
-        return bool(self.meta.get("scaled"))
+        return self.meta.get("scaled") == SCALED
+
+    @property
+    def stale(self) -> bool:
+        """Scaled engines of an older graph: built again rather than run."""
+        return bool(self.meta.get("scaled")) and not self.scaled
 
     @property
     def loadable(self) -> bool:
@@ -457,9 +464,33 @@ class Record:
 
     @property
     def encoder(self):
-        """The encoder engines' {"digest", "config", "shapes", "asked", "weights", "stripped", "weight_bytes"},
-        or None if the record has none."""
+        """The encoder engines' {"digest", "config", "shapes", "asked", "weights", "stripped", "weight_bytes",
+        "strips"}, or None if the record has none."""
         return self.meta.get("encoder") or None
+
+    @property
+    def encoder_strips(self) -> dict:
+        """{kind name: {"shapes", "weights", "stripped"}}: the engines that encode in strips."""
+        return (self.encoder or {}).get("strips") or {}
+
+    def encoder_strip_plan(self, kind: str) -> str:
+        return f"{self.base}.encode-strip-{kind}.plan"
+
+    def encoder_strips_cover(self, found: list, h: int, w: int) -> bool:
+        """Whether an encode in strips of these stages runs images of h x w on these engines (and the
+        encode-post engine takes their latents)."""
+        kinds = self.encoder_strips
+        if not kinds or not self._post_encodes(h // 8, w // 8):
+            return False
+        for s in found:
+            entry = kinds.get(s.kind.name)
+            if entry is None or not strips.engine_rows(entry["shapes"], s.kind, w // 8 * s.scale):
+                return False
+        return True
+
+    def _post_encodes(self, h: int, w: int) -> bool:
+        lo, _, hi = self.encoder["shapes"][ENCODE_POST]["x"]
+        return lo[2] <= h <= hi[2] and lo[3] <= w <= hi[3]
 
     def has_encoder(self, digest: str, c: int) -> bool:
         """Whether it has engines for an encoder of this architecture, for images of c channels."""
@@ -471,19 +502,18 @@ class Record:
         lo, _, hi = self.encoder["shapes"][ENCODE_PRE]["image"]
         return lo[2] <= h <= hi[2] and lo[3] <= w <= hi[3]
 
-    def encodes_tiles(self) -> bool:
-        """Whether they take any tile of an encode in tiles: the smallest are an overlap and 8 pixels."""
-        lo = self.encoder["shapes"][ENCODE_PRE]["image"][0]
-        return max(lo[2], lo[3]) <= TILE_OVERLAP + 8
-
     @property
     def encode_batch(self) -> int:
         return int(self.encoder["shapes"][ENCODE_PRE]["image"][2][0])
 
     def encode_reach(self) -> str:
-        """For people: "2944x2944, 1 at a time"."""
+        """For people: "1824x1824, 1 at a time, and in strips up to 2944x2944"."""
         b, _, h, w = self.encoder["shapes"][ENCODE_PRE]["image"][2]
-        return f"{w}x{h}, {b} at a time"
+        text = f"{w}x{h}, {b} at a time"
+        if self.encoder_strips:
+            _, _, ph, pw = self.encoder["shapes"][ENCODE_POST]["x"][2]
+            text += f", and in strips up to {pw * 8}x{ph * 8}"
+        return text
 
     @property
     def strips(self) -> dict:
@@ -532,11 +562,18 @@ def records(arch_id: str) -> list:
             with open(path, encoding="utf-8") as f:
                 meta = json.load(f)
             r = Record(path[: -len(".json")], meta)
+            if r.stale:
+                if r.base not in _told:
+                    _told.add(r.base)
+                    log("The VAE's FP16 engines were built with an older graph; build again in the TensorRT tab to replace them.")
+                continue
             if meta.get("vae_format") == FORMAT and r.loadable and all(os.path.isfile(r.plan(p)) for p in (PRE, POST)):
                 if not all(os.path.isfile(r.strip_plan(k)) for k in r.strips):
                     meta["strips"] = {}  # decodes on the post engine only; the tab asks to build them again
                 if r.encoder is not None and not all(os.path.isfile(r.plan(p)) for p in ENCODER):
                     meta["encoder"] = None  # likewise: it encodes on PyTorch
+                if r.encoder is not None and not all(os.path.isfile(r.encoder_strip_plan(k)) for k in r.encoder_strips):
+                    meta["encoder"]["strips"] = {}  # encodes whole only; likewise
                 found.append(r)
         except Exception as e:
             log(f"Ignoring {path}: {e}")
@@ -600,15 +637,27 @@ def needs_build(arch, profiles: list, vae=None) -> str:
 
 
 def _encoder_wanted(vae, profiles: list, dtype, vram) -> dict:
-    """{"digest", "config", "shapes"} of the encoder engines for the profiles (None if the engines can't
-    encode for this VAE)."""
+    """{"digest", "config", "shapes", "strips"} of the encoder engines for the profiles, "strips" being the
+    encode in strips' kinds and their shapes (None if the engines can't encode for this VAE)."""
     try:
         if encoder_unsupported(vae):
             return None
         cfg = encoder_config(vae)
-        return {"digest": encoder_digest(vae), "config": cfg, "shapes": encoder_shapes(profiles, cfg, dtype, vram)}
+        return {
+            "digest": encoder_digest(vae), "config": cfg, "shapes": encoder_shapes(profiles, cfg, dtype, vram),
+            "strips": _encoder_strips_wanted(vae, profiles, cfg, dtype),
+        }
     except (AttributeError, KeyError, IndexError, TypeError):
         return None
+
+
+def _encoder_strips_wanted(vae, profiles: list, cfg: dict, dtype) -> dict:
+    """The encode in strips' kinds and their shapes for the profiles ({} if it can't run for this VAE)."""
+    try:
+        lists = strips.encoder_every_way(vae.first_stage_model, cfg["padding"])
+    except (ValueError, KeyError, AttributeError, StopIteration):
+        return {}
+    return {} if any(strips.supported(found) for found in lists) else strip_shapes(profiles, lists, dtype)
 
 
 def _matching(arch_id: str, vae, dtype) -> list:
@@ -639,6 +688,14 @@ def _missing(record: Record, shapes: dict, strip_wanted: dict, enc_wanted: dict 
     if enc_wanted is not None:
         have = record.encoder
         built = have is not None and have.get("digest") == enc_wanted["digest"] and _covers(have.get("asked", have["shapes"]), enc_wanted["shapes"])
+        if built:  # and its strips, or a failed build of them for these shapes
+            kinds = have.get("strips") or {}
+            failed = have.get("strips_asked") if have.get("strips_error") else None
+            built = all(
+                (name in kinds and _covers({name: kinds[name]["shapes"]}, {name: wanted}))
+                or (failed and name in failed and _covers({name: failed[name]}, {name: wanted}))
+                for name, wanted in enc_wanted["strips"].items()
+            )
         tried = meta.get("encoder_asked") if meta.get("encoder_error") else None
         if not built and not (tried and tried.get("digest") == enc_wanted["digest"] and _covers(tried["shapes"], enc_wanted["shapes"])):
             out += list(ENCODER)
@@ -664,20 +721,18 @@ class _Scale:
 
 
 def _scaled_norm(norm, holder: _Scale):
-    """A GroupNorm's forward on a scaled tensor: in FP32 on its input divided by the scale, then the scale and
-    shift in the tensor's own precision. FP32 has the range for the values as the VAE makes them, their
-    squares included, and so the GroupNorm's epsilon is added to the variance it was meant for (to a scaled
-    one, it would be thousands of times too large).
+    """A GroupNorm's forward on a scaled tensor: all of it in FP32 (its scale and shift too, `norm` being
+    FP32), on its input divided by the scale, then cast back. FP32 has the range for the values as the VAE
+    makes them, their squares included, and so the GroupNorm's epsilon is added to the variance it was meant
+    for (to a scaled one, it would be thousands of times too large).
 
-    Cast to FP32, normalized, cast back: TensorRT's way to have a normalization accumulate in FP32 in an FP16
-    network, which its builder fuses into the normalization's kernels, so no FP32 copy of the tensor is held."""
+    The GroupNorm itself is PyTorch's own: it exports as the sequence the FP32 engines' GroupNorms are
+    (Reshape, InstanceNormalization, Reshape, Mul, Add), with nothing inside it; the casts and the division
+    come before and after."""
 
     def forward(x):
-        flat = (x.float() / holder.value.float()).reshape(x.shape[0], norm.num_groups, -1)
-        one = torch.ones(norm.num_groups, device=x.device)  # given, the exporter needn't know the reshape's sizes
-        zero = torch.zeros(norm.num_groups, device=x.device)
-        normed = torch.nn.functional.instance_norm(flat, weight=one, bias=zero, eps=norm.eps).reshape_as(x).to(x.dtype)
-        return normed * norm.weight.unsqueeze(-1).unsqueeze(-1) + norm.bias.unsqueeze(-1).unsqueeze(-1)
+        normed = torch.nn.functional.group_norm(x.float() / holder.value.float(), norm.num_groups, norm.weight, norm.bias, norm.eps)
+        return normed.to(x.dtype)
 
     return forward
 
@@ -691,6 +746,7 @@ def scale_decoder(module) -> _Scale:
     holder = _Scale()
     for m in module.modules():
         if isinstance(m, torch.nn.GroupNorm):
+            m.float()  # its scale and shift, as the engines take them (a refit gives them in FP32)
             m.forward = _scaled_norm(m, holder)
         elif all(hasattr(m, part) for part in ("norm1", "conv1", "norm2", "conv2")):
             for conv in (m.conv1, m.conv2):
@@ -925,6 +981,41 @@ def export_strips(vae, work: str, dtype, device, names) -> dict:
     return result
 
 
+@common.inference_mode
+def export_encoder_strips(vae, work: str, dtype, device, names) -> dict:
+    """Writes work/encode-strip-<kind>.onnx for the encode in strips' kinds named; returns {"encode-strip-<kind>":
+    {weight name: shape}}. Each from a stage of that kind in a fresh encoder of the VAE's layout."""
+    from . import export
+
+    cfg = encoder_config(vae)
+    module = fresh_encoder(cfg, device, dtype)
+    for t in module.state_dict(keep_vars=True).values():  # random, as in export_onnx
+        if t.is_floating_point():
+            t.normal_(0, 0.02)
+    found = [s for each in strips.encoder_every_way(module, cfg["padding"]) for s in each]
+    loaded = vae.first_stage_model.state_dict(keep_vars=True)
+    kwargs = dict(export_params=False, opset_version=17, do_constant_folding=False)
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        kwargs["dynamo"] = False
+    result = {}
+    for name in names:
+        stage = next(s for s in found if s.kind.name == name)
+        kind, part = stage.kind, strips.StageModule(stage, module)
+        path = os.path.join(work, f"{ENCODE_STRIP}{name}.onnx")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", torch.jit.TracerWarning)
+            torch.onnx.export(
+                part, strips.example_inputs(kind, dtype, device), path, input_names=list(kind.inputs()),
+                output_names=list(kind.outputs()), dynamic_axes=strips.dynamic_axes(kind), **kwargs,
+            )
+        own = {k: list(v.shape) for k, v in part.state_dict(keep_vars=True).items()}
+        theirs = {k: list(loaded[stage.weights[k]].shape) for k in own}
+        result[ENCODE_STRIP + name] = export._weightless_graph(path, kind.inputs(), (own, theirs), quiet=True)
+    del module, found
+    log(f"Exported {len(names)} graphs for encoding in strips.")
+    return result
+
+
 def _weight_bytes(vae, names, dtype) -> int:
     state = vae.first_stage_model.state_dict(keep_vars=True)
     return sum(state[n].numel() for n in names if n in state) * torch.tensor([], dtype=dtype).element_size()
@@ -932,7 +1023,8 @@ def _weight_bytes(vae, names, dtype) -> int:
 
 def build(arch, profiles: list, work: str, optimization_level=None, progress=None, vae=None):
     """Builds the VAE engines these profiles' sizes lack, for the loaded VAE and its precision: the
-    decoder's pre and post engines, the encoder's two, and the stripped decode's (strips.py), keeping what
+    decoder's pre and post engines, the encoder's two with those that encode in strips, and the stripped
+    decode's (strips.py), keeping what
     this GPU's and TensorRT version's engines for the architecture have that covers them, and deleting the
     rest. Returns (the Record or None, why it failed or None, how many kernels TensorRT skipped for want of
     VRAM). If only the encoder's engines or the stripped decode's fail, the record has the others (and says
@@ -987,6 +1079,8 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             graphs.update(export_onnx(vae, work, dtype, device))
         if ENCODE_PRE in todo:
             graphs.update({part: names for part, names in export_encoder_onnx(vae, work, dtype, device).items() if part in ENCODER})
+            if enc_wanted["strips"]:
+                graphs.update(export_encoder_strips(vae, work, dtype, device, list(enc_wanted["strips"])))
         if kinds_todo:
             graphs.update(export_strips(vae, work, dtype, device, kinds_todo))
         gc.collect()
@@ -995,7 +1089,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         built, done, tries = {}, 0, 0
 
         def job(part, plan_shapes):
-            onnx_name = f"strip-{part}" if part in kinds_todo else f"vae_{part}"
+            onnx_name = f"strip-{part}" if part in kinds_todo else part if part.startswith(ENCODE_STRIP) else f"vae_{part}"
             return {
                 "onnx": os.path.join(work, f"{onnx_name}.onnx"),
                 "plan": os.path.join(work, f"{onnx_name}.plan"),
@@ -1065,7 +1159,23 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                     "weights": {part: sorted(graphs[part]) for part in ENCODER},
                     "weight_bytes": _weight_bytes(vae, sorted(set(graphs[ENCODE_PRE]) | set(graphs[ENCODE_POST])), dtype),
                     "stripped": {part: built[part]["stripped"] for part in ENCODER},
+                    "strips": {},
                 }
+                kinds = enc_wanted["strips"]
+                for i, name in enumerate(kinds):  # the encode in strips' (a failure leaves encodes whole only)
+                    if export.CANCEL.is_set():
+                        return None, "cancelled", skipped
+                    part = ENCODE_STRIP + name
+                    result = export._build_plan(job(part, kinds[name]), work, step(f"engine {i + 1} of {len(kinds)} for encoding in strips"))
+                    skipped += result.get("memory_warnings") or 0
+                    if not result["ok"]:
+                        if export.CANCEL.is_set() or str(result.get("error")) == "cancelled":
+                            return None, "cancelled", skipped
+                        enc_meta.update(strips={}, strips_error=str(result.get("error")), strips_asked=kinds)
+                        log(f"Building the VAE encoder's engines for encoding in strips failed ({result.get('error')}); larger encodes run on PyTorch.")
+                        break
+                    built[part] = result
+                    enc_meta["strips"][name] = {"shapes": kinds[name], "weights": sorted(graphs[part]), "stripped": result["stripped"]}
         strips_error = None
         strip_meta = {k: v for k, v in old.strips.items() if k in strip_wanted and k not in todo} if old is not None else {}
         for i, name in enumerate(kinds_todo):
@@ -1084,7 +1194,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             strip_meta = {}  # a stripped decode needs every kind
         identity = [digest(vae), dtype_name(dtype), scaled(dtype), shapes, sorted((k, v["shapes"]) for k, v in strip_meta.items())]
         if enc_meta is not None:
-            identity.append([enc_meta["digest"], enc_meta["shapes"]])
+            identity.append([enc_meta["digest"], enc_meta["shapes"], sorted((k, v["shapes"]) for k, v in (enc_meta.get("strips") or {}).items())])
         key = hashlib.sha1(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:10]
         weights = {part: sorted(graphs[part]) if part in built else old.meta["weights"][part] for part in (PRE, POST)}
         meta = {
@@ -1093,7 +1203,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             "arch_id": arch.id,
             "digest": digest(vae),
             "dtype": dtype_name(dtype),
-            "scaled": scaled(dtype),
+            "scaled": SCALED if scaled(dtype) else False,
             "config": cfg,
             "shapes": shapes,
             "asked": {PRE: shapes[PRE], POST: post_asked},  # what they were built for: the shapes, unless TensorRT had to go smaller
@@ -1122,11 +1232,18 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             source = os.path.join(work, f"strip-{name}.plan") if name in built else old.strip_plan(name)
             if source != new.strip_plan(name):
                 os.replace(source, new.strip_plan(name))
+        for name in (enc_meta or {}).get("strips") or {}:
+            source = os.path.join(work, f"{ENCODE_STRIP}{name}.plan") if ENCODE_STRIP + name in built else old.encoder_strip_plan(name)
+            if source != new.encoder_strip_plan(name):
+                os.replace(source, new.encoder_strip_plan(name))
         for path in glob.glob(glob.escape(_prefix(arch.id)) + "-*.json"):  # what these replace
             if path[: -len(".json")] != base:
                 _remove(path[: -len(".json")])
         for path in glob.glob(glob.escape(base) + ".strip-*.plan"):  # this record's own, from before, it no longer has
             if path[len(base) + len(".strip-"): -len(".plan")] not in strip_meta:
+                os.remove(path)
+        for path in glob.glob(glob.escape(base) + f".{ENCODE_STRIP}*.plan"):
+            if path[len(base) + len(ENCODE_STRIP) + 1: -len(".plan")] not in ((enc_meta or {}).get("strips") or {}):
                 os.remove(path)
         if enc_meta is None:
             for part in ENCODER:
@@ -1176,6 +1293,8 @@ class VaeModel:
         self.probes = {}  # kind name -> a context for activation sizes
         self.strips_applied = None  # the key of the weights in the stage engines
         self.activations = {}  # (kind, rows, width) -> TensorRT's activation memory for it (the plans' own figures, so kept)
+        # The encoder's, likewise (its kinds' plans are its own, though their names can be the decoder's)
+        self.encoder_stage_engines, self.encoder_probes, self.encoder_strips_applied, self.encoder_activations = {}, {}, None, {}
         self.encoders = {}  # part -> the encoder's engines, loaded when an encode first needs them
         self.encoder_key = None  # the key of the VAE's encoder's weights
         self.encoder_applied = None  # (the key, the exponent) of the weights in the encoder's engines
@@ -1381,54 +1500,69 @@ class VaeModel:
         return self.needs[key]
 
     def _unload_strips(self):
-        for e in list(self.probes.values()) + [e[1] for e in self.stage_engines.values()] + [e[0] for e in self.stage_engines.values()]:
-            e.unload()  # the contexts on an engine before it
+        for engines, probes in ((self.stage_engines, self.probes), (self.encoder_stage_engines, self.encoder_probes)):
+            for e in list(probes.values()) + [e[1] for e in engines.values()] + [e[0] for e in engines.values()]:
+                e.unload()  # the contexts on an engine before it
         self.stage_engines, self.probes, self.strips_applied = {}, {}, None
+        self.encoder_stage_engines, self.encoder_probes, self.encoder_strips_applied = {}, {}, None
 
-    def stage_engine(self, stage) -> tuple:
-        """(The engine for a stage of the stripped decode, loaded with its weights; a context for its last strips.)"""
+    def stage_engine(self, stage, encoding: bool = False) -> tuple:
+        """(The engine for a stage of the stripped decode (or encode), loaded with its weights; a context for
+        its last strips.)"""
         from .engine import Engine
 
-        if stage.identity not in self.stage_engines:
-            e = Engine(self.record.strip_plan(stage.kind.name), self.arena, self.owner)
+        engines = self.encoder_stage_engines if encoding else self.stage_engines
+        if stage.identity not in engines:
+            plan = self.record.encoder_strip_plan(stage.kind.name) if encoding else self.record.strip_plan(stage.kind.name)
+            e = Engine(plan, self.arena, self.owner)
             with gpu.loading(self.owner):
                 e.load()
                 try:
-                    self._refit_stage(e, stage.weights)
+                    self._refit_stage(e, stage.weights, encoding)
                 except Exception:
                     e.unload()
                     raise
             nbytes = _weight_bytes(self.vae, stage.weights.values(), self.record.dtype)
-            self.stage_engines[stage.identity] = (e, e.twin(), stage.weights, nbytes)
-        return self.stage_engines[stage.identity][:2]
+            engines[stage.identity] = (e, e.twin(), stage.weights, nbytes)
+        return engines[stage.identity][:2]
 
-    def probe(self, stage):
+    def probe(self, stage, encoding: bool = False):
         """A context of the stage's kind for activation sizes (on its first stage's engine)."""
-        if stage.kind.name not in self.probes:
-            self.probes[stage.kind.name] = self.stage_engine(stage)[0].twin()
-        return self.probes[stage.kind.name]
+        probes = self.encoder_probes if encoding else self.probes
+        if stage.kind.name not in probes:
+            probes[stage.kind.name] = self.stage_engine(stage, encoding)[0].twin()
+        return probes[stage.kind.name]
 
     def runner_for(self, stage):
         shapes = self.record.strips[stage.kind.name]["shapes"]
         return strips.EngineRunner(lambda: self.stage_engine(stage), lambda: self.probe(stage), shapes, stage.kind)
 
-    def _refit_stage(self, engine, weights: dict):
-        _, get = self._weights()
+    def encoder_runner_for(self, stage):
+        shapes = self.record.encoder_strips[stage.kind.name]["shapes"]
+        return strips.EngineRunner(lambda: self.stage_engine(stage, True), lambda: self.probe(stage, True), shapes, stage.kind)
+
+    def _refit_stage(self, engine, weights: dict, encoding: bool = False):
+        _, get = self._weights(2.0 ** -self.encoder_exponent if encoding else None)
         engine.refit([n for n in engine.weight_names if n in weights], lambda name, device: get(weights[name], device))
 
-    def sync_strips(self):
+    def sync_strips(self, encoding: bool = False):
         """Refits the stage engines loaded with another VAE's weights, or scaled otherwise (those loaded
-        later get what's current)."""
-        wanted = (self.key, self.exponent)
-        if self.strips_applied == wanted:
+        later get what's current): the stripped decode's, or the encode's."""
+        wanted = (self.encoder_key, self.encoder_exponent) if encoding else (self.key, self.exponent)
+        engines = self.encoder_stage_engines if encoding else self.stage_engines
+        if (self.encoder_strips_applied if encoding else self.strips_applied) == wanted:
             return
-        if self.stage_engines:
+        if engines:
             start = time.time()
             torch.cuda.current_stream().synchronize()
-            for e, _, weights, _ in self.stage_engines.values():
-                self._refit_stage(e, weights)
-            log(f"Refitted the VAE decoder's {len(self.stage_engines)} engines for decoding in strips in {time.time() - start:.1f}s")
-        self.strips_applied = wanted
+            for e, _, weights, _ in engines.values():
+                self._refit_stage(e, weights, encoding)
+            what = "encoder's" if encoding else "decoder's"
+            log(f"Refitted the VAE {what} {len(engines)} engines for {'en' if encoding else 'de'}coding in strips in {time.time() - start:.1f}s")
+        if encoding:
+            self.encoder_strips_applied = wanted
+        else:
+            self.strips_applied = wanted
 
     def sync(self, quiet=False):
         """Refits both engines from self.vae unless they hold its weights already, scaled as now."""
@@ -1629,6 +1763,13 @@ def decode(vae, samples_in):
     finally:
         model.release()
         model.vae = None  # don't keep this VAE alive
+        _profiled("VAE decode")
+
+
+def _profiled(where: str):
+    from .engine import profile_report
+
+    profile_report(where)
 
 
 def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
@@ -1682,19 +1823,25 @@ def _attend(model: VaeModel, vae, mid: dict, encoding: bool = False):
     with reForge's own implementation, as PyTorch decodes or encodes. Beside scaled engines in FP32: its
     scores are products of what a GroupNorm made, which no scale keeps in FP16, and at the latent's size it
     costs little. The working memory it takes is kept, per size, for VaeModel.need and need_encode."""
-    fsm = vae.first_stage_model
-    attention = (fsm.encoder if encoding else fsm.decoder).mid.attn_1.optimized_attention
     q, k, v = mid.pop("q"), mid.pop("k"), mid.pop("v")
-    key = (encoding, q.shape[0], q.shape[2], q.shape[3])
     if model.record.scaled:
         q, k, v = q.float(), k.float(), v.float()
+    return _attention(model, vae, q, k, v, encoding)
+
+
+def _attention(model: VaeModel, vae, q, k, v, encoding: bool = False):
+    """reForge's own attention of the mid block on these queries, keys and values, in the engines'
+    precision; its working memory kept, per size (see _attend)."""
+    fsm = vae.first_stage_model
+    attention = (fsm.encoder if encoding else fsm.decoder).mid.attn_1.optimized_attention
+    key = (encoding, q.shape[0], q.shape[2], q.shape[3])
     with _Peak() as peak:
         out = attention(q, k, v)
     work = max(0, peak.held - out.numel() * out.element_size())
     if work > model.attention.get(key, 0):  # what need() or need_encode() counted at this size is short
         model.attention[key] = work
         model.needs = {kept: need for kept, need in model.needs.items() if kept[:4] != key}
-    return out.to(model.record.dtype) if model.record.scaled else out
+    return out.to(model.record.dtype)
 
 
 def _check(model: VaeModel, image, first: bool) -> bool:
@@ -1767,7 +1914,7 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list):
         if not _check(model, image, pixels is None):
             return None, ""
         if pixels is None:
-            report = f"{_strips_report(plan, planned, model)}; {_counted(peak.held, plan.vram)}"
+            report = f"{_strips_report(plan, planned, model.stage_engines)}; {_counted(peak.held, plan.vram)}"
             common.memory(f"VAE decode of {w * 8}x{h * 8}: strips done", decoder.memory_report(plan))
             pixels = torch.empty((b,) + tuple(image.shape[1:]), device=vae.output_device)
         pixels[i:i + 1] = vae.process_output(image.to(vae.output_device).float())
@@ -1808,7 +1955,17 @@ def encode(vae, pixel_samples):
         return None  # (vae.decode says when an architecture has no engines)
     pixels = vae.vae_encode_crop_pixels(pixel_samples).movedim(-1, 1)
     b, c, h, w = pixels.shape
-    if not record.has_encoder(encoder_digest(vae), c) or not (record.encodes(h, w) or _tiles(record, vae)):
+    if not record.has_encoder(encoder_digest(vae), c):
+        return None
+    found = None
+    if record.encoder_strips:
+        try:
+            found = strips.encoder_stages(vae.first_stage_model, record.encoder["config"]["padding"])
+            if strips.supported(found) or not record.encoder_strips_cover(found, h, w):
+                found = None
+        except (ValueError, KeyError, AttributeError, StopIteration):
+            found = None
+    if not record.encodes(h, w) and found is None:
         return None
     model = model_for(record)
     model.vae, model.key, model.encoder_key = vae, _key(vae), _key(vae, encoder=True)
@@ -1818,7 +1975,7 @@ def encode(vae, pixel_samples):
         while True:
             try:
                 with torch.inference_mode():
-                    return _encode(model, vae, pixels)
+                    return _encode(model, vae, pixels, found)
             except _Overflow:
                 exponent = model.encoder_exponent
                 if exponent + EXPONENT_STEP > EXPONENT_MAX:
@@ -1834,22 +1991,13 @@ def encode(vae, pixel_samples):
     finally:
         model.release()
         model.vae = None  # don't keep this VAE alive
+        _profiled("VAE encode")
 
 
-class _Unusable(Exception):
-    """A tile came out NaN/Inf on engines that aren't scaled (said already)."""
-
-
-def _tiles(record: Record, vae) -> bool:
-    """Whether an encode can run in tiles on this record's engines: reForge's tiled encode, with the engines
-    encoding each tile."""
-    return record.encodes_tiles() and callable(getattr(vae, "encode_tiled_", None))
-
-
-def _encode(model: VaeModel, vae, pixels):
+def _encode(model: VaeModel, vae, pixels, found):
     """One try at an encode of images (b, channels, h, w) in 0..1 on the encoder's engines: whole if there
-    can be room for it (VaeModel.need_encode), else in tiles, else None. Raises _Overflow if a scaled
-    encode's values outgrew its scale."""
+    can be room for it (VaeModel.need_encode), else in strips (`found`, the stages) with all the room there
+    can be, else None. Raises _Overflow if a scaled encode's values outgrew its scale."""
     mm = common.mm()
     b, _, h, w = pixels.shape
     record = model.record
@@ -1884,14 +2032,75 @@ def _encode(model: VaeModel, vae, pixels):
         log(f"Encoded {images} on the VAE encoder engines in {time.time() - start:.2f}s ({how}{at_once}; {_counted(peak.held + act, need)})")
         return samples
     why = f"whole it holds {common.gib(need)}, there could be room for {common.gib(can)}" if whole else "larger than they take whole"
-    tile = _tile_size(model, vae, h, w) if _tiles(record, vae) else 0
-    if not tile:
-        log(f"The VAE encoder engines can't encode {w}x{h} ({why}; there can't be room for any tiles either): encoding on PyTorch.")
+    if found is None:
+        log(f"The VAE encoder engines can't encode {w}x{h} ({why}): encoding on PyTorch.")
         return None
-    samples = _encode_tiled(model, vae, pixels, tile)
+    common.make_room(common.obtainable(model.load_device, keep=[model]) - common.reserve(), model.load_device, _own(model))  # all there can be
+    model.release()
+    model.sync_strips(encoding=True)
+    common.memory(f"VAE encode of {w}x{h}: before planning strips")
+    samples, report = _encode_strips(model, vae, pixels, found)
     if samples is not None:
-        log(f"Encoded {images} in tiles of {tile} on the VAE encoder engines in {time.time() - start:.2f}s ({how}; {why})")
+        log(f"Encoded {images} in strips on the VAE encoder engines in {time.time() - start:.2f}s ({how}; {why}; {report})")
     return samples
+
+
+def _encode_strips(model: VaeModel, vae, pixels, found: list):
+    """(The latents of images (b, channels, h, w) in 0..1, encoded one at a time in strips up to the mid
+    block's attention, or None; how it went for the first, for the log.) Then, on PyTorch at the latent's
+    size, the attention's GroupNorm (from the statistics the strips gave), its queries, keys and values (in
+    FP32, as a GroupNorm's output is), and the attention; then the encode-post engine, as a whole encode.
+    Raises _Overflow if a scaled encode's values outgrew its scale."""
+    record, device = model.record, model.load_device
+    dtype, stream = record.dtype, torch.cuda.current_stream().cuda_stream
+    fsm, padding = vae.first_stage_model, record.encoder["config"]["padding"]
+    exponent = model.encoder_exponent
+    encoder = strips.Encode(
+        fsm, padding, model.encoder_runner_for, dtype, device, _copy_stream(device), model.arena, model.encoder_activations,
+        set(record.encoder_strips), 2.0 ** -exponent,
+    )
+    norm = strips.norms_of(fsm, [strips.ATTENTION_NORM], device)[strips.ATTENTION_NORM]
+    a = fsm.encoder.mid.attn_1
+    convs = [(c.weight.detach().to(device, torch.float32), c.bias.detach().to(device, torch.float32)) for c in (a.q, a.k, a.v)]
+    scale = model.scale_input(exponent)
+    b, _, h, w = pixels.shape
+    samples = plan = None
+    report = ""
+    for i in range(b):
+        image = vae.process_input(pixels[i:i + 1]).to(device=device, dtype=dtype)
+        if plan is None:
+            start = time.time()
+            plan = _plan_strips(encoder, device, h // 8, w // 8)
+            if plan is None:
+                log(f"Not even a strip of the VAE encoder fits in the {common.gib(common.mm().get_free_memory(device) - common.reserve())} of VRAM there is for {w}x{h}: encoding on PyTorch.")
+                return None, ""
+            planned = time.time() - start
+        with _Peak() as peak:
+            x, stats = encoder.run(image, plan, timed=i == 0)
+        del image
+        if i == 0:
+            report = f"{_strips_report(plan, planned, model.encoder_stage_engines)}; {_counted(peak.held, plan.vram)}"
+            common.memory(f"VAE encode of {w}x{h}: strips done", encoder.memory_report(plan))
+        center, scaled, shift = stats.affine(norm, 2.0 ** -exponent)
+        normed = (x.float() - center) * scaled + shift
+        q, k, v = (torch.nn.functional.conv2d(normed, weight, bias) for weight, bias in convs)
+        del normed
+        attended = _attention(model, vae, q, k, v, encoding=True)
+        del q, k, v
+        moments = model.encoders[ENCODE_POST].infer({"x": x, "attention": attended, **scale}, 0, stream)["moments"]
+        del x, attended
+        if not torch.isfinite(moments).all():
+            if record.scaled:
+                raise _Overflow()
+            notify(f"The VAE encoder engines produced NaN/Inf values in {label(record.meta['dtype'])}; encoding on PyTorch")
+            return None, ""
+        out = fsm.regularization(moments.float())[0].to(vae.output_device).float()
+        out = vae._from_vae_latent(out) if hasattr(vae, "_from_vae_latent") else out
+        if samples is None:
+            samples = torch.empty((b,) + tuple(out.shape[1:]), device=vae.output_device)
+        samples[i:i + 1] = out
+        del moments, out
+    return samples, report
 
 
 def _encode_images(model: VaeModel, vae, image):
@@ -1914,64 +2123,13 @@ def _encode_images(model: VaeModel, vae, image):
     return vae.first_stage_model.regularization(moments.float())[0]  # reForge's own: the distribution's mode
 
 
-def _tile_shapes(tile: int, h: int, w: int) -> set:
-    """The largest tiles (height, width) of reForge's tiled encode of an image of h x w with this tile
-    size: its three passes' (square, wide and tall), no larger than the image."""
-    return {(min(th, h), min(tw, w)) for th, tw in ((tile, tile), (tile // 2, tile * 2), (tile * 2, tile // 2))}
-
-
-def _tile_size(model: VaeModel, vae, h: int, w: int) -> int:
-    """The tile size for an encode of h x w in tiles: the largest of TILES whose tiles the engines take and
-    there can be room for (0 if none). Makes the room, and allocates their activation memory for it.
-    (reForge's tiling gives each tile to the encode on the GPU.)"""
-    model.release()
-    lo, _, hi = model.record.encoder["shapes"][ENCODE_PRE]["image"]
-    can = common.obtainable(model.load_device, keep=[model]) - common.reserve()
-    for tile in TILES:
-        shapes = _tile_shapes(tile, h, w)
-        if not all(lo[2] <= th <= hi[2] and lo[3] <= tw <= hi[3] for th, tw in shapes):
-            continue
-        needs = [model.need_encode(1, th, tw, True) for th, tw in shapes]
-        need = max(n for n, _ in needs)
-        if need > can:
-            continue
-        if common.make_room(need, model.load_device, _own(model)) < need:
-            log(f"Making room for {common.gib(need)} for tiles of {tile} fell short: the models loaded hold more than reForge counts.")
-            return 0
-        model.arena.get(max(a for _, a in needs))
-        return tile
-    return 0
-
-
-def _encode_tiled(model: VaeModel, vae, pixels, tile: int):
-    """The latents of images (b, channels, h, w) in 0..1 as reForge's tiled encode makes them (three passes
-    of overlapping tiles, blended and averaged), with the engines encoding each tile in place of its first
-    stage model; None if a tile came out unusable."""
-    fsm = vae.first_stage_model
-
-    def encode(image):
-        latent = _encode_images(model, vae, image)
-        if latent is None:
-            raise _Unusable()
-        return latent
-
-    fsm.encode = encode  # on the object, over its class's: what reForge's tiling calls for each tile
-    try:
-        return vae.encode_tiled_(pixels, tile_x=tile, tile_y=tile, overlap=TILE_OVERLAP)
-    except _Unusable:
-        return None
-    finally:
-        with contextlib.suppress(AttributeError):
-            del fsm.encode
-
-
-def _strips_report(plan, planned: float, model=None) -> str:
+def _strips_report(plan, planned: float, engines: dict = None) -> str:
     """For the log: the VRAM, the blocks' ways, RAM, planning and the stages' time on the GPU, and the
     stage engines' weights."""
     parts = [f"{common.gib(plan.vram)} of VRAM"]
-    if model is not None and model.stage_engines:
-        weights = sum(e[3] for e in model.stage_engines.values())
-        parts.append(f"{len(model.stage_engines)} stage engines with {common.gib(weights)} of weights")
+    if engines:
+        weights = sum(e[3] for e in engines.values())
+        parts.append(f"{len(engines)} stage engines with {common.gib(weights)} of weights")
     if plan.describe():
         parts.append(plan.describe())
     if plan.host:

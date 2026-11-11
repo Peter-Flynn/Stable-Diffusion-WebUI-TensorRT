@@ -641,6 +641,9 @@ class Pass:
         """Undoes what the pass changed; the engine stays loaded for the next one."""
         self._restore()
         common.memory("sampling pass ended")
+        from .engine import profile_report
+
+        profile_report("sampling pass")
         hacks = self.schedule
         if hacks is not None and hacks.shallow_calls:
             log(f"Speed Hacks: {hacks.shallow_calls} of {hacks.shallow_calls + hacks.full_calls} UNet calls ran on the shallow engine.")

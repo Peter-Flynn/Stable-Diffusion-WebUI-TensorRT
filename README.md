@@ -60,7 +60,7 @@ changes nothing but the range, so any VAE of the architecture runs on them witho
 whenever reForge can make room for it, which it does like for any model (a UNet engine goes last, only if that makes
 the room). Larger decodes (a Hires. fix's) run in horizontal strips on engines built for that, with all the room
 there can be: the same image, a little slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled
-one) run on the encoder's engines, whole when there can be room and in tiles when there can't. PyTorch does anything
+one) run on the encoder's engines the same way: whole when there can be room, else in strips. PyTorch does anything
 else.
 
 **Memory.** Everything TensorRT holds in VRAM comes from PyTorch's allocator, so reForge counts it like any model's,

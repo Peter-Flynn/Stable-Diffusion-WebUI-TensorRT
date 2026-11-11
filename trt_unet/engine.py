@@ -25,6 +25,10 @@ from .common import log, memory
 # TensorRT's own pass over every weight is skipped.
 REFITTER_SETTINGS = {"max_threads": os.cpu_count() or 1, "weights_validation": False}
 _unsettable = set()
+# TRT_EXTENSION_PROFILE=1: each engine's layers timed by TensorRT's own profiler (every run waits for the GPU,
+# so everything is slower), logged after each sampling pass, decode and encode (profile_report)
+PROFILE = os.environ.get("TRT_EXTENSION_PROFILE", "").lower() in ("1", "true", "yes")
+_layer_times = {}  # plan file -> {layer: milliseconds, added up since the last report}
 
 
 _DTYPES = {
@@ -67,6 +71,31 @@ class Logger(trt.ILogger):
 
 LOGGER = Logger()
 _runtime = None
+
+
+class _LayerTimes(trt.IProfiler):
+    """A context's layers' times on the GPU, added up under its plan file (TRT_EXTENSION_PROFILE)."""
+
+    def __init__(self, plan_path: str):
+        trt.IProfiler.__init__(self)
+        self.times = _layer_times.setdefault(plan_path, {})
+
+    def report_layer_time(self, layer_name, ms):
+        self.times[layer_name] = self.times.get(layer_name, 0.0) + ms
+
+
+def profile_report(where: str, top: int = 12):
+    """Logs, per plan, the layers' time since the last report, the longest first, and forgets it."""
+    if not PROFILE:
+        return
+    for plan, times in sorted(_layer_times.items(), key=lambda kv: -sum(kv[1].values())):
+        total = sum(times.values())
+        if not total:
+            continue
+        longest = sorted(times.items(), key=lambda kv: -kv[1])[:top]
+        log(f"profile | {where} | {os.path.basename(plan)}: {total:.1f} ms in {len(times)} layers; the longest: "
+            + "; ".join(f"{name} {ms:.1f} ms" for name, ms in longest))
+        times.clear()
 
 
 def runtime():
@@ -214,6 +243,13 @@ class Engine:
             if self.context is None:
                 said = f": {LOGGER.errors[-1]}" if LOGGER.errors else ""
                 raise RuntimeError(f"Could not create a TensorRT execution context{said}")
+            if PROFILE:
+                try:
+                    self._profiler = _LayerTimes(self.plan_path)  # TensorRT doesn't keep the Python object alive
+                    self.context.profiler = self._profiler
+                    self.context.enqueue_emits_profile = False  # reported when asked, after the GPU is done
+                except Exception as e:
+                    log(f"Could not profile {os.path.basename(self.plan_path)}: {e}")
             self._reset_context_state()
         return self.context
 
@@ -348,6 +384,12 @@ class Engine:
             self.context.set_tensor_address(name, t.data_ptr())
         if not self.context.execute_async_v3(stream):
             raise RuntimeError("TensorRT inference failed")
+        if PROFILE:
+            torch.cuda.current_stream().synchronize()
+            try:
+                self.context.report_to_profiler()
+            except Exception:
+                pass
         return outputs
 
     def release_activations(self):
