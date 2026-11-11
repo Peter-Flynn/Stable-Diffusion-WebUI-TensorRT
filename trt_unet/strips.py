@@ -41,8 +41,6 @@ TWO_NORMS = (BLOCK, UPBLOCK)
 PADDINGS = ("zeros", "reflect", "replicate", "circular")
 CHAINED = ("zeros", "circular")  # paddings the kinds with several 3x3 convs in a row take
 STORE, RECOMPUTE, FUSED = "store", "recompute", "fused"
-HEADROOM = 256 * 2**20  # VRAM left free during a decode, and a 32nd of what's free
-MARGIN = 1.1  # over the model of an engine's activation memory, until a decode shows what it takes
 
 
 @dataclass(frozen=True)
@@ -517,11 +515,6 @@ def _runs(rows: list):
     return runs, zeros
 
 
-def _elements(kind: Kind, rows: int, width: int) -> int:
-    """A strip's size, for the model of its engine's activation memory: its rows with their halo, across."""
-    return (rows + 2 * kind.halo) * width
-
-
 ALIGN = 256  # bytes: where each tensor in a slab starts
 
 
@@ -663,9 +656,10 @@ class Plan:
 class Decode:
     """One image's post part in strips, for a first stage model. `runner_for(stage)` gives what runs a
     stage: runner(feed, outputs, last) -> outputs (the strip's output written to outputs["out"]; `last`: the
-    shorter last strip), runner.rows(width) -> its most output rows at that width (0: none), and for its
-    activation memory runner.points() -> the smallest and largest strips it takes (None: no memory to plan
-    for), runner.activation(shapes) -> bytes, runner.took() -> bytes when it last ran. `cache` keeps what's learnt of the engines' activation sizes between decodes ({kind: its model})."""
+    shorter last strip), runner.rows(width) -> its most output rows at that width (0: none),
+    runner.activation(shapes) -> TensorRT's activation memory for those shapes, and runner.took() -> what
+    it was when the stage last ran. `cache` keeps TensorRT's answers between decodes ({(kind, rows, width):
+    bytes}): they're the engines' own, for as long as their plans are the same."""
 
     def __init__(self, fsm, padding: dict, runner_for, dtype, device, copy_stream=None, arena=None, cache=None, available=None, scale: float = 1.0):
         self.fsm, self.padding, self.runner_for = fsm, padding, runner_for
@@ -740,32 +734,12 @@ class Decode:
         return events
 
     def _activation(self, runner, kind: Kind, rows: int, width: int) -> int:
-        """The activation memory a strip of this kind takes, from a model of its engine: linear in the
-        strip's size, between the smallest and the largest strips it takes. TensorRT is asked for those two
-        once per kind (each ask takes milliseconds, and planning weighs hundreds of shapes); a decode then
-        raises the model by what an engine took beyond it (_learn)."""
-        model = self.cache.get(kind.name)
-        if model is None:
-            points = runner.points()
-            if not points:
-                model = [0.0, 0.0, 1.0]
-            else:
-                (e0, a0), (e1, a1) = ((_elements(kind, r, w), int(runner.activation(feed_shapes(kind, r, w)))) for r, w in points)
-                slope = (a1 - a0) / (e1 - e0) if e1 > e0 else 0.0
-                model = [a0 - slope * e0, slope, MARGIN]
-            self.cache[kind.name] = model
-        base, slope, factor = model
-        return int(max(0.0, base + slope * _elements(kind, rows, width)) * factor)
-
-    def _learn(self, plan: Plan, h: int, w: int):
-        """After a decode: where an engine took more activation memory than its kind's model has, the model
-        is raised to that."""
-        for n, st in enumerate(plan.stages):
-            took, model = plan.runners[n].took(), self.cache.get(st.kind.name)
-            if took and model:
-                modelled = max(1.0, model[0] + model[1] * _elements(st.kind, plan.rows[n], self.geometry(st, h, w)[1]))
-                if took > modelled * model[2]:
-                    model[2] = took / modelled * 1.02
+        """The activation memory a strip of this kind takes: TensorRT's own figure for its shapes (asked once
+        per shape, then kept)."""
+        key = (kind.name, rows, width)
+        if key not in self.cache:
+            self.cache[key] = int(runner.activation(feed_shapes(kind, rows, width)))
+        return self.cache[key]
 
     def _io(self, st: Stage, n: int, rows: int, width: int, host: set, lag: int) -> int:
         """Bytes of a stage's working tensors: its input, residual and output for a strip (the output twice
@@ -808,26 +782,26 @@ class Decode:
         """_plan, with what it was planned for noted on it (diagnostics)."""
         plan = self._plan(h, w, free, force_host, force_modes)
         if plan is not None:
-            plan.free, plan.budget = free, free - HEADROOM - free // 32
+            plan.free = plan.budget = free
         return plan
 
     def memory_report(self, plan: Plan) -> str:
         """For the memory diagnostics: the plan's VRAM by part, and for each kind of stage, the activation
-        memory the plan reckoned with against what TensorRT took for it (the most of its stages)."""
+        memory the plan counted against what TensorRT took for it when it ran (the most of its stages)."""
         mib = lambda n: f"{n / 2**20:.0f} MiB"
         parts = [
-            f"planned for {mib(plan.free)} free (budget {mib(plan.budget)}): {mib(plan.vram)} = held {mib(plan.device_bytes)} + working {mib(max(plan.io))} + activations {mib(plan.act)}",
+            f"planned for {mib(plan.free)} free: {mib(plan.vram)} = held {mib(plan.device_bytes)} + working {mib(max(plan.io))} + activations {mib(plan.act)}",
             f"held in RAM {mib(plan.host_bytes)} ({len(plan.host)} tensors)",
         ]
         kinds = {}
         for n, st in enumerate(plan.stages):
             took = plan.runners[n].took() or 0
-            reckoned = plan.acts[n] if n < len(plan.acts) else 0
+            counted = plan.acts[n] if n < len(plan.acts) else 0
             k = kinds.setdefault(st.kind.name, [0, 0, set()])
-            k[0], k[1] = max(k[0], reckoned), max(k[1], took)
+            k[0], k[1] = max(k[0], counted), max(k[1], took)
             k[2].add(plan.rows[n])
         top = sorted(kinds.items(), key=lambda kv: -kv[1][0])
-        parts.append("activations reckoned -> took: " + ", ".join(
+        parts.append("activations counted -> took: " + ", ".join(
             f"{name} ({'/'.join(map(str, sorted(rows)))} rows) {mib(r)} -> {mib(t)}" for name, (r, t, rows) in top
         ))
         return " | ".join(parts)
@@ -837,8 +811,10 @@ class Decode:
         fit. The fastest that fits: every block STORE with strips as large as fit (down to an 8th of what the
         engines take); else, of the tensors held at the VRAM's peak, the largest one a block could do
         without (a first conv's output: that block RECOMPUTE; an upsampling's: the block after it FUSED)
-        gone, and so on; else the tensors held at the peak moved to RAM, the largest first."""
-        budget = free - HEADROOM - free // 32
+        gone, and so on; else the tensors held at the peak moved to RAM, the largest first. Every size it
+        weighs is exact (the held tensors', the working ones', TensorRT's activation memory), so `free` is
+        all it plans for."""
+        budget = free
         if force_host or force_modes is not None:
             modes = force_modes or {}
             found, _ = self._stages(modes)
@@ -943,7 +919,6 @@ class Decode:
                 if stats_last[key] == n:
                     stats.pop(key, None)
         image = held[len(found) - 1].t
-        self._learn(plan, h, w)
         if self.copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self.copy_stream)
         return image.to(self.device).permute(1, 0, 2).unsqueeze(0).contiguous()
@@ -1137,9 +1112,6 @@ class TorchRunner:
     def activation(self, shapes: dict) -> int:
         return 0
 
-    def points(self):
-        return None
-
     def took(self):
         return None
 
@@ -1166,12 +1138,6 @@ class EngineRunner:
 
     def activation(self, shapes: dict) -> int:
         return self.probe().estimate_activation_bytes(0, {n: tuple(s) for n, s in shapes.items()}, self._stream())
-
-    def points(self) -> list:
-        """The smallest and the largest strips the engine takes: [(output rows, output width)]."""
-        lo, _, hi = self.shapes["x"]
-        across = 2 if self.kind.op in UPSAMPLING else 1
-        return [(min_rows(self.kind), lo[3] * across), (engine_rows(self.shapes, self.kind, hi[3] * across), hi[3] * across)]
 
     def took(self):
         """The activation memory its strips took when it last ran (None before)."""

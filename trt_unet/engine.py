@@ -1,8 +1,14 @@
-"""A deserialized TensorRT engine: weights refitted from PyTorch tensors (or the engine brought back as it
-was serialized with them), several optimization profiles in one execution context, and activation memory
-from PyTorch's allocator sized for the shapes in use."""
+"""A deserialized TensorRT engine: weights refitted from PyTorch tensors in RAM (or the engine brought back
+as it was serialized with them), several optimization profiles in one execution context, and activation
+memory from PyTorch's allocator sized for the shapes in use.
 
+The engine's weights are the only copy of them in VRAM: a refit gives TensorRT the weights where PyTorch
+keeps them, in RAM, and TensorRT copies them into its own memory. All of TensorRT's memory comes from
+PyTorch's allocator (gpu.py), under the engine's owner."""
+
+import atexit
 import ctypes
+import math
 import os
 import time
 import weakref
@@ -11,17 +17,14 @@ from collections import deque
 import tensorrt as trt
 import torch
 
-from .common import gib, log, memory
+from . import gpu
+from .common import log, memory
 
 # Refitting prepares weights given in RAM for the GPU on the CPU, by default on one thread. Weights come
 # straight from PyTorch's FP16 tensors, and the engine's first output is checked for NaN/Inf, so
 # TensorRT's own pass over every weight is skipped.
 REFITTER_SETTINGS = {"max_threads": os.cpu_count() or 1, "weights_validation": False}
 _unsettable = set()
-# Weights given in VRAM are prepared on the GPU instead, so a refit copies as many there as fit, leaving
-# this much free for TensorRT's own refit memory. A stripped engine's first refit needs every weight at
-# once, so it can't go in parts; the weights that don't fit go from RAM.
-STAGING_RESERVE = 2**30
 
 
 _DTYPES = {
@@ -39,19 +42,6 @@ def torch_dtype(dtype):
     if dtype not in _DTYPES:
         raise TypeError(f"Unsupported TensorRT dtype {dtype}")
     return _DTYPES[dtype]
-
-
-def staging_budget() -> int:
-    """Bytes of weights a refit can copy to VRAM: what's free (PyTorch's unused cache included) but the reserve."""
-    try:
-        free = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-    except Exception:
-        return 0
-    return max(0, free - STAGING_RESERVE)
-
-
-class _StagedRefitFailed(RuntimeError):
-    pass
 
 
 class Logger(trt.ILogger):
@@ -83,7 +73,19 @@ def runtime():
     global _runtime
     if _runtime is None:
         _runtime = trt.Runtime(LOGGER)
+        gpu.attach(_runtime)  # before anything is deserialized
     return _runtime
+
+
+@atexit.register
+def _unload_all():
+    """Engines free their memory through PyTorch's allocator (gpu.py): before the interpreter takes PyTorch
+    and the allocator apart."""
+    for engine in list(Engine.instances):
+        try:
+            engine.unload()
+        except Exception:
+            pass
 
 
 def other_tensorrt(maps="/proc/self/maps") -> str:
@@ -137,11 +139,17 @@ class Arena:
 
 
 class Engine:
-    def __init__(self, plan_path: str, arena: Arena = None):
+    """An engine and its execution context. Its TensorRT memory is `owner`'s (gpu.py); twins share both."""
+
+    instances = weakref.WeakSet()  # every engine, to unload before the interpreter exits
+
+    def __init__(self, plan_path: str, arena: Arena = None, owner=None):
         self.plan_path = plan_path
         self.arena = arena or Arena()
+        self.owner = owner
         self.engine = self.context = None
         self._reset_context_state()
+        Engine.instances.add(self)
 
     def _reset_context_state(self):
         self.profile = None
@@ -152,7 +160,7 @@ class Engine:
 
     def twin(self):
         """Another execution context on the same engine (and weights), with shapes of its own."""
-        other = Engine(self.plan_path, self.arena)
+        other = Engine(self.plan_path, self.arena, self.owner)
         other.engine, other.io, other.weight_names = self.engine, self.io, self.weight_names
         return other
 
@@ -169,18 +177,19 @@ class Engine:
         if plan is None:
             with open(self.plan_path, "rb") as f:
                 plan = f.read()
-        self.engine = runtime().deserialize_cuda_engine(plan)
+        with gpu.owner(self.owner):
+            self.engine = runtime().deserialize_cuda_engine(plan)
+        if self.engine is None and gpu.give_back(runtime()):  # the allocator could be why: once more without it
+            LOGGER.clear()
+            self.engine = runtime().deserialize_cuda_engine(plan)
+        if self.engine is not None and gpu.attached():
+            gpu.proven()
         if self.engine is None:
             said = " | ".join(LOGGER.messages) or "nothing"
-            try:
-                free, total = torch.cuda.mem_get_info()
-                vram = f"{gib(free)} of {gib(total)} VRAM free"
-            except Exception as e:
-                vram = f"free VRAM unknown ({e})"
             other = other_tensorrt()
             what = self.plan_path if serialized is None else f"{self.plan_path} as kept in RAM with its weights"
             raise RuntimeError(
-                f"TensorRT {trt.__version__} could not load {what} ({memoryview(plan).nbytes} bytes; {vram}). TensorRT said: {said}"
+                f"TensorRT {trt.__version__} could not load {what} ({memoryview(plan).nbytes} bytes). TensorRT said: {said}"
                 + (f". {other}" if other else "")
             )
         self.io = []
@@ -188,25 +197,30 @@ class Engine:
             name = self.engine.get_tensor_name(i)
             is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
             self.io.append((name, is_input, torch_dtype(self.engine.get_tensor_dtype(name))))
-        self.weight_names = list(trt.Refitter(self.engine, LOGGER).get_all_weights())
+        with gpu.owner(self.owner):
+            self.weight_names = list(trt.Refitter(self.engine, LOGGER).get_all_weights())
         self.context = None  # created once the weights are in
         self._reset_context_state()
         return time.perf_counter() - start
 
     def _context(self):
         if self.context is None:
+            LOGGER.clear()
             try:
-                self.context = self.engine.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+                with gpu.owner(self.owner):
+                    self.context = self.engine.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
             except Exception:
                 self.context = None
             if self.context is None:
-                raise RuntimeError("Could not create a TensorRT execution context (out of VRAM?)")
+                said = f": {LOGGER.errors[-1]}" if LOGGER.errors else ""
+                raise RuntimeError(f"Could not create a TensorRT execution context{said}")
             self._reset_context_state()
         return self.context
 
     def unload(self):
-        self.context = None  # before its engine
-        self.engine = None
+        with gpu.owner(self.owner):
+            self.context = None  # before its engine
+            self.engine = None
         self._reset_context_state()
         self.arena.release()
 
@@ -218,39 +232,19 @@ class Engine:
         config.clear_flag(trt.SerializationFlag.EXCLUDE_WEIGHTS)  # set for a plan built without its weights
         config.set_flag(trt.SerializationFlag.INCLUDE_REFIT)  # else the weights could never change again
         LOGGER.clear()
-        serialized = self.engine.serialize_with_config(config)
+        with gpu.owner(self.owner):
+            serialized = self.engine.serialize_with_config(config)
         if serialized is None:
             raise RuntimeError("TensorRT could not serialize the engine" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
         return serialized
 
     def refit(self, names, tensor_for, label: str = None) -> dict:
-        """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name, device)`, from
-        VRAM while there's room (see STAGING_RESERVE). Returns the seconds spent getting the weights
-        ("weights") and in TensorRT ("tensorrt"), and the bytes of them given in VRAM ("staged"). With a
-        `label`, the memory diagnostics are logged around it."""
-        budget = staging_budget()
+        """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name, "cpu")`: the
+        weights in RAM, which TensorRT copies into its own memory, the only copy of them in VRAM. Returns the
+        seconds spent getting the weights ("weights") and in TensorRT ("tensorrt"). With a `label`, the
+        memory diagnostics are logged around it."""
         if label:
-            memory(f"refit {label}: before", f"{len(names)} weights, staging budget {gib(budget)}")
-        try:
-            seconds = self._refit(names, tensor_for, budget)
-            if label:
-                memory(f"refit {label}: done", f"{gib(seconds['staged'])} staged in VRAM")
-            return seconds
-        except _StagedRefitFailed as e:
-            failure = str(e)
-        # Out of the except block, so its traceback no longer holds the failed refit's copies in VRAM
-        log(f"{failure}; refitting from RAM instead.")
-        if label:
-            memory(f"refit {label}: after the failed refit from VRAM, before emptying PyTorch's cache")
-        torch.cuda.empty_cache()
-        if label:
-            memory(f"refit {label}: after the failed refit from VRAM")
-        seconds = self._refit(names, tensor_for, 0)
-        if label:
-            memory(f"refit {label}: done from RAM")
-        return seconds
-
-    def _refit(self, names, tensor_for, budget: int) -> dict:
+            memory(f"refit {label}: before", f"{len(names)} weights")
         refitter = trt.Refitter(self.engine, LOGGER)
         for setting, value in REFITTER_SETTINGS.items():
             try:
@@ -259,33 +253,18 @@ class Engine:
                 if setting not in _unsettable:
                     _unsettable.add(setting)
                     log(f"Could not set the refitter's {setting}: {e}")
-        keep, seconds = [], {"weights": 0.0, "tensorrt": 0.0, "staged": 0}
-
-        def get(name, proto):
-            nonlocal budget
-            dtype = torch_dtype(proto.dtype)
-            nbytes = proto.size * dtype.itemsize
-            if 0 < nbytes <= budget:
-                try:
-                    t = tensor_for(name, DEVICE).to(dtype=dtype).contiguous()
-                    budget -= nbytes
-                    seconds["staged"] += nbytes
-                    return t
-                except torch.cuda.OutOfMemoryError:
-                    budget = 0  # the rest from RAM
-            return tensor_for(name, "cpu").to(dtype=dtype).contiguous()
+        keep, seconds = [], {"weights": 0.0, "tensorrt": 0.0}
 
         def put(name):
             start = time.perf_counter()
             proto = refitter.get_weights_prototype(name)
-            t = get(name, proto)
+            t = tensor_for(name, "cpu").to(dtype=torch_dtype(proto.dtype)).contiguous()
             if t.numel() != proto.size:
                 raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
             keep.append(t)
-            location = trt.TensorLocation.DEVICE if t.is_cuda else trt.TensorLocation.HOST
             given = time.perf_counter()
             seconds["weights"] += given - start
-            if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), location):
+            if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), trt.TensorLocation.HOST):
                 raise RuntimeError(f"TensorRT rejected weight {name}")
             seconds["tensorrt"] += time.perf_counter() - given
 
@@ -296,33 +275,18 @@ class Engine:
             for name in refitter.get_missing_weights():
                 put(name)
             start = time.perf_counter()
-            if seconds["staged"]:
-                torch.cuda.current_stream().synchronize()  # the copies to VRAM are done before TensorRT reads them
-                seconds["weights"] += time.perf_counter() - start
-                start = time.perf_counter()
-            # Computing LoRA weights on the GPU leaves their FP32 temporaries in PyTorch's cache, taking what
-            # STAGING_RESERVE left free from TensorRT, which allocates its refit memory from the driver
-            # (without this, the refit can fail in myelin's mapNewAllocation). The staged copies stay.
-            torch.cuda.empty_cache()
-            try:
-                ok = refitter.refit_cuda_engine()
-            finally:
-                refitter.release_refit_resources()  # else the refit's scratch memory stays allocated as long as the engine
+            with gpu.owner(self.owner):
+                try:
+                    ok = refitter.refit_cuda_engine()
+                finally:
+                    refitter.release_refit_resources()  # else the refit's scratch memory stays allocated as long as the engine
             seconds["tensorrt"] += time.perf_counter() - start
-        except torch.cuda.OutOfMemoryError:
-            # e.g. a LoRA weight computed on the GPU with the copies already there: try again with none
-            if not seconds["staged"]:
-                raise
-            raise _StagedRefitFailed("Ran out of VRAM refitting from it") from None
         finally:
-            keep.clear()  # an error's traceback keeps this frame, and would keep the weights (GBs, maybe in VRAM)
+            keep.clear()  # an error's traceback keeps this frame, and would keep the weights (GBs)
         if not ok:
-            said = f": {LOGGER.errors[-1]}" if LOGGER.errors else ""
-            if seconds["staged"]:
-                raise _StagedRefitFailed(f"Refitting the engine from VRAM failed{said}")
-            raise RuntimeError(f"Refitting the engine failed{said}")
-        if seconds["staged"]:
-            torch.cuda.empty_cache()  # the copies' VRAM back to the driver, for TensorRT and the other models
+            raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
+        if label:
+            memory(f"refit {label}: done")
         return seconds
 
     def _set_shapes(self, profile: int, shapes: dict, stream: int):
@@ -359,6 +323,10 @@ class Engine:
     def estimate_activation_bytes(self, profile: int, shapes: dict, stream: int) -> int:
         self._set_shapes(profile, shapes, stream)
         return self.activation_bytes()
+
+    def io_bytes(self) -> dict:
+        """{input or output: its bytes} at the shapes set on the context (TensorRT's output shapes)."""
+        return {name: math.prod(self.context.get_tensor_shape(name)) * torch.tensor([], dtype=dtype).element_size() for name, _, dtype in self.io}
 
     def infer(self, feed: dict, profile: int, stream: int, into: dict = None) -> dict:
         """Runs on the inputs in `feed` that the engine takes (e.g. SDXL's shallow UNet takes no prompt);

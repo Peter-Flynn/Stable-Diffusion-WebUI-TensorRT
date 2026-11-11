@@ -21,12 +21,11 @@ import torch
 from modules import sd_unet
 
 from . import arch as arch_mod
-from . import common, profiles, refits, speed, store
+from . import common, gpu, profiles, refits, speed, store
 from . import vae as vae_mod
 from .common import inference_mode, log, notify
 from .weights import EffectiveWeights
 
-HEADROOM = 256 * 2**20
 _models = {}  # Record.key -> TrtModel
 _last_used = {}  # arch id -> Record.key of the engine the batch being generated last ran on (see new_batch)
 _pass = None  # the sampling pass running on an engine
@@ -43,13 +42,15 @@ class TensorRTUNet:
 class TrtModel:
     """An engine as reForge's model manager sees a model (the parts of ModelPatcher it uses), with its
     shallow partner for Speed Hacks (speed.py), loaded only for passes that use them. The two share their
-    activation memory, since they never run at once."""
+    activation memory, since they never run at once. Its size is what its engines hold in VRAM, as counted
+    (gpu.py); before its first load, the size of its weights."""
 
     parent = None
 
     def __init__(self, record: store.Record):
         mm = common.mm()
         self.record = record
+        self.owner = f"{record.arch.label} {record.label}"  # whose TensorRT memory it is (gpu.py)
         self.hacks = record.speed_hacks  # read once: it checks the disk, and model_size() is called often
         self.model = TensorRTUNet()
         self.load_device = mm.get_torch_device()
@@ -59,7 +60,8 @@ class TrtModel:
         self.shallow_failed = False  # its load failed: not tried again until this engine loads again
         self.weights = None  # EffectiveWeights the engines should run with
         self.applied = {}  # "unet" / "shallow" -> {weight name: signature of what's in that engine}
-        self.measured = 0
+        self.sizes = {}  # with the shallow engine or not -> what the engines held once loaded, as counted
+        self.peaks = {}  # likewise -> the most they held while loading
         self.keep = True  # whether unloading keeps the engines in RAM as they are (refits.py)
 
     def _engines(self):
@@ -67,9 +69,9 @@ class TrtModel:
             from .engine import Arena, Engine
 
             arena = Arena()
-            self.engine = Engine(self.record.plan, arena)
+            self.engine = Engine(self.record.plan, arena, self.owner)
             if self.hacks:
-                self.shallow = Engine(self.record.shallow_plan, arena)
+                self.shallow = Engine(self.record.shallow_plan, arena, self.owner)
         return self.engine
 
     @property
@@ -80,8 +82,14 @@ class TrtModel:
     def shallow_loaded(self) -> bool:
         return self.shallow is not None and self.shallow.loaded
 
+    def _weights_size(self, shallow: bool) -> int:
+        return self.record.weight_bytes + (self.hacks["weight_bytes"] if self.hacks and shallow else 0)
+
     def model_size(self):
-        return self.measured or self.record.weight_bytes + (self.hacks["weight_bytes"] if self.hacks and self.want_shallow else 0)
+        if self.loaded:
+            return gpu.held(self.owner)
+        shallow = bool(self.hacks and self.want_shallow)
+        return self.sizes.get(shallow) or self._weights_size(shallow)
 
     def loaded_size(self):
         return self.model_size() if self.loaded else 0
@@ -102,6 +110,9 @@ class TrtModel:
         return other is self
 
     def partially_load(self, device, extra_memory=0, force_patch_weights=False):
+        """Loads the engines, with room made first for the most the load held the last time (the weights'
+        size, the first time). A load that runs out of VRAM anyway (what it took this time is more) is tried
+        once more with all the room there is."""
         if self.loaded:
             return 0
         if self.weights is None:  # a load outside a sampling pass: the loaded checkpoint's weights
@@ -109,8 +120,37 @@ class TrtModel:
             if patcher is None:
                 raise RuntimeError("no checkpoint to take the engine's weights from")
             self.weights = EffectiveWeights(patcher)
-        common.memory(f"loading the {self.record.label}: before", f"model size {common.gib(self.model_size())}, {common.gib(self.record.weight_bytes)} of weights")
-        start, free, reserved = time.time(), torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
+        shallow = bool(self.hacks and self.want_shallow)
+        need = self.peaks.get(shallow) or self._weights_size(shallow)
+        start = time.time()
+        for attempt in (0, 1):
+            common.make_room(need if not attempt else common.obtainable(self.load_device) - common.reserve(), self.load_device)
+            common.memory(f"loading the {self.record.label}: before", f"room made for {common.gib(need)}")
+            load = {}
+            try:
+                with gpu.loading(self.owner) as load:
+                    refit, plan_seconds, kept = self._load_engines()
+                break
+            except Exception:
+                self._discard()
+                if attempt or not load.get("failures"):
+                    raise
+                log(f"Ran out of VRAM loading the {self.record.label} after {common.gib(load['peak'])}; making all the room there is and trying again.")
+                need = max(need, load["peak"])
+        size, peak = gpu.held(self.owner), load["peak"]
+        self.sizes[self.shallow_loaded], self.peaks[self.shallow_loaded] = size, peak
+        with_shallow = " with its Speed Hacks part" if self.shallow_loaded else ""
+        source = f"as kept in RAM with its weights {plan_seconds:.1f}s" if kept else f"plan {plan_seconds:.1f}s"
+        log(
+            f"Loaded the {self.owner}{with_shallow} ({common.gib(size)} in VRAM, at most {common.gib(peak)} while loading) in {time.time() - start:.1f}s: "
+            f"{source}, " + (_refit_times(refit) if refit else "no weights to refit")
+        )
+        common.memory(f"loading the {self.record.label}: done")
+        return self.model_size()
+
+    def _load_engines(self) -> tuple:
+        """(What refitting them took, None if they came as they were kept; the seconds loading them took; what
+        was kept in RAM of them, if they came from there.)"""
         engine = self._engines()
         kept = self._kept()
         self.applied = {}
@@ -123,28 +163,19 @@ class TrtModel:
                 log(f"Could not load the Speed Hacks part of the {self.record.label} ({e}); running without it.")
                 self.shallow.unload()
                 self.want_shallow, self.shallow_failed = False, True
+        refit = self.sync(quiet=True)  # what isn't in them yet: everything, unless they came as they were kept
+        return refit, plan_seconds, kept
+
+    def _discard(self):
+        """Unloads what a failed load left, keeping nothing of it in RAM."""
+        self.keep = False
         try:
-            refit = self.sync(quiet=True)  # what isn't in them yet: everything, unless they came as they were kept
-        except Exception:
-            self.keep = False  # not as they are now
-            try:
-                self.detach()
-            finally:
-                self.keep = True
-            raise
-        # TensorRT's own allocations, not what PyTorch cached meanwhile (e.g. computing LoRA weights)
-        used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
-        self.measured = max(self.measured, used)
-        with_shallow = " with its Speed Hacks part" if self.shallow_loaded else ""
-        weights = self.record.weight_bytes + (self.hacks["weight_bytes"] if self.hacks and self.shallow_loaded else 0)
-        beyond = f"; {common.gib(used - weights)} beyond the weights" if used > weights + 2**20 else ""
-        source = f"as kept in RAM with its weights {plan_seconds:.1f}s" if kept else f"plan {plan_seconds:.1f}s"
-        log(
-            f"Loaded the {self.record.arch.label} {self.record.label}{with_shallow} ({common.gib(self.model_size())}{beyond}) in {time.time() - start:.1f}s: "
-            f"{source}, " + (_refit_times(refit) if refit else "no weights to refit")
-        )
-        common.memory(f"loading the {self.record.label}: done", f"measured {common.gib(used)}")
-        return self.model_size()
+            self.detach()
+        finally:
+            self.keep = True
+        if self.engine is not None and not self.engine.loaded and self.shallow is not None:
+            self.shallow.unload()
+        gpu.forget(self.owner)
 
     def _load(self, role: str, engine, kept) -> float:
         """Loads one of the engines: as kept in RAM with its weights, if it is (what it holds then goes to
@@ -192,7 +223,7 @@ class TrtModel:
             return
         sizes = {"unet": self.record.weight_bytes, "shallow": self.hacks["weight_bytes"] if self.hacks else 0}
         if not refits.room(sum(sizes[role] for role in todo), key):
-            log(f"Not keeping the {label} in RAM with its weights: too little RAM is available ({refits.explain()}). Loading it again will refit it.")
+            log(f"Not keeping the {label} in RAM with its weights ({refits.explain()}). Loading it again will refit it.")
             return
         start = time.time()
         torch.cuda.current_stream().synchronize()  # no inference in flight
@@ -220,20 +251,23 @@ class TrtModel:
             return False
 
     def load_shallow(self):
-        """The shallow engine, for an engine loaded without it."""
+        """The shallow engine, for an engine loaded without it, with room made for what loading it took the
+        last time (its weights' size, the first time)."""
         if not self.loaded or self.shallow is None or self.shallow.loaded:
             return
-        start, free, reserved = time.time(), torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
-        try:
-            self._load("shallow", self.shallow, self._kept() if self.weights is not None else None)
-            self.sync(quiet=True)
-        except Exception:
-            self.shallow.unload()
-            self.want_shallow, self.shallow_failed = False, True
-            raise
-        used = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
-        self.measured += max(used, 0)
-        log(f"Loaded the Speed Hacks part of the {self.record.arch.label} {self.record.label} in {time.time() - start:.1f}s")
+        need = max(0, self.peaks.get(True, 0) - self.sizes.get(False, 0)) or self.hacks["weight_bytes"]
+        common.make_room(need, self.load_device, _loaded_entries(self))
+        start = time.time()
+        with gpu.loading(self.owner) as load:
+            try:
+                self._load("shallow", self.shallow, self._kept() if self.weights is not None else None)
+                self.sync(quiet=True)
+            except Exception:
+                self.shallow.unload()
+                self.want_shallow, self.shallow_failed = False, True
+                raise
+        self.sizes[True], self.peaks[True] = gpu.held(self.owner), max(self.peaks.get(True, 0), load["peak"])
+        log(f"Loaded the Speed Hacks part of the {self.owner} in {time.time() - start:.1f}s ({common.gib(self.sizes[True])} in VRAM with the engine)")
 
     def partially_unload(self, device, memory_to_free=0):
         return 0
@@ -250,6 +284,10 @@ class TrtModel:
                 self.shallow.unload()
             self.engine.unload()
             self.applied, self.shallow_failed = {}, False
+            left = gpu.held(self.owner) if gpu.attached() else 0
+            if left:
+                log(f"TensorRT still holds {common.gib(left)} of the {self.owner}'s memory after unloading it.")
+            gpu.forget(self.owner)
             common.memory(f"unloading the {self.record.label}: done")
         return self.model
 
@@ -283,8 +321,7 @@ class TrtModel:
 
 def _refit_times(refit: dict) -> str:
     patched = f", {refit['patched']} with LoRAs" if refit["patched"] else ""
-    staged = f" ({common.gib(refit['staged'])} of the weights from VRAM)" if refit.get("staged") else ""
-    return f"{refit['count']} weights {refit['weights']:.1f}s{patched}, TensorRT refit {refit['tensorrt']:.1f}s{staged}"
+    return f"{refit['count']} weights {refit['weights']:.1f}s{patched}, TensorRT refit {refit['tensorrt']:.1f}s"
 
 
 def _loaded_entries(*models):
@@ -761,19 +798,22 @@ def _begin(records, hacks, patcher, x, prepare):
 
 
 def _make_room_for_activations(model: TrtModel, patcher, x):
+    """Makes room for what the pass's UNet calls hold beside the engine (_call_bytes)."""
     try:
-        need = _activation_estimate(model, x)
+        need = _call_bytes(model, x)
     except Exception as e:
-        log(f"Could not estimate the engine's activation memory: {e}")
+        log(f"Could not size the engine's calls: {e}")
         return
     if need:
-        common.mm().free_memory(need + HEADROOM, model.load_device, keep_loaded=_loaded_entries(model, patcher))
+        common.make_room(need, model.load_device, _loaded_entries(model, patcher))
 
 
-def _activation_estimate(model: TrtModel, x) -> int:
+def _call_bytes(model: TrtModel, x) -> int:
+    """What a UNet call at the likeliest shapes (cond and uncond batched, or one at a time if no profile can
+    batch them) holds beside the engine, as TensorRT gives it: its activation memory, its inputs as the
+    engine takes them and its outputs; with Speed Hacks, also the deep feature kept from the call before."""
     b, c, h, w = x.shape
     held = model.record.profile_shapes
-    # cond and uncond batched, or one at a time if no profile can batch them (e.g. at its largest batch)
     choice = profiles.select(held, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select(held, b, h, w, profiles.CONTEXT_PER_CHUNK)
     if choice is None:
         return 0
@@ -786,7 +826,9 @@ def _activation_estimate(model: TrtModel, x) -> int:
     }
     if "y" in s:
         shapes["y"] = (padded, s["y"][0][1])
-    return model.engine.estimate_activation_bytes(profile, shapes, torch.cuda.current_stream().cuda_stream)
+    act = model.engine.estimate_activation_bytes(profile, shapes, torch.cuda.current_stream().cuda_stream)
+    io = model.engine.io_bytes()
+    return act + sum(io.values()) + io.get("deep", 0)
 
 
 def _wrap_forward(original):
@@ -851,16 +893,16 @@ def _wrap_denoiser(original):
 
 
 def _wrap_vae_decode(original):
-    """Decodes on the VAE decoder's engines when SD Unet runs the engines and they fit (vae.py), keeping
-    the UNet engines loaded; anything else decodes on PyTorch, as reForge would."""
+    """Decodes on the VAE decoder's engines when SD Unet runs the engines (vae.py), with the room it needs
+    made by reForge's manager like any model's (the UNet engines are evicted last, and only if that makes
+    the room); anything else decodes on PyTorch, as reForge would."""
 
     def decode(self, samples_in, vae_options={}):
         # Not from another thread: reForge's progress endpoint decodes "Full" live previews on its own,
         # while the generation's thread samples on the UNet engine.
         if not vae_options and setting() in (AUTOMATIC, SPEED_HACKS) and threading.get_ident() == _generation_thread:
             try:
-                with _keeping(*[m for m in _models.values() if m.loaded]):
-                    pixels = vae_mod.decode(self, samples_in)
+                pixels = vae_mod.decode(self, samples_in)
                 if pixels is not None:
                     return pixels
             except Exception as e:
@@ -873,14 +915,13 @@ def _wrap_vae_decode(original):
 
 
 def _wrap_vae_encode(original):
-    """Encodes on the VAE encoder's engines likewise (an img2img's image, a Hires. fix's upscaled one),
-    keeping the UNet engines loaded; anything they pass on encodes on PyTorch, as reForge would."""
+    """Encodes on the VAE encoder's engines likewise (an img2img's image, a Hires. fix's upscaled one);
+    anything they pass on encodes on PyTorch, as reForge would."""
 
     def encode(self, pixel_samples):
         if setting() in (AUTOMATIC, SPEED_HACKS) and threading.get_ident() == _generation_thread:
             try:
-                with _keeping(*[m for m in _models.values() if m.loaded]):
-                    latents = vae_mod.encode(self, pixel_samples)
+                latents = vae_mod.encode(self, pixel_samples)
                 if latents is not None:
                     return latents
             except Exception as e:

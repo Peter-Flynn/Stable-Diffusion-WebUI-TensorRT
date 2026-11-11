@@ -76,6 +76,39 @@ def gib(n: float) -> str:
     return f"{n / 2**30:.2f} GiB" if n >= 2**30 else f"{n / 2**20:.0f} MiB"
 
 
+# --- Making room in VRAM: exact sizes, through reForge's model manager
+
+
+def reserve() -> int:
+    """The VRAM reForge keeps free for what no allocator counts (other applications, CUDA's own code): its
+    --reserve-vram, or its default for the OS. The only margin anything here keeps."""
+    try:
+        return int(mm().extra_reserved_memory())
+    except Exception:
+        return 0
+
+
+def obtainable(device, keep=()) -> int:
+    """The most VRAM making room could give: what's free now (PyTorch's unused cache included, which
+    TensorRT allocates from too), and what every loaded model but those in `keep` holds."""
+    m = mm()
+    held = sum(
+        lm.model_loaded_memory()
+        for lm in m.current_loaded_models
+        if lm.device == device and lm.model is not None and not any(lm.model is k for k in keep)
+    )
+    return m.get_free_memory(device) + held
+
+
+def make_room(nbytes: int, device, keep_loaded=()) -> int:
+    """Has reForge's manager evict models (least recently used first; engines last, see runtime.py) until
+    `nbytes` are free beside the reserve. Returns what's free then, beside the reserve."""
+    m = mm()
+    with torch.inference_mode():  # models unloaded outside it are left unusable (see inference_mode)
+        m.free_memory(nbytes + reserve(), device, keep_loaded=list(keep_loaded))
+    return m.get_free_memory(device) - reserve()
+
+
 # --- Memory diagnostics: these only read counters, and change nothing.
 
 _nvml = None  # NVML's handle for this GPU; False once NVML turned out not to be usable
@@ -119,6 +152,12 @@ def _ours() -> str:
     the strips' pinned RAM, engines kept in RAM."""
     parts = []
     try:
+        from . import gpu
+
+        parts.append(gpu.summary())
+    except Exception:
+        pass
+    try:
         from .engine import Arena
 
         arenas = [a.memory.numel() for a in list(Arena.instances) if a.memory is not None]
@@ -141,7 +180,7 @@ def _ours() -> str:
             parts.append(f"{count} engines kept in RAM {gib(nbytes)}")
     except Exception:
         pass
-    return ", ".join(parts)
+    return ", ".join(p for p in parts if p)
 
 
 def _ram() -> str:
@@ -168,9 +207,13 @@ def memory(where: str, extra: str = ""):
             outside = f"outside PyTorch {gib(process - reserved)} (this process holds {gib(process)}; other processes {gib(used - process)})"
         else:
             outside = f"outside PyTorch {gib(used - reserved)} (other processes included)"
+        try:
+            backend = torch.cuda.get_allocator_backend()
+        except Exception:
+            backend = "?"
         parts = [
             f"VRAM {gib(used)} used of {gib(total)}, {gib(free)} free (reForge counts {gib(free + reserved - active)} free)",
-            f"PyTorch {gib(allocated)} allocated + {gib(reserved - allocated)} cached",
+            f"PyTorch ({backend}) {gib(allocated)} allocated + {gib(reserved - allocated)} cached",
             outside,
             f"loaded: {_loaded_models()}",
             _ours(),

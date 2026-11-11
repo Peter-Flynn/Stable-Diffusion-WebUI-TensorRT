@@ -32,8 +32,8 @@ PyTorch instead, with a notice.
    **Build engines**; the first build takes a few minutes.
 3. Generate. Every checkpoint with the same architecture now uses the engines. One is loaded at a time: each
    batch runs on the one that fits it best, and its Hires. fix stays on it if it covers the larger size. An engine
-   that makes way for another is kept in RAM with its weights while RAM allows, so it comes back for the same
-   checkpoint and LoRAs without loading them into it again.
+   that makes way for another is kept in RAM with its weights when the system can spare the RAM, until it says it's
+   short of memory, so it comes back for the same checkpoint and LoRAs without loading them into it again.
 
 **Engine modes.** *Per-profile engines*, the default, are an engine per profile, built one at a time; only the one
 a generation's sizes need is loaded. A *merged engine* holds every profile of an architecture, so no pass ever
@@ -54,14 +54,19 @@ LoRAs) run as usual.
 
 **The VAE.** Its decoder and its encoder get engines too, built along with the UNet's for the same sizes. They run in
 the precision reForge picks for the VAE: BF16 on RTX 30 series and newer, and on older cards FP16 rather than
-reForge's FP32, at half the VRAM and several times the speed (a `--vae-in-*` flag at build time overrides either).
-VAEs overflow FP16, which is why reForge avoids it; the engines run the VAE scaled down by a power of two between its
-normalizations, where that changes nothing but the range, so any VAE of the architecture runs on them without NaNs.
-A decode runs on them whenever they fit in the VRAM that's free. Larger decodes (a Hires. fix's, or beside a UNet
-engine that leaves too little VRAM) run in horizontal strips on engines built for that: the same image, a little
-slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines, whole
-when that fits in the free VRAM and in tiles when it doesn't, without unloading the UNet engine. PyTorch does
-anything else.
+reForge's FP32, at half the VRAM (a `--vae-in-*` flag at build time overrides either). VAEs overflow FP16, which is
+why reForge avoids it; the engines run the VAE scaled down by a power of two between its normalizations, where that
+changes nothing but the range, so any VAE of the architecture runs on them without NaNs. A decode runs on them whole
+whenever reForge can make room for it, which it does like for any model (a UNet engine goes last, only if that makes
+the room). Larger decodes (a Hires. fix's) run in horizontal strips on engines built for that, with all the room
+there can be: the same image, a little slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled
+one) run on the encoder's engines, whole when there can be room and in tiles when there can't. PyTorch does anything
+else.
+
+**Memory.** Everything TensorRT holds in VRAM comes from PyTorch's allocator, so reForge counts it like any model's,
+and every size used to make room is exact: what each engine held when it last loaded, TensorRT's own activation sizes,
+and the tensors between them. The only margin is reForge's own reserve (`--reserve-vram`). Set
+`TRT_EXTENSION_TORCH_ALLOCATOR=0` to leave TensorRT on its own allocator.
 
 > [!NOTE]
 > An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build again;
