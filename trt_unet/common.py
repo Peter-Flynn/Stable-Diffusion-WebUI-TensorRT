@@ -94,14 +94,16 @@ def free(device) -> int:
     return mm().get_free_memory(device) - reserve()
 
 
-def obtainable(device, keep=()) -> int:
+def obtainable(device, keep=(), engines: bool = True) -> int:
     """The most VRAM making room could give: what's free now (PyTorch's unused cache included, which
-    TensorRT allocates from too), and what every loaded model but those in `keep` holds."""
+    TensorRT allocates from too), and what every loaded model but those in `keep` holds; UNet engines' too
+    (models `evicted_last`) unless not `engines`."""
     m = mm()
     held = sum(
         lm.model_loaded_memory()
         for lm in m.current_loaded_models
         if lm.device == device and lm.model is not None and not any(lm.model is k for k in keep)
+        and (engines or not getattr(lm.model, "evicted_last", False))
     )
     return m.get_free_memory(device) + held
 

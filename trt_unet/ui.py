@@ -33,7 +33,7 @@ HELP = """
 
 **SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engines of the loaded checkpoint's architecture, `Speed Hacks` uses them with Speed Hacks, `None` always uses PyTorch.
 
-**The VAE** gets engines too, for its decoder and its encoder, built with the UNet's for the sizes its profiles cover, in the precision reForge runs the VAE in where the GPU has BF16, and in FP16 where reForge falls back to FP32 for want of it: half the VRAM (a `--vae-in-*` flag at build time decides otherwise). FP16 engines run the VAE scaled down by a power of two between its normalizations, so no VAE overflows in them, and any VAE of the architecture runs on them. Each decode runs on them when they fit in the VRAM free, as many images at a time as fit. Larger ones (a Hires. fix's, or beside a UNet engine) run in strips on engines of their own: the same image, a bit slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines, whole when that fits in the VRAM free and in strips like the decoder's when it doesn't. PyTorch does the rest.
+**The VAE** gets engines too, for its decoder and its encoder, built with the UNet's for the sizes its profiles cover, in the precision reForge runs the VAE in where the GPU has BF16, and in FP16 where reForge falls back to FP32 for want of it: half the VRAM (a `--vae-in-*` flag at build time decides otherwise). FP16 engines run the VAE scaled down by a power of two between its normalizations, so no VAE overflows in them, and any VAE of the architecture runs on them. Each decode runs on them whole when there can be room for it (reForge's manager makes it, a UNet engine going last), several images at a time where that takes no UNet engine's room. Larger ones (a Hires. fix's) run in strips on engines of their own: the same image, a bit slower. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines the same way, whole or in strips. PyTorch does the rest.
 
 **Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and, late in a pass, wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). The first 30% and last 5% of steps run in full, so composition and detail stay close (both shares are in Settings, Stable Diffusion, TensorRT). Passes of 12 steps or more should run roughly 1.6x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
 """
@@ -484,10 +484,10 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
         vae_record = result["vae"]
         message += (
             f"\n\nBuilt the VAE's engines, in {vae_mod.label(vae_record.meta['dtype'])}, for decodes up to {vae_record.reach()}: "
-            "decodes run on them whenever they fit in the VRAM free, else in strips, with what doesn't fit held in RAM."
+            "decodes run on them whole whenever there can be room, else in strips, with what doesn't fit held in RAM."
             if vae_record.strips else
             f"\n\nBuilt the VAE's engines, in {vae_mod.label(vae_record.meta['dtype'])}, for decodes up to {vae_record.reach()}: "
-            "decodes run on them whenever they fit in the VRAM free."
+            "decodes run on them whenever there can be room."
         )
         if vae_record.meta.get("strips_error"):
             message += f" Its engines for decoding in strips couldn't be built (`{vae_record.meta['strips_error']}`), so larger decodes run on PyTorch."

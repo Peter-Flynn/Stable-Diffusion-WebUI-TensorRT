@@ -1365,6 +1365,7 @@ class _Side:
             self.probes, self.lasts = {}, {}
         for which in [w for w in self.engines if not self._kept(w, keep)]:
             self.engines.pop(which).unload()
+            gpu.unloaded(self.model.owner, self.sizes.get(which, 0))
             for d in (self.names, self.applied, self.sizes):
                 d.pop(which, None)
 
@@ -1464,11 +1465,20 @@ class VaeModel:
             gpu.forget(self.owner)
         return self.model
 
-    def obtainable(self) -> int:
+    def use(self, side: _Side, parts=(), strips: bool = False):
+        """What's under way runs on these parts of `side`'s whole one, loaded now (each with its room), and
+        with `strips`, on its stages' engines (loaded as they're planned): the room made for it is beside
+        them."""
+        self.using = set(parts) | ({side.strips_key} if strips else set())
+        for part in parts:
+            side.engine(part)
+
+    def obtainable(self, engines: bool = True) -> int:
         """The most VRAM there could be beside the reserve for what's under way: what's free, what every other
-        model holds, and what this one's engines that it doesn't run on hold."""
+        model holds (the UNet engines' too, unless not `engines`), and what this one's engines that it doesn't
+        run on hold."""
         spare = self.decoder.spare(self.using) + self.encoder.spare(self.using)
-        return common.obtainable(self.load_device, keep=[self]) - common.reserve() + spare
+        return common.obtainable(self.load_device, keep=[self], engines=engines) - common.reserve() + spare
 
     def make_room(self, nbytes: int) -> int:
         """Makes `nbytes` free beside the reserve: this model's engines that what's under way doesn't run on go
@@ -1614,14 +1624,15 @@ def release_all():
 def _fit(model: VaeModel, top: int, need_for) -> tuple:
     """(The most latents a decode on the pre and post engines takes at once, up to `top` (or images, an
     encode on the encoder's), 0 if not even one can; what that holds at its most; the engines' activation
-    memory for it; the most room there could be.) `need_for(n)` gives what n hold, and loads the engines (for
-    their activation sizes). Room is made for exactly that (this model's engines that it doesn't run on
-    first, then by reForge's manager, the UNet engines last), and the activation memory is allocated for it,
-    once."""
+    memory for it; the most room there could be.) `need_for(n)` gives what n hold, the engines being loaded
+    (VaeModel.use). Room is made for exactly that (this model's engines that it doesn't run on first, then by
+    reForge's manager, the UNet engines last). Several at a time only where that takes no UNet engine's
+    room: one at a time is barely slower, and bringing an engine back costs seconds. The activation memory
+    is allocated for it, once."""
     model.release()
-    need_for(1)  # the engines, loaded: what they hold isn't room
     can = model.obtainable()
-    n = next((n for n in range(top, 0, -1) if need_for(n)[0] <= can), 0)
+    beside = model.obtainable(engines=False)
+    n = next((n for n in range(top, 0, -1) if need_for(n)[0] <= beside), 0) or (1 if need_for(1)[0] <= can else 0)
     if not n:
         return 0, need_for(1)[0], 0, can
     need, act = need_for(n)
@@ -1808,7 +1819,7 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
 
     n = need = act = can = 0
     if whole:
-        model.using = {PRE, POST}
+        model.use(side, (PRE, POST))
         n, need, act, can = _fit(model, min(b, model.record.max_batch), need_for)
         common.memory(
             f"VAE decode of {w * 8}x{h * 8}: {'whole, ' + str(n) + ' at a time' if n else 'not whole'}",
@@ -1825,7 +1836,7 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
     if found is None:
         log(f"The VAE decoder engines hold {common.gib(need)} at most for {w * 8}x{h * 8}, there could be room for {common.gib(can)}: decoding on PyTorch.")
         return None
-    model.using = {PRE, side.strips_key}
+    model.use(side, (PRE,), strips=True)
     model.release()
     common.memory(f"VAE decode of {w * 8}x{h * 8}: before planning strips")
     start = time.time()
@@ -2014,7 +2025,7 @@ def _encode(model: VaeModel, vae, pixels, found):
     pixels_gpu = pixels.is_cuda
     n = need = act = can = 0
     if whole:
-        model.using = set(ENCODER)
+        model.use(side, ENCODER)
         n, need, act, can = _fit(model, min(b, record.encode_batch), lambda n: model.need_encode(n, h, w, pixels_gpu))
         common.memory(
             f"VAE encode of {w}x{h}: {'whole, ' + str(n) + ' at a time' if n else 'not whole'}",
@@ -2041,7 +2052,7 @@ def _encode(model: VaeModel, vae, pixels, found):
     if found is None:
         log(f"The VAE encoder engines can't encode {w}x{h} ({why}): encoding on PyTorch.")
         return None
-    model.using = {ENCODE_POST, side.strips_key}
+    model.use(side, (ENCODE_POST,), strips=True)
     model.release()
     common.memory(f"VAE encode of {w}x{h}: before planning strips")
     samples, report = _encode_strips(model, vae, pixels, found)

@@ -264,6 +264,18 @@ def loading(name):
         result.update(held=held(name), peak=held(name), failures=0)
 
 
+def unloaded(name, nbytes: int):
+    """`name` unloaded an engine that held `nbytes`: without PyTorch's allocator, that's how the ledger learns
+    it (with it, every free is counted)."""
+    if not attached():
+        with _lock:
+            left = _held.get(name, 0) - nbytes
+            if left > 0:
+                _held[name] = left
+            else:
+                _held.pop(name, None)
+
+
 def forget(name):
     """`name` unloaded everything: without PyTorch's allocator, that's how the ledger learns it (with it,
     every free is counted, and anything left is what TensorRT didn't give back)."""

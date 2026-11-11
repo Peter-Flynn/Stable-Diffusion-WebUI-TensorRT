@@ -2,8 +2,8 @@
 
 An architecture has an engine per profile, or one merged engine holding them all (store.py), and a sampling
 pass loads the one for its sizes; only one is in VRAM at a time. Each is a model of reForge's own model
-manager, so the manager makes room for it and loads it back for sampling like any other model, but evicts
-it only as a last resort (_wrap_free_memory): an engine comes back without its weights. One that's unloaded
+manager, held like any other (it makes exactly its room as it loads), but evicted only as a last resort
+(_wrap_free_memory): an engine comes back without its weights. One that's unloaded
 is kept in RAM as it is, weights and all, while RAM allows (refits.py), and comes back from there for the
 same weights; otherwise every weight is refitted. While a sampling pass runs on an engine, the PyTorch UNet
 stays in RAM (its patches still apply, it just isn't loaded)."""
@@ -46,6 +46,7 @@ class TrtModel:
     (gpu.py); before its first load, the size of its weights."""
 
     parent = None
+    evicted_last = True  # by reForge's manager (_wrap_free_memory), and not counted on for room otherwise (common.obtainable)
 
     def __init__(self, record: store.Record):
         mm = common.mm()
@@ -516,7 +517,7 @@ def _wrap_free_memory(original):
         mm = common.mm()
         engines = []
         if not _evicting and not getattr(mm, "DISABLE_SMART_MEMORY", False):
-            engines = [lm for lm in mm.current_loaded_models if isinstance(lm.model, TrtModel) and lm.device == device and lm not in keep_loaded]
+            engines = [lm for lm in mm.current_loaded_models if getattr(lm.model, "evicted_last", False) and lm.device == device and lm not in keep_loaded]
         if not engines:
             return original(memory_required, device, keep_loaded)
         unloaded = original(memory_required, device, list(keep_loaded) + engines)
