@@ -1014,8 +1014,14 @@ class Decode:
                 held[-1].t.mul_(self.scale)
 
         held, _ = self._run(plan, x.shape[2], x.shape[3], fill, timed)
-        image = held[len(plan.stages) - 1].t
-        return image.to(self.device).permute(1, 0, 2).unsqueeze(0).contiguous()
+        return self._out(held[len(plan.stages) - 1].t)
+
+    def _out(self, t):
+        """A held tensor (rows, channels, width), in VRAM or RAM, as (1, channels, rows, width) in VRAM: one
+        copy there, however it's held (the size VaeModel counts beside the plan)."""
+        out = torch.empty((1, t.shape[1], t.shape[0], t.shape[2]), dtype=t.dtype, device=self.device)
+        out[0].copy_(t.permute(1, 0, 2))
+        return out
 
     def _run(self, plan: Plan, h: int, w: int, fill, timed: bool = False) -> tuple:
         """Runs the plan's stages for latents of h x w, `fill(held)` having put the tensors it starts with in.
@@ -1245,8 +1251,7 @@ class Encode(Decode):
                 held[-1].t.mul_(self.scale)  # as the scaled encoder takes it (vae._EncodePre)
 
         held, stats = self._run(plan, h, w, fill, timed)
-        x = held[len(plan.stages) - 1].t
-        return x.to(self.device).permute(1, 0, 2).unsqueeze(0).contiguous(), stats
+        return self._out(held[len(plan.stages) - 1].t), stats
 
 
 class _nothing:
