@@ -10,6 +10,7 @@ stays in RAM (its patches still apply, it just isn't loaded)."""
 
 import contextlib
 import math
+import os
 import sys
 import threading
 import time
@@ -222,8 +223,7 @@ class TrtModel:
         todo = [role for role in loaded if entry is None or entry.signatures.get(role) != self.applied[role]]
         if not todo:
             return
-        sizes = {"unet": self.record.weight_bytes, "shallow": self.hacks["weight_bytes"] if self.hacks else 0}
-        if not refits.room(sum(sizes[role] for role in todo), key):
+        if not refits.room(sum(self._serialized_size(role) for role in todo), key):
             log(f"Not keeping the {label} in RAM with its weights ({refits.explain()}). Loading it again will refit it.")
             return
         start = time.time()
@@ -236,6 +236,15 @@ class TrtModel:
         refits.put(key, kept)
         count, total = refits.held()
         log(f"Kept the {label} in RAM with its weights ({common.gib(kept.nbytes)}) in {time.time() - start:.1f}s; {count} kept, {common.gib(total)}.")
+
+    def _serialized_size(self, role: str) -> int:
+        """About what serializing an engine with its weights takes in RAM: its plan (kernels and all, without
+        weights) and its weights."""
+        plan, weights = (self.record.plan, self.record.weight_bytes) if role == "unet" else (self.record.shallow_plan, self.hacks["weight_bytes"])
+        try:
+            return weights + os.path.getsize(plan)
+        except OSError:
+            return weights
 
     def _source(self):
         """() -> the UNet module the engine's weights are from, or None once it's gone: its signatures' weak

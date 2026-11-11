@@ -60,20 +60,16 @@ def _meminfo() -> dict:
         return {line.split(":")[0]: int(line.split()[1]) * 1024 for line in f if line.split()[1:]}
 
 
-def _supply():
-    """The RAM the OS can hand over without paging anything out, as it counts it, or None if it can't
-    tell: on Linux, the free memory and the clean file cache and kernel caches it drops on demand; on
-    Windows and macOS, what they call available (free, standby or inactive)."""
-    try:
-        if sys.platform.startswith("linux"):
-            m = _meminfo()
-            return m["MemFree"] + m.get("Active(file)", 0) + m.get("Inactive(file)", 0) + m.get("SReclaimable", 0)
-        import psutil
+def _supply() -> int:
+    """The RAM the OS can hand over without paging anything out, as it counts it: on Linux, the free memory
+    and the clean file cache and kernel caches it drops on demand; on Windows and macOS, what they call
+    available (free, standby or inactive). Raises if it can't tell."""
+    if sys.platform.startswith("linux"):
+        m = _meminfo()
+        return m["MemFree"] + m.get("Active(file)", 0) + m.get("Inactive(file)", 0) + m.get("SReclaimable", 0)
+    import psutil
 
-        return int(psutil.virtual_memory().available)
-    except Exception as e:
-        _last["error"] = f"{type(e).__name__}: {e}"
-        return None
+    return int(psutil.virtual_memory().available)
 
 
 _swapped = None  # Linux without pressure stall information: pages swapped out, at the last look
@@ -209,9 +205,11 @@ def room(nbytes: int, key: str = None) -> bool:
     if why:
         _last["pressure"] = why
         return False
-    supply = _supply()
-    if supply is None:
-        return False  # no telling what it would push out
+    try:
+        supply = _supply()
+    except Exception as e:  # no telling what it would push out
+        _last["error"] = f"{type(e).__name__}: {e}"
+        return False
     dropped = 0
     with _lock:
         others = [k for k in _kept if k != key]

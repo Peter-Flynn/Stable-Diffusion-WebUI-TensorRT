@@ -225,8 +225,7 @@ def _ram() -> str:
 
         from . import refits
 
-        supply = refits._supply()
-        return f"RAM {gib(supply) if supply is not None else 'unreadable'} to spare of {gib(psutil.virtual_memory().total)}"
+        return f"RAM {gib(refits._supply())} to spare of {gib(psutil.virtual_memory().total)}"
     except Exception as e:
         return f"RAM unreadable ({type(e).__name__}: {e})"
 
