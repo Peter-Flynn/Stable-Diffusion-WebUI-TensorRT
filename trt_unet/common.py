@@ -74,3 +74,109 @@ def trt_tag(version: str = None) -> str:
 
 def gib(n: float) -> str:
     return f"{n / 2**30:.2f} GiB" if n >= 2**30 else f"{n / 2**20:.0f} MiB"
+
+
+# --- Memory diagnostics: these only read counters, and change nothing.
+
+_nvml = None  # NVML's handle for this GPU; False once NVML turned out not to be usable
+
+
+def _process_vram():
+    """VRAM held by this process by the driver's own count (NVML), or None where it can't tell (no pynvml,
+    or Windows, whose driver doesn't count it per process)."""
+    global _nvml
+    if _nvml is False:
+        return None
+    try:
+        import os
+
+        import pynvml
+
+        if _nvml is None:
+            pynvml.nvmlInit()
+            uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
+            _nvml = pynvml.nvmlDeviceGetHandleByUUID(uuid if uuid.startswith("GPU-") else f"GPU-{uuid}")
+        for p in pynvml.nvmlDeviceGetComputeRunningProcesses(_nvml):
+            if p.pid == os.getpid() and p.usedGpuMemory:
+                return int(p.usedGpuMemory)
+        return None
+    except Exception:
+        _nvml = False
+        return None
+
+
+def _loaded_models() -> str:
+    out = []
+    for lm in mm().current_loaded_models:
+        model = lm.model
+        if model is not None:
+            out.append(f"{type(getattr(model, 'model', model)).__name__} {gib(lm.model_loaded_memory())}")
+    return ", ".join(out) or "nothing"
+
+
+def _ours() -> str:
+    """What this extension holds outside the models' sizes: TensorRT activation arenas (PyTorch's memory),
+    the strips' pinned RAM, engines kept in RAM."""
+    parts = []
+    try:
+        from .engine import Arena
+
+        arenas = [a.memory.numel() for a in list(Arena.instances) if a.memory is not None]
+        parts.append(f"activation arenas {gib(sum(arenas))} ({len(arenas)})")
+    except Exception:
+        pass
+    try:
+        from . import strips
+
+        kind, nbytes, _ = strips.host_memory()
+        if nbytes:
+            parts.append(f"strips' {kind} RAM {gib(nbytes)}")
+    except Exception:
+        pass
+    try:
+        from . import refits
+
+        count, nbytes = refits.held()
+        if count:
+            parts.append(f"{count} engines kept in RAM {gib(nbytes)}")
+    except Exception:
+        pass
+    return ", ".join(parts)
+
+
+def _ram() -> str:
+    try:
+        import psutil
+
+        ram = psutil.virtual_memory()
+        return f"RAM {gib(ram.available)} available of {gib(ram.total)}"
+    except Exception as e:
+        return f"RAM unreadable ({type(e).__name__}: {e})"
+
+
+def memory(where: str, extra: str = ""):
+    """Logs who holds VRAM and RAM at this point (diagnostics: it reads counters, and changes nothing).
+    "Outside PyTorch" is VRAM that PyTorch's allocator doesn't hold: TensorRT's own allocations (engine
+    weights, refit memory), CUDA's context and kernels, and, where the driver can't count this process
+    alone, other processes."""
+    try:
+        free, total = torch.cuda.mem_get_info()
+        stats = torch.cuda.memory_stats()
+        allocated, active, reserved = (int(stats.get(f"{k}_bytes.all.current", 0)) for k in ("allocated", "active", "reserved"))
+        used, process = total - free, _process_vram()
+        if process is not None:
+            outside = f"outside PyTorch {gib(process - reserved)} (this process holds {gib(process)}; other processes {gib(used - process)})"
+        else:
+            outside = f"outside PyTorch {gib(used - reserved)} (other processes included)"
+        parts = [
+            f"VRAM {gib(used)} used of {gib(total)}, {gib(free)} free (reForge counts {gib(free + reserved - active)} free)",
+            f"PyTorch {gib(allocated)} allocated + {gib(reserved - allocated)} cached",
+            outside,
+            f"loaded: {_loaded_models()}",
+            _ours(),
+            _ram(),
+            extra,
+        ]
+        log(f"mem | {where} | " + " | ".join(p for p in parts if p))
+    except Exception as e:
+        log(f"mem | {where} | unreadable ({type(e).__name__}: {e})")

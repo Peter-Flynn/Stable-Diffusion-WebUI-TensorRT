@@ -109,6 +109,7 @@ class TrtModel:
             if patcher is None:
                 raise RuntimeError("no checkpoint to take the engine's weights from")
             self.weights = EffectiveWeights(patcher)
+        common.memory(f"loading the {self.record.label}: before", f"model size {common.gib(self.model_size())}, {common.gib(self.record.weight_bytes)} of weights")
         start, free, reserved = time.time(), torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
         engine = self._engines()
         kept = self._kept()
@@ -142,6 +143,7 @@ class TrtModel:
             f"Loaded the {self.record.arch.label} {self.record.label}{with_shallow} ({common.gib(self.model_size())}{beyond}) in {time.time() - start:.1f}s: "
             f"{source}, " + (_refit_times(refit) if refit else "no weights to refit")
         )
+        common.memory(f"loading the {self.record.label}: done", f"measured {common.gib(used)}")
         return self.model_size()
 
     def _load(self, role: str, engine, kept) -> float:
@@ -177,6 +179,8 @@ class TrtModel:
         kept with these weights already, the weights aren't the loaded checkpoint's anymore, or RAM is short."""
         loaded = {role: e for role, e in (("unet", self.engine), ("shallow", self.shallow)) if e is not None and e.loaded and self.applied.get(role)}
         if "unet" not in loaded or not self._current():
+            why = "it holds no weights" if "unet" not in loaded else "its weights aren't the loaded checkpoint's"
+            log(f"Not keeping the {self.record.label} in RAM with its weights: {why}.")
             return
         key, label = self.record.key, f"{self.record.arch.label} {self.record.label}"
         entry = refits.get(key)
@@ -188,7 +192,7 @@ class TrtModel:
             return
         sizes = {"unet": self.record.weight_bytes, "shallow": self.hacks["weight_bytes"] if self.hacks else 0}
         if not refits.room(sum(sizes[role] for role in todo), key):
-            log(f"Not keeping the {label} in RAM with its weights: too little RAM is available. Loading it again will refit it.")
+            log(f"Not keeping the {label} in RAM with its weights: too little RAM is available ({refits.explain()}). Loading it again will refit it.")
             return
         start = time.time()
         torch.cuda.current_stream().synchronize()  # no inference in flight
@@ -236,6 +240,7 @@ class TrtModel:
 
     def detach(self, unpatch_all=True):
         if unpatch_all and self.loaded:
+            common.memory(f"unloading the {self.record.label}: before")
             if self.keep:
                 try:
                     self._keep()
@@ -245,6 +250,7 @@ class TrtModel:
                 self.shallow.unload()
             self.engine.unload()
             self.applied, self.shallow_failed = {}, False
+            common.memory(f"unloading the {self.record.label}: done")
         return self.model
 
     def sync(self, quiet=False):
@@ -266,7 +272,7 @@ class TrtModel:
             self.applied[role] = {}
             refits.drop(self.record.key, role)  # what's kept in RAM of it holds other weights than it will now
             torch.cuda.current_stream().synchronize()  # no inference in flight while the weights change
-            seconds = engine.refit(changed, weights.tensor)
+            seconds = engine.refit(changed, weights.tensor, label=f"{self.record.label} ({role})")
             self.applied[role] = wanted
             refit = {**seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
             total = refit if total is None else {k: total[k] + refit[k] for k in refit}
@@ -597,6 +603,7 @@ class Pass:
     def end(self):
         """Undoes what the pass changed; the engine stays loaded for the next one."""
         self._restore()
+        common.memory("sampling pass ended")
         hacks = self.schedule
         if hacks is not None and hacks.shallow_calls:
             log(f"Speed Hacks: {hacks.shallow_calls} of {hacks.shallow_calls + hacks.full_calls} UNet calls ran on the shallow engine.")

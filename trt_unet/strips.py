@@ -645,6 +645,9 @@ class Plan:
     act: int
     moved: int = 0  # bytes copied between RAM and VRAM, counted as the decode runs
     times: dict = field(default_factory=dict)  # stage -> CUDA events around it, for the log
+    acts: list = field(default_factory=list)  # each stage's activation memory as planned, for the diagnostics
+    free: int = 0  # the VRAM free it was planned for, and the budget made of that (diagnostics)
+    budget: int = 0
 
     @property
     def vram(self) -> int:
@@ -789,7 +792,8 @@ class Decode:
                 return None
             rows.append(min(cap, max(min_rows(st.kind), cap // div // st.kind.step * st.kind.step)))
         widths = [self.geometry(st, h, w)[1] for st in found]
-        act = max(self._activation(runners[n], st.kind, rows[n], widths[n]) for n, st in enumerate(found))
+        acts = [self._activation(runners[n], st.kind, rows[n], widths[n]) for n, st in enumerate(found)]
+        act = max(acts)
         in_place = self._in_place(found, host)
         io = [self._io(st, n, rows[n], widths[n], host, in_place.get(n, 0)) for n, st in enumerate(found)]
         shapes = self._shapes(found, h, w)
@@ -797,10 +801,38 @@ class Decode:
         events = self._events(found, in_place)
         offsets, peak, at = _layout([e for e in events if e[0] not in host], sizes)
         host_offsets, host_bytes, _ = _layout([e for e in events if e[0] in host], sizes)
-        plan = Plan(dict(modes), found, runners, rows, set(host), {**offsets, **host_offsets}, peak, host_bytes, in_place, io, act)
+        plan = Plan(dict(modes), found, runners, rows, set(host), {**offsets, **host_offsets}, peak, host_bytes, in_place, io, act, acts=acts)
         return plan, at, sizes
 
     def plan(self, h: int, w: int, free: int, force_host: bool = False, force_modes: dict = None):
+        """_plan, with what it was planned for noted on it (diagnostics)."""
+        plan = self._plan(h, w, free, force_host, force_modes)
+        if plan is not None:
+            plan.free, plan.budget = free, free - HEADROOM - free // 32
+        return plan
+
+    def memory_report(self, plan: Plan) -> str:
+        """For the memory diagnostics: the plan's VRAM by part, and for each kind of stage, the activation
+        memory the plan reckoned with against what TensorRT took for it (the most of its stages)."""
+        mib = lambda n: f"{n / 2**20:.0f} MiB"
+        parts = [
+            f"planned for {mib(plan.free)} free (budget {mib(plan.budget)}): {mib(plan.vram)} = held {mib(plan.device_bytes)} + working {mib(max(plan.io))} + activations {mib(plan.act)}",
+            f"held in RAM {mib(plan.host_bytes)} ({len(plan.host)} tensors)",
+        ]
+        kinds = {}
+        for n, st in enumerate(plan.stages):
+            took = plan.runners[n].took() or 0
+            reckoned = plan.acts[n] if n < len(plan.acts) else 0
+            k = kinds.setdefault(st.kind.name, [0, 0, set()])
+            k[0], k[1] = max(k[0], reckoned), max(k[1], took)
+            k[2].add(plan.rows[n])
+        top = sorted(kinds.items(), key=lambda kv: -kv[1][0])
+        parts.append("activations reckoned -> took: " + ", ".join(
+            f"{name} ({'/'.join(map(str, sorted(rows)))} rows) {mib(r)} -> {mib(t)}" for name, (r, t, rows) in top
+        ))
+        return " | ".join(parts)
+
+    def _plan(self, h: int, w: int, free: int, force_host: bool = False, force_modes: dict = None):
         """The Plan for latents of h x w in `free` bytes of VRAM, or None if not even the smallest strips
         fit. The fastest that fits: every block STORE with strips as large as fit (down to an 8th of what the
         engines take); else, of the tensors held at the VRAM's peak, the largest one a block could do

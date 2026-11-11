@@ -5,12 +5,13 @@ from PyTorch's allocator sized for the shapes in use."""
 import ctypes
 import os
 import time
+import weakref
 from collections import deque
 
 import tensorrt as trt
 import torch
 
-from .common import gib, log
+from .common import gib, log, memory
 
 # Refitting prepares weights given in RAM for the GPU on the CPU, by default on one thread. Weights come
 # straight from PyTorch's FP16 tensors, and the engine's first output is checked for NaN/Inf, so
@@ -116,8 +117,11 @@ class Arena:
     engine and its shallow partner): it only grows until it's released, and each engine binds it again
     when it was reallocated."""
 
+    instances = weakref.WeakSet()  # every arena, for the memory diagnostics (common.memory)
+
     def __init__(self):
         self.memory, self.version = None, 0
+        Arena.instances.add(self)
 
     def get(self, size: int):
         if self.memory is None or self.memory.numel() < size:
@@ -219,18 +223,32 @@ class Engine:
             raise RuntimeError("TensorRT could not serialize the engine" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
         return serialized
 
-    def refit(self, names, tensor_for) -> dict:
+    def refit(self, names, tensor_for, label: str = None) -> dict:
         """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name, device)`, from
         VRAM while there's room (see STAGING_RESERVE). Returns the seconds spent getting the weights
-        ("weights") and in TensorRT ("tensorrt"), and the bytes of them given in VRAM ("staged")."""
+        ("weights") and in TensorRT ("tensorrt"), and the bytes of them given in VRAM ("staged"). With a
+        `label`, the memory diagnostics are logged around it."""
+        budget = staging_budget()
+        if label:
+            memory(f"refit {label}: before", f"{len(names)} weights, staging budget {gib(budget)}")
         try:
-            return self._refit(names, tensor_for, staging_budget())
+            seconds = self._refit(names, tensor_for, budget)
+            if label:
+                memory(f"refit {label}: done", f"{gib(seconds['staged'])} staged in VRAM")
+            return seconds
         except _StagedRefitFailed as e:
             failure = str(e)
         # Out of the except block, so its traceback no longer holds the failed refit's copies in VRAM
         log(f"{failure}; refitting from RAM instead.")
+        if label:
+            memory(f"refit {label}: after the failed refit from VRAM, before emptying PyTorch's cache")
         torch.cuda.empty_cache()
-        return self._refit(names, tensor_for, 0)
+        if label:
+            memory(f"refit {label}: after the failed refit from VRAM")
+        seconds = self._refit(names, tensor_for, 0)
+        if label:
+            memory(f"refit {label}: done from RAM")
+        return seconds
 
     def _refit(self, names, tensor_for, budget: int) -> dict:
         refitter = trt.Refitter(self.engine, LOGGER)

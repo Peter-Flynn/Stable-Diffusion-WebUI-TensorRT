@@ -46,6 +46,9 @@ _lock = threading.RLock()
 _watcher = None  # the thread looking at the RAM, while there's anything kept
 
 
+_last = {}  # what room() last weighed, for the log (explain)
+
+
 def _memory():
     """(RAM available, the reserve to leave available), or None if it can't tell."""
     try:
@@ -53,8 +56,21 @@ def _memory():
 
         ram = psutil.virtual_memory()
         return int(ram.available), max(RESERVE_MIN, int(ram.total * RESERVE_SHARE))
-    except Exception:
+    except Exception as e:
+        _last["error"] = f"{type(e).__name__}: {e}"
         return None
+
+
+def explain() -> str:
+    """For the log: what room() last weighed, and why it said no."""
+    if "error" in _last:
+        return f"RAM couldn't be read: {_last['error']}"
+    if not _last:
+        return "nothing weighed"
+    return (
+        f"needs {gib(_last['nbytes'])}, {gib(_last['available'])} available, {gib(_last['reserve'])} to stay available, "
+        f"{gib(_last['others'])} in other kept engines; said {_last['said']}"
+    )
 
 
 def _give_back():
@@ -112,6 +128,7 @@ def held() -> tuple:
 def room(nbytes: int, key: str = None) -> bool:
     """Whether RAM allows keeping `nbytes` more, once the least recently used engines (other than `key`'s)
     are dropped if that's what it takes. If dropping them all wouldn't make room, none is dropped."""
+    _last.clear()
     memory = _memory()
     if memory is None:
         return False  # no telling when it would run low
@@ -119,8 +136,10 @@ def room(nbytes: int, key: str = None) -> bool:
     dropped = 0
     with _lock:
         others = [k for k in _kept if k != key]
+        _last.update(nbytes=nbytes, available=available, reserve=reserve, others=sum(_kept[k].nbytes for k in others), said="no room even dropping the others")
         if available + sum(_kept[k].nbytes for k in others) - nbytes < reserve:
             return False
+        _last["said"] = "room" if available - nbytes >= reserve else "room once others are dropped"
         while available - nbytes < reserve and others:
             entry = _kept.pop(others.pop(0))
             available += entry.nbytes

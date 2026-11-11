@@ -1586,7 +1586,14 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
     how = f"{label(model.record.meta['dtype'])}" + (f", scaled by 2^-{model.exponent}" if model.record.scaled else "")
     mm.load_models_gpu([model])
     model.sync()
+    common.memory(f"VAE decode of {w * 8}x{h * 8}: decoder engines loaded")
     n, need, free = _fit(model, b, h, w) if whole else (0, 0, 0)
+    if whole:
+        act = model.need(max(1, n), h, w)[1]  # the shapes _fit last asked about: TensorRT's answer is cached
+        common.memory(
+            f"VAE decode of {w * 8}x{h * 8}: {'whole, ' + str(n) + ' at a time' if n else 'not whole'}",
+            f"whole needs {common.gib(need)} (TensorRT activations {common.gib(act)}), reForge counted {common.gib(free)} free",
+        )
     if n:
         start = time.time()
         pixels = _run(model, vae, samples_in, n)  # ends with a copy to the CPU, so the time is the decode's
@@ -1601,6 +1608,7 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
         mm.free_memory(_vram() or 2**62, model.load_device, keep_loaded=_own(model))
     model.release()
     model.sync_strips()
+    common.memory(f"VAE decode of {w * 8}x{h * 8}: before planning strips")
     start = time.time()
     pixels, report = _run_strips(model, vae, samples_in, found)
     if pixels is not None:
@@ -1701,6 +1709,7 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list):
             return None, ""
         if pixels is None:
             report = _strips_report(plan, planned, model)
+            common.memory(f"VAE decode of {w * 8}x{h * 8}: strips done", decoder.memory_report(plan))
             pixels = torch.empty((b,) + tuple(image.shape[1:]), device=vae.output_device)
         pixels[i:i + 1] = vae.process_output(image.to(vae.output_device).float())
         del image
@@ -1789,7 +1798,11 @@ def _encode(model: VaeModel, vae, pixels):
         mm.free_memory(2 * int(record.encoder["weight_bytes"]) + HEADROOM, model.load_device, keep_loaded=_own(model))
     model.encoder_engines()
     whole = record.encodes(h, w)
+    common.memory(f"VAE encode of {w}x{h}: encoder engines loaded")
     n, need, free = _fit(model, b, h, w, encoding=True) if whole else (0, 0, 0)
+    if whole:
+        act = model.need_encode(max(1, n), h, w)[1]  # cached
+        log(f"mem | VAE encode of {w}x{h}: {'whole' if n else 'not whole'} | needs {common.gib(need)} (TensorRT activations {common.gib(act)}), reForge counted {common.gib(free)} free")
     start = time.time()
     if n:
         samples = None
