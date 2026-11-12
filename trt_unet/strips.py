@@ -1034,6 +1034,10 @@ class Decode:
         io = torch.empty(max(max(plan.io), 1), dtype=torch.uint8, device=self.device)
         if self.arena is not None:
             self.arena.get(plan.act)  # once, at its largest: every engine binds it as is
+        if timed:
+            from .common import phase
+
+            phase(f"strips: their blocks allocated ({(plan.device_bytes + max(plan.io) + plan.act) // 2**20} MiB planned)")
         held = {}
         for key, shape in shapes.items():
             base = ram if key in plan.host else slab

@@ -1315,7 +1315,7 @@ class _Side:
             room += os.path.getsize(plan)
         e = Engine(plan, model.arena, model.owner)
         for attempt in (0, 1):
-            model.make_room(room)
+            model.make_room(common.padded(room) if not attempt else room)
             load, failures = {}, gpu.failures()
             try:
                 with gpu.loading(model.owner) as load:
@@ -1635,6 +1635,12 @@ def _fit(model: VaeModel, top: int, need_for, engines: bool, load) -> tuple:
     which is barely faster than one. Room is made for exactly that (this model's engines that it doesn't
     run on first, then by reForge's manager), and the activation memory is allocated for it, once."""
     model.release()
+    counted = need_for
+
+    def need_for(n):  # with the buffer on top (the activation memory as it is: it's allocated as such)
+        need, act = counted(n)
+        return common.padded(need), act
+
     for loaded in (False, True):
         can = model.obtainable(engines)
         beside = model.obtainable(engines=False)
@@ -1685,13 +1691,13 @@ def _plan_strips(model: VaeModel, planner, h: int, w: int, beside: int, engines:
     evicted and tensors held in RAM if it takes that), room made for what it holds and `beside` (what's
     held beside the strips that isn't allocated yet when they're planned), then planned for what's free
     then, which gives that plan unless reForge's manager couldn't make the room."""
-    best = _settled(planner, h, w, lambda: model.obtainable(engines) - beside, engines)
+    best = _settled(planner, h, w, lambda: common.usable(model.obtainable(engines)) - beside, engines)
     if best is None:
         return None, 0.0
     start = time.time()
-    model.make_room(best.vram + beside)
+    model.make_room(common.padded(best.vram + beside))
     made = time.time() - start
-    return _settled(planner, h, w, lambda: common.free(model.load_device) - beside, engines), made
+    return _settled(planner, h, w, lambda: common.usable(common.free(model.load_device)) - beside, engines), made
 
 
 class _Peak:
@@ -2005,7 +2011,8 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
     beside = image * sdtype.itemsize + (image * 4 * (b + 1) if out_gpu else 0)
     before = model.need(1, h, w, whole=False)[0]  # the part before the strips
     held = 2 * cfg["mid_channels"] * h * w * dtype.itemsize  # what it leaves held through them: the mid block's input, the attention's output
-    if before > model.obtainable(engines) or _settled(decoder, h, w, lambda: model.obtainable(engines) - beside - held, engines) is None:
+    before = common.padded(before)
+    if before > model.obtainable(engines) or _settled(decoder, h, w, lambda: common.usable(model.obtainable(engines)) - beside - held, engines) is None:
         return _NO_ROOM
     common.memory(f"VAE decode of {w * 8}x{h * 8}: in strips {_beside(engines)}")
     pixels = plan = None
@@ -2022,6 +2029,8 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
         del mid
         attending = _synced() - start if i == 0 else 0
         model.release()  # the pre engine's activations: the strips size their own
+        if i == 0:
+            common.phase(f"VAE decode of {w * 8}x{h * 8}: after the part before the strips and the attention")
         if plan is None:
             start = time.time()
             plan, made = _plan_strips(model, decoder, h, w, beside, engines)
@@ -2030,9 +2039,13 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
             planned = time.time() - start - made
         if side.scale != 1.0:  # as the strips run: scaled, while still in a precision that holds what a VAE makes
             x, attended = x.float().mul_(side.scale), attended.float().mul_(side.scale)
+        if i == 0:
+            common.phase(f"VAE decode of {w * 8}x{h * 8}: planned, room made, before the strips")
         with _Peak() as peak:
             image_out = decoder.run(x, attended, plan, timed=i == 0)
         del x, attended
+        if i == 0:
+            common.phase(f"VAE decode of {w * 8}x{h * 8}: after the strips")
         if not torch.isfinite(image_out).all():
             if record.scaled:
                 raise _Overflow()
@@ -2184,7 +2197,8 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
     beside = cfg["mid_channels"] * mh * mw * sdtype.itemsize  # the strips' output, copied out of them
     after = model.need_after_strips(mh, mw)
     can = model.obtainable(engines)
-    if max(image_bytes, after + beside) > can or _settled(encoder, mh, mw, lambda: model.obtainable(engines) - beside - image_bytes, engines) is None:
+    image_room, after = common.padded(image_bytes), common.padded(after)
+    if max(image_room, after + beside) > can or _settled(encoder, mh, mw, lambda: common.usable(model.obtainable(engines)) - beside - image_bytes, engines) is None:
         return _NO_ROOM
     common.memory(f"VAE encode of {w}x{h}: in strips {_beside(engines)}")
     norm = strips.norms_of(fsm, [strips.ATTENTION_NORM], device)[strips.ATTENTION_NORM]
@@ -2194,7 +2208,7 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
     report = ""
     for i in range(b):
         if i == 0:
-            model.make_room(image_bytes)
+            model.make_room(image_room)
         image = vae.process_input(pixels[i:i + 1]).to(device=device, dtype=sdtype)
         if plan is None:
             start = time.time()
@@ -2202,10 +2216,14 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
             if plan is None:
                 return _NO_ROOM
             planned = time.time() - start - made
+        if i == 0:
+            common.phase(f"VAE encode of {w}x{h}: planned, room made, before the strips")
         with _Peak() as peak:
             x, stats = encoder.run(image, plan, timed=i == 0)
         del image
         model.release()  # the strips' activations
+        if i == 0:
+            common.phase(f"VAE encode of {w}x{h}: after the strips")
         if record.scaled and not torch.isfinite(x).all():
             raise _Overflow()
         if i == 0:
@@ -2218,6 +2236,8 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
         del normed
         attended = _attention(model, vae, q, k, v, encoding=True)
         del q, k, v
+        if i == 0:
+            common.phase(f"VAE encode of {w}x{h}: after the attention")
         if i == 0:
             report = f"{_strips_report(plan, planned, made, side)}; the attention {_synced() - start:.2f}s; {_counted(peak.held, plan.vram + beside)}"
         x = (x.float().div_(side.scale) if side.scale != 1.0 else x).to(dtype)  # as the encode-post engine takes it

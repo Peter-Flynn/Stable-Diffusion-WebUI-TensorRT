@@ -67,7 +67,7 @@ one) run on the encoder's engines the same way. PyTorch does anything else.
 engine (its weights and its plan) and TensorRT's activation memory for the pass's exact image size, batch size and
 prompt length. TensorRT only gives the latter for an engine in VRAM, so for sizes not yet run this session the
 engine is weighed alone first, and the rest once its plan is in VRAM, before its weights are refitted. A pass that
-can't fit runs on PyTorch.
+can't fit runs on PyTorch. Every estimate has 10% added before it's weighed or room is made for it.
 Nothing is measured ahead and nothing about sizes is kept on disk.
 Free VRAM is the driver's own figure and PyTorch's unused cache. Engine models don't take the room reForge makes for
 a model by its own estimate. The only margin is reForge's own reserve (`--reserve-vram`). What TensorRT holds comes from

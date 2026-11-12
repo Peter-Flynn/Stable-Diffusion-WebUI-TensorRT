@@ -158,7 +158,7 @@ class TrtModel:
                 kept = self._kept()
                 predicted = self.full(shallow, kept)
                 need = max(0, predicted - gpu.held(self.owner))
-                common.make_room(need if not attempt else common.obtainable(self.load_device) - common.reserve(), self.load_device)
+                common.make_room(common.padded(need) if not attempt else common.obtainable(self.load_device) - common.reserve(), self.load_device)
                 common.memory(f"loading the {self.record.label}: before", f"room made for {common.gib(need)}")
                 with gpu.loading(self.owner) as load:
                     engine = self._engines()
@@ -214,10 +214,12 @@ class TrtModel:
         held = gpu.held(self.owner)
         engine = max(predicted, held)
         room = common.obtainable(self.load_device, keep=[self]) - common.reserve() + held
-        said = _said(self, x, engine, calls, room)
-        if engine + calls > room:
+        need = held + common.padded(engine - held + calls)  # the buffer on what isn't in VRAM yet
+        said = _said(self, x, engine, calls, room, need)
+        if need > room:
             raise DoesNotFit(said)
         log(f"It fits: {said}.")
+        common.phase(f"{self.record.label}: deserialized, before its weights")
 
     def _load_engines(self, kept) -> tuple:
         """With the UNet engine deserialized: (what refitting took, None if they came as they were kept; the
@@ -330,7 +332,7 @@ class TrtModel:
             return
         kept = self._kept() if self.weights is not None else None
         need = self.full(True, kept) - self.full(False, kept)
-        common.make_room(need, self.load_device, _loaded_entries(self))
+        common.make_room(common.padded(need), self.load_device, _loaded_entries(self))
         start = time.time()
         with gpu.loading(self.owner):
             try:
@@ -738,6 +740,7 @@ class Pass:
 
     def end(self):
         """Undoes what the pass changed; the engine stays loaded for the next one."""
+        common.phase("UNet pass: ended, before its memory is released")
         self._restore()
         common.memory("sampling pass ended")
         from .engine import profile_report
@@ -892,6 +895,7 @@ def _begin(records, hacks, patcher, x, prepare):
             _fits(model_for(record), p, x)
             model = p.use(record)
             _make_room_for_activations(model, patcher, x)
+            common.phase(f"UNet pass on the {record.label}: loaded, before the first step")
         except Exception as e:
             if not isinstance(e, RuntimeError):
                 traceback.print_exc()
@@ -902,10 +906,11 @@ def _begin(records, hacks, patcher, x, prepare):
     return p
 
 
-def _said(model: TrtModel, x, engine: int, calls, room: int) -> str:
+def _said(model: TrtModel, x, engine: int, calls, room: int, need: int) -> str:
     size = f"{x.shape[3] * 8}x{x.shape[2] * 8}, batch size {x.shape[0]}"
     parts = f"{common.gib(engine)} for the engine, " + (f"{common.gib(calls)} for its calls" if calls is not None else "its calls not counted yet")
-    return f"the {model.record.label} at {size} needs {common.gib(engine + (calls or 0))} of VRAM ({parts}), and there can be {common.gib(room)}"
+    buffer = f", {common.gib(need - engine - (calls or 0))} of buffer"
+    return f"the {model.record.label} at {size} needs {common.gib(need)} of VRAM ({parts}{buffer}), and there can be {common.gib(room)}"
 
 
 def _fits(model: TrtModel, p: Pass, x):
@@ -927,8 +932,9 @@ def _fits(model: TrtModel, p: Pass, x):
         model.weights = p.weights
         engine = model.full(shallow, model._kept())
     room = common.obtainable(model.load_device, keep=[model]) - common.reserve() + held
-    said = _said(model, x, engine, calls, room)
-    if engine + (calls or 0) > room:
+    need = held + common.padded(engine - held + (calls or 0))  # the buffer on what isn't in VRAM yet
+    said = _said(model, x, engine, calls, room, need)
+    if need > room:
         raise DoesNotFit(said)
     model.pending = x if calls is None else None
     if calls is not None:
@@ -945,6 +951,7 @@ def _make_room_for_activations(model: TrtModel, patcher, x):
         log(f"Could not size the engine's calls: {e}")
         return
     if need:
+        need = common.padded(need)
         free = common.make_room(need, model.load_device, _loaded_entries(model, patcher))
         if free < need:
             size = f"{x.shape[3] * 8}x{x.shape[2] * 8}, batch size {x.shape[0]}"

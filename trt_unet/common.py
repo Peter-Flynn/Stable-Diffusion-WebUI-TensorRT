@@ -80,6 +80,32 @@ def gib(n: float) -> str:
 # --- Making room in VRAM: exact sizes, through reForge's model manager
 
 
+BUFFER = 0.10  # added to every estimate of VRAM something is about to take, before it's weighed or room is made
+
+
+def padded(nbytes: int) -> int:
+    """An estimate with the buffer on top."""
+    return int(nbytes * (1 + BUFFER))
+
+
+def usable(room: int) -> int:
+    """What an estimate may be for it to fit `room` with the buffer on top."""
+    return int(room / (1 + BUFFER))
+
+
+def phase(where: str):
+    """Diagnostics: what PyTorch's allocator has in use and has reserved at a point between the phases of a
+    run, and what the driver has free. Reserved rising while in use falls is memory freed by one phase that
+    the next couldn't use."""
+    try:
+        stats = torch.cuda.memory_stats()
+        used, reserved = (int(stats.get(f"{k}_bytes.all.current", 0)) for k in ("allocated", "reserved"))
+        peak = int(stats.get("allocated_bytes.all.peak", 0))
+        log(f"phase | {where} | in use {gib(used)}, reserved {gib(reserved)} ({gib(reserved - used)} unused), peak in use {gib(peak)}, driver free {gib(torch.cuda.mem_get_info()[0])}")
+    except Exception as e:
+        log(f"phase | {where} | unreadable ({type(e).__name__}: {e})")
+
+
 def reserve() -> int:
     """The VRAM reForge keeps free for what no allocator counts (other applications, CUDA's own code): its
     --reserve-vram, or its default for the OS. The only margin anything here keeps."""
