@@ -1425,6 +1425,7 @@ class VaeModel:
         self.needs = {}  # (encoding, images, height, width, ...) -> what need() or need_encode() found
         self.attention = {}  # (encoding, images, height, width) -> the attention's working memory, as it took
         self.failed = set()  # (encoding, height, width) that TensorRT failed to run whole: in strips from then on
+        self.beside = False  # the way under way runs beside the UNet engines: making room doesn't evict them
 
     @property
     def loaded(self) -> bool:
@@ -1497,11 +1498,16 @@ class VaeModel:
     def make_room(self, nbytes: int) -> int:
         """Makes `nbytes` free beside the reserve: this model's engines that what's under way doesn't run on go
         first (their weights are copies, and they're the cheapest to bring back), then other models, by
-        reForge's manager (the UNet engines last). Returns what's free then, beside the reserve."""
+        reForge's manager (the UNet engines last; not at all for a way that runs beside them, `beside`:
+        if what else there is gives back less than it holds, that way has less room, and the next way is
+        the one that evicts them). Returns what's free then, beside the reserve."""
         if common.free(self.load_device) < nbytes:
             self.decoder.drop(self.using)
             self.encoder.drop(self.using)
-        return common.make_room(nbytes, self.load_device, _own(self))
+        keep = _own(self)
+        if self.beside:
+            keep += [lm for lm in common.mm().current_loaded_models if getattr(lm.model, "evicted_last", False)]
+        return common.make_room(nbytes, self.load_device, keep)
 
     def need(self, n: int, h: int, w: int, out_gpu: bool = False, whole: bool = True) -> tuple:
         """(The most VRAM a decode of n latents of h x w on the pre and post engines holds beside what's
@@ -1635,6 +1641,7 @@ def _fit(model: VaeModel, top: int, need_for, engines: bool, load) -> tuple:
     which is barely faster than one. Room is made for that with the buffer on top (this model's engines
     that it doesn't run on first, then by reForge's manager), and the activation memory is allocated for
     it, once."""
+    model.beside = not engines
     model.release()
     counted = need_for
 
@@ -1837,7 +1844,7 @@ def decode(vae, samples_in):
                 log(f"Ran out of VRAM decoding on the VAE engines ({said}); trying again with what PyTorch held unused given back.")
     finally:
         model.release()
-        model.vae, model.using = None, set()  # don't keep this VAE alive
+        model.vae, model.using, model.beside = None, set(), False  # don't keep this VAE alive
         _profiled("VAE decode")
 
 
@@ -1996,6 +2003,7 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
     go for it, and tensors be held in RAM). The part before the strips gets exactly its room (VaeModel.need,
     not whole), the strips theirs (_plan_strips). Raises _Overflow if scaled strips outgrew their scale. A
     plan that runs out of VRAM anyway raises (decode() says so): it was counted wrong."""
+    model.beside = not engines
     side, record = model.decoder, model.record
     dtype, sdtype, device = record.dtype, record.strips_dtype, model.load_device
     stream = torch.cuda.current_stream().cuda_stream
@@ -2017,7 +2025,8 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
     report = ""
     for i in range(b):
         if i == 0:
-            model.make_room(before)
+            if model.make_room(before) < before and model.beside:  # what else there is gave back less than it holds
+                return _NO_ROOM
         else:  # the image before's strips are freed: back to the driver, for this one's part before them
             model.release()
             common.trim()
@@ -2117,7 +2126,7 @@ def encode(vae, pixel_samples):
                 log(f"Ran out of VRAM encoding on the VAE engines ({said}); trying again with what PyTorch held unused given back.")
     finally:
         model.release()
-        model.vae, model.using = None, set()  # don't keep this VAE alive
+        model.vae, model.using, model.beside = None, set(), False  # don't keep this VAE alive
         _profiled("VAE encode")
 
 
@@ -2188,6 +2197,7 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
     encode-post engine, as a whole encode. The image gets exactly its room, the strips theirs
     (_plan_strips), and the rest its own (VaeModel.need_after_strips). Raises _Overflow if scaled strips
     outgrew their scale."""
+    model.beside = not engines
     side, record, device = model.encoder, model.record, model.load_device
     dtype, sdtype, stream = record.dtype, record.strips_dtype, torch.cuda.current_stream().cuda_stream
     cfg = record.encoder["config"]
@@ -2210,7 +2220,8 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
     report = ""
     for i in range(b):
         if i == 0:
-            model.make_room(image_room)
+            if model.make_room(image_room) < image_room and model.beside:
+                return _NO_ROOM
         else:  # what the image before freed: back to the driver
             model.release()
             common.trim()
@@ -2233,7 +2244,8 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
             raise _Overflow()
         if i == 0:
             common.memory(f"VAE encode of {w}x{h}: strips done", encoder.memory_report(plan))
-            model.make_room(after)
+            if model.make_room(after) < after and model.beside:
+                return _NO_ROOM
         else:
             common.trim()
         start = _synced() if i == 0 else 0
