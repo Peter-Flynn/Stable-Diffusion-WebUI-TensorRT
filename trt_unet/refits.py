@@ -80,7 +80,8 @@ def _read() -> tuple:
     if sys.platform.startswith("linux"):
         m = _meminfo()
         supply = m["MemFree"] + m.get("Active(file)", 0) + m.get("Inactive(file)", 0) + m.get("SReclaimable", 0)
-        if m["MemTotal"] <= 0 or supply <= 0 or m.get("MemAvailable", 1) <= 0:
+        # (Not the kernel's MemAvailable: it can read 0 on a system with memory to give, and nothing here uses it)
+        if m["MemTotal"] <= 0 or supply <= 0:
             raise RuntimeError("the kernel's memory counts came back empty")
         return supply, m.get("SwapFree", 0), m["MemTotal"]
     import warnings
