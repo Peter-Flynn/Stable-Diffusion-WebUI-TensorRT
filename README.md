@@ -32,8 +32,9 @@ PyTorch instead, with a notice.
    **Build engines**; the first build takes a few minutes.
 3. Generate. Every checkpoint with the same architecture now uses the engines. One is loaded at a time: each
    batch runs on the one that fits it best, and its Hires. fix stays on it if it covers the larger size. An engine
-   that makes way for another is kept in RAM with its weights when the system can spare the RAM, until it says it's
-   short of memory, so it comes back for the same checkpoint and LoRAs without loading them into it again.
+   that makes way for another is kept in RAM with its weights when the system can spare the RAM, so it comes back
+   for the same checkpoint and LoRAs without loading them into it again. It stays there until the system needs that
+   memory: next to nothing left to give, swap included, or everything stalled on memory for half of a minute.
 
 **Engine modes.** *Per-profile engines*, the default, are an engine per profile, built one at a time; only the one
 a generation's sizes need is loaded. A *merged engine* holds every profile of an architecture, so no pass ever
@@ -62,12 +63,15 @@ UNet engine; in strips beside it, all in VRAM; whole with the UNet engine evicte
 what doesn't fit. Either way it's the same image. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled
 one) run on the encoder's engines the same way. PyTorch does anything else.
 
-**Memory.** Every size used to make room is exact: what each engine held when it last loaded, TensorRT's own
-activation sizes, and the tensors between them; free VRAM is the driver's own figure and PyTorch's unused cache.
-Engine models don't take the room reForge makes for a model by its own estimate. The only margin is reForge's own
-reserve (`--reserve-vram`). With PyTorch's native allocator, what TensorRT holds comes from it, so reForge counts it
-like any model's (`TRT_EXTENSION_TORCH_ALLOCATOR=0` leaves TensorRT on its own); with `--cuda-malloc` TensorRT keeps
-its own allocator, and its engines' sizes are measured from the driver's free memory.
+**Memory.** Every size used to make room is exact: what each engine was counted to hold in VRAM and the most its
+load took, TensorRT's own activation sizes, and the tensors between them; free VRAM is the driver's own figure and
+PyTorch's unused cache. Those counts are kept beside each engine, so from its second use on a machine a pass knows
+before anything loads whether it fits, and runs on PyTorch from the start if it doesn't; the first time, it's
+counted as it loads and checked before the first step. Engine models don't take the room reForge makes for a model
+by its own estimate. The only margin is reForge's own reserve (`--reserve-vram`). What TensorRT holds comes from
+PyTorch's allocator, with `--cuda-malloc` too, so reForge counts it like any model's
+(`TRT_EXTENSION_TORCH_ALLOCATOR=0` leaves TensorRT on its own allocator, as does an engine that fails to load with
+PyTorch's), and reForge's count of free VRAM is never taken below the driver's.
 
 > [!NOTE]
 > An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build again;

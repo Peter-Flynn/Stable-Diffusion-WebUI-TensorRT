@@ -20,6 +20,7 @@ from .profiles import Profile
 FORMAT = 2  # an engine holds one profile, or (with "mode": "merged") several
 PER_PROFILE, MERGED = "per_profile", "merged"
 SHALLOW = ".shallow.plan"
+SIZES = ".sizes"  # what an engine was counted to hold in VRAM on this machine (read_sizes), beside its plan: JSON
 MODES = (PER_PROFILE, MERGED)
 
 
@@ -239,6 +240,42 @@ def profiles_of(records: list) -> list:
     return [r.profiles[j] for r, j in slots(records)]
 
 
+def _plans_identity(record: Record) -> list:
+    """The record's plan files as they are now: what was counted for them holds until they change."""
+    out = []
+    for path in (record.plan, record.shallow_plan):
+        try:
+            st = os.stat(path)
+            out.append([os.path.basename(path), st.st_size, st.st_mtime_ns])
+        except (OSError, TypeError):
+            out.append(None)
+    return out
+
+
+def read_sizes(record: Record) -> dict:
+    """What the record's engines were counted to hold in VRAM as they loaded and ran on this machine
+    (runtime.py keeps it): {"loads": {how they loaded: [held, most on the way]}, "calls": {a UNet call's
+    shapes: bytes}}. Empty if nothing was counted yet, or for other plans than these (built again)."""
+    try:
+        with open(record.plan[: -len(".plan")] + SIZES, encoding="utf-8") as f:
+            saved = json.load(f)
+        if saved.get("plans") == _plans_identity(record):
+            return {"loads": dict(saved.get("loads") or {}), "calls": dict(saved.get("calls") or {})}
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return {"loads": {}, "calls": {}}
+
+
+def write_sizes(record: Record, loads: dict, calls: dict):
+    path = record.plan[: -len(".plan")] + SIZES
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({"plans": _plans_identity(record), "loads": loads, "calls": calls}, f, indent=1)
+        os.replace(path + ".tmp", path)
+    except OSError as e:  # they're counted again next session
+        common.log(f"Could not save what the {record.label} holds in VRAM ({e}).")
+
+
 def _write_meta(base: str, meta: dict):
     with open(base + ".json.tmp", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=1)
@@ -251,8 +288,9 @@ def save(arch: Arch, plan_tmp: str, meta: dict, shallow_tmp: str = None) -> Reco
     record = Record("", {"format": FORMAT, "arch": arch.to_dict(), **meta})
     base = f"{_prefix(arch.id)}-{record.engine_key}"
     os.makedirs(os.path.dirname(base), exist_ok=True)
-    with contextlib.suppress(FileNotFoundError):
-        os.remove(base + SHALLOW)  # an older build's
+    for old in (base + SHALLOW, base + SIZES):  # an older build's
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(old)
     if shallow_tmp:
         os.replace(shallow_tmp, base + SHALLOW)
         record.meta["speed_hacks"] = {**record.meta["speed_hacks"], "plan": os.path.basename(base) + SHALLOW}
@@ -288,7 +326,7 @@ def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
                 if indexes != record.indexes:
                     _write_meta(base, record.renumbered(indexes))
             continue
-        for stale in (path, base + ".json", base + SHALLOW):
+        for stale in (path, base + ".json", base + SHALLOW, base + SIZES):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stale)
         deleted += 1
@@ -298,7 +336,8 @@ def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
 def delete(group: list):
     """Deletes these engines (Records)."""
     for record in group:
-        for path in (record.plan, record.plan[: -len(".plan")] + ".json", record.plan[: -len(".plan")] + SHALLOW):
+        base = record.plan[: -len(".plan")]
+        for path in (record.plan, base + ".json", base + SHALLOW, base + SIZES):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(path)
     for folder in {os.path.dirname(r.plan) for r in group}:

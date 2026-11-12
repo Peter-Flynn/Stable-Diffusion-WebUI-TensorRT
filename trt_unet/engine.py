@@ -4,9 +4,11 @@ memory from PyTorch's allocator sized for the shapes in use.
 
 The engine's weights are the only copy of them in VRAM: a refit gives TensorRT the weights where PyTorch
 keeps them, in RAM, and TensorRT copies them into its own memory. All of TensorRT's memory comes from
-PyTorch's allocator (gpu.py), under the engine's owner."""
+PyTorch's allocator (gpu.py), under the engine's owner; if an engine can't load or refit that way before
+any has run that way, TensorRT gets its own allocator back (_deserialize, own_allocator)."""
 
 import atexit
+import contextlib
 import ctypes
 import math
 import os
@@ -18,7 +20,7 @@ import tensorrt as trt
 import torch
 
 from . import gpu
-from .common import log, memory
+from .common import gib, log, memory
 
 # Refitting prepares weights given in RAM for the GPU on the CPU, by default on one thread. Weights come
 # straight from PyTorch's FP16 tensors, and the engine's first output is checked for NaN/Inf, so
@@ -109,18 +111,14 @@ def runtime():
 
 def _deserialize(plan, owner):
     """The engine in `plan`, or None if TensorRT can't load it. One that fails with PyTorch's allocator before
-    any engine loaded with it, and not for want of VRAM, is tried on a runtime with TensorRT's own allocator:
+    any engine ran with it, and not for want of VRAM, is tried on a runtime with TensorRT's own allocator:
     if it loads there, that runtime is used from now on (gpu.retire); if not, the allocator wasn't why."""
     global _runtime
     before = gpu.failures()
     with gpu.owner(owner):
         engine = runtime().deserialize_cuda_engine(plan)
-    if engine is not None:
-        if gpu.attached():
-            gpu.proven()
+    if engine is not None or not gpu.suspect(before, owner):
         return engine
-    if not gpu.suspect(before):
-        return None
     own = trt.Runtime(LOGGER)
     engine = own.deserialize_cuda_engine(plan)
     if engine is not None:
@@ -128,6 +126,20 @@ def _deserialize(plan, owner):
         _runtime = own
         gpu.retire()
     return engine
+
+
+def own_allocator(failures_before: int, owner) -> bool:
+    """After `owner`'s engine loaded but failed past that (its refit, its execution context) and was
+    unloaded: if PyTorch's allocator could be why (gpu.suspect: none has run with it yet, it didn't run out,
+    nothing else is loaded through it), TensorRT allocates its own memory from now on. Returns whether it
+    changed, for the caller to load the engine again."""
+    global _runtime
+    if not gpu.suspect(failures_before, owner):
+        return False
+    _set_aside.append(_runtime)
+    _runtime = trt.Runtime(LOGGER)
+    gpu.retire()
+    return True
 
 
 @atexit.register
@@ -201,6 +213,7 @@ class Engine:
         self.arena = arena or Arena()
         self.owner = owner
         self.engine = self.context = None
+        self.extra = 0  # what TensorRT took for it after it loaded (its context, its first run), by the ledger
         self._reset_context_state()
         Engine.instances.add(self)
 
@@ -210,6 +223,7 @@ class Engine:
         self.memory_bound = False
         self.bound_version = None
         self.size = None  # the activation memory the shapes set need
+        self.ran = False  # whether the context has run: its first run is watched (infer)
 
     def twin(self):
         """Another execution context on the same engine (and weights), with shapes of its own."""
@@ -250,11 +264,31 @@ class Engine:
         self._reset_context_state()
         return time.perf_counter() - start
 
+    @contextlib.contextmanager
+    def _taking(self, what: str = None):
+        """What TensorRT allocates in here, after the engine loaded, is its owner's too (gpu.py's ledger
+        says how much: nothing, without PyTorch's allocator). Said if it's `what` and a lot."""
+        if gpu.counting(self.owner):  # a load under way counts it
+            with gpu.owner(self.owner):
+                yield
+            return
+        before = gpu.ledger(self.owner)
+        try:
+            with gpu.owner(self.owner):
+                yield
+        finally:
+            more = gpu.ledger(self.owner) - before
+            if more > 0:
+                self.extra += more
+                gpu.grew(self.owner, more)
+                if what and more >= 16 * 2**20:
+                    log(f"{os.path.basename(self.plan_path)} took {gib(more)} more of VRAM {what}.")
+
     def _context(self):
         if self.context is None:
             LOGGER.clear()
             try:
-                with gpu.owner(self.owner):
+                with self._taking():
                     self.context = self.engine.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
             except Exception:
                 self.context = None
@@ -277,6 +311,9 @@ class Engine:
             self.engine = None
         self._reset_context_state()
         self.arena.release()
+        if self.extra:
+            gpu.unloaded(self.owner, self.extra)
+            self.extra = 0
 
     def serialize(self):
         """The engine with the weights it holds now, still refittable: what load() takes in place of the plan
@@ -329,7 +366,7 @@ class Engine:
             for name in refitter.get_missing_weights():
                 put(name)
             start = time.perf_counter()
-            with gpu.owner(self.owner):
+            with self._taking():
                 try:
                     ok = refitter.refit_cuda_engine()
                 finally:
@@ -400,8 +437,16 @@ class Engine:
                 else:
                     t = outputs[name] = torch.empty(shape, dtype=dtype, device=DEVICE)
             self.context.set_tensor_address(name, t.data_ptr())
-        if not self.context.execute_async_v3(stream):
+        if self.ran:
+            ran = self.context.execute_async_v3(stream)
+        else:  # what TensorRT takes only as a context first runs is counted too
+            with self._taking("as it first ran"):
+                ran = self.context.execute_async_v3(stream)
+        if not ran:
             raise RuntimeError("TensorRT inference failed")
+        if not self.ran:
+            self.ran = True
+            gpu.proven()  # PyTorch's allocator works with these bindings
         if PROFILE:
             torch.cuda.current_stream().synchronize()
             try:

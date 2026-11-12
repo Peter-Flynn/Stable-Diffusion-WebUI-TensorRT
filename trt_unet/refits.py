@@ -5,20 +5,26 @@ or reForge needs its VRAM), and loading it again would mean refitting every one 
 unloaded with its weights in is serialized with them first, and loading it again for the same weights (the
 same checkpoint with the same LoRAs) deserializes that instead: nothing is gathered, patched or refitted.
 
-A kept engine is about as large as its weights (GBs), and RAM is there to be used: one is kept whenever the
-system can hand over that much without paging anything out (its free memory and the file cache it can drop,
-as the OS counts them: _supply) and isn't short of memory already, dropping the least recently used ones if
-that's what it takes. While any is kept, the OS's own signal that it's short of memory (_pressure: Linux's
-pressure stall information, Windows' low-memory notification, macOS' memory pressure level) is looked at
-every few seconds, and the least recently used is dropped each time it says so. On Linux that's tasks
-having waited on memory for a tenth of a 10-second window with none of this module's own doing in it:
-keeping an engine has the kernel reclaim file cache for it, which stalls tasks briefly and is no shortage
-(the cache was counted as there to hand over). One whose checkpoint is gone is dropped then too, and one
+A kept engine is about as large as its weights (GBs), and RAM is there to be used: generating is what the
+machine is for while reForge runs, so one is kept whenever the system can hand over that much without
+paging anything out (its free memory and the file cache it can drop, as the OS counts them: memory) and
+stays kept until the system needs the memory: other programs' pages going to swap as the system makes
+room, and the stalls that brings for a while, are not that. While any is kept, the OS is asked every few
+seconds whether it does (_pressure), and the least recently used goes each time it says so:
+
+- Linux: it has next to nothing left to give (free memory, droppable caches and free swap together under
+  FLOOR of the RAM: the next thing to ask would be killed for it), or everything that runs, generating
+  included, has been stalled on memory at once for STALLED % of the last WINDOW seconds (the kernel's
+  "full" stall time, /proc/pressure/memory): it does nothing but page.
+- Windows: its low-memory notification. macOS: its memory pressure is critical.
+
+One is also dropped to make room for another, but not one that's been used since the other was used the
+time before last: two engines taking turns (a Hires. fix's) with room for one would push each other out
+at every turn, each time at the cost of keeping one. One whose checkpoint is gone is dropped too, and one
 kept for other weights than those wanted now when that's found out (a LoRA changed: the next unload keeps
 the engine as it is then)."""
 
 import collections
-import contextlib
 import ctypes
 import os
 import sys
@@ -28,10 +34,11 @@ from dataclasses import dataclass
 
 from .common import gib, log
 
-INTERVAL = 2.0  # seconds between looks at the OS's memory pressure, while engines are kept
-# Linux: the system is short of memory when some task waited on it for PRESSURE_SOME % of a WINDOW of seconds
-# (the kernel's stall total, /proc/pressure/memory) in which this module neither kept nor dropped an engine
-WINDOW, PRESSURE_SOME = 10.0, 10.0
+INTERVAL = 2.0  # seconds between looks at whether the system needs the memory, while engines are kept
+# Linux: it does when every task that isn't idle has been stalled on memory at once for STALLED % of the
+# last WINDOW seconds, or when what it could still hand over, swap included, is under FLOOR of its RAM
+WINDOW, STALLED = 60.0, 50.0
+FLOOR = 0.05
 
 
 @dataclass
@@ -52,8 +59,10 @@ class Kept:
 
 
 _kept = {}  # engine key -> Kept, the least recently used first
+_uses = {}  # engine key -> (when its engine was loaded the time before last, when it last was), as counts
+_count = 0  # engine loads so far (used)
 _lock = threading.RLock()
-_watcher = None  # the thread looking at the RAM, while there's anything kept
+_watcher = None  # the thread asking whether the system needs the memory, while there's anything kept
 
 
 _last = {}  # what room() last weighed, for the log (explain)
@@ -64,60 +73,52 @@ def _meminfo() -> dict:
         return {line.split(":")[0]: int(line.split()[1]) * 1024 for line in f if line.split()[1:]}
 
 
-def _supply() -> int:
-    """The RAM the OS can hand over without paging anything out, as it counts it: on Linux, the free memory
-    and the clean file cache and kernel caches it drops on demand; on Windows and macOS, what they call
-    available (free, standby or inactive). Raises if it can't tell."""
+def memory() -> tuple:
+    """(The RAM the OS can hand over without paging anything out, as it counts it: on Linux, the free
+    memory and the clean file cache and kernel caches it drops on demand; on Windows and macOS, what they
+    call available (free, standby or inactive). The swap space it has free. All its RAM.) Raises if it
+    can't tell."""
     if sys.platform.startswith("linux"):
         m = _meminfo()
-        return m["MemFree"] + m.get("Active(file)", 0) + m.get("Inactive(file)", 0) + m.get("SReclaimable", 0)
+        supply = m["MemFree"] + m.get("Active(file)", 0) + m.get("Inactive(file)", 0) + m.get("SReclaimable", 0)
+        return supply, m.get("SwapFree", 0), m["MemTotal"]
     import psutil
 
-    return int(psutil.virtual_memory().available)
+    ram = psutil.virtual_memory()
+    try:
+        swap = int(psutil.swap_memory().free)
+    except Exception:
+        swap = 0
+    return int(ram.available), swap, int(ram.total)
 
 
-_swapped = None  # Linux without pressure stall information: pages swapped out, at the last look
+def _supply() -> int:
+    return memory()[0]
+
+
 _windows_signal = None  # Windows: the low-memory notification's handle
-_stalls = collections.deque()  # Linux: (when, microseconds some task waited on memory in all) at each look, since _settled, the first the base of the window
-_settled = 0.0  # when (time.monotonic) this module last kept or dropped an engine
-_keeping = 0  # engines being kept now
+_stalls = collections.deque()  # Linux: (when, microseconds every task was stalled on memory at once, in all) at each look, the first the base of the window
+_settled = 0.0  # when (time.monotonic) an engine was last dropped: the window starts over
 _stalls_lock = threading.Lock()
 
 
 def _settle():
-    """This module kept or dropped an engine: the stalls up to now aren't the system's own."""
+    """An engine was dropped: the stalls up to now say nothing of the system as it is without it."""
     global _settled
     with _stalls_lock:
         _stalls.clear()
         _settled = time.monotonic()
 
 
-@contextlib.contextmanager
-def keeping():
-    """While an engine is serialized into RAM: the stalls that causes (the kernel reclaiming file cache for
-    it) aren't weighed, during it or in any window it's in."""
-    global _keeping
-    with _stalls_lock:
-        _keeping += 1
-    try:
-        yield
-    finally:
-        with _stalls_lock:
-            _keeping -= 1
-        _settle()
-
-
 def _stalled():
-    """Linux: (the % of a window in which some task waited on memory, its seconds), or None if there's no
-    window to judge by yet. The window is the last WINDOW seconds of looks since this module last kept or
-    dropped an engine; before there are that many, the kernel's own 10-second average if that has none of
-    it either, else nothing. Raises OSError on a kernel without pressure stall information."""
+    """Linux: (the % of the last WINDOW seconds in which every task that wasn't idle was stalled on memory
+    at once, its seconds), or None if there's no such window since an engine was last dropped. The window
+    is this module's own looks; before there's a WINDOW of them, the kernel's own one-minute average.
+    Raises on a kernel without pressure stall information."""
     with open("/proc/pressure/memory") as f:
-        some = next(dict(kv.split("=") for kv in line.split()[1:]) for line in f if line.startswith("some"))
-    now, total = time.monotonic(), float(some["total"])
+        full = next(dict(kv.split("=") for kv in line.split()[1:]) for line in f if line.startswith("full"))
+    now, total = time.monotonic(), float(full["total"])
     with _stalls_lock:
-        if _keeping:
-            return None
         _stalls.append((now, total))
         while len(_stalls) > 1 and now - _stalls[1][0] >= WINDOW:  # the newest look that's a window old is the base
             _stalls.popleft()
@@ -125,24 +126,24 @@ def _stalled():
         clean = now - _settled
     if now - when >= WINDOW:
         return (total - base) / ((now - when) * 1e4), now - when
-    return (float(some["avg10"]), 10.0) if clean >= WINDOW else None
+    return (float(full["avg60"]), 60.0) if clean >= WINDOW else None
 
 
 def _pressure() -> str:
-    """Why the OS says it's short of memory, or "" if it doesn't."""
-    global _swapped, _windows_signal
+    """Why the system needs the kept engines' memory, or "" if it doesn't (see the module)."""
+    global _windows_signal
     try:
         if sys.platform.startswith("linux"):
+            supply, swap, total = memory()
+            if supply + swap < FLOOR * total:
+                return f"it has {gib(supply + swap)} of memory and swap left to give"
             try:
                 verdict = _stalled()
-                if verdict is not None and verdict[0] >= PRESSURE_SOME:
-                    return f"tasks waited on memory {verdict[0]:.0f}% of the last {verdict[1]:.0f} s"
+            except (OSError, StopIteration, KeyError, ValueError):  # a kernel without it: only the above tells
                 return ""
-            except OSError:  # a kernel without it: swapping out at all says so
-                with open("/proc/vmstat") as f:
-                    out = next(int(line.split()[1]) for line in f if line.startswith("pswpout "))
-                before, _swapped = _swapped, out
-                return "it's swapping out" if before is not None and out > before else ""
+            if verdict is not None and verdict[0] >= STALLED:
+                return f"everything waited on memory for {verdict[0]:.0f}% of the last {verdict[1]:.0f} s"
+            return ""
         if os.name == "nt":
             k32 = ctypes.windll.kernel32
             if _windows_signal is None:
@@ -154,8 +155,8 @@ def _pressure() -> str:
             return ""
         if sys.platform == "darwin":
             libc, level, size = ctypes.CDLL("libc.dylib"), ctypes.c_int(0), ctypes.c_size_t(4)
-            if libc.sysctlbyname(b"kern.memorystatus_vm_pressure_level", ctypes.byref(level), ctypes.byref(size), None, 0) == 0 and level.value >= 2:
-                return "macOS' memory pressure is " + ("critical" if level.value >= 4 else "elevated")
+            if libc.sysctlbyname(b"kern.memorystatus_vm_pressure_level", ctypes.byref(level), ctypes.byref(size), None, 0) == 0 and level.value >= 4:
+                return "macOS' memory pressure is critical"
             return ""
     except Exception:
         pass
@@ -167,10 +168,12 @@ def explain() -> str:
     if "error" in _last:
         return f"RAM couldn't be read: {_last['error']}"
     if "pressure" in _last:
-        return f"the system is short of memory: {_last['pressure']}"
+        return f"the system needs its memory: {_last['pressure']}"
     if not _last:
         return "nothing weighed"
-    return f"needs {gib(_last['nbytes'])}, the system could hand over {gib(_last['supply'])}, other kept engines hold {gib(_last['others'])}"
+    floor = f" and must keep {gib(_last['floor'])} to give" if _last["floor"] else ""
+    others = f", kept engines that could go for it hold {gib(_last['others'])}" if _last["others"] else ""
+    return f"needs {gib(_last['nbytes'])}, the system could hand over {gib(_last['supply'])}{floor}{others}"
 
 
 def _give_back():
@@ -216,6 +219,7 @@ def drop(key: str, role: str = None):
 def clear():
     with _lock:
         _kept.clear()
+        _uses.clear()
     _give_back()
 
 
@@ -225,27 +229,48 @@ def held() -> tuple:
         return len(_kept), sum(entry.nbytes for entry in _kept.values())
 
 
+def used(key: str):
+    """The engine under this key was loaded (from RAM or not): what room() goes by."""
+    global _count
+    with _lock:
+        _count += 1
+        _uses[key] = (_uses.get(key, (None, None))[1], _count)
+
+
+def _may_go(k: str, key: str) -> bool:
+    """Whether the engine kept under `k` may go to make room for `key`'s: it hasn't been used since `key`'s
+    was used the time before last."""
+    before = _uses.get(key, (None, None))[0]
+    return before is not None and (_uses.get(k, (None, None))[1] or 0) < before
+
+
 def room(nbytes: int, key: str = None) -> bool:
-    """Whether to keep `nbytes` more: the system isn't short of memory, and can hand that much over without
-    paging anything out, once the least recently used engines (other than `key`'s) are dropped if that's
-    what it takes. If dropping them all wouldn't make room, none is dropped."""
+    """Whether to keep `nbytes` more for `key`'s engine: the system doesn't need the memory, can hand that
+    much over without paging anything out, and still has FLOOR of its RAM to give then (so keeping it isn't
+    what makes the system need it back), once the least recently used engines that may go for it (_may_go)
+    are dropped if that's what it takes. If dropping them all wouldn't make room, none is dropped."""
     _last.clear()
     why = _pressure()
     if why:
         _last["pressure"] = why
         return False
     try:
-        supply = _supply()
+        supply, swap, total = memory()
     except Exception as e:  # no telling what it would push out
         _last["error"] = f"{type(e).__name__}: {e}"
         return False
+    floor = int(FLOOR * total)
+
+    def fits(have: int) -> bool:
+        return have >= nbytes and have - nbytes + swap >= floor
+
     dropped = 0
     with _lock:
-        others = [k for k in _kept if k != key]
-        _last.update(nbytes=nbytes, supply=supply, others=sum(_kept[k].nbytes for k in others))
-        if supply + _last["others"] < nbytes:
+        others = [k for k in _kept if k != key and _may_go(k, key)]
+        _last.update(nbytes=nbytes, supply=supply, floor=max(0, floor - swap), others=sum(_kept[k].nbytes for k in others))
+        if not fits(supply + _last["others"]):
             return False
-        while supply < nbytes and others:
+        while not fits(supply) and others:
             entry = _kept.pop(others.pop(0))
             supply += entry.nbytes
             dropped += 1
@@ -254,11 +279,12 @@ def room(nbytes: int, key: str = None) -> bool:
     if dropped:
         _give_back()
         _settle()
-    return supply >= nbytes
+    return fits(supply)
 
 
 def put(key: str, entry: Kept):
-    """Keeps an engine (in place of what was kept under its key); starts looking at the RAM."""
+    """Keeps an engine (in place of what was kept under its key); starts asking whether the system needs
+    the memory."""
     global _watcher
     with _lock:
         _kept.pop(key, None)
@@ -266,13 +292,12 @@ def put(key: str, entry: Kept):
         if _watcher is None:
             _watcher = threading.Thread(target=_watch, name="trt-refits", daemon=True)
             _watcher.start()
-    _settle()
 
 
 def trim() -> int:
-    """Drops the engines whose checkpoint is gone, and the least recently used one if the system says it's
-    short of memory (one, then a new window: the OS's signal has to follow what was freed). Returns how
-    many it dropped."""
+    """Drops the engines whose checkpoint is gone, and the least recently used one if the system needs the
+    memory (one, then a new window: what it says has to follow what was freed). Returns how many it
+    dropped."""
     dropped = 0
     with _lock:
         for key in [k for k, entry in _kept.items() if entry.orphaned]:
@@ -283,7 +308,7 @@ def trim() -> int:
         why = _pressure() if _kept else ""
         if why:
             entry = _kept.pop(next(iter(_kept)))
-            log(f"The system is short of memory ({why}): dropped the {entry.label} kept in RAM ({gib(entry.nbytes)}).")
+            log(f"The system needs its memory ({why}): dropped the {entry.label} kept in RAM ({gib(entry.nbytes)}).")
             dropped += 1
             del entry
     if dropped:

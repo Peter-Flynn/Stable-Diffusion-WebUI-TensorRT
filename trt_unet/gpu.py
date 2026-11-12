@@ -1,19 +1,23 @@
-"""TensorRT's GPU memory, from PyTorch's allocator.
+"""TensorRT's GPU memory: taken through PyTorch's allocator, and counted.
 
-By default TensorRT takes its memory (engine weights, execution contexts, refit memory) straight from the
-driver, beside PyTorch's caching allocator: neither can use what the other holds, and reForge's count of
-free VRAM (the driver's free memory plus PyTorch's unused cache) can't tell what TensorRT holds. Here the
-TensorRT runtime allocates through PyTorch's allocator instead (TorchAllocator), so there's one pool and
-one count: what TensorRT holds is PyTorch memory in use, what it frees is PyTorch's cache, for anything.
+Left to itself, TensorRT takes its memory (engine weights, execution contexts, refit memory) beside PyTorch:
+from the driver, or from the driver's pool that reForge's --cuda-malloc has PyTorch use too. Neither can use
+what the other holds unused, reForge's count of free VRAM (the driver's free memory plus PyTorch's unused
+cache) can't tell what TensorRT holds, and with --cuda-malloc TensorRT's own frees into that pool leave the
+pool's count of memory in use above what it holds (seen: by 1.3 GiB after a few dozen generations; PyTorch
+reads that count as its own, and reForge then counts that much less VRAM free than there is). Here the
+TensorRT runtime allocates through PyTorch's allocator instead (TorchAllocator), whichever backend PyTorch
+is on: what TensorRT holds is PyTorch memory in use, what it frees is freed the way PyTorch frees its
+tensors, and is PyTorch's cache, for anything.
 
-Every allocation is also entered in a ledger under its owner (an engine's model: `owner()` says whose
-allocations are being made), so a model's size is what it holds, to the byte, and a load's peak is what
-the load took at most. Nothing about memory is estimated from it: it's counted.
+What an owner (an engine's model: `owner()` says whose allocations are being made) holds is counted as its
+engines load: what loading adds to the VRAM in use (in_use), which is what it takes whoever TensorRT got it
+from, and unloading takes that off again. Through the allocator every allocation is also entered in a
+ledger under its owner, which gives the most a load held on the way and says when one ran out. Nothing
+about memory is estimated from either: it's counted.
 
-TensorRT stays on its own allocator where PyTorch isn't on its native one (reForge's --cuda-malloc: its
-memory is then the driver's pool, with no cache of PyTorch's to share, and its counts of it aren't
-reliable), or with TRT_EXTENSION_TORCH_ALLOCATOR=0. An owner's size then comes from the driver's free
-memory before and after it loads."""
+TensorRT stays on its own allocator with TRT_EXTENSION_TORCH_ALLOCATOR=0, or once an engine that fails
+with PyTorch's loads with its own (engine.py); an owner's size is counted the same way then."""
 
 import contextlib
 import ctypes
@@ -26,8 +30,9 @@ from .common import gib, log
 
 _lock = threading.RLock()
 _live = {}  # address given to TensorRT -> (address allocated, bytes, owner)
-_held = {}  # owner -> bytes it holds
-_peaks = {}  # owner -> the most it held since its peak was reset
+_ledger = {}  # owner -> bytes TensorRT holds for it through PyTorch's allocator
+_peaks = {}  # owner -> the most the ledger had for it since its peak was reset
+_held = {}  # owner -> what loading its engines added to the VRAM in use
 _owners = []  # stack: whose allocations TensorRT is making now (None: nobody's in particular)
 _failures = 0  # allocations PyTorch couldn't satisfy, counted
 _allocator = None
@@ -45,20 +50,27 @@ def _pointer(memory) -> int:
     return int(get(memory, None) or 0)
 
 
-def _allocate(size: int, alignment: int, stream) -> int:
+def _allocate(size: int, alignment: int) -> int:
+    """`size` bytes from PyTorch's allocator, on PyTorch's current stream (as its tensors are: TensorRT may
+    use them on streams of its own, and _free waits for those)."""
     global _failures
     if size <= 0:
         return 0
     alignment = max(int(alignment or 1), 1)
     extra = alignment - 1  # wherever PyTorch's block starts, an aligned address is in it with `size` after
-    try:
-        base = torch.cuda.caching_allocator_alloc(size + extra, torch.cuda.current_device(), int(stream) if stream else None)
-    except torch.cuda.OutOfMemoryError:
-        with _lock:
-            _failures += 1
-        return 0
-    except Exception as e:
-        log(f"PyTorch's allocator failed TensorRT's request for {gib(size)}: {e}")
+    base = None
+    for again in (False, True):
+        try:
+            base = torch.cuda.caching_allocator_alloc(size + extra, torch.cuda.current_device())
+            break
+        except torch.cuda.OutOfMemoryError:
+            break
+        except Exception as e:
+            # With --cuda-malloc, PyTorch's allocator first raises whatever CUDA error an earlier call left
+            # behind on this thread (TensorRT's own, say), which clears it: that's not this request failing
+            if again:
+                log(f"PyTorch's allocator failed TensorRT's request for {gib(size)}: {e}")
+    if base is None:
         with _lock:
             _failures += 1
         return 0
@@ -66,14 +78,13 @@ def _allocate(size: int, alignment: int, stream) -> int:
     with _lock:
         owner = _owners[-1] if _owners else None
         _live[address] = (base, size, owner)
-        _held[owner] = _held.get(owner, 0) + size
-        for o in set(_owners):
-            if o in _peaks:
-                _peaks[o] = max(_peaks[o], _held.get(o, 0))
+        _ledger[owner] = _ledger.get(owner, 0) + size
+        if owner in _peaks:
+            _peaks[owner] = max(_peaks[owner], _ledger[owner])
     return address
 
 
-def _free(memory, stream) -> bool:
+def _free(memory) -> bool:
     address = _pointer(memory)
     if not address:
         return True
@@ -82,55 +93,67 @@ def _free(memory, stream) -> bool:
     if entry is None:
         return False
     base, size, owner = entry
-    # TensorRT may have used it on another stream than the one PyTorch files it under: done there first
-    if stream:
-        torch.cuda.ExternalStream(int(stream)).synchronize()
-    else:
-        torch.cuda.synchronize()
-    torch.cuda.caching_allocator_delete(base)
+    for again in (False, True):
+        try:
+            torch.cuda.synchronize()  # TensorRT may have used it on streams of its own: done there first
+            torch.cuda.caching_allocator_delete(base)
+            break
+        except Exception as e:  # an earlier call's CUDA error, raised here and cleared by that (see _allocate)
+            if again:
+                log(f"PyTorch's allocator could not free {gib(size)} of TensorRT's: {e}")
+                with _lock:
+                    _live[address] = entry  # still held, and counted so
+                return False
     with _lock:
-        _held[owner] = _held.get(owner, 0) - size
-        if not _held[owner]:
-            del _held[owner]
+        _ledger[owner] = _ledger.get(owner, 0) - size
+        if not _ledger[owner]:
+            del _ledger[owner]
     return True
 
 
 def _make_allocator():
     import tensorrt as trt
 
-    base = trt.IGpuAllocator  # with the asynchronous methods too, which TensorRT calls
-
-    class TorchAllocator(base):
-        """TensorRT's device allocations, from PyTorch's caching allocator (see the module). Addresses go
-        back as ints, which is what TensorRT's bindings read (whatever their documentation's signatures
-        say: a capsule is "not an int" to them, and the allocation failed). Nothing may raise back into
-        TensorRT: a failure is 0 (a null address) or False, which TensorRT reports."""
+    class TorchAllocator(trt.IGpuAllocator):
+        """TensorRT's device allocations, from PyTorch's allocator (see the module). TensorRT's bindings call
+        allocate and deallocate (its asynchronous calls come down to them), and read the address as an int
+        (whatever their documentation's signatures say: a capsule is "not an int" to them, and the
+        allocation failed). Nothing may raise back into TensorRT: a failure is 0 (a null address) or False,
+        which TensorRT reports."""
 
         def __init__(self):
-            base.__init__(self)
+            trt.IGpuAllocator.__init__(self)
 
-        def allocate_async(self, size, alignment, flags, stream):
+        def allocate(self, size, alignment, flags):
             try:
-                return _allocate(size, alignment, stream)
+                return _allocate(size, alignment)
             except Exception:
                 return 0
 
-        def deallocate_async(self, memory, stream):
+        def deallocate(self, memory):
             try:
-                return _free(memory, stream)
+                return _free(memory)
             except Exception:
                 return False
 
-        def allocate(self, size, alignment, flags):
-            return self.allocate_async(size, alignment, flags, None)
+        def allocate_async(self, size, alignment, flags, stream):
+            return self.allocate(size, alignment, flags)
 
-        def deallocate(self, memory):
-            return self.deallocate_async(memory, None)
+        def deallocate_async(self, memory, stream):
+            return self.deallocate(memory)
 
         def reallocate(self, address, alignment, new_size):
             return 0  # not resized in place: TensorRT allocates anew
 
     return TorchAllocator()
+
+
+def backend() -> str:
+    """PyTorch's CUDA allocator: "native", or "cudaMallocAsync" (reForge's --cuda-malloc)."""
+    try:
+        return torch.cuda.get_allocator_backend()
+    except Exception:
+        return "native"
 
 
 def attach(runtime) -> bool:
@@ -139,13 +162,6 @@ def attach(runtime) -> bool:
     global _allocator
     if os.environ.get("TRT_EXTENSION_TORCH_ALLOCATOR", "").lower() in ("0", "false", "no"):
         log("TensorRT allocates its own GPU memory (TRT_EXTENSION_TORCH_ALLOCATOR is off).")
-        return False
-    try:
-        backend = torch.cuda.get_allocator_backend()
-    except Exception:
-        backend = "native"
-    if backend != "native":  # the driver's pool (--cuda-malloc): nothing of PyTorch's to share, and its counts are off
-        log(f"TensorRT allocates its own GPU memory (PyTorch's allocator is {backend}).")
         return False
     try:
         allocator = _make_allocator()
@@ -161,7 +177,7 @@ def attached() -> bool:
     return _allocator is not None
 
 
-_proven = False  # an engine loaded with PyTorch's allocator: it works with these bindings
+_proven = False  # an engine ran with PyTorch's allocator: it works with these bindings
 
 
 def proven():
@@ -175,28 +191,35 @@ def failures() -> int:
         return _failures
 
 
-def suspect(failures_before: int) -> bool:
-    """Whether an engine that just failed to load could have failed for PyTorch's allocator: no engine has
-    loaded with it yet (TensorRT's bindings could be taking addresses otherwise than their documentation
-    says), and none of its allocations failed since `failures_before` (running out of VRAM isn't its doing,
-    and loading again with more room is what fixes that)."""
-    return _allocator is not None and not _proven and failures() == failures_before
+def suspect(failures_before: int, name=None) -> bool:
+    """Whether `name`'s engine that just failed to load could have failed for PyTorch's allocator: no engine
+    has run with it yet (TensorRT's bindings could be taking addresses otherwise than their documentation
+    says), none of its allocations failed since `failures_before` (running out of VRAM isn't its doing, and
+    loading again with more room is what fixes that), and no other owner's engines hold memory through it
+    (retiring it frees what it gave)."""
+    with _lock:
+        others = any(n for o, n in _ledger.items() if o is not None and o != name)
+        return _allocator is not None and not _proven and _failures == failures_before and not others
 
 
 def retire():
-    """An engine that failed to load with PyTorch's allocator loaded on a runtime with TensorRT's own, which
-    is used from now on (engine.py): what the failed load was given is freed, and the ledger counts from the
-    driver from now on (see loading)."""
+    """An engine that failed to load with PyTorch's allocator is loaded on a runtime with TensorRT's own,
+    which is used from now on (engine.py): what the failed load was given is freed."""
     global _allocator, _retired
     with _lock:
         entries = list(_live.values())
         _live.clear()
-        _held.clear()
-    torch.cuda.synchronize()
+        _ledger.clear()
     for base, _, _ in entries:
-        torch.cuda.caching_allocator_delete(base)
+        for again in (False, True):
+            try:
+                torch.cuda.synchronize()
+                torch.cuda.caching_allocator_delete(base)
+                break
+            except Exception:  # as in _free
+                pass
     _retired, _allocator = _allocator, None
-    log("An engine failed to load with PyTorch's allocator and loaded with TensorRT's own, so TensorRT allocates its own GPU memory from now on.")
+    log("An engine failed to load with PyTorch's allocator, so TensorRT allocates its own GPU memory from now on.")
 
 
 @contextlib.contextmanager
@@ -213,82 +236,94 @@ def owner(name):
 
 
 def held(name) -> int:
-    """Bytes `name` holds of TensorRT's allocations now."""
+    """Bytes of VRAM `name`'s engines hold: what loading them added to the VRAM in use."""
     with _lock:
         return _held.get(name, 0)
 
 
-@contextlib.contextmanager
-def measuring(name):
-    """Within: `name`'s allocations, and the most it holds at once (yields a dict that gets "peak" and
-    "failures", allocations that couldn't be satisfied, when the block ends)."""
-    result = {}
+def ledger(name) -> int:
+    """Bytes TensorRT holds for `name` through PyTorch's allocator now."""
     with _lock:
-        _peaks[name] = _held.get(name, 0)
-        failures = _failures
-    try:
-        with owner(name):
-            yield result
-    finally:
-        with _lock:
-            result["peak"] = _peaks.pop(name, 0)
-            result["failures"] = _failures - failures
+        return _ledger.get(name, 0)
 
 
-def _outside_pytorch() -> int:
-    """VRAM in use that PyTorch's allocator doesn't hold (TensorRT's own, without PyTorch's allocator)."""
+def in_use() -> int:
+    """VRAM in use on the device, by anyone: what the driver has handed out, less what PyTorch holds unused
+    (its reserved less its allocated). What loading an engine adds to it is what the engine holds, wherever
+    TensorRT took it from: PyTorch's allocator, the driver, or (--cuda-malloc) the driver's pool whose
+    counters PyTorch reports as its own."""
     free, total = torch.cuda.mem_get_info()
-    return total - free - torch.cuda.memory_reserved()
+    stats = torch.cuda.memory_stats()
+    return total - free - int(stats.get("reserved_bytes.all.current", 0)) + int(stats.get("allocated_bytes.all.current", 0))
 
 
 @contextlib.contextmanager
 def loading(name):
-    """Measures loading (or adding to) `name`'s engines: yields a dict that gets, when the block ends,
-    "held" (what `name` holds then), "peak" (the most it held during the load) and "failures" (allocations
-    PyTorch couldn't satisfy). Without PyTorch's allocator, from what the driver showed in use beyond
-    PyTorch before and after, which is then all `name` is known to hold."""
-    if attached():
-        result, m = {}, {}
-        try:
-            with measuring(name) as m:
-                yield result
-        finally:  # also when the load failed: the caller asks whether it ran out
-            result.update(held=held(name), peak=max(m.get("peak", 0), held(name)), failures=m.get("failures", 0))
-        return
-    before, result = _outside_pytorch(), {}
+    """Counts loading (or adding to) `name`'s engines: yields a dict that gets, when the block ends, "grew"
+    (what it added to the VRAM in use: at least what the ledger entered for `name`), "held" (what `name`
+    holds then), "peak" (the most it held on the way, by the ledger; what it holds then, without one) and
+    "failures" (allocations PyTorch couldn't satisfy). Also when the load failed: what it left is still
+    there until it's unloaded, and the caller asks whether it ran out."""
+    result = {}
     try:
-        yield result
+        before = in_use()
+    except Exception:
+        before = None
+    with _lock:
+        entered = _ledger.get(name, 0)
+        _peaks[name] = entered
+        failed = _failures
+    try:
+        with owner(name):
+            yield result
     finally:
-        grew = max(0, _outside_pytorch() - before)
+        try:
+            grew = max(0, in_use() - before) if before is not None else 0
+        except Exception:
+            grew = 0
         with _lock:
-            _held[name] = _held.get(name, 0) + grew
-        result.update(held=held(name), peak=held(name), failures=0)
+            through = _ledger.get(name, 0) - entered
+            most = _peaks.pop(name, entered) - entered
+            grew = max(grew, through)
+            base = _held.get(name, 0)
+            _held[name] = base + grew
+            # The most on the way: the ledger's most, and whatever came from elsewhere than the ledger
+            result.update(grew=grew, held=base + grew, peak=base + max(grew, most + max(0, grew - max(through, 0))), failures=_failures - failed)
+
+
+def counting(name) -> bool:
+    """Whether a load of `name`'s is being counted now (loading)."""
+    with _lock:
+        return name in _peaks
+
+
+def grew(name, nbytes: int):
+    """`name`'s engines took `nbytes` more after they loaded (as one first ran)."""
+    if nbytes > 0:
+        with _lock:
+            _held[name] = _held.get(name, 0) + nbytes
 
 
 def unloaded(name, nbytes: int):
-    """`name` unloaded an engine that held `nbytes`: without PyTorch's allocator, that's how the ledger learns
-    it (with it, every free is counted)."""
-    if not attached():
-        with _lock:
-            left = _held.get(name, 0) - nbytes
-            if left > 0:
-                _held[name] = left
-            else:
-                _held.pop(name, None)
-
-
-def forget(name):
-    """`name` unloaded everything: without PyTorch's allocator, that's how the ledger learns it (with it,
-    every free is counted, and anything left is what TensorRT didn't give back)."""
-    if not attached():
-        with _lock:
+    """`name` unloaded an engine that held `nbytes`."""
+    with _lock:
+        left = _held.get(name, 0) - nbytes
+        if left > 0:
+            _held[name] = left
+        else:
             _held.pop(name, None)
 
 
+def forget(name):
+    """`name` unloaded everything."""
+    with _lock:
+        _held.pop(name, None)
+
+
 def summary() -> str:
-    """For the memory diagnostics."""
+    """For the memory diagnostics: what TensorRT holds through PyTorch's allocator, by owner."""
     if not attached():
         return ""
     with _lock:
-        parts = [f"{o or 'unattributed'} {gib(n)}" for o, n in sorted(_held.items(), key=lambda kv: -kv[1]) if n]
+        parts = [f"{o or 'unattributed'} {gib(n)}" for o, n in sorted(_ledger.items(), key=lambda kv: -kv[1]) if n]
     return "TensorRT holds " + (", ".join(parts) if parts else "nothing")

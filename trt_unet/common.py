@@ -1,4 +1,5 @@
 import functools
+import sys
 
 import torch
 
@@ -147,20 +148,33 @@ def register(model):
 
 def make_room(nbytes: int, device, keep_loaded=()) -> int:
     """Has reForge's manager evict models (least recently used first; engines last, see runtime.py) until
-    `nbytes` are free beside the reserve: nothing, if they are already. Returns what's free then, beside
-    the reserve."""
+    `nbytes` are free beside the reserve: nothing, if they are already; again while it's short and the
+    asking freed something (a model reForge unloads in part gives back a little less than it was asked
+    for). Returns what's free then, beside the reserve."""
     from . import gpu
 
     m = mm()
-    short = nbytes - free(device)
-    if short > 0:
+    # What PyTorch has freed stays its own: whole blocks of the driver's pool with --cuda-malloc, which only
+    # a request that fits one can have, and its cache otherwise, which TensorRT on its own allocator can't
+    # have at all. Given back to the driver, anything can.
+    trim = not gpu.attached() or gpu.backend() != "native"
+    if trim:
+        torch.cuda.empty_cache()
+    had = free(device)
+    for _ in range(16):
+        if had >= nbytes:
+            break
         with torch.inference_mode():  # models unloaded outside it are left unusable (see inference_mode)
             # By reForge's own count, which can be short of what's free (_free_now): what it counts free
             # now, and the shortfall more
-            m.free_memory(m.get_free_memory(device) + short, device, keep_loaded=list(keep_loaded))
-    if not gpu.attached():  # TensorRT allocates from the driver: what PyTorch has cached isn't free to it
-        torch.cuda.empty_cache()
-    return free(device)
+            m.free_memory(m.get_free_memory(device) + nbytes - had, device, keep_loaded=list(keep_loaded))
+        if trim:
+            torch.cuda.empty_cache()
+        now = free(device)
+        if now <= had:  # nothing more goes
+            break
+        had = now
+    return had
 
 
 # --- Memory diagnostics: these only read counters, and change nothing.
@@ -239,13 +253,17 @@ def _ours() -> str:
 
 def _ram() -> str:
     """The RAM the system could hand over without paging anything out, as the engines kept in RAM count it
-    (refits._supply), of all there is."""
+    (refits.memory), of all there is; and what's in swap, if anything is."""
     try:
-        import psutil
-
         from . import refits
 
-        return f"RAM {gib(refits._supply())} to spare of {gib(psutil.virtual_memory().total)}"
+        supply, _, total = refits.memory()
+        swapped = ""
+        if sys.platform.startswith("linux"):
+            m = refits._meminfo()
+            out = m.get("SwapTotal", 0) - m.get("SwapFree", 0)
+            swapped = f", {gib(out)} in swap" if out > 0 else ""
+        return f"RAM {gib(supply)} to spare of {gib(total)}{swapped}"
     except Exception as e:
         return f"RAM unreadable ({type(e).__name__}: {e})"
 
@@ -268,9 +286,17 @@ def memory(where: str, extra: str = ""):
             backend = torch.cuda.get_allocator_backend()
         except Exception:
             backend = "?"
+        try:
+            counted = int(mm().get_free_memory(torch.device("cuda", torch.cuda.current_device())))
+        except Exception:
+            counted = free + reserved - active
+        if reserved >= allocated:
+            pool = f"PyTorch ({backend}) {gib(allocated)} allocated + {gib(reserved - allocated)} cached"
+        else:  # seen with --cuda-malloc: the driver's pool counts more in use than it holds (see gpu.py)
+            pool = f"PyTorch ({backend}) counts {gib(allocated)} allocated, {gib(allocated - reserved)} more than the {gib(reserved)} it holds"
         parts = [
-            f"VRAM {gib(used)} used of {gib(total)}, {gib(free)} free (reForge counts {gib(free + reserved - active)} free)",
-            f"PyTorch ({backend}) {gib(allocated)} allocated + {gib(reserved - allocated)} cached",
+            f"VRAM {gib(used)} used of {gib(total)}, {gib(free)} free (reForge counts {gib(counted)} free)",
+            pool,
             outside,
             f"loaded: {_loaded_models()}",
             _ours(),
