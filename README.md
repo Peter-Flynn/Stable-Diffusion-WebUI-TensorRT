@@ -1,83 +1,81 @@
-# TensorRT for reForge
+[adaptivediffusion]: https://jiakangyuan.github.io/AdaptiveDiffusion-project-page
+[deepcache]: https://github.com/horseee/DeepCache
+[nvidia]: https://github.com/NVIDIA/Stable-Diffusion-WebUI-TensorRT
+[reforge]: https://github.com/Panchovix/stable-diffusion-webui-reForge
+[tensorrt]: https://developer.nvidia.com/tensorrt
 
-A fork of [NVIDIA's TensorRT extension](https://github.com/NVIDIA/Stable-Diffusion-WebUI-TensorRT), rewritten for
-[reForge](https://github.com/Panchovix/stable-diffusion-webui-reForge). It runs SD 1.x, SD 2.x and SDXL models on
-TensorRT, fine-tunes like Pony, Illustrious and NoobAI included, on an RTX 2080 Ti or newer.
+<h1 align="center">
+	<a href="https://developer.nvidia.com/tensorrt">TensorRT</a> for
+	<a href="https://github.com/Panchovix/stable-diffusion-webui-reForge">reForge</a>
+</h1>
 
+A fork of [NVIDIA's TensorRT extension][nvidia], rewritten for [reForge][] – runs SD&nbsp;1.x,
+SD&nbsp;2.x, and SDXL models (Pony, Illustrious, NoobAI, etc.) on [TensorRT][], without building an
+engine per checkpoint, or converting each LoRA.
+
+## Installation
+> Requires an RTX&nbsp;2080&nbsp;Ti or newer.
+
+1. In [reForge][], open **Extensions → Install from URL**, and paste this repo.'s URL.
+2. Restart reForge. TensorRT 11 (or later) is installed on launch.<br />
+   Set `TRT_EXTENSION_SKIP_INSTALL=1` to skip this.
+3. Load a checkpoint, open the **TensorRT** tab, and click **Build engines**. The first build takes
+   a few minutes.
+4. Generate. You can now use any checkpoint of the same architecture with these engines.
+
+Engines are used while **Settings → Stable Diffusion → SD Unet** is set to `Automatic` (the
+default). Set it to `Speed Hacks` to enable [Speed Hacks](#speed-hacks), or `None` to return to
+PyTorch.
+
+> **Note**<br />
+> Engines can only be loaded on the GPU, and TensorRT version used to build them. After updating
+> TensorRT, build again – your profiles are saved in the tab.
+
+## Differences from Upstream
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/engines-dark.svg">
-    <img alt="NVIDIA's extension builds an engine for each checkpoint and converts each LoRA. This fork builds engines for each architecture, one per profile, and loads the weights of whatever checkpoint and LoRAs are in use." src="docs/engines-light.svg" width="880">
-  </picture>
+	<picture>
+		<source media="(prefers-color-scheme: dark)" srcset="docs/engines-dark.svg">
+		<img alt="NVIDIA's extension builds an engine for each checkpoint and converts each LoRA. This fork builds engines for each architecture, one per profile, and loads the weights of whatever checkpoint and LoRAs are in use." src="docs/engines-light.svg" width="880">
+	</picture>
 </p>
 
-## How it differs
+|                | NVIDIA's extension             | This fork                          |
+| -------------- | ------------------------------ | ---------------------------------- |
+| WebUI          | Automatic1111                  | reForge                            |
+| Engines        | One per checkpoint, GBs each   | One per profile of an architecture |
+| New checkpoint | Build a new engine             | Nothing to do                      |
+| LoRAs          | Convert each one first         | Work as usual                      |
+| Hires. fix     | Build an engine for both sizes | Covered by the default profiles    |
+| VAE            | PyTorch                        | TensorRT                           |
 
-|                | NVIDIA's extension                     | This fork                                             |
-| -------------- | -------------------------------------- | ----------------------------------------------------- |
-| WebUI          | Automatic1111                          | reForge                                               |
-| Engines        | One per checkpoint, GBs each           | One per profile of an architecture (or one for all of them), no weights inside |
-| New checkpoint | Build a new engine                     | Nothing to do                                         |
-| LoRAs          | Convert each one first                 | Work as usual                                         |
-| Hires. fix     | Build an engine that covers both sizes | Covered by the default profiles                       |
+Anything unsupported by the engines (ControlNet, UNet patches like FreeU, sizes outside every
+profile) is run on PyTorch instead, with a notice.
 
-Anything the engines can't run, like ControlNet, UNet patches such as FreeU, or a size no profile covers, runs on
-PyTorch instead, with a notice.
+## Functionality
+- Builds engines per architecture, rather than per checkpoint. Engines hold no weights – those of
+  the loaded checkpoint, and LoRAs are loaded into them.
+- Offers two engine modes, chosen on first build:
+  - *Per-profile engines* (default) – one engine per resolution profile, loaded as needed.
+  - *Merged engine* – every profile in one engine, which never needs swapping. Requires 24&nbsp;GB
+    of VRAM, and 64&nbsp;GB of RAM.
 
-## Use
+  The mode can only be changed while no engines exist.
+- Builds engines for the VAE's encoder and decoder alongside the UNet. Large decodes (ex. Hires.
+  fix) are split into strips to save VRAM, with identical results.
+- Checks that a generation fits in VRAM before loading anything, and falls back to PyTorch if it
+  doesn't. Figures are printed to the console.
+- Keeps swapped-out engines in RAM (with their weights) when there's room to spare, making them
+  quick to bring back.
 
-1. Install from **Extensions → Install from URL** with this repo's URL. TensorRT 11 or later is installed on the
-   next launch (set `TRT_EXTENSION_SKIP_INSTALL=1` to skip that).
-2. Load a checkpoint and open the **TensorRT** tab. The first time, it asks for the engine mode (below). Click
-   **Build engines**; the first build takes a few minutes.
-3. Generate. Every checkpoint with the same architecture now uses the engines. One is loaded at a time: each
-   batch runs on the one that fits it best, and its Hires. fix stays on it if it covers the larger size. An engine
-   that makes way for another is kept in RAM with its weights when the system can spare the RAM, so it comes back
-   for the same checkpoint and LoRAs without loading them into it again. It stays there until the system needs that
-   memory: next to nothing left to give, swap included, or everything stalled on memory for half of a minute.
+### Speed Hacks
+Implements [DeepCache][] and [AdaptiveDiffusion][] – about half of the denoising steps are computed
+by a small engine of the UNet's outermost blocks, using cached deep features from a recent full
+step. Generations of 12 steps or more are roughly 1.6x faster (estimated), but images differ
+slightly from those made without Speed Hacks, even with the same seed. Generations with fewer steps
+are unaffected.
 
-**Engine modes.** *Per-profile engines*, the default, are an engine per profile, built one at a time; only the one
-a generation's sizes need is loaded. A *merged engine* holds every profile of an architecture, so no pass ever
-loads another engine, but it takes every profile's share of TensorRT's memory at once, and its build takes them all
-at once: it needs at least 24 GB of VRAM and 64 GB of RAM. The mode can only change while there are no engines.
-
-**SD Unet** (in Settings → Stable Diffusion) decides how generations run: `Automatic`, the default, uses the
-engines; `Speed Hacks` uses them with Speed Hacks; `None` uses PyTorch.
-
-**Speed Hacks.** Every engine comes with a small engine of just the UNet's outermost blocks. With Speed Hacks, about
-half of the denoising steps run on it, reusing the deep features the full UNet computed a step or two before
-([DeepCache](https://github.com/horseee/DeepCache)), and late in a pass, full steps wait longer while the image changes
-smoothly ([AdaptiveDiffusion](https://jiakangyuan.github.io/AdaptiveDiffusion-project-page)). The first 30% and last 5%
-of steps run in full, where composition and fine detail settle; both shares are in Settings → Stable Diffusion →
-TensorRT. Passes of 12 steps or more should run roughly 1.6x as fast as on the engines alone (estimated); images are a
-little less precise, so a seed gives a somewhat different image than without them. Fewer steps (e.g. with few-step
-LoRAs) run as usual.
-
-**The VAE.** Its decoder and its encoder get engines too, built along with the UNet's for the same sizes. Those that
-take a whole image run in the precision reForge runs the VAE in: BF16 on RTX 30 series and newer, FP32 on older
-cards. Larger decodes (a Hires. fix's) run in horizontal strips on engines built for that, which on those older cards
-run in FP16, at half the VRAM: VAEs overflow FP16, which is why reForge avoids it, but the strips run the VAE scaled
-down by a power of two between its normalizations, where that changes nothing but the range, so any VAE of the
-architecture runs on them without NaNs. A decode takes the first of these there can be room for: whole beside the
-UNet engine; in strips beside it, all in VRAM; whole with the UNet engine evicted; in strips likewise, holding in RAM
-what doesn't fit. Either way it's the same image. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled
-one) run on the encoder's engines the same way. PyTorch does anything else.
-
-**Memory.** Whether a pass fits is worked out before anything loads, and said in the console with the figures:
-the engine (its weights and its plan) and the working memory of its UNet calls, which is a function of the image's
-size and the batch size: bytes for each pixel of each image, worked out once from the UNet's architecture (a call
-run through it for shapes only, which takes no VRAM and under a second). A pass that can't fit runs on PyTorch.
-Every estimate has 10% added before it's weighed or room is made for it, beside reForge's own reserve
-(`--reserve-vram`). Nothing about sizes is kept on disk. Free VRAM is the driver's own figure (with PyTorch's
-native allocator, its unused cache too; with `--cuda-malloc`, that goes back to the driver first). Engine models
-don't take the room reForge makes for a model by its own estimate. What TensorRT holds comes from PyTorch's
-allocator, with `--cuda-malloc` too, so reForge counts it like any model's (`TRT_EXTENSION_TORCH_ALLOCATOR=0`
-leaves TensorRT on its own allocator, as does an engine that fails to load with PyTorch's), and reForge's count of
-free VRAM is never taken below the driver's.
-
-> [!NOTE]
-> An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build again;
-> the tab keeps the profiles.
+The first 30%, and last 5% of steps are always computed in full, as they determine composition, and
+fine detail. Both are adjustable in **Settings → Stable Diffusion → TensorRT**.
 
 <br>
 
