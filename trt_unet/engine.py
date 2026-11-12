@@ -324,15 +324,6 @@ class Engine:
             gpu.unloaded(self.owner, self.extra)
             self.extra = 0
 
-    def stripped_bytes(self):
-        """The bytes of weights the plan was built without, which a refit puts in (TensorRT's own figure), or
-        None if it doesn't say."""
-        try:
-            n = int(self.engine.get_engine_stat(trt.EngineStat.STRIPPED_WEIGHTS_SIZE))
-            return n if n > 0 else None
-        except Exception:
-            return None
-
     def serialize(self):
         """The engine with the weights it holds now, still refittable: what load() takes in place of the plan
         to bring it back as it is, with nothing to refit. TensorRT's own host memory (a buffer), about as

@@ -117,10 +117,10 @@ def pooled() -> bool:
 
 
 def trim():
-    """Gives what PyTorch holds unused back to the driver, where it has to be to be used (pooled)."""
+    """Gives what PyTorch holds unused back to the driver, where it has to be to be used (pooled). (It waits
+    for the GPU to be done with it first.)"""
     if pooled():
         try:
-            torch.cuda.synchronize()
             torch.cuda.empty_cache()
         except Exception:
             pass
@@ -137,14 +137,16 @@ def reserve() -> int:
 
 def _free_now(device) -> int:
     """VRAM an allocation could have now: what the driver has free, and, with PyTorch's native allocator,
-    what it holds unused in its cache. Not that otherwise (pooled): what's left unused after a trim is
-    pieces of blocks still in use, which nothing can have (seen: 130 to 340 MiB). reForge counts the
-    driver's free memory plus PyTorch's reserved less its active whatever the allocator. reForge's count
-    is used where the device isn't CUDA's."""
+    what it holds unused in its cache. Otherwise (pooled) that goes back to the driver first, and what's
+    still unused then isn't counted: it's pieces of blocks still in use, which nothing can have (seen: 130
+    to 340 MiB). reForge counts the driver's free memory plus PyTorch's reserved less its active whatever
+    the allocator. reForge's count is used where the device isn't CUDA's."""
     try:
         if torch.device(device).type == "cuda":
             cached = 0
-            if not pooled():
+            if pooled():
+                trim()
+            else:
                 stats = torch.cuda.memory_stats(device)
                 cached = stats.get("reserved_bytes.all.current", 0) - stats.get("active_bytes.all.current", 0)
             return torch.cuda.mem_get_info(device)[0] + max(0, cached)
@@ -200,7 +202,6 @@ def make_room(nbytes: int, device, keep_loaded=()) -> int:
     asking freed something (a model reForge unloads in part gives back a little less than it was asked
     for). Returns what's free then, beside the reserve."""
     m = mm()
-    trim()
     had = free(device)
     for _ in range(16):
         if had >= nbytes:
@@ -209,7 +210,6 @@ def make_room(nbytes: int, device, keep_loaded=()) -> int:
             # By reForge's own count, which can be short of what's free (_free_now): what it counts free
             # now, and the shortfall more
             m.free_memory(m.get_free_memory(device) + nbytes - had, device, keep_loaded=list(keep_loaded))
-        trim()
         now = free(device)
         if now <= had:  # nothing more goes
             break

@@ -78,6 +78,7 @@ class TrtModel:
         self.weights = None  # EffectiveWeights the engines should run with
         self.applied = {}  # "unet" / "shallow" -> {weight name: signature of what's in that engine}
         store.forget_sizes(record)
+        self._plan_bytes = {}  # "unet" / "shallow" -> its plan file's size (read once: model_size() is called often)
         self.took = {}  # a pass's sizes (batch, height, width of its latents) -> what TensorRT turned out to take for its calls, where that didn't fit
         self.keep = True  # whether unloading keeps the engines in RAM as they are (refits.py)
 
@@ -138,8 +139,8 @@ class TrtModel:
         return other is self
 
     def partially_load(self, device, extra_memory=0, force_patch_weights=False):
-        """Loads the engines, with room made for what that takes (full) beyond what's opened. A load that
-        fails is tried once more: on TensorRT's own allocator if PyTorch's could be why
+        """Loads the engines, with room made for what that takes (full). A load that fails is tried once
+        more: on TensorRT's own allocator if PyTorch's could be why
         (engine.own_allocator), else with all the room there is, if it ran out (or, without PyTorch's
         allocator, for all that's known)."""
         from . import engine as engine_mod
@@ -153,12 +154,13 @@ class TrtModel:
             self.weights = EffectiveWeights(patcher)
         shallow = bool(self.hacks and self.want_shallow)
         start, need, predicted = time.time(), 0, 0
+        if self.opened:  # in VRAM without its weights (a refit that failed): from the start
+            self._discard()
         for attempt in (0, 1):
             load, failures = {}, gpu.failures()
             try:
                 kept = self._kept()
-                predicted = self.full(shallow, kept)
-                need = max(0, predicted - gpu.held(self.owner))
+                need = predicted = self.full(shallow, kept)
                 common.make_room(common.padded(need) if not attempt else common.obtainable(self.load_device) - common.reserve(), self.load_device)
                 common.memory(f"loading the {self.record.label}: before", f"room made for {common.gib(need)}")
                 with gpu.loading(self.owner) as load:
@@ -280,10 +282,12 @@ class TrtModel:
         """About what serializing an engine with its weights takes in RAM: its plan (kernels and all, without
         weights) and its weights."""
         plan, weights = (self.record.plan, self.record.weight_bytes) if role == "unet" else (self.record.shallow_plan, self.hacks["weight_bytes"])
-        try:
-            return weights + os.path.getsize(plan)
-        except OSError:
-            return weights
+        if role not in self._plan_bytes:
+            try:
+                self._plan_bytes[role] = os.path.getsize(plan)
+            except OSError:
+                self._plan_bytes[role] = 0
+        return weights + self._plan_bytes[role]
 
     def _source(self):
         """() -> the UNet module the engine's weights are from, or None once it's gone: its signatures' weak
@@ -650,7 +654,7 @@ class Pass:
         model = model_for(record)
         if model is not self.model or not model.loaded:
             for other in list(_models.values()):
-                if other is not model and other.loaded:
+                if other is not model and other.opened:
                     _unload(other)
             self._hold(None)
             model.weights = self.weights
@@ -765,6 +769,9 @@ class Pass:
             except Exception as e:
                 if not isinstance(e, RuntimeError):
                     traceback.print_exc()
+                failed = _models.get(record.key)
+                if failed is not None and failed.opened and not failed.loaded:  # its refit failed: PyTorch's UNet needs that VRAM
+                    _unload(failed, keep=False)
                 self.fall_back(f"Could not load the {record.label} ({e})")
         stream = torch.cuda.current_stream().cuda_stream
         slot = deep = None
@@ -908,10 +915,11 @@ def _fits(model: TrtModel, p: Pass, x):
 
 
 def _make_room_for_activations(model: TrtModel, patcher, x):
-    """Makes room for what the pass's UNet calls hold beside the engine, which is TensorRT's to say now that
-    the engine is loaded (its activation memory is allocated as it asks). Where that's well off what the
-    image's size gives (call_bytes), both are said. Raises RuntimeError if there can't be that much: the
-    pass runs on PyTorch before it starts, and these sizes are weighed by it from now on (_fits)."""
+    """Makes room for what the pass's UNet calls hold beside the engine: what the image's size gives
+    (call_bytes), or what TensorRT takes now that the engine is loaded (its activation memory is allocated
+    as it asks, with its inputs and outputs) if that's more, which is said. Raises RuntimeError if there
+    can't be that much: the pass runs on PyTorch before it starts, and these sizes are weighed by what
+    TensorRT takes from now on (_fits)."""
     try:
         takes = _call_bytes(model, x)
     except Exception as e:
@@ -923,7 +931,7 @@ def _make_room_for_activations(model: TrtModel, patcher, x):
     if takes > counted:
         most = " (the most its profile's sizes take: it gave no figure for these)" if model.engine.size_is_most else ""
         log(f"TensorRT takes {common.gib(takes)} for the {model.record.label}'s calls at {_sizes(x)}{most}; their size gives {common.gib(counted)}.")
-    need = common.padded(takes)
+    need = common.padded(max(takes, counted))
     free = common.make_room(need, model.load_device, _loaded_entries(model, patcher))
     if free < need:
         model.took[tuple(x.shape[i] for i in (0, 2, 3))] = takes

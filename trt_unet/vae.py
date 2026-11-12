@@ -1258,7 +1258,7 @@ class _Side:
         """The engine of a part of the one that runs whole, loaded, holding the current weights."""
         record = self.model.record
         listed = (record.encoder if self.encoding else record.meta)["weights"][part]
-        return self._get(part, record.plan(part), None, listed, part)
+        return self._get(part, record.plan(part), None, listed)
 
     def part_probe(self, part: str):
         """A context of its own on a part's engine (loaded, holding the current weights), for TensorRT's
@@ -1276,7 +1276,7 @@ class _Side:
         on it for the stage's last strips, so neither changes shapes from one decode of a size to the next.)"""
         record, kind = self.model.record, stage.kind.name
         plan = record.encoder_strip_plan(kind) if self.encoding else record.strip_plan(kind)
-        e = self._get(stage.identity, plan, stage.weights, stage.weights.values(), kind)
+        e = self._get(stage.identity, plan, stage.weights, stage.weights.values())
         if stage.identity not in self.lasts:
             self.lasts[stage.identity] = e.twin()
         return e, self.lasts[stage.identity]
@@ -1290,13 +1290,13 @@ class _Side:
     def runner_for(self, stage):
         return strips.EngineRunner(lambda: self.stage(stage), lambda: self.probe(stage), self.kinds[stage.kind.name]["shapes"], stage.kind)
 
-    def _get(self, which, plan: str, weights, listed, peak_key):
+    def _get(self, which, plan: str, weights, listed):
         """`which`'s engine (a part's, whose weights are named as the VAE's, or a stage's, `weights` naming
-        them: {the engine's: the VAE's}): loaded from `plan` if it isn't, with room made for what it takes: the
-        plan's size and the `listed` weights' (a
-        load that fails anyway is tried once more: with all the room there could be if it ran out, or with
-        TensorRT's own allocator if PyTorch's could be why); refitted if it holds other weights than the
-        current ones. What it holds is what loading it added to the VRAM in use (gpu.loading)."""
+        them: {the engine's: the VAE's}): loaded from `plan` if it isn't, with room made for what it takes,
+        the plan's size and the `listed` weights' (a load that fails anyway is tried once more: with all the
+        room there could be if it ran out, or with TensorRT's own allocator if PyTorch's could be why);
+        refitted if it holds other weights than the current ones. What it holds is what loading it added
+        to the VRAM in use (gpu.loading)."""
         from . import engine as engine_mod
         from .engine import Engine
 
@@ -1632,27 +1632,27 @@ def _fit(model: VaeModel, top: int, need_for, engines: bool, load) -> tuple:
     memory for it; the most room there could be.) `need_for(n)` gives what n hold (it loads the engines for
     a size it hasn't weighed before; `load()` loads them once one fits, and it's weighed again beside them:
     what they hold isn't room). With `engines`, a UNet engine may go for it; never for several at a time,
-    which is barely faster than one. Room is made for exactly that (this model's engines that it doesn't
-    run on first, then by reForge's manager), and the activation memory is allocated for it, once."""
+    which is barely faster than one. Room is made for that with the buffer on top (this model's engines
+    that it doesn't run on first, then by reForge's manager), and the activation memory is allocated for
+    it, once."""
     model.release()
     counted = need_for
 
-    def need_for(n):  # with the buffer on top (the activation memory as it is: it's allocated as such)
-        need, act = counted(n)
-        return common.padded(need), act
+    def room_for(n):  # what n hold, with the buffer on top
+        return common.padded(counted(n)[0])
 
     for loaded in (False, True):
         can = model.obtainable(engines)
         beside = model.obtainable(engines=False)
-        n = next((n for n in range(top, 0, -1) if need_for(n)[0] <= beside), 0) or (1 if need_for(1)[0] <= can else 0)
+        n = next((n for n in range(top, 0, -1) if room_for(n) <= beside), 0) or (1 if room_for(1) <= can else 0)
         if not n:
-            return 0, *need_for(1), can
+            return 0, *counted(1), can
         if not loaded:
             load()
-    need, act = need_for(n)
-    free = model.make_room(need)
-    if free < need:
-        log(f"Making room for {common.gib(need)} left {common.gib(free)} free: the models loaded hold more than reForge counts.")
+    need, act = counted(n)
+    free = model.make_room(room_for(n))
+    if free < room_for(n):
+        log(f"Making room for {common.gib(room_for(n))} left {common.gib(free)} free: the models loaded hold more than reForge counts.")
         return 0, need, act, can
     model.arena.get(act)
     return n, need, act, can
@@ -1669,8 +1669,7 @@ def _settled(planner, h: int, w: int, budget, ram: bool = True):
     loaded while it was made. None if no such plan fits (or, which planning converges well before, PLANNINGS
     plans weren't enough)."""
     for _ in range(PLANNINGS):
-        common.trim()  # what PyTorch freed, back to the driver (common.make_room)
-        room = budget()
+        room = budget()  # (what PyTorch freed goes back to the driver first: common.free)
         plan = planner.plan(h, w, room, ram=ram)
         if plan is None:
             return None

@@ -66,14 +66,14 @@ one) run on the encoder's engines the same way. PyTorch does anything else.
 **Memory.** Whether a pass fits is worked out before anything loads, and said in the console with the figures:
 the engine (its weights and its plan) and the working memory of its UNet calls, which is a function of the image's
 size and the batch size: bytes for each pixel of each image, worked out once from the UNet's architecture (a call
-run through it for shapes only, which takes no VRAM and under a second). A pass that can't fit runs on PyTorch. Every estimate has 10% added before it's weighed or
-room is made for it.
-Nothing is measured ahead and nothing about sizes is kept on disk.
-Free VRAM is the driver's own figure and PyTorch's unused cache. Engine models don't take the room reForge makes for
-a model by its own estimate. The only margin is reForge's own reserve (`--reserve-vram`). What TensorRT holds comes from
-PyTorch's allocator, with `--cuda-malloc` too, so reForge counts it like any model's
-(`TRT_EXTENSION_TORCH_ALLOCATOR=0` leaves TensorRT on its own allocator, as does an engine that fails to load with
-PyTorch's), and reForge's count of free VRAM is never taken below the driver's.
+run through it for shapes only, which takes no VRAM and under a second). A pass that can't fit runs on PyTorch.
+Every estimate has 10% added before it's weighed or room is made for it, beside reForge's own reserve
+(`--reserve-vram`). Nothing about sizes is kept on disk. Free VRAM is the driver's own figure (with PyTorch's
+native allocator, its unused cache too; with `--cuda-malloc`, that goes back to the driver first). Engine models
+don't take the room reForge makes for a model by its own estimate. What TensorRT holds comes from PyTorch's
+allocator, with `--cuda-malloc` too, so reForge counts it like any model's (`TRT_EXTENSION_TORCH_ALLOCATOR=0`
+leaves TensorRT on its own allocator, as does an engine that fails to load with PyTorch's), and reForge's count of
+free VRAM is never taken below the driver's.
 
 > [!NOTE]
 > An engine only loads on the GPU and TensorRT version it was built with. After updating TensorRT, build again;

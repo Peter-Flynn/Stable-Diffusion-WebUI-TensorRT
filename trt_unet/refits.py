@@ -73,7 +73,7 @@ def _meminfo() -> dict:
         return {line.split(":")[0]: int(line.split()[1]) * 1024 for line in f if line.split()[1:]}
 
 
-READS = 5  # times the OS is asked for its memory counts before a look gives up (memory)
+READS = 5  # times the OS is asked for its memory counts before keeping an engine goes ahead without them (room); the watcher just looks again
 
 
 def _read() -> tuple:
@@ -99,17 +99,17 @@ def _read() -> tuple:
     return int(ram.available), swap, int(ram.total)
 
 
-def memory() -> tuple:
+def memory(reads: int = 1) -> tuple:
     """(The RAM the OS can hand over without paging anything out, as it counts it: on Linux, the free
     memory and the clean file cache and kernel caches it drops on demand; on Windows and macOS, what they
     call available (free, standby or inactive). The swap space it has free. All its RAM.) Counts that come
-    back empty or with a warning are the tool failing, not the system out of memory: it's asked again,
-    and raises if it still can't tell, which nothing is decided on."""
-    for attempt in range(READS):
+    back empty or with a warning are the tool failing, not the system out of memory: it's asked up to
+    `reads` times, and raises if it still can't tell, which nothing is decided on."""
+    for attempt in range(reads):
         try:
             return _read()
         except Exception:
-            if attempt == READS - 1:
+            if attempt == reads - 1:
                 raise
             time.sleep(0.2)
 
@@ -277,7 +277,7 @@ def room(nbytes: int, key: str = None) -> bool:
         _last["pressure"] = why
         return False
     try:
-        supply, swap, total = memory()
+        supply, swap, total = memory(READS)
     except Exception as e:  # the tool failed: nothing is decided on that, and the engine is kept
         _last["error"] = f"{type(e).__name__}: {e}"
         return True
