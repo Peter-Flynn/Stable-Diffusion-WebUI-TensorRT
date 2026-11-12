@@ -78,9 +78,11 @@ READS = 5  # times the OS is asked for its memory counts before keeping an engin
 
 def _read() -> tuple:
     if sys.platform.startswith("linux"):
+        # As htop counts it (which reads true where the kernel's own MemAvailable doesn't: that reads 0 on
+        # some systems with most of their RAM free, and is never looked at here): what's free, and the
+        # buffers and caches the kernel drops on demand, less shared memory, which it can't drop
         m = _meminfo()
-        supply = m["MemFree"] + m.get("Active(file)", 0) + m.get("Inactive(file)", 0) + m.get("SReclaimable", 0)
-        # (Not the kernel's MemAvailable: it can read 0 on a system with memory to give, and nothing here uses it)
+        supply = m["MemFree"] + m.get("Buffers", 0) + m.get("Cached", 0) + m.get("SReclaimable", 0) - m.get("Shmem", 0)
         if m["MemTotal"] <= 0 or supply <= 0:
             raise RuntimeError("the kernel's memory counts came back empty")
         return supply, m.get("SwapFree", 0), m["MemTotal"]
@@ -102,7 +104,7 @@ def _read() -> tuple:
 
 def memory(reads: int = 1) -> tuple:
     """(The RAM the OS can hand over without paging anything out, as it counts it: on Linux, the free
-    memory and the clean file cache and kernel caches it drops on demand; on Windows and macOS, what they
+    memory and the buffers and caches it drops on demand, as htop counts them; on Windows and macOS, what they
     call available (free, standby or inactive). The swap space it has free. All its RAM.) Counts that come
     back empty or with a warning are the tool failing, not the system out of memory: it's asked up to
     `reads` times, and raises if it still can't tell, which nothing is decided on."""
