@@ -31,7 +31,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from .common import log
 
 CALL_FACTOR = 1.40  # a pass's working memory, as a multiple of its UNet's activations (see the module)
-FALLBACK = 315  # bytes a pixel where the architecture can't be run through (SDXL's)
+FALLBACK = 520  # bytes a pixel where the architecture can't be run through: the most of those that have been (SD 1.5's), so it errs towards PyTorch
 GUIDANCE = 2  # both halves of the guidance run as one batch
 PROBE = 64  # the latent's side the architecture is run through at (the figure doesn't depend on it)
 
@@ -123,7 +123,10 @@ def per_pixel(arch, patcher) -> float:
                 log(f"A {arch.name} UNet's calls take {_figures[arch.id]:.0f} bytes of working VRAM for each pixel of each image, by its architecture.")
             except Exception as e:
                 _figures[arch.id] = FALLBACK
-                log(f"Could not work out the working VRAM of a {arch.name} UNet's calls from its architecture ({type(e).__name__}: {e}); taking {FALLBACK} bytes a pixel.")
+                log(
+                    f"Could not work out the working VRAM of a {arch.name} UNet's calls from its architecture ({type(e).__name__}: {e}); "
+                    f"taking {FALLBACK} bytes a pixel, the most of any architecture it has been worked out for: passes that would fit may run on PyTorch."
+                )
         return _figures[arch.id]
 
 
