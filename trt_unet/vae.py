@@ -1810,6 +1810,7 @@ def decode(vae, samples_in):
         return None
     side = model.decoder
     model.vae, side.key = vae, _key(vae)
+    again = True
     try:
         while True:
             if found is not None and record.scaled and _exponents.get(side.key, EXPONENT) is None:
@@ -1821,20 +1822,50 @@ def decode(vae, samples_in):
                     return _decode(model, vae, samples_in, whole, found)
             except _Overflow:
                 _outgrew(side, "decoder")
-    except torch.cuda.OutOfMemoryError as e:
-        frame = traceback.extract_tb(e.__traceback__)[-1]
-        where = f"{os.path.basename(frame.filename)}:{frame.lineno}, {frame.name}"
-        del e
-        try:
-            vram = f"; {common.gib(torch.cuda.mem_get_info()[0])} free, {common.gib(torch.cuda.memory_allocated())} of PyTorch's {common.gib(torch.cuda.memory_reserved())} in use"
-        except Exception:
-            vram = ""
-        log(f"Ran out of VRAM decoding on the VAE engines ({where}{vram}); decoding on PyTorch.")
-        return None
+            except torch.cuda.OutOfMemoryError as e:
+                said = _ran_out(model, e)
+                del e
+                if not again:
+                    log(f"Ran out of VRAM decoding on the VAE engines again ({said}); decoding on PyTorch.")
+                    _make_way(model)
+                    return None
+                again = False
+                log(f"Ran out of VRAM decoding on the VAE engines ({said}); trying again with what PyTorch held unused given back.")
     finally:
         model.release()
         model.vae, model.using = None, set()  # don't keep this VAE alive
         _profiled("VAE decode")
+
+
+def _ran_out(model: VaeModel, error) -> str:
+    """After a decode or encode ran out of VRAM though room was made for all it holds: where, and how VRAM
+    stood, for the log; then its working memory is released and what PyTorch holds unused goes back to the
+    driver. PyTorch's freed memory isn't always usable for the next request (with --cuda-malloc it's the
+    driver's pool, in pieces as they were freed), so a run that fits can still run out; it's tried again."""
+    frame = traceback.extract_tb(error.__traceback__)[-1]
+    said = f"{os.path.basename(frame.filename)}:{frame.lineno}, {frame.name}"
+    error.__traceback__ = None  # it holds the run's frames, and through them its tensors
+    try:
+        said += f"; {common.gib(torch.cuda.mem_get_info()[0])} free, {common.gib(torch.cuda.memory_allocated())} of PyTorch's {common.gib(torch.cuda.memory_reserved())} in use"
+    except Exception:
+        pass
+    model.release()
+    gc.collect()
+    with contextlib.suppress(Exception):
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    return said
+
+
+def _make_way(model: VaeModel):
+    """Before PyTorch decodes or encodes instead: the VAE engines' VRAM is its to use."""
+    with contextlib.suppress(Exception):
+        model.decoder.drop()
+        model.encoder.drop()
+        model.release()
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 def _profiled(where: str):
@@ -2048,6 +2079,7 @@ def encode(vae, pixel_samples):
         return None
     side = model.encoder
     model.vae, side.key = vae, _key(vae, encoder=True)
+    again = True
     try:
         while True:
             if found is not None and record.scaled and _exponents.get(side.key, EXPONENT) is None:
@@ -2059,10 +2091,15 @@ def encode(vae, pixel_samples):
                     return _encode(model, vae, pixels, whole, found)
             except _Overflow:
                 _outgrew(side, "encoder")
-    except torch.cuda.OutOfMemoryError as e:
-        del e
-        log("Ran out of VRAM encoding on the VAE engines; encoding on PyTorch.")
-        return None
+            except torch.cuda.OutOfMemoryError as e:
+                said = _ran_out(model, e)
+                del e
+                if not again:
+                    log(f"Ran out of VRAM encoding on the VAE engines again ({said}); encoding on PyTorch.")
+                    _make_way(model)
+                    return None
+                again = False
+                log(f"Ran out of VRAM encoding on the VAE engines ({said}); trying again with what PyTorch held unused given back.")
     finally:
         model.release()
         model.vae, model.using = None, set()  # don't keep this VAE alive
