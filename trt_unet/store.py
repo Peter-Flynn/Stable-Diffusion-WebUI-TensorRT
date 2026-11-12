@@ -20,7 +20,7 @@ from .profiles import Profile
 FORMAT = 2  # an engine holds one profile, or (with "mode": "merged") several
 PER_PROFILE, MERGED = "per_profile", "merged"
 SHALLOW = ".shallow.plan"
-SIZES = ".sizes"  # what an engine was counted to hold in VRAM on this machine (read_sizes), beside its plan: JSON
+SIZES = ".sizes"  # an earlier version's file beside a plan: removed where found
 MODES = (PER_PROFILE, MERGED)
 
 
@@ -240,40 +240,10 @@ def profiles_of(records: list) -> list:
     return [r.profiles[j] for r, j in slots(records)]
 
 
-def _plans_identity(record: Record) -> list:
-    """The record's plan files as they are now: what was counted for them holds until they change."""
-    out = []
-    for path in (record.plan, record.shallow_plan):
-        try:
-            st = os.stat(path)
-            out.append([os.path.basename(path), st.st_size, st.st_mtime_ns])
-        except (OSError, TypeError):
-            out.append(None)
-    return out
-
-
-def read_sizes(record: Record) -> dict:
-    """What the record's engines were counted to hold in VRAM as they loaded and ran on this machine
-    (runtime.py keeps it): {"loads": {how they loaded: [held, most on the way]}, "calls": {a UNet call's
-    shapes: bytes}}. Empty if nothing was counted yet, or for other plans than these (built again)."""
-    try:
-        with open(record.plan[: -len(".plan")] + SIZES, encoding="utf-8") as f:
-            saved = json.load(f)
-        if saved.get("plans") == _plans_identity(record):
-            return {"loads": dict(saved.get("loads") or {}), "calls": dict(saved.get("calls") or {})}
-    except (OSError, ValueError, AttributeError, TypeError):
-        pass
-    return {"loads": {}, "calls": {}}
-
-
-def write_sizes(record: Record, loads: dict, calls: dict):
-    path = record.plan[: -len(".plan")] + SIZES
-    try:
-        with open(path + ".tmp", "w", encoding="utf-8") as f:
-            json.dump({"plans": _plans_identity(record), "loads": loads, "calls": calls}, f, indent=1)
-        os.replace(path + ".tmp", path)
-    except OSError as e:  # they're counted again next session
-        common.log(f"Could not save what the {record.label} holds in VRAM ({e}).")
+def forget_sizes(record: Record):
+    """Removes the sizes an earlier version kept beside the record's plan."""
+    with contextlib.suppress(OSError):
+        os.remove(record.plan[: -len(".plan")] + SIZES)
 
 
 def _write_meta(base: str, meta: dict):

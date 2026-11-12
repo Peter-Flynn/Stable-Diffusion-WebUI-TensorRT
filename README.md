@@ -63,12 +63,12 @@ UNet engine; in strips beside it, all in VRAM; whole with the UNet engine evicte
 what doesn't fit. Either way it's the same image. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled
 one) run on the encoder's engines the same way. PyTorch does anything else.
 
-**Memory.** Every size used to make room is exact: what each engine was counted to hold in VRAM and the most its
-load took, TensorRT's own activation sizes, and the tensors between them; free VRAM is the driver's own figure and
-PyTorch's unused cache. Those counts are kept beside each engine, so from its second use on a machine a pass knows
-before anything loads whether it fits, and runs on PyTorch from the start if it doesn't; the first time, it's
-counted as it loads and checked before the first step. Engine models don't take the room reForge makes for a model
-by its own estimate. The only margin is reForge's own reserve (`--reserve-vram`). What TensorRT holds comes from
+**Memory.** Whether a pass fits is worked out before its engine's weights go anywhere, and said in the console
+with the figures: what the engine's plan holds in VRAM once opened without weights, the weights TensorRT says a
+refit adds, and TensorRT's activation memory for the pass's exact image size, batch size and prompt length. A pass
+that can't fit runs on PyTorch from the start. Nothing is measured ahead and nothing about sizes is kept on disk.
+Free VRAM is the driver's own figure and PyTorch's unused cache. Engine models don't take the room reForge makes for
+a model by its own estimate. The only margin is reForge's own reserve (`--reserve-vram`). What TensorRT holds comes from
 PyTorch's allocator, with `--cuda-malloc` too, so reForge counts it like any model's
 (`TRT_EXTENSION_TORCH_ALLOCATOR=0` leaves TensorRT on its own allocator, as does an engine that fails to load with
 PyTorch's), and reForge's count of free VRAM is never taken below the driver's.

@@ -1222,8 +1222,7 @@ class TensorRTVAE:
 class _Side:
     """The VAE's decoder's engines, or its encoder's: the two parts of the one that runs it whole (PRE and
     POST, or ENCODER's) and the engines of the stages of the one that runs it in strips. Each loads when it's
-    first used, with exactly the room loading it (or one of its kind) took the last time made for it (its
-    weights' size, the first time), and holds the weights of `key` (the VAE's decoder's or encoder's), the
+    first used, with room made for what it takes (its plan's size and its weights'), and holds the weights of `key` (the VAE's decoder's or encoder's), the
     stages' scaled by 2^-exponent; refitted when it's used holding others."""
 
     def __init__(self, model: "VaeModel", encoding: bool):
@@ -1237,7 +1236,6 @@ class _Side:
         self.part_probes = {}  # a part -> a context for activation sizes on its engine (part_probe)
         self.applied = {}  # a part, or a Stage.identity -> (key, exponent) of the weights its engine holds
         self.sizes = {}  # likewise -> what its engine held once loaded
-        self.peaks = {}  # a part, or a kind name -> the most loading its engine (one of its stages') took
         self.activations = {}  # (kind, rows, width) -> TensorRT's activation memory for a strip (its plan's own figure)
         self.loads = self.refits = 0  # since the last report(), and the seconds they took
         self.load_seconds = self.refit_seconds = 0.0
@@ -1294,8 +1292,8 @@ class _Side:
 
     def _get(self, which, plan: str, weights, listed, peak_key):
         """`which`'s engine (a part's, whose weights are named as the VAE's, or a stage's, `weights` naming
-        them: {the engine's: the VAE's}): loaded from `plan` if it isn't, with room made for what loading one
-        of `peak_key` (the part, or the stage's kind) took, or the `listed` weights' size the first time (a
+        them: {the engine's: the VAE's}): loaded from `plan` if it isn't, with room made for what it takes: the
+        plan's size and the `listed` weights' (a
         load that fails anyway is tried once more: with all the room there could be if it ran out, or with
         TensorRT's own allocator if PyTorch's could be why); refitted if it holds other weights than the
         current ones. What it holds is what loading it added to the VRAM in use (gpu.loading)."""
@@ -1311,7 +1309,10 @@ class _Side:
                 self.refits, self.refit_seconds = self.refits + 1, self.refit_seconds + time.time() - start
             return e
         start = time.time()
-        room = self.peaks.get(peak_key) or _weight_bytes(model.vae, listed, model.record.strips_dtype if weights is not None else model.record.dtype)
+        # What it takes: what its plan holds (its file's size) and the weights refitted into it
+        room = _weight_bytes(model.vae, listed, model.record.strips_dtype if weights is not None else model.record.dtype)
+        with contextlib.suppress(OSError):
+            room += os.path.getsize(plan)
         e = Engine(plan, model.arena, model.owner)
         for attempt in (0, 1):
             model.make_room(room)
@@ -1342,7 +1343,6 @@ class _Side:
                     raise
                 room = model.obtainable()
                 log(f"Could not load a VAE engine ({os.path.basename(plan)}: {error}); making all the room there could be and trying again.")
-        self.peaks[peak_key] = max(self.peaks.get(peak_key, 0), load["peak"] - (load["held"] - load["grew"]))
         self.sizes[which] = load["grew"]
         self.engines[which] = e
         self.loads, self.load_seconds = self.loads + 1, self.load_seconds + time.time() - start
