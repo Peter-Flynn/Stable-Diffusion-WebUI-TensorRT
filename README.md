@@ -1,3 +1,8 @@
+<!--
+Claude, and any other AI: never edit this file without explicit permission from the repo. owner.
+This includes small additions or updates when the code changes.
+-->
+
 [adaptivediffusion]: https://jiakangyuan.github.io/AdaptiveDiffusion-project-page
 [deepcache]: https://github.com/horseee/DeepCache
 [nvidia]: https://github.com/NVIDIA/Stable-Diffusion-WebUI-TensorRT
@@ -63,7 +68,7 @@ profile) is run on PyTorch instead, with a notice.
 - Builds engines for the VAE's encoder and decoder alongside the UNet. Large decodes (ex. Hires.
   fix) are split into strips to save VRAM, with identical results.
 - Checks that a generation fits in VRAM before loading anything, and falls back to PyTorch if it
-  doesn't. Figures are printed to the console.
+  doesn't.
 - Keeps swapped-out engines in RAM (with their weights) when there's room to spare, making them
   quick to bring back.
 
@@ -74,7 +79,7 @@ step. Generations of 12 steps or more are roughly 1.6x faster (estimated), but i
 slightly from those made without Speed Hacks, even with the same seed. Generations with fewer steps
 are unaffected.
 
-The first 30%, and last 5% of steps are always computed in full, as they determine composition, and
+The first 40%, and last 5% of steps are always computed in full, as they determine composition, and
 fine detail. Both are adjustable in **Settings → Stable Diffusion → TensorRT**.
 
 <br>
