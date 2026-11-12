@@ -65,7 +65,8 @@ one) run on the encoder's engines the same way. PyTorch does anything else.
 
 **Memory.** Whether a pass fits is worked out before anything loads, and said in the console with the figures:
 the engine (its weights and its plan) and the working memory of its UNet calls, which is a function of the image's
-size and the batch size. A pass that can't fit runs on PyTorch. Every estimate has 10% added before it's weighed or
+size and the batch size: bytes for each pixel of each image, worked out once from the UNet's architecture (a call
+run through it for shapes only, which takes no VRAM and under a second). A pass that can't fit runs on PyTorch. Every estimate has 10% added before it's weighed or
 room is made for it.
 Nothing is measured ahead and nothing about sizes is kept on disk.
 Free VRAM is the driver's own figure and PyTorch's unused cache. Engine models don't take the room reForge makes for

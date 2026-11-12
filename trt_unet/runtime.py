@@ -10,7 +10,7 @@ stays in RAM (its patches still apply, it just isn't loaded).
 
 Whether a pass fits is worked out before anything loads (_fits), from what it will take: the engine, which
 is its weights and its plan, and the working memory of its UNet calls, which is the image's size: so many
-bytes for each pixel of each image of the batch (CALL_BYTES_PER_PIXEL). One that doesn't fit runs on
+bytes for each pixel of each image of the batch, by the UNet's architecture (working.py). One that doesn't fit runs on
 PyTorch, with the figures said. Nothing of this is kept on disk."""
 
 import contextlib
@@ -27,7 +27,7 @@ import torch
 from modules import sd_unet
 
 from . import arch as arch_mod
-from . import common, gpu, profiles, refits, speed, store
+from . import common, gpu, profiles, refits, speed, store, working
 from . import vae as vae_mod
 from .common import inference_mode, log, notify
 from .weights import EffectiveWeights
@@ -45,14 +45,10 @@ class TensorRTUNet:
     """What the model manager holds for an engine (its name shows in reForge's log)."""
 
 
-# The working VRAM of a pass's UNet calls, for each pixel of each image of its batch. An SDXL UNet in FP16
-# takes this at every size and batch size it was seen at (1024x1472 at 1 and at 2, 1536x2208 at 1: within 1%)
-CALL_BYTES_PER_PIXEL = 433
-
-
-def call_bytes(x) -> int:
-    """The working VRAM a pass on latents `x` takes for its UNet calls."""
-    return x.shape[0] * x.shape[2] * 8 * x.shape[3] * 8 * CALL_BYTES_PER_PIXEL
+def call_bytes(model, patcher, x) -> int:
+    """The working VRAM a pass on latents `x` takes for its UNet calls: by the architecture and the images'
+    size (working.py)."""
+    return working.call_bytes(model.record.arch, patcher, x.shape[0], x.shape[3] * 8, x.shape[2] * 8)
 
 
 class DoesNotFit(RuntimeError):
@@ -893,7 +889,7 @@ def _fits(model: TrtModel, p: Pass, x):
     engine is what TrtModel.full gives, or what it holds if it's loaded; the calls are the image's size
     (call_bytes), or what TensorRT turned out to take at these sizes this session, where that didn't fit."""
     shallow = bool(model.hacks and (model.want_shallow or (p.schedule is not None and not model.shallow_failed)))
-    calls = max(call_bytes(x), model.took.get(tuple(x.shape[i] for i in (0, 2, 3)), 0))
+    calls = max(call_bytes(model, p.patcher, x), model.took.get(tuple(x.shape[i] for i in (0, 2, 3)), 0))
     held = gpu.held(model.owner)
     if model.loaded:
         engine = held + (model._serialized_size("shallow") if shallow and not model.shallow_loaded else 0)
@@ -923,8 +919,8 @@ def _make_room_for_activations(model: TrtModel, patcher, x):
         return
     if not takes:
         return
-    counted = call_bytes(x)
-    if abs(takes - counted) > 0.15 * counted:
+    counted = call_bytes(model, patcher, x)
+    if takes > counted:
         most = " (the most its profile's sizes take: it gave no figure for these)" if model.engine.size_is_most else ""
         log(f"TensorRT takes {common.gib(takes)} for the {model.record.label}'s calls at {_sizes(x)}{most}; their size gives {common.gib(counted)}.")
     need = common.padded(takes)
@@ -956,15 +952,14 @@ def _call_shapes(model: TrtModel, x):
 
 def _call_bytes(model: TrtModel, x) -> int:
     """What a UNet call at the likeliest shapes holds beside the loaded engine, as TensorRT has it: its
-    activation memory, its inputs as the engine takes them and its outputs; with Speed Hacks, also the deep
-    feature kept from the call before."""
+    activation memory, its inputs as the engine takes them and its outputs."""
     found = _call_shapes(model, x)
     if found is None:
         return 0
     profile, shapes = found
     act = model.engine.estimate_activation_bytes(profile, shapes, torch.cuda.current_stream().cuda_stream)
     io = model.engine.io_bytes()
-    return act + sum(io.values()) + io.get("deep", 0)
+    return act + sum(io.values())
 
 
 def _wrap_forward(original):
