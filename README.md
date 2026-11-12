@@ -35,7 +35,7 @@ PyTorch.
 <p align="center">
 	<picture>
 		<source media="(prefers-color-scheme: dark)" srcset="docs/engines-dark.svg">
-		<img alt="NVIDIA's extension builds an engine for each checkpoint and converts each LoRA. This fork builds engines for each architecture, one per profile, and loads the weights of whatever checkpoint and LoRAs are in use." src="docs/engines-light.svg" width="880">
+		<img alt="NVIDIA's extension builds a UNet engine for each checkpoint, converts each LoRA, and runs the VAE on PyTorch. This fork builds UNet and VAE engines for each architecture, and loads the weights of whatever checkpoint, LoRAs, and VAE are in use." src="docs/engines-light.svg" width="880">
 	</picture>
 </p>
 
