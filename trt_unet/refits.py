@@ -12,10 +12,11 @@ stays kept until the system needs the memory: other programs' pages going to swa
 room, and the stalls that brings for a while, are not that. While any is kept, the OS is asked every few
 seconds whether it does (_pressure), and the least recently used goes each time it says so:
 
-- Linux: it has next to nothing left to give (free memory, droppable caches and free swap together under
-  FLOOR of the RAM: the next thing to ask would be killed for it), or everything that runs, generating
-  included, has been stalled on memory at once for STALLED % of the last WINDOW seconds (the kernel's
-  "full" stall time, /proc/pressure/memory): it does nothing but page.
+- Linux: its free memory and droppable caches have been under FLOOR of the RAM for LOW seconds on end (it
+  had that long to swap something out by itself, and didn't get back above it; swap isn't counted as
+  memory to give), or everything that runs, generating included, has been stalled on memory at once for
+  STALLED % of the last WINDOW seconds (the kernel's "full" stall time, /proc/pressure/memory): it does
+  nothing but page.
 - Windows: its low-memory notification. macOS: its memory pressure is critical.
 
 One is also dropped to make room for another, but not one that's been used since the other was used the
@@ -36,9 +37,10 @@ from .common import gib, log
 
 INTERVAL = 2.0  # seconds between looks at whether the system needs the memory, while engines are kept
 # Linux: it does when every task that isn't idle has been stalled on memory at once for STALLED % of the
-# last WINDOW seconds, or when what it could still hand over, swap included, is under FLOOR of its RAM
+# last WINDOW seconds, or when what it could hand over without swapping has been under FLOOR of its RAM
+# for LOW seconds on end
 WINDOW, STALLED = 60.0, 50.0
-FLOOR = 0.05
+FLOOR, LOW = 0.05, 30.0
 
 
 @dataclass
@@ -127,12 +129,31 @@ _settled = 0.0  # when (time.monotonic) an engine was last dropped: the window s
 _stalls_lock = threading.Lock()
 
 
+_low_since = None  # when what the system could hand over was first seen under FLOOR of its RAM, if it still is
+
+
 def _settle():
-    """An engine was dropped: the stalls up to now say nothing of the system as it is without it."""
-    global _settled
+    """An engine was dropped: the stalls and the low memory up to now say nothing of the system as it is
+    without it."""
+    global _settled, _low_since
     with _stalls_lock:
         _stalls.clear()
         _settled = time.monotonic()
+        _low_since = None
+
+
+def _low(supply: int, total: int):
+    """The seconds what the system could hand over has been under FLOOR of its RAM, as of this look (0.0
+    at the first that sees it so), or None if it isn't: it starts over whenever it's back above."""
+    global _low_since
+    now = time.monotonic()
+    with _stalls_lock:
+        if supply >= FLOOR * total:
+            _low_since = None
+            return None
+        if _low_since is None:
+            _low_since = now
+        return now - _low_since
 
 
 def _stalled():
@@ -159,9 +180,13 @@ def _pressure() -> str:
     global _windows_signal
     try:
         if sys.platform.startswith("linux"):
-            supply, swap, total = memory()
-            if supply + swap < FLOOR * total:
-                return f"it has {gib(supply + swap)} of memory and swap left to give"
+            try:
+                supply, _, total = memory()
+            except Exception:  # the tool failed: nothing is decided on that, and the next look asks again
+                supply = total = None
+            low = _low(supply, total) if total else None
+            if low is not None and low >= LOW:
+                return f"it has had under {FLOOR:.0%} of its RAM to give for {low:.0f} s ({gib(supply)} now)"
             try:
                 verdict = _stalled()
             except (OSError, StopIteration, KeyError, ValueError):  # a kernel without it: only the above tells
@@ -271,28 +296,29 @@ def _may_go(k: str, key: str) -> bool:
 
 def room(nbytes: int, key: str = None) -> bool:
     """Whether to keep `nbytes` more for `key`'s engine: the system doesn't need the memory, can hand that
-    much over without paging anything out, and still has FLOOR of its RAM to give then (so keeping it isn't
-    what makes the system need it back), once the least recently used engines that may go for it (_may_go)
-    are dropped if that's what it takes. If dropping them all wouldn't make room, none is dropped."""
+    much over without paging anything out, and still has FLOOR of its RAM to give then, swap not counted
+    (so keeping it isn't what makes the system need it back: _pressure), once the least recently used
+    engines that may go for it (_may_go) are dropped if that's what it takes. If dropping them all wouldn't
+    make room, none is dropped."""
     _last.clear()
     why = _pressure()
     if why:
         _last["pressure"] = why
         return False
     try:
-        supply, swap, total = memory(READS)
+        supply, _, total = memory(READS)
     except Exception as e:  # the tool failed: nothing is decided on that, and the engine is kept
         _last["error"] = f"{type(e).__name__}: {e}"
         return True
     floor = int(FLOOR * total)
 
     def fits(have: int) -> bool:
-        return have >= nbytes and have - nbytes + swap >= floor
+        return have - nbytes >= floor
 
     dropped = 0
     with _lock:
         others = [k for k in _kept if k != key and _may_go(k, key)]
-        _last.update(nbytes=nbytes, supply=supply, floor=max(0, floor - swap), others=sum(_kept[k].nbytes for k in others))
+        _last.update(nbytes=nbytes, supply=supply, floor=floor, others=sum(_kept[k].nbytes for k in others))
         if not fits(supply + _last["others"]):
             return False
         while not fits(supply) and others:
