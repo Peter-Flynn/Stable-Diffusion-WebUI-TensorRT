@@ -8,13 +8,10 @@ is kept in RAM as it is, weights and all, while RAM allows (refits.py), and come
 same weights; otherwise every weight is refitted. While a sampling pass runs on an engine, the PyTorch UNet
 stays in RAM (its patches still apply, it just isn't loaded).
 
-Whether a pass fits is worked out from what it will take (_fits): the engine, which is its weights and
-its plan (TensorRT takes the weights' memory as it deserializes the plan, before any is refitted), and
-TensorRT's activation memory for the pass's exact shapes with the calls' inputs and outputs. TensorRT only
-gives that for an engine in VRAM: for shapes it hasn't been asked about this session, the engine is
-weighed alone first, and its calls once it's deserialized, before its weights are refitted
-(TrtModel.partially_load). One that doesn't fit runs on PyTorch, with the figures said. Nothing of this is
-kept on disk."""
+Whether a pass fits is worked out before anything loads (_fits), from what it will take: the engine, which
+is its weights and its plan, and the working memory of its UNet calls, which is the image's size: so many
+bytes for each pixel of each image of the batch (CALL_BYTES_PER_PIXEL). One that doesn't fit runs on
+PyTorch, with the figures said. Nothing of this is kept on disk."""
 
 import contextlib
 import math
@@ -48,6 +45,16 @@ class TensorRTUNet:
     """What the model manager holds for an engine (its name shows in reForge's log)."""
 
 
+# The working VRAM of a pass's UNet calls, for each pixel of each image of its batch. An SDXL UNet in FP16
+# takes this at every size and batch size it was seen at (1024x1472 at 1 and at 2, 1536x2208 at 1: within 1%)
+CALL_BYTES_PER_PIXEL = 433
+
+
+def call_bytes(x) -> int:
+    """The working VRAM a pass on latents `x` takes for its UNet calls."""
+    return x.shape[0] * x.shape[2] * 8 * x.shape[3] * 8 * CALL_BYTES_PER_PIXEL
+
+
 class DoesNotFit(RuntimeError):
     """A pass's engine and calls can't be in VRAM together: said with the figures."""
 
@@ -75,10 +82,7 @@ class TrtModel:
         self.weights = None  # EffectiveWeights the engines should run with
         self.applied = {}  # "unet" / "shallow" -> {weight name: signature of what's in that engine}
         store.forget_sizes(record)
-        self.calls = {}  # a UNet call's shapes (_call_key) -> TensorRT's figure for what it holds beside the engines, as asked this session
-        self.most = set()  # those of them TensorRT gave no figure for: the most any shapes of the profile take
-        self.pending = None  # the pass's latent whose calls are to be weighed once the engine is deserialized (_fits)
-        self.contexts_need_weights = False  # TensorRT wouldn't make a context on the plan without weights
+        self.took = {}  # a pass's sizes (batch, height, width of its latents) -> what TensorRT turned out to take for its calls, where that didn't fit
         self.keep = True  # whether unloading keeps the engines in RAM as they are (refits.py)
 
     def _engines(self):
@@ -165,15 +169,11 @@ class TrtModel:
                     engine = self._engines()
                     self.applied = {}
                     plan_seconds = self._load("unet", engine, kept)
-                self._weigh_calls(shallow, predicted)  # before any weight is refitted
                 with gpu.loading(self.owner) as rest:
                     refit, more, kept = self._load_engines(kept)
                 load["failures"] = load.get("failures", 0) + rest.get("failures", 0)
                 plan_seconds += more
                 break
-            except DoesNotFit:
-                self._discard()
-                raise
             except Exception as e:
                 past = self.opened  # it deserialized, and failed past that
                 if not attempt:
@@ -197,30 +197,6 @@ class TrtModel:
         )
         common.memory(f"loading the {self.record.label}: done")
         return self.model_size()
-
-    def _weigh_calls(self, shallow: bool, predicted: int):
-        """With the engine deserialized: raises DoesNotFit if what the pending pass's calls hold beside it
-        (TensorRT's figure, now that it can be asked) can't be in VRAM with it, whatever else is evicted."""
-        x, self.pending = self.pending, None
-        if x is None or (not self.applied.get("unet") and self.contexts_need_weights):
-            return
-        try:
-            calls = _call_bytes(self, x, shallow)
-        except Exception as e:
-            if self.applied.get("unet"):
-                raise
-            self.contexts_need_weights = True
-            log(f"TensorRT sizes the {self.record.label}'s calls only once its weights are in ({e}).")
-            return
-        held = gpu.held(self.owner)
-        engine = max(predicted, held)
-        room = common.obtainable(self.load_device, keep=[self]) - common.reserve() + held
-        need = held + common.padded(engine - held + calls)  # the buffer on what isn't in VRAM yet
-        said = _said(self, x, engine, calls, room, need)
-        if need > room:
-            raise DoesNotFit(said)
-        log(f"It fits: {said}.")
-        common.phase(f"{self.record.label}: deserialized, before its weights")
 
     def _load_engines(self, kept) -> tuple:
         """With the UNet engine deserialized: (what refitting took, None if they came as they were kept; the
@@ -907,57 +883,55 @@ def _begin(records, hacks, patcher, x, prepare):
     return p
 
 
-def _said(model: TrtModel, x, engine: int, calls, room: int, need: int) -> str:
-    size = f"{x.shape[3] * 8}x{x.shape[2] * 8}, batch size {x.shape[0]}"
-    most = " (the most its profile's sizes take: TensorRT gave none for these)" if _call_key(model, x, model.shallow_loaded) in model.most or _call_key(model, x, True) in model.most else ""
-    parts = f"{common.gib(engine)} for the engine, " + (f"{common.gib(calls)} for its calls{most}" if calls is not None else "its calls not counted yet")
-    buffer = f", {common.gib(need - engine - (calls or 0))} of buffer"
-    return f"the {model.record.label} at {size} needs {common.gib(need)} of VRAM ({parts}{buffer}), and there can be {common.gib(room)}"
+def _sizes(x) -> str:
+    return f"{x.shape[3] * 8}x{x.shape[2] * 8}, batch size {x.shape[0]}"
 
 
 def _fits(model: TrtModel, p: Pass, x):
-    """Before anything loads: raises DoesNotFit, with the figures, if the engine and what a pass's UNet calls
-    at these sizes hold beside it can't be in VRAM whatever else is evicted; says them if they can. The
-    engine is what TrtModel.full gives, or what it holds if it's loaded; the calls are TensorRT's figure
-    for these exact shapes, which it gives for an engine in VRAM: asked now if this one is, or as asked
-    before this session. Otherwise the engine alone is weighed here, and its calls as soon as it's
-    deserialized, before its weights are refitted (TrtModel._weigh_calls)."""
+    """Before anything loads: raises DoesNotFit, with the figures, if the engine and the working memory of a
+    pass's UNet calls at these sizes can't be in VRAM whatever else is evicted; says them if they can. The
+    engine is what TrtModel.full gives, or what it holds if it's loaded; the calls are the image's size
+    (call_bytes), or what TensorRT turned out to take at these sizes this session, where that didn't fit."""
     shallow = bool(model.hacks and (model.want_shallow or (p.schedule is not None and not model.shallow_failed)))
-    key = _call_key(model, x, shallow)
-    calls = model.calls.get(key)
+    calls = max(call_bytes(x), model.took.get(tuple(x.shape[i] for i in (0, 2, 3)), 0))
     held = gpu.held(model.owner)
     if model.loaded:
-        if calls is None:
-            calls = _call_bytes(model, x, shallow)
         engine = held + (model._serialized_size("shallow") if shallow and not model.shallow_loaded else 0)
     else:
         model.weights = p.weights
         engine = model.full(shallow, model._kept())
     room = common.obtainable(model.load_device, keep=[model]) - common.reserve() + held
-    need = held + common.padded(engine - held + (calls or 0))  # the buffer on what isn't in VRAM yet
-    said = _said(model, x, engine, calls, room, need)
+    need = held + common.padded(engine - held + calls)  # the buffer on what isn't in VRAM yet
+    said = (
+        f"the {model.record.label} at {_sizes(x)} needs {common.gib(need)} of VRAM ({common.gib(engine)} for the engine, "
+        f"{common.gib(calls)} for its calls, {common.gib(need - engine - calls)} of buffer), and there can be {common.gib(room)}"
+    )
     if need > room:
         raise DoesNotFit(said)
-    model.pending = x if calls is None else None
-    if calls is not None:
-        log(f"It fits: {said}.")
+    log(f"It fits: {said}.")
 
 
 def _make_room_for_activations(model: TrtModel, patcher, x):
-    """Makes room for what the pass's UNet calls hold beside the engine (_call_bytes). Raises RuntimeError if
-    there can't be that much (said before this, unless TensorRT couldn't size them until now): the pass
-    runs on PyTorch before it starts, not once it has run out."""
+    """Makes room for what the pass's UNet calls hold beside the engine, which is TensorRT's to say now that
+    the engine is loaded (its activation memory is allocated as it asks). Where that's well off what the
+    image's size gives (call_bytes), both are said. Raises RuntimeError if there can't be that much: the
+    pass runs on PyTorch before it starts, and these sizes are weighed by it from now on (_fits)."""
     try:
-        need = _call_bytes(model, x)
+        takes = _call_bytes(model, x)
     except Exception as e:
         log(f"Could not size the engine's calls: {e}")
         return
-    if need:
-        need = common.padded(need)
-        free = common.make_room(need, model.load_device, _loaded_entries(model, patcher))
-        if free < need:
-            size = f"{x.shape[3] * 8}x{x.shape[2] * 8}, batch size {x.shape[0]}"
-            raise RuntimeError(f"a pass at {size} holds {common.gib(need)} of VRAM beside the {model.record.label}, and there can be {common.gib(free)}")
+    if not takes:
+        return
+    counted = call_bytes(x)
+    if abs(takes - counted) > 0.15 * counted:
+        most = " (the most its profile's sizes take: it gave no figure for these)" if model.engine.size_is_most else ""
+        log(f"TensorRT takes {common.gib(takes)} for the {model.record.label}'s calls at {_sizes(x)}{most}; their size gives {common.gib(counted)}.")
+    need = common.padded(takes)
+    free = common.make_room(need, model.load_device, _loaded_entries(model, patcher))
+    if free < need:
+        model.took[tuple(x.shape[i] for i in (0, 2, 3))] = takes
+        raise RuntimeError(f"a pass at {_sizes(x)} holds {common.gib(need)} of VRAM beside the {model.record.label}, and there can be {common.gib(free)}")
 
 
 def _call_shapes(model: TrtModel, x):
@@ -980,35 +954,17 @@ def _call_shapes(model: TrtModel, x):
     return profile, shapes
 
 
-def _call_key(model: TrtModel, x, shallow: bool) -> str:
-    """What TrtModel.calls keeps a call's bytes under: its profile and shapes, and whether with Speed Hacks
-    (their deep feature is held too)."""
-    found = _call_shapes(model, x)
-    if found is None:
-        return ""
-    profile, shapes = found
-    return f"{profile}:" + ",".join("x".join(map(str, shapes[name])) for name in sorted(shapes)) + (":deep" if shallow else "")
-
-
-def _call_bytes(model: TrtModel, x, shallow: bool = None) -> int:
-    """What a UNet call at the likeliest shapes holds beside the engine, as TensorRT gives it: its
+def _call_bytes(model: TrtModel, x) -> int:
+    """What a UNet call at the likeliest shapes holds beside the loaded engine, as TensorRT has it: its
     activation memory, its inputs as the engine takes them and its outputs; with Speed Hacks, also the deep
-    feature kept from the call before. Remembered under its shapes for the session (TrtModel.calls): an
-    engine that comes back as it was kept in RAM is weighed by it before it loads."""
+    feature kept from the call before."""
     found = _call_shapes(model, x)
     if found is None:
         return 0
     profile, shapes = found
     act = model.engine.estimate_activation_bytes(profile, shapes, torch.cuda.current_stream().cuda_stream)
     io = model.engine.io_bytes()
-    need = act + sum(io.values()) + io.get("deep", 0)
-    key = _call_key(model, x, model.shallow_loaded if shallow is None else shallow)
-    model.calls[key] = need
-    if model.engine.size_is_most:
-        model.most.add(key)
-    else:
-        model.most.discard(key)
-    return need
+    return act + sum(io.values()) + io.get("deep", 0)
 
 
 def _wrap_forward(original):

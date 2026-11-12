@@ -63,11 +63,10 @@ UNet engine; in strips beside it, all in VRAM; whole with the UNet engine evicte
 what doesn't fit. Either way it's the same image. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled
 one) run on the encoder's engines the same way. PyTorch does anything else.
 
-**Memory.** Whether a pass fits is worked out from what it takes, and said in the console with the figures: the
-engine (its weights and its plan) and TensorRT's activation memory for the pass's exact image size, batch size and
-prompt length. TensorRT only gives the latter for an engine in VRAM, so for sizes not yet run this session the
-engine is weighed alone first, and the rest once its plan is in VRAM, before its weights are refitted. A pass that
-can't fit runs on PyTorch. Every estimate has 10% added before it's weighed or room is made for it.
+**Memory.** Whether a pass fits is worked out before anything loads, and said in the console with the figures:
+the engine (its weights and its plan) and the working memory of its UNet calls, which is a function of the image's
+size and the batch size. A pass that can't fit runs on PyTorch. Every estimate has 10% added before it's weighed or
+room is made for it.
 Nothing is measured ahead and nothing about sizes is kept on disk.
 Free VRAM is the driver's own figure and PyTorch's unused cache. Engine models don't take the room reForge makes for
 a model by its own estimate. The only margin is reForge's own reserve (`--reserve-vram`). What TensorRT holds comes from

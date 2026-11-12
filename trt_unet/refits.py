@@ -73,23 +73,45 @@ def _meminfo() -> dict:
         return {line.split(":")[0]: int(line.split()[1]) * 1024 for line in f if line.split()[1:]}
 
 
-def memory() -> tuple:
-    """(The RAM the OS can hand over without paging anything out, as it counts it: on Linux, the free
-    memory and the clean file cache and kernel caches it drops on demand; on Windows and macOS, what they
-    call available (free, standby or inactive). The swap space it has free. All its RAM.) Raises if it
-    can't tell."""
+READS = 5  # times the OS is asked for its memory counts before a look gives up (memory)
+
+
+def _read() -> tuple:
     if sys.platform.startswith("linux"):
         m = _meminfo()
         supply = m["MemFree"] + m.get("Active(file)", 0) + m.get("Inactive(file)", 0) + m.get("SReclaimable", 0)
+        if m["MemTotal"] <= 0 or supply <= 0 or m.get("MemAvailable", 1) <= 0:
+            raise RuntimeError("the kernel's memory counts came back empty")
         return supply, m.get("SwapFree", 0), m["MemTotal"]
+    import warnings
+
     import psutil
 
-    ram = psutil.virtual_memory()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # "available memory stats couldn't be determined and was set to 0"
+        ram = psutil.virtual_memory()
+    if ram.total <= 0 or ram.available <= 0:
+        raise RuntimeError("the system's memory counts came back empty")
     try:
         swap = int(psutil.swap_memory().free)
     except Exception:
         swap = 0
     return int(ram.available), swap, int(ram.total)
+
+
+def memory() -> tuple:
+    """(The RAM the OS can hand over without paging anything out, as it counts it: on Linux, the free
+    memory and the clean file cache and kernel caches it drops on demand; on Windows and macOS, what they
+    call available (free, standby or inactive). The swap space it has free. All its RAM.) Counts that come
+    back empty or with a warning are the tool failing, not the system out of memory: it's asked again,
+    and raises if it still can't tell, which nothing is decided on."""
+    for attempt in range(READS):
+        try:
+            return _read()
+        except Exception:
+            if attempt == READS - 1:
+                raise
+            time.sleep(0.2)
 
 
 def _supply() -> int:
@@ -256,9 +278,9 @@ def room(nbytes: int, key: str = None) -> bool:
         return False
     try:
         supply, swap, total = memory()
-    except Exception as e:  # no telling what it would push out
+    except Exception as e:  # the tool failed: nothing is decided on that, and the engine is kept
         _last["error"] = f"{type(e).__name__}: {e}"
-        return False
+        return True
     floor = int(FLOOR * total)
 
     def fits(have: int) -> bool:
