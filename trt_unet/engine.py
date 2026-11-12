@@ -247,7 +247,7 @@ class Engine:
         self.engine = _deserialize(plan, self.owner)
         if self.engine is None:
             said = " | ".join(LOGGER.messages) or "nothing"
-            other = other_tensorrt()
+            other = "" if "OutOfMemory" in said else other_tensorrt()  # (not why it ran out)
             what = self.plan_path if serialized is None else f"{self.plan_path} as kept in RAM with its weights"
             raise RuntimeError(
                 f"TensorRT {trt.__version__} could not load {what} ({memoryview(plan).nbytes} bytes). TensorRT said: {said}"

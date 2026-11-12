@@ -8,10 +8,12 @@ is kept in RAM as it is, weights and all, while RAM allows (refits.py), and come
 same weights; otherwise every weight is refitted. While a sampling pass runs on an engine, the PyTorch UNet
 stays in RAM (its patches still apply, it just isn't loaded).
 
-Whether a pass fits is worked out before its engine's weights go anywhere (_fits), from what it will take:
-what the plan holds in VRAM once deserialized without weights (as it is, then), the weights TensorRT says a
-refit puts in, and TensorRT's activation memory for the pass's exact shapes with the calls' inputs and
-outputs. One that doesn't fit runs on PyTorch from the start, with the figures said. Nothing of this is
+Whether a pass fits is worked out from what it will take (_fits): the engine, which is its weights and
+its plan (TensorRT takes the weights' memory as it deserializes the plan, before any is refitted), and
+TensorRT's activation memory for the pass's exact shapes with the calls' inputs and outputs. TensorRT only
+gives that for an engine in VRAM: for shapes it hasn't been asked about this session, the engine is
+weighed alone first, and its calls once it's deserialized, before its weights are refitted
+(TrtModel.partially_load). One that doesn't fit runs on PyTorch, with the figures said. Nothing of this is
 kept on disk."""
 
 import contextlib
@@ -46,6 +48,10 @@ class TensorRTUNet:
     """What the model manager holds for an engine (its name shows in reForge's log)."""
 
 
+class DoesNotFit(RuntimeError):
+    """A pass's engine and calls can't be in VRAM together: said with the figures."""
+
+
 class TrtModel:
     """An engine as reForge's model manager sees a model (the parts of ModelPatcher it uses), with its
     shallow partner for Speed Hacks (speed.py), loaded only for passes that use them. The two share their
@@ -69,12 +75,9 @@ class TrtModel:
         self.weights = None  # EffectiveWeights the engines should run with
         self.applied = {}  # "unet" / "shallow" -> {weight name: signature of what's in that engine}
         store.forget_sizes(record)
-        # "unet" -> (what its plan holds in VRAM deserialized without weights, the bytes of weights TensorRT
-        # says a refit puts in), since it was last opened this session (open)
-        self.figures = {}
         self.calls = {}  # a UNet call's shapes (_call_key) -> TensorRT's figure for what it holds beside the engines, as asked this session
+        self.pending = None  # the pass's latent whose calls are to be weighed once the engine is deserialized (_fits)
         self.contexts_need_weights = False  # TensorRT wouldn't make a context on the plan without weights
-        self.open_seconds = 0.0
         self.keep = True  # whether unloading keeps the engines in RAM as they are (refits.py)
 
     def _engines(self):
@@ -102,39 +105,13 @@ class TrtModel:
         return self.shallow is not None and self.shallow.loaded
 
     def full(self, shallow: bool, kept=None) -> int:
-        """What the engines hold in VRAM once loaded: as kept in RAM with their weights, that serialized
-        engine's bytes; else what the plan holds deserialized without weights and the weights a refit puts
-        in (open's figures; until it has been opened, the plan file's size and the weights' as built)."""
+        """What the engines hold in VRAM once loaded: their weights and their plans' size, or, as kept in
+        RAM with their weights, that serialized engine's bytes."""
         total = 0
         for role in ("unet", "shallow") if shallow else ("unet",):
             blob = kept.blobs.get(role) if kept is not None else None
-            if blob is not None:
-                total += memoryview(blob).nbytes
-            elif role in self.figures:
-                total += sum(self.figures[role])
-            else:
-                total += self._serialized_size(role)
+            total += memoryview(blob).nbytes if blob is not None else self._serialized_size(role)
         return total
-
-    def remaining(self, shallow: bool, kept=None) -> int:
-        """What loading the engines still takes: all of them (full), less what the opened plan holds."""
-        opened = self.figures["unet"][0] if self.opened and kept is None and "unet" in self.figures else 0
-        return self.full(shallow, kept) - opened
-
-    def open(self):
-        """Deserializes the UNet engine's plan, without weights, with room made for it: what it holds then
-        is counted, and TensorRT says what a refit adds and what its calls take, before any weight moves."""
-        engine = self._engines()
-        known = self.figures.get("unet")
-        try:
-            plan = known[0] if known else os.path.getsize(self.record.plan)
-        except OSError:
-            plan = 0
-        common.make_room(plan, self.load_device)
-        self.applied.pop("unet", None)
-        with gpu.loading(self.owner) as load:
-            self.open_seconds = engine.load()
-        self.figures["unet"] = (load["grew"], engine.stripped_bytes() or self.record.weight_bytes)
 
     def model_size(self):
         if self.loaded:
@@ -179,17 +156,23 @@ class TrtModel:
             load, failures = {}, gpu.failures()
             try:
                 kept = self._kept()
-                if kept is not None and self.opened:  # opened only for its figures: it comes as it was kept
-                    self._discard()
-                if kept is None and not self.opened:
-                    self.open()
-                need = self.remaining(shallow, kept)
-                predicted = gpu.held(self.owner) + need
+                predicted = self.full(shallow, kept)
+                need = max(0, predicted - gpu.held(self.owner))
                 common.make_room(need if not attempt else common.obtainable(self.load_device) - common.reserve(), self.load_device)
                 common.memory(f"loading the {self.record.label}: before", f"room made for {common.gib(need)}")
                 with gpu.loading(self.owner) as load:
-                    refit, plan_seconds, kept = self._load_engines()
+                    engine = self._engines()
+                    self.applied = {}
+                    plan_seconds = self._load("unet", engine, kept)
+                self._weigh_calls(shallow, predicted)  # before any weight is refitted
+                with gpu.loading(self.owner) as rest:
+                    refit, more, kept = self._load_engines(kept)
+                load["failures"] = load.get("failures", 0) + rest.get("failures", 0)
+                plan_seconds += more
                 break
+            except DoesNotFit:
+                self._discard()
+                raise
             except Exception as e:
                 past = self.opened  # it deserialized, and failed past that
                 if not attempt:
@@ -206,8 +189,7 @@ class TrtModel:
         size = gpu.held(self.owner)
         refits.used(self.record.key)
         with_shallow = " with its Speed Hacks part" if self.shallow_loaded else ""
-        source = f"as kept in RAM with its weights {plan_seconds:.1f}s" if kept else f"plan {plan_seconds + self.open_seconds:.1f}s"
-        self.open_seconds = 0.0
+        source = f"as kept in RAM with its weights {plan_seconds:.1f}s" if kept else f"plan {plan_seconds:.1f}s"
         log(
             f"Loaded the {self.owner}{with_shallow} ({common.gib(size)} in VRAM, {common.gib(predicted)} predicted) in {time.time() - start:.1f}s: "
             f"{source}, " + (_refit_times(refit) if refit else "no weights to refit")
@@ -215,13 +197,32 @@ class TrtModel:
         common.memory(f"loading the {self.record.label}: done")
         return self.model_size()
 
-    def _load_engines(self) -> tuple:
-        """(What refitting them took, None if they came as they were kept; the seconds loading them took; what
-        was kept in RAM of them, if they came from there.)"""
-        engine = self._engines()
-        kept = self._kept()
-        self.applied = {}
-        plan_seconds = self._load("unet", engine, kept)
+    def _weigh_calls(self, shallow: bool, predicted: int):
+        """With the engine deserialized: raises DoesNotFit if what the pending pass's calls hold beside it
+        (TensorRT's figure, now that it can be asked) can't be in VRAM with it, whatever else is evicted."""
+        x, self.pending = self.pending, None
+        if x is None or (not self.applied.get("unet") and self.contexts_need_weights):
+            return
+        try:
+            calls = _call_bytes(self, x, shallow)
+        except Exception as e:
+            if self.applied.get("unet"):
+                raise
+            self.contexts_need_weights = True
+            log(f"TensorRT sizes the {self.record.label}'s calls only once its weights are in ({e}).")
+            return
+        held = gpu.held(self.owner)
+        engine = max(predicted, held)
+        room = common.obtainable(self.load_device, keep=[self]) - common.reserve() + held
+        said = _said(self, x, engine, calls, room)
+        if engine + calls > room:
+            raise DoesNotFit(said)
+        log(f"It fits: {said}.")
+
+    def _load_engines(self, kept) -> tuple:
+        """With the UNet engine deserialized: (what refitting took, None if they came as they were kept; the
+        seconds loading the shallow engine took; what was kept in RAM of them, if they came from there.)"""
+        plan_seconds = 0.0
         kept = kept if "unet" in self.applied else None
         if self.want_shallow and self.shallow is not None:
             try:
@@ -247,8 +248,6 @@ class TrtModel:
         `applied`, so nothing is refitted), else its plan, without weights. Returns the seconds it took."""
         blob = kept.blobs.get(role) if kept is not None else None
         self.applied.pop(role, None)
-        if blob is None and engine.loaded:  # opened already (open)
-            return 0.0
         if blob is not None:
             try:
                 seconds = engine.load(blob)
@@ -903,56 +902,42 @@ def _begin(records, hacks, patcher, x, prepare):
     return p
 
 
+def _said(model: TrtModel, x, engine: int, calls, room: int) -> str:
+    size = f"{x.shape[3] * 8}x{x.shape[2] * 8}, batch size {x.shape[0]}"
+    parts = f"{common.gib(engine)} for the engine, " + (f"{common.gib(calls)} for its calls" if calls is not None else "its calls not counted yet")
+    return f"the {model.record.label} at {size} needs {common.gib(engine + (calls or 0))} of VRAM ({parts}), and there can be {common.gib(room)}"
+
+
 def _fits(model: TrtModel, p: Pass, x):
-    """Before the engine's weights go anywhere: raises RuntimeError, with the figures, if the engine and what
-    a pass's UNet calls at these sizes hold beside it can't be in VRAM whatever else is evicted; says them
-    if they can. The engine is what TrtModel.full gives, for which its plan is deserialized without weights
-    if it isn't in VRAM (unless it comes as it's kept in RAM, with calls of these shapes asked before); the
-    calls are TensorRT's figure for these exact shapes. Should TensorRT not size calls on an engine without
-    weights, the engine alone is weighed here, and its calls before the first step
-    (_make_room_for_activations)."""
+    """Before anything loads: raises DoesNotFit, with the figures, if the engine and what a pass's UNet calls
+    at these sizes hold beside it can't be in VRAM whatever else is evicted; says them if they can. The
+    engine is what TrtModel.full gives, or what it holds if it's loaded; the calls are TensorRT's figure
+    for these exact shapes, which it gives for an engine in VRAM: asked now if this one is, or as asked
+    before this session. Otherwise the engine alone is weighed here, and its calls as soon as it's
+    deserialized, before its weights are refitted (TrtModel._weigh_calls)."""
     shallow = bool(model.hacks and (model.want_shallow or (p.schedule is not None and not model.shallow_failed)))
-    key, kept = _call_key(model, x, shallow), None
-    try:
-        if not model.loaded:
-            model.weights = p.weights
-            kept = model._kept()
-            if (kept is None or key not in model.calls) and not model.opened:
-                model.open()
-        calls = model.calls.get(key)
-        if calls is None and model.opened and (model.loaded or not model.contexts_need_weights):
-            try:
-                calls = _call_bytes(model, x, shallow)
-            except Exception as e:
-                if model.loaded:
-                    raise
-                model.contexts_need_weights = True
-                log(f"TensorRT sizes the {model.record.label}'s calls only once its weights are in ({e}).")
-        held = gpu.held(model.owner)
-        if model.loaded:
-            engine = held + (model._serialized_size("shallow") if shallow and not model.shallow_loaded else 0)
-        elif kept is not None:
-            engine = model.full(shallow, kept)  # (what's opened for its figures goes first)
-        else:
-            engine = held + model.remaining(shallow)
-        # What's free and what everything else loaded holds, and what this engine holds of it already
-        room = common.obtainable(model.load_device, keep=[model]) - common.reserve() + held
-        need = engine + (calls or 0)
-        size = f"{x.shape[3] * 8}x{x.shape[2] * 8}, batch size {x.shape[0]}"
-        parts = f"{common.gib(engine)} for the engine, " + (f"{common.gib(calls)} for its calls" if calls is not None else "its calls sized once its weights are in")
-        said = f"the {model.record.label} at {size} needs {common.gib(need)} of VRAM ({parts}), and there can be {common.gib(room)}"
-        if need > room:
-            raise RuntimeError(said)
+    key = _call_key(model, x, shallow)
+    calls = model.calls.get(key)
+    held = gpu.held(model.owner)
+    if model.loaded:
+        if calls is None:
+            calls = _call_bytes(model, x, shallow)
+        engine = held + (model._serialized_size("shallow") if shallow and not model.shallow_loaded else 0)
+    else:
+        model.weights = p.weights
+        engine = model.full(shallow, model._kept())
+    room = common.obtainable(model.load_device, keep=[model]) - common.reserve() + held
+    said = _said(model, x, engine, calls, room)
+    if engine + (calls or 0) > room:
+        raise DoesNotFit(said)
+    model.pending = x if calls is None else None
+    if calls is not None:
         log(f"It fits: {said}.")
-    except Exception:
-        if model.opened and not model.loaded:
-            model._discard()
-        raise
 
 
 def _make_room_for_activations(model: TrtModel, patcher, x):
     """Makes room for what the pass's UNet calls hold beside the engine (_call_bytes). Raises RuntimeError if
-    there can't be that much (_fits said so already, unless TensorRT couldn't size them then): the pass
+    there can't be that much (said before this, unless TensorRT couldn't size them until now): the pass
     runs on PyTorch before it starts, not once it has run out."""
     try:
         need = _call_bytes(model, x)
