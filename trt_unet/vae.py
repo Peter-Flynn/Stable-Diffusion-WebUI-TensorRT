@@ -1669,8 +1669,7 @@ def _settled(planner, h: int, w: int, budget, ram: bool = True):
     loaded while it was made. None if no such plan fits (or, which planning converges well before, PLANNINGS
     plans weren't enough)."""
     for _ in range(PLANNINGS):
-        if not gpu.attached() or gpu.backend() != "native":  # what PyTorch freed, back to the driver (common.make_room)
-            torch.cuda.empty_cache()
+        common.trim()  # what PyTorch freed, back to the driver (common.make_room)
         room = budget()
         plan = planner.plan(h, w, room, ram=ram)
         if plan is None:
@@ -2020,6 +2019,9 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
     for i in range(b):
         if i == 0:
             model.make_room(before)
+        else:  # the image before's strips are freed: back to the driver, for this one's part before them
+            model.release()
+            common.trim()
         z = to_latent(samples_in[i:i + 1]).to(device=device, dtype=dtype)
         mid = side.engine(PRE).infer({"latent": z}, 0, stream)
         del z
@@ -2029,6 +2031,7 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
         del mid
         attending = _synced() - start if i == 0 else 0
         model.release()  # the pre engine's activations: the strips size their own
+        common.trim()
         if i == 0:
             common.phase(f"VAE decode of {w * 8}x{h * 8}: after the part before the strips and the attention")
         if plan is None:
@@ -2209,6 +2212,9 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
     for i in range(b):
         if i == 0:
             model.make_room(image_room)
+        else:  # what the image before freed: back to the driver
+            model.release()
+            common.trim()
         image = vae.process_input(pixels[i:i + 1]).to(device=device, dtype=sdtype)
         if plan is None:
             start = time.time()
@@ -2229,6 +2235,8 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
         if i == 0:
             common.memory(f"VAE encode of {w}x{h}: strips done", encoder.memory_report(plan))
             model.make_room(after)
+        else:
+            common.trim()
         start = _synced() if i == 0 else 0
         center, factor, shift = stats.affine(norm, side.scale)
         normed = (x.float() - center) * factor + shift

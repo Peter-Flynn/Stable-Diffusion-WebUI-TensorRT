@@ -58,9 +58,9 @@ def _machine():
     except Exception:
         pass
     try:
-        import psutil
+        from . import refits
 
-        ram = psutil.virtual_memory().total
+        ram = refits.memory()[2]  # (on Linux from the kernel's own counts, without psutil)
     except Exception:
         pass
     return vram, ram

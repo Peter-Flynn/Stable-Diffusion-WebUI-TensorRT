@@ -106,6 +106,26 @@ def phase(where: str):
         log(f"phase | {where} | unreadable ({type(e).__name__}: {e})")
 
 
+def pooled() -> bool:
+    """Whether what PyTorch has freed is only reliably usable once it's back with the driver: with
+    --cuda-malloc it stays in the driver's pool in the blocks it was freed in, which a later request of
+    another size often can't have (seen: 1.7 GiB unused and a 0.5 GiB request failing); and TensorRT on
+    its own allocator can't have PyTorch's cache at all."""
+    from . import gpu
+
+    return not gpu.attached() or gpu.backend() != "native"
+
+
+def trim():
+    """Gives what PyTorch holds unused back to the driver, where it has to be to be used (pooled)."""
+    if pooled():
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 def reserve() -> int:
     """The VRAM reForge keeps free for what no allocator counts (other applications, CUDA's own code): its
     --reserve-vram, or its default for the OS. The only margin anything here keeps."""
@@ -116,15 +136,17 @@ def reserve() -> int:
 
 
 def _free_now(device) -> int:
-    """VRAM an allocation could have now: what the driver has free, and what PyTorch holds unused in its
-    cache. reForge counts the same (the driver's free memory, plus PyTorch's reserved less its active),
-    but with --cuda-malloc PyTorch can report less reserved than active, and reForge's count then falls
-    short of what's free by the difference (seen: 1.7 GiB, which had it evict a UNet engine for a decode
-    that fit). reForge's count is used where the device isn't CUDA's."""
+    """VRAM an allocation could have now: what the driver has free, and, with PyTorch's native allocator,
+    what it holds unused in its cache. Not that otherwise (pooled): what's left unused after a trim is
+    pieces of blocks still in use, which nothing can have (seen: 130 to 340 MiB). reForge counts the
+    driver's free memory plus PyTorch's reserved less its active whatever the allocator. reForge's count
+    is used where the device isn't CUDA's."""
     try:
         if torch.device(device).type == "cuda":
-            stats = torch.cuda.memory_stats(device)
-            cached = stats.get("reserved_bytes.all.current", 0) - stats.get("active_bytes.all.current", 0)
+            cached = 0
+            if not pooled():
+                stats = torch.cuda.memory_stats(device)
+                cached = stats.get("reserved_bytes.all.current", 0) - stats.get("active_bytes.all.current", 0)
             return torch.cuda.mem_get_info(device)[0] + max(0, cached)
     except Exception:
         pass
@@ -177,15 +199,8 @@ def make_room(nbytes: int, device, keep_loaded=()) -> int:
     `nbytes` are free beside the reserve: nothing, if they are already; again while it's short and the
     asking freed something (a model reForge unloads in part gives back a little less than it was asked
     for). Returns what's free then, beside the reserve."""
-    from . import gpu
-
     m = mm()
-    # What PyTorch has freed stays its own: whole blocks of the driver's pool with --cuda-malloc, which only
-    # a request that fits one can have, and its cache otherwise, which TensorRT on its own allocator can't
-    # have at all. Given back to the driver, anything can.
-    trim = not gpu.attached() or gpu.backend() != "native"
-    if trim:
-        torch.cuda.empty_cache()
+    trim()
     had = free(device)
     for _ in range(16):
         if had >= nbytes:
@@ -194,8 +209,7 @@ def make_room(nbytes: int, device, keep_loaded=()) -> int:
             # By reForge's own count, which can be short of what's free (_free_now): what it counts free
             # now, and the shortfall more
             m.free_memory(m.get_free_memory(device) + nbytes - had, device, keep_loaded=list(keep_loaded))
-        if trim:
-            torch.cuda.empty_cache()
+        trim()
         now = free(device)
         if now <= had:  # nothing more goes
             break

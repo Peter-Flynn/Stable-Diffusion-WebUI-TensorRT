@@ -76,6 +76,7 @@ class TrtModel:
         self.applied = {}  # "unet" / "shallow" -> {weight name: signature of what's in that engine}
         store.forget_sizes(record)
         self.calls = {}  # a UNet call's shapes (_call_key) -> TensorRT's figure for what it holds beside the engines, as asked this session
+        self.most = set()  # those of them TensorRT gave no figure for: the most any shapes of the profile take
         self.pending = None  # the pass's latent whose calls are to be weighed once the engine is deserialized (_fits)
         self.contexts_need_weights = False  # TensorRT wouldn't make a context on the plan without weights
         self.keep = True  # whether unloading keeps the engines in RAM as they are (refits.py)
@@ -908,7 +909,8 @@ def _begin(records, hacks, patcher, x, prepare):
 
 def _said(model: TrtModel, x, engine: int, calls, room: int, need: int) -> str:
     size = f"{x.shape[3] * 8}x{x.shape[2] * 8}, batch size {x.shape[0]}"
-    parts = f"{common.gib(engine)} for the engine, " + (f"{common.gib(calls)} for its calls" if calls is not None else "its calls not counted yet")
+    most = " (the most its profile's sizes take: TensorRT gave none for these)" if _call_key(model, x, model.shallow_loaded) in model.most or _call_key(model, x, True) in model.most else ""
+    parts = f"{common.gib(engine)} for the engine, " + (f"{common.gib(calls)} for its calls{most}" if calls is not None else "its calls not counted yet")
     buffer = f", {common.gib(need - engine - (calls or 0))} of buffer"
     return f"the {model.record.label} at {size} needs {common.gib(need)} of VRAM ({parts}{buffer}), and there can be {common.gib(room)}"
 
@@ -1000,7 +1002,12 @@ def _call_bytes(model: TrtModel, x, shallow: bool = None) -> int:
     act = model.engine.estimate_activation_bytes(profile, shapes, torch.cuda.current_stream().cuda_stream)
     io = model.engine.io_bytes()
     need = act + sum(io.values()) + io.get("deep", 0)
-    model.calls[_call_key(model, x, model.shallow_loaded if shallow is None else shallow)] = need
+    key = _call_key(model, x, model.shallow_loaded if shallow is None else shallow)
+    model.calls[key] = need
+    if model.engine.size_is_most:
+        model.most.add(key)
+    else:
+        model.most.discard(key)
     return need
 
 

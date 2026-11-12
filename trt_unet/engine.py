@@ -192,8 +192,16 @@ class Arena:
 
     def get(self, size: int):
         if self.memory is None or self.memory.numel() < size:
+            from . import common
+
             self.release()  # a new version even if the allocation fails: nothing may stay bound to the old one
-            self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=DEVICE)
+            try:
+                self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=DEVICE)
+            except torch.cuda.OutOfMemoryError:
+                if not common.pooled():
+                    raise
+                common.trim()  # what PyTorch freed wasn't this request's to have: from the driver, then
+                self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=DEVICE)
             self.version += 1
         return self.memory
 
@@ -223,6 +231,7 @@ class Engine:
         self.memory_bound = False
         self.bound_version = None
         self.size = None  # the activation memory the shapes set need
+        self.size_is_most = False  # TensorRT didn't say for the shapes: it's the most the profile's shapes take
         self.ran = False  # whether the context has run: its first run is watched (infer)
 
     def twin(self):
@@ -417,6 +426,7 @@ class Engine:
         """For the profile and input shapes set on the context (asked of TensorRT once per shapes set)."""
         if self.size is None:
             size = int(self.context.update_device_memory_size_for_shapes())  # 0 if it can't tell
+            self.size_is_most = size <= 0  # the most any shapes of the profile take, then
             self.size = size if size > 0 else int(self.engine.get_device_memory_size_for_profile_v2(self.profile))
         return self.size
 

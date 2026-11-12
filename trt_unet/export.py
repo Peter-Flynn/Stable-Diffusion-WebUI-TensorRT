@@ -268,13 +268,13 @@ def _builder_env() -> dict:
 def _memory_short():
     """Why the build has to stop, if the system is about to run out of memory, else None."""
     try:
-        import psutil
+        from . import refits
 
-        ram, swap = psutil.virtual_memory(), psutil.swap_memory()
+        available, swap, total = refits.memory()  # (on Linux from the kernel's own counts, without psutil)
     except Exception:
         return None
-    free = ram.available + swap.free
-    if free >= max(MEMORY_RESERVE, ram.total // 20):
+    free = available + swap
+    if free >= max(MEMORY_RESERVE, total // 20):
         return None
     return f"Stopped before the system ran out of memory ({gib(free)} of RAM and swap left). Build fewer or narrower profiles, or close other programs."
 
