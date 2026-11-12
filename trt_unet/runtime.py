@@ -47,8 +47,11 @@ class TensorRTUNet:
 
 def call_bytes(model, patcher, x) -> int:
     """The working VRAM a pass on latents `x` takes for its UNet calls: by the architecture and the images'
-    size (working.py)."""
-    return working.call_bytes(model.record.arch, patcher, x.shape[0], x.shape[3] * 8, x.shape[2] * 8)
+    size (working.py), for as many images as a call runs at once (both halves of the guidance where a
+    profile of the engine takes them, padded to the profile's least: _call_shapes)."""
+    found = _call_shapes(model, x)
+    batch = found[1]["sample"][0] if found is not None else 2 * x.shape[0]
+    return working.call_bytes(model.record.arch, patcher, batch, x.shape[3] * 8, x.shape[2] * 8)
 
 
 class DoesNotFit(RuntimeError):

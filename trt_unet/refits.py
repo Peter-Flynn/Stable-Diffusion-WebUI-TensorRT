@@ -88,7 +88,7 @@ def _read() -> tuple:
     import psutil
 
     with warnings.catch_warnings():
-        warnings.simplefilter("error")  # "available memory stats couldn't be determined and was set to 0"
+        warnings.simplefilter("error", RuntimeWarning)  # "available memory stats couldn't be determined and was set to 0"
         ram = psutil.virtual_memory()
     if ram.total <= 0 or ram.available <= 0:
         raise RuntimeError("the system's memory counts came back empty")

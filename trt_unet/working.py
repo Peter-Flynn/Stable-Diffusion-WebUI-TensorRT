@@ -4,14 +4,16 @@ A call's working memory is its activations: every tensor the UNet makes on the w
 still needs it. Their sizes follow from the architecture and the image's size alone, so they're counted
 here without an engine, without weights and without VRAM: reForge's own UNet is built from its
 configuration on PyTorch's meta device (shapes only), one call is run through it, and the bytes of every
-tensor alive at each point are added up. The most that was alive at once, for each pixel of each image, is
-the architecture's figure (`per_pixel`). It's the same at every image size, batch size and prompt length
-(every tensor that matters scales with the image), which is why one figure does for all of them.
+tensor alive at each point are added up. The most that was alive at once, for each pixel of each image the
+call runs, is the architecture's figure (`per_pixel`). It's the same at every image size, batch size and
+prompt length (every tensor that matters scales with the image), which is why one figure does for all of
+them. A call runs the two halves of the guidance as one batch where a profile takes them, so twice the
+images of the pass (runtime.call_bytes has how many).
 
 Where it comes from: the most is alive in the feed-forward layer of the first transformer block of the up
 path, at the highest resolution that has attention (it widens to eight times the level's channels), with
-the skip connections the up path hasn't used yet. SDXL (attention from half resolution down): 315 bytes
-a pixel. SD 1.5 (attention at full resolution): 520. Both halves of the guidance run as one batch, in FP16.
+the skip connections the up path hasn't used yet. In FP16, for each image a call runs: SDXL (attention
+from half resolution down), 157.5 bytes a pixel; SD 1.5 (attention at full resolution), 260.
 
 Attention is counted as one operation, as TensorRT runs it: its output, and no map of every query against
 every key (which would grow with the square of the image; an engine's memory doesn't).
@@ -31,11 +33,10 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from .common import log
 
 CALL_FACTOR = 1.40  # a pass's working memory, as a multiple of its UNet's activations (see the module)
-FALLBACK = 520  # bytes a pixel where the architecture can't be run through: the most of those that have been (SD 1.5's), so it errs towards PyTorch
-GUIDANCE = 2  # both halves of the guidance run as one batch
+FALLBACK = 260  # bytes a pixel where the architecture can't be run through: the most of those that have been (SD 1.5's), so it errs towards PyTorch
 PROBE = 64  # the latent's side the architecture is run through at (the figure doesn't depend on it)
 
-_figures = {}  # architecture id -> bytes a pixel of image, for each image of the batch
+_figures = {}  # architecture id -> bytes a pixel of image, for each image a call runs
 _lock = threading.Lock()
 
 
@@ -88,7 +89,7 @@ def _attention(q, k, v, heads, *args, **kwargs):
 
 def measure(config: dict, in_channels: int, context_dim: int, adm_channels: int, dtype=torch.float16) -> float:
     """The architecture's figure: the bytes a UNet call has alive at its most, for each pixel of each image
-    of the batch. Takes no VRAM, and a few hundred milliseconds."""
+    it runs. Takes no VRAM, and a few hundred milliseconds."""
     import ldm_patched.ldm.modules.attention as attention
     import ldm_patched.modules.ops as ops
     from ldm_patched.ldm.modules.diffusionmodules.openaimodel import UNetModel
@@ -96,11 +97,11 @@ def measure(config: dict, in_channels: int, context_dim: int, adm_channels: int,
     side = PROBE
     unet = UNetModel(**config, dtype=dtype, device="meta", operations=ops.disable_weight_init).eval()
     feed = [
-        torch.empty(GUIDANCE, in_channels, side, side, dtype=dtype, device="meta"),
-        torch.empty(GUIDANCE, dtype=dtype, device="meta"),
-        torch.empty(GUIDANCE, 77, context_dim, dtype=dtype, device="meta"),
+        torch.empty(1, in_channels, side, side, dtype=dtype, device="meta"),
+        torch.empty(1, dtype=dtype, device="meta"),
+        torch.empty(1, 77, context_dim, dtype=dtype, device="meta"),
     ]
-    y = torch.empty(GUIDANCE, adm_channels, dtype=dtype, device="meta") if adm_channels else None
+    y = torch.empty(1, adm_channels, dtype=dtype, device="meta") if adm_channels else None
     originals = (attention.optimized_attention, attention.optimized_attention_masked)
     alive = _Alive()
     attention.optimized_attention = attention.optimized_attention_masked = _attention
@@ -120,7 +121,7 @@ def per_pixel(arch, patcher) -> float:
 
             try:
                 _figures[arch.id] = measure(unet_config(patcher), arch.in_channels, arch.context_dim, arch.adm_channels)
-                log(f"A {arch.name} UNet's calls take {_figures[arch.id]:.0f} bytes of working VRAM for each pixel of each image, by its architecture.")
+                log(f"A {arch.name} UNet's calls take {_figures[arch.id]:.1f} bytes of working VRAM for each pixel of each image they run, by its architecture.")
             except Exception as e:
                 _figures[arch.id] = FALLBACK
                 log(
@@ -131,6 +132,6 @@ def per_pixel(arch, patcher) -> float:
 
 
 def call_bytes(arch, patcher, batch: int, width: int, height: int) -> int:
-    """The working VRAM of a pass of `batch` images of width x height: the architecture's figure for its
-    UNet's calls, and what a pass holds around them (CALL_FACTOR)."""
+    """The working VRAM of a pass whose UNet calls run `batch` images of width x height at once: the
+    architecture's figure for them, and what a pass holds around its calls (CALL_FACTOR)."""
     return int(batch * width * height * per_pixel(arch, patcher) * CALL_FACTOR)
