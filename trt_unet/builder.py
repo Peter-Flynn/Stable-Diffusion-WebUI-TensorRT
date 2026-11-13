@@ -1,5 +1,6 @@
 """Builds a weightless engine, in a process of its own so all the VRAM the builder holds goes back to the
-driver when it ends. Run by export.py; reports progress and its result on stdout. Doesn't import torch."""
+driver when it ends. Run by export.py; reports progress, what it has to say (export.py logs it) and its
+result on stdout, and shows a progress bar on stderr. Doesn't import torch."""
 
 import contextlib
 import json
@@ -13,19 +14,22 @@ import tensorrt as trt
 from tqdm import tqdm
 
 PROGRESS = "@@trt-progress "
+LOG = "@@trt-log "
 RESULT = "@@trt-result "
 _MEMORY_HINTS = ("insufficient memory", "memory is insufficient", "could not be allocated", "out of memory")
 _ALLOCATION_FAILED = ("outofmemory (requested size",)  # TensorRT 11's error for a kernel's memory it then does without
 
 
-def log(message):
-    print(f"[TensorRT] {message}", flush=True)
+def log(level: str, message: str):
+    """Logged by export.py, at `level` ("DEBUG", "INFO", "WARNING", ...)."""
+    _send(LOG, {"level": level, "message": message})
 
 
 class Logger(trt.ILogger):
-    """Errors, each warning once, and the number of out-of-memory messages TensorRT gives when it has to
-    skip kernels (with the first one): a build can give a great many. TensorRT 11 gives them as errors
-    ("Error Code 2: OutOfMemory (Requested size was ...)"), though the build goes on without those kernels."""
+    """TensorRT's errors and warnings, at DEBUG (each warning once: the error that ends a build is in its
+    result), and the number of out-of-memory messages TensorRT gives when it has to skip kernels, with the
+    first one: a build can give a great many. TensorRT 11 gives them as errors ("Error Code 2: OutOfMemory
+    (Requested size was ...)"), though the build goes on without those kernels."""
 
     def __init__(self):
         trt.ILogger.__init__(self)
@@ -39,22 +43,20 @@ class Logger(trt.ILogger):
         lower = msg.lower()
         skipped = any(h in lower for h in _MEMORY_HINTS) and level == int(trt.ILogger.Severity.WARNING)
         if skipped or any(h in lower for h in _ALLOCATION_FAILED):
-            if not self.memory_warnings:
-                print(f"[TensorRT] Some kernels need more VRAM than is free at the profiles' largest sizes, so TensorRT skips them ({msg})", flush=True)
             self.memory_warnings += 1
             self.memory_example = self.memory_example or msg
         elif level <= int(trt.ILogger.Severity.ERROR):
             self.errors.append(msg)
-            print(f"[TensorRT] ERROR: {msg}", flush=True)
+            log("DEBUG", f"Builder error: {msg}")
         elif msg not in self._seen:
             self._seen.add(msg)
-            print(f"[TensorRT] Warning: {msg}", flush=True)
+            log("DEBUG", f"Builder warning: {msg}")
 
 
 class Progress(trt.IProgressMonitor):
-    """tqdm bars per build phase, and `callback(fraction, text)` for the top phase and its active sub-phase."""
+    """A tqdm bar for the build's top phase, and `callback(fraction, text)` for it and its active sub-phase."""
 
-    def __init__(self, callback, max_depth=3):
+    def __init__(self, callback, max_depth=1):
         trt.IProgressMonitor.__init__(self)
         self.callback, self.max_depth = callback, max_depth
         self.phases, self.top, self.fraction, self.cancel = {}, None, 0.0, False
@@ -83,7 +85,7 @@ class Progress(trt.IProgressMonitor):
                 depth, self.top, self.fraction = 0, phase_name, 0.0
             else:
                 depth = self.phases.get(parent_phase, {}).get("depth", self.max_depth) + 1
-            bar = tqdm(total=num_steps, desc=phase_name, leave=depth == 0, position=depth, dynamic_ncols=True) if depth < self.max_depth else None
+            bar = tqdm(total=num_steps, desc=phase_name, leave=False, position=depth, dynamic_ncols=True) if depth < self.max_depth else None
             self.phases[phase_name] = {"bar": bar, "depth": depth, "parent": parent_phase, "total": max(int(num_steps), 1), "n": 0}
             self._report()
         except KeyboardInterrupt:
@@ -171,7 +173,7 @@ def build(job, logger, progress, strip=True):
     try:
         cache = config.create_timing_cache(data)
     except Exception as e:
-        log(f"Ignoring the unreadable timing cache: {e}")
+        log("WARNING", f"The timing cache couldn't be read, so this build starts without it: {e}")
         cache = config.create_timing_cache(b"")
     del data  # TensorRT has its own copy; the file can be large (it keeps compiled kernels from every build)
     config.set_timing_cache(cache, ignore_mismatch=True)
@@ -223,16 +225,14 @@ def main(job_path):
     strip = job.get("strip", True)
     result = {"ok": False, "error": None}
     try:
-        log(f"Building with TensorRT {trt.__version__}")
+        log("DEBUG", f"Building {os.path.basename(job['plan'])} with TensorRT {trt.__version__}.")
         build(job, logger, Progress(_progress_sender()), strip=strip)
         result["ok"] = True
-    except Exception as e:
+    except Exception as e:  # export.py says it
         result["error"] = str(e)
         # TensorRT refusing to strip the weights: export.py builds again without, in a new process (this
         # one still holds what the failed build left behind)
         result["retry_without_strip"] = strip and isinstance(e, NoEngine) and any(w in " ".join(logger.errors).lower() for w in ("refit", "strip", "weight"))
-        if not result["retry_without_strip"]:
-            log(f"Engine build failed: {e}")
     result["memory_warnings"] = logger.memory_warnings
     result["memory_example"] = logger.memory_example
     _send(RESULT, result)

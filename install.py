@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from importlib import metadata
@@ -5,6 +6,7 @@ from importlib import metadata
 import launch
 
 MIN_TRT = (11, 0)
+logger = logging.getLogger("TensorRT")
 
 
 def installed_tensorrt():
@@ -24,10 +26,9 @@ def install():
         return
     package, version = installed_tensorrt()
     if package is None:
-        print("[TensorRT] Installing TensorRT...")
         launch.run_pip("install tensorrt", "tensorrt", live=True)
     elif tuple(map(int, re.findall(r"\d+", version)[:2])) < MIN_TRT:
-        print(f"[TensorRT] Updating {package} {version}: this extension needs TensorRT {MIN_TRT[0]} or later...")
+        logger.info(f"Updating {package} {version}: this extension needs TensorRT {MIN_TRT[0]} or later.")
         launch.run_pip(f"install -U {package}", package, live=True)  # the same CUDA build
     if not launch.is_installed("onnx"):
         launch.run_pip("install onnx", "onnx", live=True)
@@ -36,4 +37,4 @@ def install():
 try:
     install()
 except Exception as e:
-    print(f"[TensorRT] Installing dependencies failed: {e}")
+    logger.error(f"Couldn't install TensorRT: {e}")

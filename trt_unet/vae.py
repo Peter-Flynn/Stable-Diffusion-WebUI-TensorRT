@@ -54,13 +54,12 @@ import math
 import os
 import time
 import traceback
-import warnings
 from dataclasses import dataclass, field
 
 import torch
 
 from . import common, gpu, store, strips
-from .common import log, notify
+from .common import logger, notify
 
 PRE, POST = "pre", "post"
 ENCODE_PRE, ENCODE_POST = "encode-pre", "encode-post"
@@ -318,8 +317,8 @@ def _excess(cfg: dict, b: int, h: int, w: int, budget) -> tuple:
 
 def _why(cause: str, dtype, vram, what: str = "decode") -> str:
     if cause == "tensor":
-        return f"TensorRT can't hold a larger {what}'s largest tensor (2^31 elements)"
-    return f"a larger {what} wouldn't fit in this GPU's {common.gib(vram)} in {label(dtype_name(dtype))}, even alone"
+        return f"a larger {what}'s largest tensor would pass TensorRT's limit of 2^31 values"
+    return f"a larger {what} in {label(dtype_name(dtype))} wouldn't fit in this GPU's {common.gib(vram)}, even alone"
 
 
 def _shrunk(h: int, w: int, over, step: int = 1) -> tuple:
@@ -586,7 +585,7 @@ def records(arch_id: str) -> list:
                     meta["encoder"]["strips"] = {}  # encodes whole only; likewise
                 found.append(r)
         except Exception as e:
-            log(f"Ignoring {path}: {e}")
+            logger.debug(f"Ignoring {path}, which couldn't be read: {e}")
     return found
 
 
@@ -597,7 +596,7 @@ def record_for(arch_id: str, vae):
         wanted = digest(vae)
         matching = [r for r in records(arch_id) if r.meta.get("digest") == wanted]
     except Exception as e:
-        log(f"Could not look up the VAE decoder engines: {e}")
+        logger.debug(f"Couldn't look up the VAE engines: {e}")
         return None
     wanted = (engine_dtype(vae), strip_dtype(vae))
     return next((r for r in matching if (r.dtype, r.strips_dtype) == wanted), matching[0] if matching else None)
@@ -639,7 +638,7 @@ def needs_build(arch, profiles: list, vae=None) -> str:
         if any(not parts for parts in lacking):
             return ""
     except Exception as e:
-        log(f"Could not check the VAE's engines: {e}")
+        logger.debug(f"Couldn't check which VAE engines are built: {e}")
         return ""
     only_encoder = any(all(part in ENCODER or part.startswith(ENCODE_STRIP) for part in parts) for parts in lacking)
     what = "VAE encoder" if only_encoder else "VAE decoder and encoder" if enc_wanted else "VAE decoder"
@@ -853,8 +852,7 @@ def _export(module, halves: dict, work: str, first, loaded: dict) -> dict:
     result = {}
     for part, (_, inputs, outputs, axes) in halves.items():
         path = os.path.join(work, f"vae_{part}.onnx")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", torch.jit.TracerWarning)
+        with export.quiet_warnings():
             torch.onnx.export(parts[part], args[part], path, input_names=inputs, output_names=outputs, dynamic_axes=axes, **export.ONNX_KWARGS)
         result[part] = export._weightless_graph(path, inputs, (exported, loaded))
     return result
@@ -912,8 +910,7 @@ def export_strips(vae, work: str, dtype, device, names, encoding: bool = False) 
         stage = next(s for s in found if s.kind.name == name)
         kind, part = stage.kind, strips.StageModule(stage, module)
         path = os.path.join(work, f"{prefix}{name}.onnx")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", torch.jit.TracerWarning)
+        with export.quiet_warnings():
             torch.onnx.export(
                 part, strips.example_inputs(kind, dtype, device), path, input_names=list(kind.inputs()),
                 output_names=list(kind.outputs()), dynamic_axes=strips.dynamic_axes(kind), **export.ONNX_KWARGS,
@@ -922,7 +919,6 @@ def export_strips(vae, work: str, dtype, device, names, encoding: bool = False) 
         theirs = {k: list(loaded[stage.weights[k]].shape) for k in own}
         result[key + name] = export._weightless_graph(path, kind.inputs(), (own, theirs), quiet=True)
     del module, found
-    log(f"Exported {len(names)} graphs for {'en' if encoding else 'de'}coding in strips.")
     return result
 
 
@@ -936,8 +932,9 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
     (engine_dtype, strip_dtype): the decoder's pre and post engines, the encoder's two, and those that
     decode and encode in strips (strips.py), keeping what this GPU's and TensorRT version's engines for the
     architecture have that covers them, and deleting the rest. Returns (the Record or None, why it failed
-    or None, how many kernels TensorRT skipped for want of VRAM). If only the encoder's engines or the stripped decode's fail, the record has the others (and says
-    why in "encoder_error" or "strips_error")."""
+    or None, how many kernels TensorRT skipped for want of VRAM); a failure is logged here. If only the
+    encoder's engines or the stripped decode's fail, the record has the others (and says why in
+    "encoder_error" or "strips_error")."""
     from . import export
 
     vae = vae if vae is not None else loaded_vae()
@@ -975,17 +972,23 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             b, _, h, w = asked[POST]["x"][2]
             if (h, w) != (wanted_h, wanted_w):
                 cause = _excess(cfg, 1, wanted_h, wanted_w, _budget(dtype, vram))[1]
-                further = " and further in strips" if strip_wanted else "; larger decodes run on PyTorch"
-                log(f"The VAE decoder's post engine goes up to {w * 8}x{h * 8} ({b} at a time), not the profiles' {wanted_w * 8}x{wanted_h * 8}: {_why(cause, dtype, vram)}. It decodes up to there{further}.")
+                further = "in strips" if strip_wanted else "on PyTorch"
+                logger.info(
+                    f"The VAE decoder's engines take whole images up to {w * 8}x{h * 8} ({b} at a time) rather than "
+                    f"{wanted_w * 8}x{wanted_h * 8}: {_why(cause, dtype, vram)}. Larger decodes run {further}."
+                )
         if ENCODE_PRE in todo:
             wanted_h, wanted_w = max(p.height[2] for p in profiles) // 8 * 8, max(p.width[2] for p in profiles) // 8 * 8
             b, _, h, w = enc_wanted["shapes"][ENCODE_PRE]["image"][2]
             if (h, w) != (wanted_h, wanted_w):
                 cause = _encoder_excess(enc_wanted["config"], 1, wanted_h, wanted_w, _budget(dtype, vram))[1]
                 further = "in strips" if enc_wanted["strips"] else "on PyTorch"
-                log(f"The VAE encoder's engines go up to {w}x{h} ({b} at a time), not the profiles' {wanted_w}x{wanted_h}: {_why(cause, dtype, vram, 'encode')}. Larger encodes run {further}.")
+                logger.info(
+                    f"The VAE encoder's engines take whole images up to {w}x{h} ({b} at a time) rather than "
+                    f"{wanted_w}x{wanted_h}: {_why(cause, dtype, vram, 'encode')}. Larger encodes run {further}."
+                )
         if old is not None and sorted(todo) != sorted(everything):
-            log(f"Keeping the VAE engines that cover these sizes; building {len(todo)} of {len(everything)}.")
+            logger.debug(f"{len(everything) - len(todo)} of the {len(everything)} VAE engines already cover these sizes; building the rest.")
         if progress:
             progress(0.0, "exporting the graphs")
         graphs = {}
@@ -1033,7 +1036,8 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                     if export.CANCEL.is_set() or str(result.get("error")) == "cancelled":
                         raise _Cancelled()
                     total -= len(kinds) - i
-                    log(f"Building the VAE's engines for {what} in strips failed ({result.get('error')}); larger ones run on PyTorch.")
+                    larger = "decodes" if what == "decoding" else "encodes"
+                    logger.warning(f"Couldn't build the VAE engines for {what} in strips, so larger {larger} run on PyTorch: {result.get('error')}")
                     return metas, str(result.get("error"))
                 built[prefix + name] = result
                 metas[name] = {"shapes": kinds[name], "weights": sorted(graphs[prefix + name]), "stripped": result["stripped"]}
@@ -1049,10 +1053,11 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             if not result["ok"]:
                 smaller = shapes_for(profiles, cfg, dtype, vram, RETRY_SHARE) if dtype is not None and vram else asked
                 if part != POST or tries or not warned or smaller[POST] == shapes[POST]:
+                    logger.warning(f"Couldn't build the VAE engines, so the VAE runs on PyTorch: {result.get('error')}")
                     return None, str(result.get("error")), skipped
                 tries, shapes[POST] = 1, smaller[POST]
                 b, _, h, w = shapes[POST]["x"][2]
-                log(f"TensorRT found no kernels with the VRAM to spare at the largest size; trying again up to {w * 8}x{h * 8} ({b} at a time).")
+                logger.info(f"TensorRT found no kernels for the VAE decoder that fit in the VRAM free; trying again up to {w * 8}x{h * 8} ({b} at a time).")
                 continue
             built[part] = result
             parts.pop(0)
@@ -1083,11 +1088,11 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                     break
                 tries, enc_shapes = 1, smaller
                 b, _, h, w = enc_shapes[ENCODE_PRE]["image"][2]
-                log(f"TensorRT found no kernels with the VRAM to spare at the largest size; trying again up to {w}x{h} ({b} at a time).")
+                logger.info(f"TensorRT found no kernels for the VAE encoder that fit in the VRAM free; trying again up to {w}x{h} ({b} at a time).")
             if enc_error:
                 done = len([p for p in todo if p in (PRE, POST) + ENCODER])
                 total -= len(enc_kinds_todo)
-                log(f"Building the VAE encoder's engines failed ({enc_error}); it encodes on PyTorch.")
+                logger.warning(f"Couldn't build the VAE encoder's engines, so it encodes on PyTorch: {enc_error}")
             else:
                 enc_meta = {
                     "digest": enc_wanted["digest"],
@@ -1178,7 +1183,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
     except _Cancelled:
         return None, "cancelled", skipped
     except Exception as e:
-        traceback.print_exc()
+        logger.error(f"Couldn't build the VAE engines, so the VAE runs on PyTorch: {e}", exc_info=True)
         return None, str(e), skipped
 
 
@@ -1310,13 +1315,12 @@ class _Side:
                 if attempt:
                     raise
                 alone = not model.decoder.engines and not model.encoder.engines  # nothing of this owner's to lose
-                if past and alone and engine_mod.own_allocator(failures, model.owner):
-                    log(f"Loading a VAE engine ({os.path.basename(plan)}) failed with PyTorch's allocator ({error}); trying again with TensorRT's own.")
+                if past and alone and engine_mod.own_allocator(failures, model.owner, error):
                     continue
                 if gpu.attached() and not load.get("failures"):  # it didn't run out: more room changes nothing
                     raise
                 room = model.obtainable()
-                log(f"Could not load a VAE engine ({os.path.basename(plan)}: {error}); making all the room there could be and trying again.")
+                logger.debug(f"Loading {os.path.basename(plan)} ran out of VRAM ({error}); freeing all there is and trying again.")
         self.sizes[which] = load["grew"]
         self.engines[which] = e
         self.loads, self.load_seconds = self.loads + 1, self.load_seconds + time.time() - start
@@ -1355,11 +1359,6 @@ class _Side:
             gpu.unloaded(self.model.owner, self.sizes.get(which, 0))
             for d in (self.names, self.applied, self.sizes):
                 d.pop(which, None)
-
-    def stage_count(self) -> tuple:
-        """(How many of its stages' engines are loaded, what they hold.)"""
-        stages = [w for w in self.engines if not isinstance(w, str)]
-        return len(stages), sum(self.sizes.get(w, 0) for w in stages)
 
     def report(self) -> str:
         """For the log: the engines it loaded and refitted since the last report."""
@@ -1617,6 +1616,7 @@ def _fit(model: VaeModel, top: int, need_for, engines: bool, load) -> tuple:
     it, once."""
     model.beside = not engines
     model.release()
+
     def room_for(n):  # what n hold, with the buffer on top
         return common.padded(need_for(n)[0])
 
@@ -1631,7 +1631,7 @@ def _fit(model: VaeModel, top: int, need_for, engines: bool, load) -> tuple:
     need, act = need_for(n)
     free = model.make_room(room_for(n))
     if free < room_for(n):
-        log(f"Making room for {common.gib(room_for(n))} left {common.gib(free)} free: the models loaded hold more than reForge counts.")
+        logger.debug(f"Freeing {common.gib(room_for(n))} of VRAM left only {common.gib(free)}: the models loaded held more than reForge counts.")
         return 0, need, act, can
     model.arena.get(act)
     return n, need, act, can
@@ -1657,24 +1657,21 @@ def _settled(planner, h: int, w: int, budget, ram: bool = True):
             r.engines = r.load()
         if not missing and budget() >= room:
             return plan
-    log(f"Planning strips didn't settle in {PLANNINGS} plans while their engines loaded.")
+    logger.debug(f"Planning the strips didn't settle in {PLANNINGS} tries while their engines loaded.")
     return None
 
 
-def _plan_strips(model: VaeModel, planner, h: int, w: int, beside: int, engines: bool) -> tuple:
-    """(The fastest plan in strips there can be room for, with exactly that room made, or None; the seconds
-    making the room took: evicting a UNet engine keeps it in RAM first.) Planned for the most there could
-    be (VaeModel.obtainable: beside any UNet engine and all in VRAM, or with `engines`, the UNet engines
+def _plan_strips(model: VaeModel, planner, h: int, w: int, beside: int, engines: bool):
+    """The fastest plan in strips there can be room for, with exactly that room made, or None. Planned for
+    the most there could be (VaeModel.obtainable: beside any UNet engine and all in VRAM, or with `engines`, the UNet engines
     evicted and tensors held in RAM if it takes that), room made for what it holds and `beside` (what's
     held beside the strips that isn't allocated yet when they're planned), then planned for what's free
     then, which gives that plan unless reForge's manager couldn't make the room."""
     best = _settled(planner, h, w, lambda: common.usable(model.obtainable(engines)) - beside, engines)
     if best is None:
-        return None, 0.0
-    start = time.time()
+        return None
     model.make_room(common.padded(best.vram + beside))
-    made = time.time() - start
-    return _settled(planner, h, w, lambda: common.usable(common.free(model.load_device)) - beside, engines), made
+    return _settled(planner, h, w, lambda: common.usable(common.free(model.load_device)) - beside, engines)
 
 
 class _Peak:
@@ -1701,10 +1698,13 @@ class _Peak:
 
 
 def _counted(held: int, need: int) -> str:
-    """For the log: what a decode or an encode held at most, beside what was counted for it."""
-    if held > need:
-        return f"held {common.gib(held)}, {common.gib(held - need)} more than the {common.gib(need)} counted"
-    return f"held {common.gib(held)} of the {common.gib(need)} counted"
+    """For the log: what a decode or an encode used at most, beside what was estimated for it."""
+    return f"Used {common.gib(held)} of VRAM ({common.gib(need)} estimated)"
+
+
+def _passed(need: int, can: int) -> str:
+    """For the log: why a decode or an encode didn't run whole."""
+    return f" (whole would need {common.gib(need)}, and at most {common.gib(can)} can be freed)"
 
 
 def _did(side: _Side) -> str:
@@ -1727,15 +1727,9 @@ def _copy_stream(device):
     return _copy_streams[device]
 
 
-def _synced() -> float:
-    """The time, once the GPU has done what it was given (for timing a part of a decode)."""
-    torch.cuda.current_stream().synchronize()
-    return time.time()
-
-
 def _in_strips(record: Record, side: _Side) -> str:
     """For the log: the precision the strips' engines run in, and their scale."""
-    return label(dtype_name(record.strips_dtype)) + (f", scaled by 2^-{side.exponent}" if record.scaled else "")
+    return label(dtype_name(record.strips_dtype)) + (f" scaled by 2^-{side.exponent}" if record.scaled else "")
 
 
 def _beside(engines: bool) -> str:
@@ -1749,10 +1743,10 @@ def _outgrew(side: _Side, what: str) -> bool:
     exponent = side.exponent
     if exponent + EXPONENT_STEP > EXPONENT_MAX:
         _exponents[side.key] = None
-        notify(f"The VAE {what}'s engines for strips produced NaN/Inf values in FP16 even scaled by 2^-{exponent}; this VAE doesn't run in strips")
+        notify(f"The VAE {what}'s strip engines produced NaN/Inf values even scaled down by 2^-{exponent}, so this VAE's {what} won't run in strips.")
         return False
     _exponents[side.key] = exponent + EXPONENT_STEP
-    log(f"This VAE's {what} outgrew FP16 scaled by 2^-{exponent} in strips: again scaled by 2^-{exponent + EXPONENT_STEP}, as from now on.")
+    logger.info(f"This VAE's {what} overflowed FP16 in strips scaled by 2^-{exponent}, so it's scaled by 2^-{exponent + EXPONENT_STEP} from now on.")
     return True
 
 
@@ -1769,7 +1763,7 @@ def decode(vae, samples_in):
     if record is None:
         if arch.id not in _told and store.engines(arch.id):  # the tab shows it as to build, too
             _told.add(arch.id)
-            log("The VAE decoder has no engines for this architecture yet: build in the TensorRT tab to add them.")
+            logger.info("There are no engines for this VAE yet, so it runs on PyTorch. Building in the TensorRT tab adds them.")
         return None
     b, c, h, w = samples_in.shape
     found = None
@@ -1786,7 +1780,10 @@ def decode(vae, samples_in):
     wanted = (engine_dtype(vae), strip_dtype(vae))
     if (record.dtype, record.strips_dtype) != wanted and record.base not in _told:
         _told.add(record.base)
-        log(f"The VAE decoder engines were built in {precisions(record.dtype, record.strips_dtype)}; they'd now be built in {precisions(*wanted)}. Build again to match.")
+        logger.info(
+            f"The VAE engines were built in {precisions(record.dtype, record.strips_dtype)}, and would now be built in "
+            f"{precisions(*wanted)}. Building again in the TensorRT tab matches them."
+        )
     model = model_for(record)
     whole = whole and (False, h, w) not in model.failed
     if not whole and found is None:
@@ -1808,12 +1805,12 @@ def decode(vae, samples_in):
             except torch.cuda.OutOfMemoryError as e:
                 said = _ran_out(model, e)
                 del e
+                logger.debug(f"The VAE engines ran out of VRAM decoding ({said}).")
                 if not again:
-                    log(f"Ran out of VRAM decoding on the VAE engines again ({said}); decoding on PyTorch.")
+                    logger.warning("The VAE engines ran out of VRAM, so this decode runs on PyTorch.")
                     _make_way(model)
                     return None
                 again = False
-                log(f"Ran out of VRAM decoding on the VAE engines ({said}); trying again with what PyTorch held unused given back.")
     finally:
         model.release()
         model.vae, model.using, model.beside = None, set(), False  # don't keep this VAE alive
@@ -1826,12 +1823,10 @@ def _ran_out(model: VaeModel, error) -> str:
     driver. PyTorch's freed memory isn't always usable for the next request (with --cuda-malloc it's the
     driver's pool, in pieces as they were freed), so a run that fits can still run out; it's tried again."""
     frame = traceback.extract_tb(error.__traceback__)[-1]
-    said = f"{os.path.basename(frame.filename)}:{frame.lineno}, {frame.name}"
+    said = f"in {frame.name}, {os.path.basename(frame.filename)}:{frame.lineno}"
     error.__traceback__ = None  # it holds the run's frames, and through them its tensors
-    try:
-        said += f"; {common.gib(torch.cuda.mem_get_info()[0])} free, {common.gib(torch.cuda.memory_allocated())} of PyTorch's {common.gib(torch.cuda.memory_reserved())} in use"
-    except Exception:
-        pass
+    with contextlib.suppress(Exception):
+        said += f"; {common.gib(torch.cuda.mem_get_info()[0])} was free"
     model.release()
     gc.collect()
     with contextlib.suppress(Exception):
@@ -1878,10 +1873,6 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
         if whole:
             model.use(side, (PRE, POST), load=False)
             n, need, act, can = _fit(model, min(b, record.max_batch), need_for, engines, lambda: model.use(side, (PRE, POST)))
-            common.memory(
-                f"VAE decode of {w * 8}x{h * 8}: {'whole, ' + str(n) + ' at a time' if n else 'not whole'} {_beside(engines)}",
-                f"whole holds {common.gib(need)} at most (TensorRT activations {common.gib(act)}); there could be room for {common.gib(can)}",
-            )
             if n:
                 start = time.time()
                 try:
@@ -1894,10 +1885,13 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
                 else:
                     if pixels is not None:
                         at_once = f", {n} at a time" if n < b else ""
-                        log(f"Decoded {images} on the VAE decoder engines in {time.time() - start:.2f}s ({label(record.meta['dtype'])}{at_once}; {_counted(peak.held + act, need)}{_did(side)})")
+                        logger.debug(
+                            f"Decoded {images} on the VAE engines in {time.time() - start:.2f}s: whole{at_once}, in {label(record.meta['dtype'])}, "
+                            f"{_beside(engines)}. {_counted(peak.held + act, need)}{_did(side)}."
+                        )
                     return pixels
             else:
-                passed = f"whole it holds {common.gib(need)}, there could be room for {common.gib(can)} {_beside(engines)}; "
+                passed = _passed(need, can)
         if found is not None:
             model.use(side, (PRE,), strips=True)
             model.release()
@@ -1906,25 +1900,24 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
             if result is not _NO_ROOM:
                 pixels, report = result
                 if pixels is not None:
-                    log(f"Decoded {images} in strips on the VAE decoder engines in {time.time() - start:.2f}s ({_in_strips(record, side)}; {passed}{report}{_did(side)})")
+                    logger.debug(
+                        f"Decoded {images} on the VAE engines in {time.time() - start:.2f}s: in strips, in {_in_strips(record, side)}, "
+                        f"{_beside(engines)}{passed}. {report}{_did(side)}."
+                    )
                 return pixels
     if (False, h, w) not in model.failed:  # (said, if they failed to run it)
-        log(f"There can't be room to decode {w * 8}x{h * 8} on the VAE engines ({passed.rstrip('; ') or 'not even a strip fits'}): decoding on PyTorch.")
+        logger.warning(f"There's too little VRAM to decode {w * 8}x{h * 8} on the VAE engines{passed or ' (not even in strips)'}, so it runs on PyTorch.")
     return None
 
 
 def _whole_failed(model: VaeModel, encoding: bool, h: int, w: int, what: str, error, strips_too: bool) -> str:
-    """TensorRT failed to run the whole-image engines at this size (its own error is in the console): said,
-    and not tried whole at this size again this session. Returns why whole was passed over, for the log."""
+    """TensorRT failed to run the whole-image engines at this size: said, and not tried whole at this size
+    again this session. Returns why whole was passed over, for the log."""
     model.release()
     model.failed.add((encoding, h, w))
-    then = "it goes in strips, as that size will from now on" if strips_too else "that size goes to PyTorch from now on"
-    try:
-        free = f" {common.gib(torch.cuda.mem_get_info()[0])} of VRAM was free when they did."
-    except Exception:
-        free = ""
-    log(f"The VAE engines failed to {what} whole ({error}): {then}.{free}")
-    return "the engines failed to run it whole; "
+    then = "in strips" if strips_too else "on PyTorch"
+    logger.warning(f"The VAE engines failed to {what} whole, so that size runs {then} from now on: {error}")
+    return " (the engines failed to run it whole)"
 
 
 def _attention(model: VaeModel, vae, q, k, v, encoding: bool = False):
@@ -1959,7 +1952,7 @@ def _run(model: VaeModel, vae, samples_in, n: int):
         image = post.infer({"x": mid.pop("x"), "attention": h}, 0, stream)["image"]
         del h
         if pixels is None and not torch.isfinite(image).all():
-            notify(f"The VAE decoder engines produced NaN/Inf values in {label(record.meta['dtype'])}; decoding on PyTorch")
+            notify(f"The VAE decoder engines produced NaN/Inf values in {label(record.meta['dtype'])}, so this decode runs on PyTorch.")
             return None
         if pixels is None:
             pixels = torch.empty((samples_in.shape[0],) + tuple(image.shape[1:]), device=vae.output_device)
@@ -1990,7 +1983,6 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
     before = common.padded(before)
     if before > model.obtainable(engines) or _settled(decoder, h, w, lambda: common.usable(model.obtainable(engines)) - beside - held, engines) is None:
         return _NO_ROOM
-    common.memory(f"VAE decode of {w * 8}x{h * 8}: in strips {_beside(engines)}")
     pixels = plan = None
     report = ""
     for i in range(b):
@@ -2004,38 +1996,27 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
         mid = side.engine(PRE).infer({"latent": z}, 0, stream)
         del z
         x = mid.pop("x")
-        start = _synced() if i == 0 else 0
         attended = _attention(model, vae, mid.pop("q"), mid.pop("k"), mid.pop("v"))
         del mid
-        attending = _synced() - start if i == 0 else 0
         model.release()  # the pre engine's activations: the strips size their own
         common.trim()
-        if i == 0:
-            common.phase(f"VAE decode of {w * 8}x{h * 8}: after the part before the strips and the attention")
         if plan is None:
-            start = time.time()
-            plan, made = _plan_strips(model, decoder, h, w, beside, engines)
+            plan = _plan_strips(model, decoder, h, w, beside, engines)
             if plan is None:
                 return _NO_ROOM
-            planned = time.time() - start - made
         if side.scale != 1.0:  # as the strips run: scaled, while still in a precision that holds what a VAE makes
             x, attended = x.float().mul_(side.scale), attended.float().mul_(side.scale)
-        if i == 0:
-            common.phase(f"VAE decode of {w * 8}x{h * 8}: planned, room made, before the strips")
         with _Peak() as peak:
-            image_out = decoder.run(x, attended, plan, timed=i == 0)
+            image_out = decoder.run(x, attended, plan)
         del x, attended
-        if i == 0:
-            common.phase(f"VAE decode of {w * 8}x{h * 8}: after the strips")
         if not torch.isfinite(image_out).all():
             if record.scaled:
                 raise _Overflow()
             if pixels is None:
-                notify(f"The VAE decoder's engines for strips produced NaN/Inf values in {label(dtype_name(sdtype))}; decoding on PyTorch")
+                notify(f"The VAE decoder's strip engines produced NaN/Inf values in {label(dtype_name(sdtype))}, so this decode runs on PyTorch.")
                 return None, ""
         if pixels is None:
-            report = f"{_strips_report(plan, planned, made, side)}; the attention {attending:.2f}s; {_counted(peak.held, plan.vram + beside)}"
-            common.memory(f"VAE decode of {w * 8}x{h * 8}: strips done", decoder.memory_report(plan))
+            report = _strips_report(plan, peak.held, plan.vram + beside)
             pixels = torch.empty((b,) + tuple(image_out.shape[1:]), device=vae.output_device)
         pixels[i:i + 1] = vae.process_output(image_out.to(vae.output_device).float())
         del image_out
@@ -2088,12 +2069,12 @@ def encode(vae, pixel_samples):
             except torch.cuda.OutOfMemoryError as e:
                 said = _ran_out(model, e)
                 del e
+                logger.debug(f"The VAE engines ran out of VRAM encoding ({said}).")
                 if not again:
-                    log(f"Ran out of VRAM encoding on the VAE engines again ({said}); encoding on PyTorch.")
+                    logger.warning("The VAE engines ran out of VRAM, so this encode runs on PyTorch.")
                     _make_way(model)
                     return None
                 again = False
-                log(f"Ran out of VRAM encoding on the VAE engines ({said}); trying again with what PyTorch held unused given back.")
     finally:
         model.release()
         model.vae, model.using, model.beside = None, set(), False  # don't keep this VAE alive
@@ -2109,15 +2090,11 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
     images = f"{b} image{'' if b == 1 else 's'} of {w}x{h}"
     common.register(model)
     pixels_gpu = pixels.is_cuda
-    passed = "" if whole else "larger than they take whole; "
+    passed = "" if whole else " (larger than the engines take whole)"
     for engines in (False, True):
         if whole:
             model.use(side, ENCODER, load=False)
             n, need, act, can = _fit(model, min(b, record.encode_batch), lambda n: model.need_encode(n, h, w, pixels_gpu), engines, lambda: model.use(side, ENCODER))
-            common.memory(
-                f"VAE encode of {w}x{h}: {'whole, ' + str(n) + ' at a time' if n else 'not whole'} {_beside(engines)}",
-                f"whole holds {common.gib(need)} at most (TensorRT activations {common.gib(act)}); there could be room for {common.gib(can)}",
-            )
             if n:
                 start = time.time()
                 samples = None
@@ -2139,10 +2116,13 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
                     whole, passed = False, _whole_failed(model, True, h // 8, w // 8, f"encode {w}x{h}", e, found is not None)
                 else:
                     at_once = f", {n} at a time" if n < b else ""
-                    log(f"Encoded {images} on the VAE encoder engines in {time.time() - start:.2f}s ({label(record.meta['dtype'])}{at_once}; {_counted(peak.held + act, need)}{_did(side)})")
+                    logger.debug(
+                        f"Encoded {images} on the VAE engines in {time.time() - start:.2f}s: whole{at_once}, in {label(record.meta['dtype'])}, "
+                        f"{_beside(engines)}. {_counted(peak.held + act, need)}{_did(side)}."
+                    )
                     return samples
             else:
-                passed = f"whole it holds {common.gib(need)}, there could be room for {common.gib(can)} {_beside(engines)}; "
+                passed = _passed(need, can)
         if found is not None:
             model.use(side, (ENCODE_POST,), strips=True)
             model.release()
@@ -2151,10 +2131,13 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
             if result is not _NO_ROOM:
                 samples, report = result
                 if samples is not None:
-                    log(f"Encoded {images} in strips on the VAE encoder engines in {time.time() - start:.2f}s ({_in_strips(record, side)}; {passed}{report}{_did(side)})")
+                    logger.debug(
+                        f"Encoded {images} on the VAE engines in {time.time() - start:.2f}s: in strips, in {_in_strips(record, side)}, "
+                        f"{_beside(engines)}{passed}. {report}{_did(side)}."
+                    )
                 return samples
     if (True, h // 8, w // 8) not in model.failed:  # (said, if they failed to run it)
-        log(f"There can't be room to encode {w}x{h} on the VAE engines ({passed.rstrip('; ') or 'not even a strip fits'}): encoding on PyTorch.")
+        logger.warning(f"There's too little VRAM to encode {w}x{h} on the VAE engines{passed or ' (not even in strips)'}, so it runs on PyTorch.")
     return None
 
 
@@ -2182,7 +2165,6 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
     image_room, after = common.padded(image_bytes), common.padded(after)
     if max(image_room, after + beside) > can or _settled(encoder, mh, mw, lambda: common.usable(model.obtainable(engines)) - beside - image_bytes, engines) is None:
         return _NO_ROOM
-    common.memory(f"VAE encode of {w}x{h}: in strips {_beside(engines)}")
     norm = strips.norms_of(fsm, [strips.ATTENTION_NORM], device)[strips.ATTENTION_NORM]
     a = fsm.encoder.mid.attn_1
     convs = [(conv.weight.detach().to(device, torch.float32), conv.bias.detach().to(device, torch.float32)) for conv in (a.q, a.k, a.v)]
@@ -2197,28 +2179,20 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
             common.trim()
         image = vae.process_input(pixels[i:i + 1]).to(device=device, dtype=sdtype)
         if plan is None:
-            start = time.time()
-            plan, made = _plan_strips(model, encoder, mh, mw, beside, engines)
+            plan = _plan_strips(model, encoder, mh, mw, beside, engines)
             if plan is None:
                 return _NO_ROOM
-            planned = time.time() - start - made
-        if i == 0:
-            common.phase(f"VAE encode of {w}x{h}: planned, room made, before the strips")
         with _Peak() as peak:
-            x, stats = encoder.run(image, plan, timed=i == 0)
+            x, stats = encoder.run(image, plan)
         del image
         model.release()  # the strips' activations
-        if i == 0:
-            common.phase(f"VAE encode of {w}x{h}: after the strips")
         if record.scaled and not torch.isfinite(x).all():
             raise _Overflow()
         if i == 0:
-            common.memory(f"VAE encode of {w}x{h}: strips done", encoder.memory_report(plan))
             if model.make_room(after) < after and model.beside:
                 return _NO_ROOM
         else:
             common.trim()
-        start = _synced() if i == 0 else 0
         center, factor, shift = stats.affine(norm, side.scale)
         normed = (x.float() - center) * factor + shift
         q, k, v = (torch.nn.functional.conv2d(normed, weight, bias) for weight, bias in convs)
@@ -2226,14 +2200,12 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
         attended = _attention(model, vae, q, k, v, encoding=True)
         del q, k, v
         if i == 0:
-            common.phase(f"VAE encode of {w}x{h}: after the attention")
-        if i == 0:
-            report = f"{_strips_report(plan, planned, made, side)}; the attention {_synced() - start:.2f}s; {_counted(peak.held, plan.vram + beside)}"
+            report = _strips_report(plan, peak.held, plan.vram + beside)
         x = (x.float().div_(side.scale) if side.scale != 1.0 else x).to(dtype)  # as the encode-post engine takes it
         moments = side.engine(ENCODE_POST).infer({"x": x, "attention": attended}, 0, stream)["moments"]
         del x, attended
         if not torch.isfinite(moments).all():
-            notify(f"The VAE encoder engines produced NaN/Inf values in {label(record.meta['dtype'])}; encoding on PyTorch")
+            notify(f"The VAE encoder engines produced NaN/Inf values in {label(record.meta['dtype'])}, so this encode runs on PyTorch.")
             return None, ""
         out = fsm.regularization(moments.float())[0].to(vae.output_device).float()
         out = vae._from_vae_latent(out)
@@ -2256,29 +2228,16 @@ def _encode_images(model: VaeModel, vae, image):
     moments = side.engine(ENCODE_POST).infer({"x": mid.pop("x"), "attention": attended}, 0, stream)["moments"]
     del attended, mid
     if not torch.isfinite(moments).all():
-        notify(f"The VAE encoder engines produced NaN/Inf values in {label(record.meta['dtype'])}; encoding on PyTorch")
+        notify(f"The VAE encoder engines produced NaN/Inf values in {label(record.meta['dtype'])}, so this encode runs on PyTorch.")
         return None
     return vae.first_stage_model.regularization(moments.float())[0]  # reForge's own: the distribution's mode
 
 
-def _strips_report(plan, planned: float, made: float, side: _Side) -> str:
-    """For the log: the VRAM, the blocks' ways, RAM, the time planning and making room took, the stages' on
-    the GPU, and the stage engines."""
-    parts = [f"{common.gib(plan.vram)} of VRAM"]
-    count, held = side.stage_count()
-    if count:
-        parts.append(f"{count} stage engines holding {common.gib(held)}")
+def _strips_report(plan, held: int, need: int) -> str:
+    """For the log: how a plan in strips ran, and what it used of the VRAM it was planned for."""
+    parts = [_counted(held, need)]
     if plan.describe():
         parts.append(plan.describe())
     if plan.host:
-        kind, nbytes, seconds = strips.host_memory()
-        parts.append(f"{len(plan.host)} outputs in {kind} RAM ({common.gib(plan.moved)} copied; {common.gib(nbytes)} had in {seconds:.1f}s)")
-    parts.append(f"planned in {planned * 1000:.0f} ms" + (f", room made in {made:.1f}s" if made >= 0.1 else ""))
-    if plan.times:
-        try:
-            times = {n: a.elapsed_time(b) / 1000 for n, (a, b) in plan.times.items()}
-            slowest = max(times, key=times.get)
-            parts.append(f"stages {sum(times.values()):.2f}s on the GPU, the slowest {plan.stages[slowest].kind.name} {times[slowest]:.2f}s")
-        except Exception:
-            pass
+        parts.append(f"{len(plan.host)} tensors held in RAM")
     return "; ".join(parts)

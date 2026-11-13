@@ -33,7 +33,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .common import gib, log
+from .common import gib, logger
 
 INTERVAL = 2.0  # seconds between looks at whether the system needs the memory, while engines are kept
 # Linux: it does when every task that isn't idle has been stalled on memory at once for STALLED % of the
@@ -182,13 +182,13 @@ def _pressure() -> str:
                 supply = total = None
             low = _low(supply, total) if total else None
             if low is not None and low >= LOW:
-                return f"it has had under {FLOOR:.0%} of its RAM to give for {low:.0f} s ({gib(supply)} now)"
+                return f"under {FLOOR:.0%} of its RAM has been free for {low:.0f}s ({gib(supply)} now)"
             try:
                 verdict = _stalled()
             except (OSError, StopIteration, KeyError, ValueError):  # a kernel without it: only the above tells
                 return ""
             if verdict is not None and verdict[0] >= STALLED:
-                return f"everything waited on memory for {verdict[0]:.0f}% of the last {verdict[1]:.0f} s"
+                return f"everything waited on memory for {verdict[0]:.0f}% of the last {verdict[1]:.0f}s"
             return ""
         if os.name == "nt":
             k32 = ctypes.windll.kernel32
@@ -212,14 +212,14 @@ def _pressure() -> str:
 def explain() -> str:
     """For the log: what room() last weighed, and why it said no."""
     if "error" in _last:
-        return f"RAM couldn't be read: {_last['error']}"
+        return f"RAM couldn't be read ({_last['error']})"
     if "pressure" in _last:
-        return f"the system needs its memory: {_last['pressure']}"
+        return f"the system needs the memory, as {_last['pressure']}"
     if not _last:
         return "nothing weighed"
-    floor = f" and must keep {gib(_last['floor'])} to give" if _last["floor"] else ""
-    others = f", kept engines that could go for it hold {gib(_last['others'])}" if _last["others"] else ""
-    return f"needs {gib(_last['nbytes'])}, the system could hand over {gib(_last['supply'])}{floor}{others}"
+    floor = f", and {gib(_last['floor'])} must stay free" if _last["floor"] else ""
+    others = f"; engines kept that could make way hold {gib(_last['others'])}" if _last["others"] else ""
+    return f"it needs {gib(_last['nbytes'])}, {gib(_last['supply'])} is free{floor}{others}"
 
 
 def _give_back():
@@ -321,7 +321,7 @@ def room(nbytes: int, key: str = None) -> bool:
             entry = _kept.pop(others.pop(0))
             supply += entry.nbytes
             dropped += 1
-            log(f"Dropped the {entry.label} kept in RAM ({gib(entry.nbytes)}) to make room for another.")
+            logger.debug(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}) to make room for another.")
             del entry
     if dropped:
         _give_back()
@@ -349,13 +349,13 @@ def trim() -> int:
     with _lock:
         for key in [k for k, entry in _kept.items() if entry.orphaned]:
             entry = _kept.pop(key)
-            log(f"Dropped the {entry.label} kept in RAM ({gib(entry.nbytes)}): its checkpoint is no longer loaded.")
+            logger.debug(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}): its checkpoint isn't loaded anymore.")
             dropped += 1
             del entry
         why = _pressure() if _kept else ""
         if why:
             entry = _kept.pop(next(iter(_kept)))
-            log(f"The system needs its memory ({why}): dropped the {entry.label} kept in RAM ({gib(entry.nbytes)}).")
+            logger.debug(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}): the system needs the memory, as {why}.")
             dropped += 1
             del entry
     if dropped:
@@ -366,6 +366,7 @@ def trim() -> int:
 
 def _watch():
     global _watcher
+    failed = False  # said already
     while True:
         time.sleep(INTERVAL)
         with _lock:
@@ -375,4 +376,6 @@ def _watch():
         try:
             trim()
         except Exception as e:  # keep looking: nothing else would
-            log(f"Could not check the system's memory for the engines kept in RAM: {e}")
+            if not failed:
+                failed = True
+                logger.warning(f"Couldn't check whether the system needs the RAM that engines are kept in: {e}")

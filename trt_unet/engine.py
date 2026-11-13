@@ -20,7 +20,7 @@ import tensorrt as trt
 import torch
 
 from . import gpu
-from .common import gib, log, memory
+from .common import gib, logger
 
 # Refitting prepares weights given in RAM for the GPU on the CPU, by default on one thread. Weights come
 # straight from PyTorch's FP16 tensors, and the engine's first output is checked for NaN/Inf, so
@@ -51,7 +51,8 @@ def torch_dtype(dtype):
 
 
 class Logger(trt.ILogger):
-    """Prints TensorRT's errors; keeps everything but its verbose messages to explain a failure."""
+    """TensorRT's runtime messages, at DEBUG (its errors reach the console in the errors raised from them);
+    keeps them, but for the verbose ones, to explain a failure."""
 
     def __init__(self):
         trt.ILogger.__init__(self)
@@ -65,10 +66,10 @@ class Logger(trt.ILogger):
     def log(self, severity, msg):
         if severity == trt.ILogger.Severity.VERBOSE:
             return
-        self.messages.append(f"{severity.name}: {msg}")
+        self.messages.append(msg)
         if int(severity) <= int(trt.ILogger.Severity.ERROR):
             self.errors.append(msg)
-            print(f"[TensorRT] ERROR: {msg}", flush=True)
+        logger.debug(f"Runtime {severity.name.lower()}: {msg}")
 
 
 LOGGER = Logger()
@@ -96,8 +97,10 @@ def profile_report(where: str, top: int = 12):
         if not total:
             continue
         longest = sorted(times.items(), key=lambda kv: -kv[1])[:top]
-        log(f"profile | {where} | {os.path.basename(plan)}: {total:.1f} ms in {len(times)} layers; the longest: "
-            + "; ".join(f"{name} {ms:.1f} ms" for name, ms in longest))
+        logger.info(
+            f"Layer times of {os.path.basename(plan)} for the {where}: {total:.1f} ms in {len(times)} layers. The slowest:\n"
+            + "\n".join(f"    {ms:8.1f} ms  {name}" for name, ms in longest)
+        )
         times.clear()
 
 
@@ -125,20 +128,22 @@ def _deserialize(plan, owner):
         _set_aside.append(_runtime)
         _runtime = own
         gpu.retire()
+        logger.warning("An engine wouldn't load with PyTorch's allocator, so TensorRT manages its own VRAM from now on.")
     return engine
 
 
-def own_allocator(failures_before: int, owner) -> bool:
-    """After `owner`'s engine loaded but failed past that (its refit, its execution context) and was
-    unloaded: if PyTorch's allocator could be why (gpu.suspect: none has run with it yet, it didn't run out,
-    nothing else is loaded through it), TensorRT allocates its own memory from now on. Returns whether it
-    changed, for the caller to load the engine again."""
+def own_allocator(failures_before: int, owner, error) -> bool:
+    """After `owner`'s engine loaded but failed past that (its refit, its execution context) with `error`
+    and was unloaded: if PyTorch's allocator could be why (gpu.suspect: none has run with it yet, it didn't
+    run out, nothing else is loaded through it), TensorRT allocates its own memory from now on. Returns
+    whether it changed, for the caller to load the engine again."""
     global _runtime
     if not gpu.suspect(failures_before, owner):
         return False
     _set_aside.append(_runtime)
     _runtime = trt.Runtime(LOGGER)
     gpu.retire()
+    logger.warning(f"Loading the {owner} failed with PyTorch's allocator ({error}), so TensorRT manages its own VRAM from now on. Trying again.")
     return True
 
 
@@ -172,10 +177,9 @@ def other_tensorrt(maps="/proc/self/maps") -> str:
         paths = []
     where = f" ({', '.join(paths)})" if paths else ""
     return (
-        f"TensorRT {version // 10000}.{version // 100 % 100}{where} is loaded for the whole process, likely by another "
-        f"extension, and TensorRT's bindings may be calling it instead of TensorRT {trt.__version__}. "
-        "This extension's preload.py imports TensorRT before other extensions load to prevent that; "
-        "something loaded the other TensorRT even earlier."
+        f"TensorRT {version // 10000}.{version // 100 % 100}{where} is loaded process-wide, likely by another extension, "
+        f"and may be answering in place of TensorRT {trt.__version__}. This extension's preload.py loads its own "
+        "TensorRT first to prevent that, but something loaded the other one even earlier."
     )
 
 
@@ -255,13 +259,10 @@ class Engine:
                 plan = f.read()
         self.engine = _deserialize(plan, self.owner)
         if self.engine is None:
-            said = " | ".join(LOGGER.messages) or "nothing"
-            other = "" if "OutOfMemory" in said else other_tensorrt()  # (not why it ran out)
-            what = self.plan_path if serialized is None else f"{self.plan_path} as kept in RAM with its weights"
-            raise RuntimeError(
-                f"TensorRT {trt.__version__} could not load {what} ({memoryview(plan).nbytes} bytes). TensorRT said: {said}"
-                + (f". {other}" if other else "")
-            )
+            said = LOGGER.errors[-1] if LOGGER.errors else "no reason given"
+            other = "" if any("OutOfMemory" in m for m in LOGGER.messages) else other_tensorrt()  # (not why it ran out)
+            what = os.path.basename(self.plan_path) + ("" if serialized is None else " as kept in RAM")
+            raise RuntimeError(f"TensorRT {trt.__version__} couldn't load {what}: {said}" + (f" {other}" if other else ""))
         self.io = []
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
@@ -291,7 +292,7 @@ class Engine:
                 self.extra += more
                 gpu.grew(self.owner, more)
                 if what and more >= 16 * 2**20:
-                    log(f"{os.path.basename(self.plan_path)} took {gib(more)} more of VRAM {what}.")
+                    logger.debug(f"{os.path.basename(self.plan_path)} took {gib(more)} more VRAM {what}.")
 
     def _context(self):
         if self.context is None:
@@ -310,7 +311,7 @@ class Engine:
                     self.context.profiler = self._profiler
                     self.context.enqueue_emits_profile = False  # reported when asked, after the GPU is done
                 except Exception as e:
-                    log(f"Could not profile {os.path.basename(self.plan_path)}: {e}")
+                    logger.warning(f"Couldn't profile {os.path.basename(self.plan_path)}: {e}")
             self._reset_context_state()
         return self.context
 
@@ -338,13 +339,10 @@ class Engine:
             raise RuntimeError("TensorRT could not serialize the engine" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
         return serialized
 
-    def refit(self, names, tensor_for, label: str = None) -> dict:
+    def refit(self, names, tensor_for) -> dict:
         """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name, "cpu")`: the
         weights in RAM, which TensorRT copies into its own memory, the only copy of them in VRAM. Returns the
-        seconds spent getting the weights ("weights") and in TensorRT ("tensorrt"). With a `label`, the
-        memory diagnostics are logged around it."""
-        if label:
-            memory(f"refit {label}: before", f"{len(names)} weights")
+        seconds spent getting the weights ("weights") and in TensorRT ("tensorrt")."""
         refitter = trt.Refitter(self.engine, LOGGER)
         for setting, value in REFITTER_SETTINGS.items():
             try:
@@ -352,7 +350,7 @@ class Engine:
             except (AttributeError, TypeError) as e:  # the Python API reference doesn't say they're settable
                 if setting not in _unsettable:
                     _unsettable.add(setting)
-                    log(f"Could not set the refitter's {setting}: {e}")
+                    logger.debug(f"Couldn't set the refitter's {setting}: {e}")
         keep, seconds = [], {"weights": 0.0, "tensorrt": 0.0}
 
         def put(name):
@@ -385,8 +383,6 @@ class Engine:
             keep.clear()  # an error's traceback keeps this frame, and would keep the weights (GBs)
         if not ok:
             raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
-        if label:
-            memory(f"refit {label}: done")
         return seconds
 
     def _set_shapes(self, profile: int, shapes: dict, stream: int):
@@ -447,13 +443,14 @@ class Engine:
                 else:
                     t = outputs[name] = torch.empty(shape, dtype=dtype, device=DEVICE)
             self.context.set_tensor_address(name, t.data_ptr())
+        LOGGER.clear()
         if self.ran:
             ran = self.context.execute_async_v3(stream)
         else:  # what TensorRT takes only as a context first runs is counted too
             with self._taking("as it first ran"):
                 ran = self.context.execute_async_v3(stream)
         if not ran:
-            raise RuntimeError("TensorRT inference failed")
+            raise RuntimeError("TensorRT inference failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
         if not self.ran:
             self.ran = True
             gpu.proven()  # PyTorch's allocator works with these bindings

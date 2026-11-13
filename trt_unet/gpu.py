@@ -26,7 +26,7 @@ import threading
 
 import torch
 
-from .common import gib, log
+from .common import gib, logger
 
 _lock = threading.RLock()
 _live = {}  # address given to TensorRT -> (address allocated, bytes, owner)
@@ -69,7 +69,7 @@ def _allocate(size: int, alignment: int) -> int:
             # With --cuda-malloc, PyTorch's allocator first raises whatever CUDA error an earlier call left
             # behind on this thread (TensorRT's own, say), which clears it: that's not this request failing
             if again:
-                log(f"PyTorch's allocator failed TensorRT's request for {gib(size)}: {e}")
+                logger.debug(f"PyTorch's allocator refused TensorRT {gib(size)}: {e}")
     if base is None:
         with _lock:
             _failures += 1
@@ -100,7 +100,7 @@ def _free(memory) -> bool:
             break
         except Exception as e:  # an earlier call's CUDA error, raised here and cleared by that (see _allocate)
             if again:
-                log(f"PyTorch's allocator could not free {gib(size)} of TensorRT's: {e}")
+                logger.warning(f"Couldn't free {gib(size)} of TensorRT's VRAM: {e}")
                 with _lock:
                     _live[address] = entry  # still held, and counted so
                 return False
@@ -161,7 +161,7 @@ def attach(runtime) -> bool:
     did; if not, TensorRT keeps its own."""
     global _allocator
     if os.environ.get("TRT_EXTENSION_TORCH_ALLOCATOR", "").lower() in ("0", "false", "no"):
-        log("TensorRT allocates its own GPU memory (TRT_EXTENSION_TORCH_ALLOCATOR is off).")
+        logger.info("TensorRT manages its own VRAM (TRT_EXTENSION_TORCH_ALLOCATOR is off).")
         return False
     try:
         allocator = _make_allocator()
@@ -169,7 +169,7 @@ def attach(runtime) -> bool:
         _allocator = allocator  # TensorRT doesn't keep the Python object alive
         return True
     except Exception as e:
-        log(f"Could not give TensorRT PyTorch's allocator, so it allocates its own GPU memory: {e}")
+        logger.warning(f"Couldn't give TensorRT PyTorch's allocator, so TensorRT manages its own VRAM: {e}")
         return False
 
 
@@ -219,7 +219,6 @@ def retire():
             except Exception:  # as in _free
                 pass
     _retired, _allocator = _allocator, None
-    log("An engine failed to load with PyTorch's allocator, so TensorRT allocates its own GPU memory from now on.")
 
 
 @contextlib.contextmanager
@@ -320,10 +319,8 @@ def forget(name):
         _held.pop(name, None)
 
 
-def summary() -> str:
-    """For the memory diagnostics: what TensorRT holds through PyTorch's allocator, by owner."""
-    if not attached():
-        return ""
+def by_owner() -> list:
+    """For the memory diagnostics: [(owner, bytes)] that TensorRT holds through PyTorch's allocator, the
+    most first."""
     with _lock:
-        parts = [f"{o or 'unattributed'} {gib(n)}" for o, n in sorted(_ledger.items(), key=lambda kv: -kv[1]) if n]
-    return "TensorRT holds " + (", ".join(parts) if parts else "nothing")
+        return [(o or "unattributed", n) for o, n in sorted(_ledger.items(), key=lambda kv: -kv[1]) if n]

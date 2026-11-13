@@ -35,7 +35,7 @@ scaled as it comes in, and a GroupNorm's epsilon is scaled with the variance it'
 import contextlib
 import math
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -746,10 +746,6 @@ class Plan:
     in_place: dict
     io: list
     act: int
-    moved: int = 0  # bytes copied between RAM and VRAM, counted as the decode runs
-    times: dict = field(default_factory=dict)  # stage -> CUDA events around it, for the log
-    acts: list = field(default_factory=list)  # each stage's activation memory as planned, for the diagnostics
-    free: int = 0  # the VRAM it was planned for (diagnostics)
 
     @property
     def vram(self) -> int:
@@ -766,8 +762,7 @@ class Decode:
     """One image's post part in strips, for a first stage model. `runner_for(stage)` gives what runs a
     stage: runner(feed, outputs, last) -> outputs (the strip's output written to outputs["out"]; `last`: the
     shorter last strip), runner.rows(width) -> its most output rows at that width (0: none),
-    runner.activation(shapes) -> TensorRT's activation memory for those shapes, and runner.took() -> what
-    it was when the stage last ran. `cache` keeps TensorRT's answers between decodes ({(kind, rows, width):
+    runner.activation(shapes) -> TensorRT's activation memory for those shapes. `cache` keeps TensorRT's answers between decodes ({(kind, rows, width):
     bytes}): they're the engines' own, for as long as their plans are the same."""
 
     inputs = (-2, -1)  # the held tensors a run starts with: the mid block's input and its attention's output
@@ -897,38 +892,10 @@ class Decode:
         events = self._events(found, in_place)
         offsets, peak, at = _layout([e for e in events if e[0] not in host], sizes)
         host_offsets, host_bytes, _ = _layout([e for e in events if e[0] in host], sizes)
-        plan = Plan(dict(modes), found, runners, rows, set(host), {**offsets, **host_offsets}, peak, host_bytes, in_place, io, act, acts=acts)
+        plan = Plan(dict(modes), found, runners, rows, set(host), {**offsets, **host_offsets}, peak, host_bytes, in_place, io, act)
         return plan, at, sizes
 
-    def plan(self, h: int, w: int, free: int, ram: bool = True):
-        """_plan, with what it was planned for noted on it (diagnostics)."""
-        plan = self._plan(h, w, free, ram)
-        if plan is not None:
-            plan.free = free
-        return plan
-
-    def memory_report(self, plan: Plan) -> str:
-        """For the memory diagnostics: the plan's VRAM by part, and for each kind of stage, the activation
-        memory the plan counted against what TensorRT took for it when it ran (the most of its stages)."""
-        mib = lambda n: f"{n / 2**20:.0f} MiB"
-        parts = [
-            f"planned for {mib(plan.free)} free: {mib(plan.vram)} = held {mib(plan.device_bytes)} + working {mib(max(plan.io))} + activations {mib(plan.act)}",
-            f"held in RAM {mib(plan.host_bytes)} ({len(plan.host)} tensors)",
-        ]
-        kinds = {}
-        for n, st in enumerate(plan.stages):
-            took = plan.runners[n].took() or 0
-            counted = plan.acts[n] if n < len(plan.acts) else 0
-            k = kinds.setdefault(st.kind.name, [0, 0, set()])
-            k[0], k[1] = max(k[0], counted), max(k[1], took)
-            k[2].add(plan.rows[n])
-        top = sorted(kinds.items(), key=lambda kv: -kv[1][0])
-        parts.append("activations counted -> took: " + ", ".join(
-            f"{name} ({'/'.join(map(str, sorted(rows)))} rows) {mib(r)} -> {mib(t)}" for name, (r, t, rows) in top
-        ))
-        return " | ".join(parts)
-
-    def _plan(self, h: int, w: int, budget: int, ram: bool = True):
+    def plan(self, h: int, w: int, budget: int, ram: bool = True):
         """The Plan for latents of h x w in `budget` bytes of VRAM, or None if not even the smallest strips
         fit (or, if not `ram`, none that holds every tensor in VRAM does). The fastest that fits: every
         block STORE with strips as large as fit (down to an 8th of what the engines take); else, of the
@@ -998,7 +965,7 @@ class Decode:
                 return list(live)
         return list(live)
 
-    def run(self, x, attention, plan: Plan, timed: bool = False):
+    def run(self, x, attention, plan: Plan):
         """The image (1, out channels, H, W) for the mid block's input x and its attention's output (each
         (1, channels, h, w), in VRAM, in any precision, scaled as the decoder runs scaled: by whoever has
         them in a precision that holds them unscaled)."""
@@ -1007,7 +974,7 @@ class Decode:
             held[-2].t.copy_(x[0].permute(1, 0, 2))
             held[-1].t.copy_(attention[0].permute(1, 0, 2))
 
-        held, _ = self._run(plan, x.shape[2], x.shape[3], fill, timed)
+        held, _ = self._run(plan, x.shape[2], x.shape[3], fill)
         return self._out(held[len(plan.stages) - 1].t)
 
     def _out(self, t):
@@ -1017,7 +984,7 @@ class Decode:
         out[0].copy_(t.permute(1, 0, 2))
         return out
 
-    def _run(self, plan: Plan, h: int, w: int, fill, timed: bool = False) -> tuple:
+    def _run(self, plan: Plan, h: int, w: int, fill) -> tuple:
         """Runs the plan's stages for latents of h x w, `fill(held)` having put the tensors it starts with in.
         Returns (the held tensors, the last stage's output's statistics)."""
         found = plan.stages
@@ -1027,30 +994,19 @@ class Decode:
         io = torch.empty(max(max(plan.io), 1), dtype=torch.uint8, device=self.device)
         if self.arena is not None:
             self.arena.get(plan.act)  # once, at its largest: every engine binds it as is
-        if timed:
-            from .common import phase
-
-            phase(f"strips: their blocks allocated ({(plan.device_bytes + max(plan.io) + plan.act) // 2**20} MiB planned)")
         held = {}
         for key, shape in shapes.items():
             base = ram if key in plan.host else slab
             offset, nbytes = plan.offsets[key], math.prod(shape) * self.size
             held[key] = Held(base[offset:offset + nbytes].view(self.dtype).view(shape), key in plan.host)
         fill(held)
-        plan.moved, plan.times = 0, {}
         stats_last = {}
         for n, st in enumerate(found):
             for _, key in st.norms:
                 stats_last[key] = n
         stats = {}
         for n, stage in enumerate(found):
-            if timed and self.device.type == "cuda":
-                events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-                events[0].record()
             stats[n] = self._sweep(n, stage, held, stats, plan, io)
-            if timed and self.device.type == "cuda":
-                events[1].record()
-                plan.times[n] = events
             for _, key in stage.norms:
                 if stats_last[key] == n:
                     stats.pop(key, None)
@@ -1115,7 +1071,6 @@ class Decode:
                     runs, zeros = _runs(want)
                     for d, start, length in runs:
                         view[d:d + length].copy_(held_t.t[start:start + length], non_blocking=True)
-                        plan.moved += length * held_t.t[0].numel() * self.size
                     for i in zeros:
                         view[i].zero_()
                     views[name] = view
@@ -1142,7 +1097,6 @@ class Decode:
             if compute is not None and stored[slot] is not None:
                 compute.wait_event(stored[slot])  # its last copy out is done
             staging.copy_(rows_first)
-            plan.moved += staging.numel() * self.size
             if copy is None:
                 out.t[a:b].copy_(staging)
                 return
@@ -1236,7 +1190,7 @@ class Encode(Decode):
     def _list(fsm, padding: dict, modes: dict = None) -> list:
         return encoder_stages(fsm, padding, modes)
 
-    def run(self, image, plan: Plan, timed: bool = False) -> tuple:
+    def run(self, image, plan: Plan) -> tuple:
         """(The mid block's first resnet block's output (1, channels, h, w) in VRAM, scaled as the encoder runs
         scaled; its statistics, for the attention's GroupNorm) for an image (1, channels, H, W) in VRAM, as
         the encoder takes it (-1..1)."""
@@ -1248,7 +1202,7 @@ class Encode(Decode):
             if self.scale != 1.0:
                 held[-1].t.mul_(self.scale)  # as the scaled encoder takes it (vae._EncodePre)
 
-        held, stats = self._run(plan, h, w, fill, timed)
+        held, stats = self._run(plan, h, w, fill)
         return self._out(held[len(plan.stages) - 1].t), stats
 
 
@@ -1271,10 +1225,6 @@ class EngineRunner:
 
     def activation(self, shapes: dict) -> int:
         return self.probe().estimate_activation_bytes(0, {n: tuple(s) for n, s in shapes.items()}, self._stream())
-
-    def took(self):
-        """The activation memory its strips took when it last ran (None before)."""
-        return self.engines[0].size if self.engines is not None else None
 
     def rows(self, width: int) -> int:
         return engine_rows(self.shapes, self.kind, width)

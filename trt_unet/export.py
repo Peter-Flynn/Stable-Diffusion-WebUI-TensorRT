@@ -6,6 +6,7 @@ import copy
 import gc
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -15,7 +16,6 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 import types
 import warnings
 
@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from . import common, speed, store
 from .arch import Arch, unet_config
-from .common import gib, log
+from .common import duration, gib, logger
 
 INPUTS = ("sample", "timesteps", "encoder_hidden_states", "y")
 PLACEHOLDER_STRIDE = 256  # bytes between the placeholder weights' starts
@@ -42,6 +42,19 @@ DYNAMIC_AXES = {
 ONNX_KWARGS = dict(export_params=False, opset_version=17, do_constant_folding=False)
 if "dynamo" in inspect.signature(torch.onnx.export).parameters:
     ONNX_KWARGS["dynamo"] = False
+
+
+@contextlib.contextmanager
+def quiet_warnings():
+    """Python warnings raised in here (PyTorch's exporter has a few for every graph) are logged at DEBUG,
+    each once, instead of printed."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            yield
+        finally:
+            for message in dict.fromkeys(f"{w.category.__name__}: {w.message}" for w in caught):
+                logger.debug(f"While exporting: {message}")
 
 
 def _attention(q, k, v, mask=None, upcast=False, scale=None):
@@ -136,10 +149,9 @@ def _weightless_graph(onnx_path: str, input_names, agree_with, quiet: bool = Fal
         before, after = graph_mod.tidy(tidied, shapes)
         model, graph = tidied, tidied.graph
         if not quiet:
-            log(f"Tidied the graph from {before} to {after} nodes in {time.time() - start:.0f}s")
+            logger.debug(f"Tidied {os.path.basename(onnx_path)} from {before:,} to {after:,} nodes in {duration(time.time() - start)}.")
     except Exception as e:  # the graph as exported runs the same, with more layers
-        traceback.print_exc()
-        log(f"Could not tidy the graph ({e}); building from it as exported.")
+        logger.warning(f"Couldn't tidy {os.path.basename(onnx_path)}, so it's built as exported: {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
     used = {name for node in graph.node for name in node.input}
     for value in [i for i in graph.input if i.name in shapes and i.name not in used]:  # TensorRT couldn't mark it refittable
         graph.input.remove(value)
@@ -194,11 +206,9 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
         inputs.append(torch.randn(2, arch.adm_channels, dtype=dtype, device=device))
     paths = {"unet": os.path.join(folder, "unet.onnx"), "shallow": os.path.join(folder, "shallow.onnx")}
     axes = {k: v for k, v in DYNAMIC_AXES.items() if k in names or k == "latent"}
-    log(f"Exporting the {arch.name} UNet graphs...")
+    logger.debug(f"Exporting the {arch.name} UNet to ONNX.")
     shallow = True
-    with _traceable_attention(), warnings.catch_warnings():
-        # The values it warns about (shape checks, the head size) are fixed for an architecture.
-        warnings.simplefilter("ignore", torch.jit.TracerWarning)
+    with _traceable_attention(), quiet_warnings():
         try:
             deep = speed.full_forward(unet, *inputs)[1]
             scale = inputs[0].shape[2] // deep.shape[2]
@@ -207,8 +217,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
             unet.forward = types.MethodType(_as_full, unet)  # the parameters keep their names
             torch.onnx.export(unet, tuple(inputs), paths["unet"], input_names=names, output_names=["latent", "deep"], dynamic_axes=axes, **ONNX_KWARGS)
         except Exception as e:  # the UNet as reForge runs it, without Speed Hacks
-            traceback.print_exc()
-            log(f"Could not export the UNet with its deep feature ({e}); exporting it without Speed Hacks.")
+            logger.warning(f"Couldn't export the UNet for Speed Hacks, so these engines are built without them: {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
             shallow, deep, info = False, None, None
             with contextlib.suppress(AttributeError):
                 del unet.forward
@@ -221,8 +230,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
                     unet, (*inputs, deep), paths["shallow"], input_names=names + ["deep"], output_names=["latent"], dynamic_axes=axes, **ONNX_KWARGS
                 )
         except Exception as e:
-            traceback.print_exc()
-            log(f"Could not export the shallow UNet graph ({e}); the engines will be built without Speed Hacks.")
+            logger.warning(f"Couldn't export the UNet's Speed Hacks part, so these engines are built without it: {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
             shallow = False
         finally:
             with contextlib.suppress(AttributeError):
@@ -238,8 +246,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
         try:
             result["shallow"] = _weightless_graph(paths["shallow"], names + ["deep"], (exported, loaded))
         except Exception as e:
-            traceback.print_exc()
-            log(f"Could not prepare the shallow UNet graph ({e}); the engines will be built without Speed Hacks.")
+            logger.warning(f"Couldn't prepare the UNet's Speed Hacks part, so these engines are built without it: {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
     return result
 
 
@@ -330,7 +337,6 @@ def run_builder(job_path: str, progress=None) -> dict:
                 return stop()  # anything it left running
             short = _memory_short()
             if short:
-                log(short)
                 return stop(short)
 
     threading.Thread(target=watch, daemon=True).start()
@@ -342,12 +348,15 @@ def run_builder(job_path: str, progress=None) -> dict:
                     with contextlib.suppress(Exception):
                         message = json.loads(line[len(builder.PROGRESS):])
                         progress(message["fraction"], message["text"])
+            elif line.startswith(builder.LOG):
+                with contextlib.suppress(Exception):
+                    message = json.loads(line[len(builder.LOG):])
+                    logger.log(logging.getLevelName(message["level"]), message["message"])
             elif line.startswith(builder.RESULT):
                 with contextlib.suppress(ValueError):
                     result = json.loads(line[len(builder.RESULT):])
-            else:
-                sys.stdout.write(line)
-                sys.stdout.flush()
+            elif line.strip():  # anything else the builder's libraries printed
+                logger.debug(f"Builder: {line.rstrip()}")
         ended = True
     finally:
         if not ended:
@@ -380,7 +389,7 @@ def _build_plan(job: dict, folder: str, step) -> dict:
         if not result.get("retry_without_strip"):
             return result
         # Without stripping, the plan holds placeholder weights (GBs) but runs the same way.
-        log("Building a weight-stripped engine failed; building one that stores placeholder weights instead.")
+        logger.info("TensorRT couldn't leave the weights out of the engine, so it's building one with placeholder weights: a larger file, as fast.")
     return result
 
 
@@ -425,10 +434,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 result = {"ok": False, "error": "cancelled"}
                 break
             start = time.time()
-            if merged:
-                what, detail = f"merged engine ({len(group)} profiles)", "; ".join(p.describe() for _, p in group)
-            else:
-                what, detail = f"engine for profile {group[0][0] + 1}", f"{group[0][1].describe()} ({n + 1} of {len(groups)})"
+            what = f"merged {arch.name} engine" if merged else f"{arch.name} engine for profile {group[0][0] + 1}"
             step = shallow_step = None
             if progress:
                 title = (f"Merged engine, {len(group)} profiles" if merged else f"Profile {group[0][0] + 1} ({n + 1} of {len(groups)} to build)")
@@ -444,10 +450,15 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 "timing_cache": store.timing_cache_path(),
                 "optimization_level": optimization_level,
             }
-            log(f"Building the {arch.label} {what}, {detail}; the first build takes several minutes.")
+            if merged:
+                logger.info(f"Building the {what} for {len(group)} profiles: " + "; ".join(p.describe() for _, p in group))
+            else:
+                logger.info(f"Building the {what} ({n + 1} of {len(groups)}): {group[0][1].describe()}")
             result = _build_plan(job, folder, step)
             memory_warnings += result.get("memory_warnings") or 0
             if not result["ok"]:
+                if result.get("error") != "cancelled":
+                    logger.error(f"Couldn't build the {what}: {result.get('error')}")
                 break
             hacks = shallow_plan = hack_error = None
             if graphs["shallow"] is not None:
@@ -458,7 +469,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                     "weights": sorted(graphs["shallow"]),
                     "profiles": [speed.shallow_shapes(s, graphs["deep"]) for s in unet_shapes],
                 }
-                log(f"Building its Speed Hacks part, the shallow UNet ({len(shallow_job['weights'])} of {len(job['weights'])} weights).")
+                logger.debug(f"Building the {what}'s Speed Hacks part.")
                 shallow = _build_plan(shallow_job, folder, shallow_step)
                 memory_warnings += shallow.get("memory_warnings") or 0
                 if shallow.get("error") == "cancelled" or CANCEL.is_set():
@@ -475,7 +486,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                     }
                 else:
                     hack_error = str(shallow.get("error"))
-                    log(f"Building the Speed Hacks part failed ({hack_error}); keeping the engine without it.")
+                    logger.warning(f"Couldn't build the {what}'s Speed Hacks part, so it runs without Speed Hacks: {hack_error}")
             else:
                 hack_error = "the shallow UNet graph couldn't be exported"
             if hack_error:
@@ -500,19 +511,19 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 replaced = before.get(store.merged_key([p for _, p in group]) if merged else store.profile_key(group[0][1]))
                 meta["speed_hacks_retried"] = replaced is not None and "speed_hacks_error" in replaced.meta
             records.append(store.save(arch, job["plan"], meta, shallow_plan))
-            log(f"Built {records[-1].describe()} in {time.time() - start:.0f}s")
+            logger.info(f"Built the {what} in {duration(time.time() - start)} ({gib(records[-1].disk_bytes)}).")
         if vae_part and result["ok"] and not CANCEL.is_set():
             start = time.time()
-            log(f"Building the {arch.label} engines for {vae_part}.")
+            logger.info(f"Building the engines for {vae_part}.")
             step = (lambda f, t: progress((len(groups) + f) / total, f"VAE: {t}")) if progress else None
-            vae_record, vae_error, skipped = vae_mod.build(arch, profiles, folder, optimization_level, step)
+            vae_record, vae_error, skipped = vae_mod.build(arch, profiles, folder, optimization_level, step)  # (says why it failed)
             memory_warnings += skipped
             if vae_record is not None:
-                log(f"Built the VAE's engines in {time.time() - start:.0f}s")
+                logger.info(f"Built the VAE engines in {duration(time.time() - start)}.")
             elif vae_error == "cancelled" or CANCEL.is_set():
                 result = {"ok": False, "error": "cancelled"}
-            else:
-                log(f"Building the VAE's engines failed ({vae_error}); the VAE runs on PyTorch.")
+        if memory_warnings:
+            logger.info(f"TensorRT skipped {memory_warnings} kernels that needed more VRAM than was free, so the largest sizes may run a little slower.")
         return {**result, "records": records, "memory_warnings": memory_warnings, "hack_errors": hack_errors, "vae": vae_record, "vae_error": vae_error}
     finally:
         shutil.rmtree(folder, ignore_errors=True)

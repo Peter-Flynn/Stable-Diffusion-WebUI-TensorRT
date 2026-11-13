@@ -1,22 +1,25 @@
 import functools
+import logging
 import sys
 
 import torch
 
-
-def log(message: str):
-    print(f"[TensorRT] {message}", flush=True)
-
+# Everything this extension says goes through here, at reForge's --loglevel and in its format.
+logger = logging.getLogger("TensorRT")
 
 _notified = set()
 
 
-def notify(message: str, once: bool = True):
-    """Console and UI toast; `once` per generation."""
-    if once and message in _notified:
+def notify(message: str, error: BaseException = None):
+    """A warning in the console and in the UI, once per generation. With an unexpected `error`, an error
+    in the console, with its traceback."""
+    if message in _notified:
         return
     _notified.add(message)
-    log(message)
+    if error is not None:
+        logger.error(message, exc_info=error)
+    else:
+        logger.warning(message)
     try:
         import gradio as gr
 
@@ -77,6 +80,15 @@ def gib(n: float) -> str:
     return f"{n / 2**30:.2f} GiB" if n >= 2**30 else f"{n / 2**20:.0f} MiB"
 
 
+def duration(seconds: float) -> str:
+    """For people: "0.4s", "12s", "3m 05s"."""
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    return f"{int(seconds // 60)}m {int(seconds % 60):02d}s"
+
+
 # --- Making room in VRAM: exact sizes, through reForge's model manager
 
 
@@ -91,19 +103,6 @@ def padded(nbytes: int) -> int:
 def usable(room: int) -> int:
     """What an estimate may be for it to fit `room` with the buffer on top."""
     return int(room / (1 + BUFFER))
-
-
-def phase(where: str):
-    """Diagnostics: what PyTorch's allocator has in use and has reserved at a point between the phases of a
-    run, and what the driver has free. Reserved rising while in use falls is memory freed by one phase that
-    the next couldn't use."""
-    try:
-        stats = torch.cuda.memory_stats()
-        used, reserved = (int(stats.get(f"{k}_bytes.all.current", 0)) for k in ("allocated", "reserved"))
-        peak = int(stats.get("allocated_bytes.all.peak", 0))
-        log(f"phase | {where} | in use {gib(used)}, reserved {gib(reserved)} ({gib(reserved - used)} unused), peak in use {gib(peak)}, driver free {gib(torch.cuda.mem_get_info()[0])}")
-    except Exception as e:
-        log(f"phase | {where} | unreadable ({type(e).__name__}: {e})")
 
 
 def pooled() -> bool:
@@ -214,33 +213,7 @@ def make_room(nbytes: int, device, keep_loaded=()) -> int:
     return had
 
 
-# --- Memory diagnostics: these only read counters, and change nothing.
-
-_nvml = None  # NVML's handle for this GPU; False once NVML turned out not to be usable
-
-
-def _process_vram():
-    """VRAM held by this process by the driver's own count (NVML), or None where it can't tell (no pynvml,
-    or Windows, whose driver doesn't count it per process)."""
-    global _nvml
-    if _nvml is False:
-        return None
-    try:
-        import os
-
-        import pynvml
-
-        if _nvml is None:
-            pynvml.nvmlInit()
-            uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
-            _nvml = pynvml.nvmlDeviceGetHandleByUUID(uuid if uuid.startswith("GPU-") else f"GPU-{uuid}")
-        for p in pynvml.nvmlDeviceGetComputeRunningProcesses(_nvml):
-            if p.pid == os.getpid() and p.usedGpuMemory:
-                return int(p.usedGpuMemory)
-        return None
-    except Exception:
-        _nvml = False
-        return None
+# --- Memory diagnostics, at DEBUG: they only read counters, and change nothing.
 
 
 def _loaded_models() -> str:
@@ -248,98 +221,59 @@ def _loaded_models() -> str:
     for lm in mm().current_loaded_models:
         model = lm.model
         if model is not None:
-            out.append(f"{type(getattr(model, 'model', model)).__name__} {gib(lm.model_loaded_memory())}")
+            name = getattr(model, "owner", None) or type(getattr(model, "model", model)).__name__
+            out.append(f"{name} {gib(lm.model_loaded_memory())}")
     return ", ".join(out) or "nothing"
 
 
-def _ours() -> str:
-    """What this extension holds outside the models' sizes: TensorRT activation arenas (PyTorch's memory),
-    the strips' pinned RAM, engines kept in RAM."""
-    parts = []
-    try:
-        from . import gpu
+def _tensorrt() -> str:
+    """What TensorRT holds in VRAM through PyTorch's allocator, by owner, and its activation memory."""
+    from . import gpu
+    from .engine import Arena
 
-        parts.append(gpu.summary())
-    except Exception:
-        pass
-    try:
-        from .engine import Arena
-
-        arenas = [a.memory.numel() for a in list(Arena.instances) if a.memory is not None]
-        parts.append(f"activation arenas {gib(sum(arenas))} ({len(arenas)})")
-    except Exception:
-        pass
-    try:
-        from . import strips
-
-        kind, nbytes, _ = strips.host_memory()
-        if nbytes:
-            parts.append(f"strips' {kind} RAM {gib(nbytes)}")
-    except Exception:
-        pass
-    try:
-        from . import refits
-
-        count, nbytes = refits.held()
-        if count:
-            parts.append(f"{count} engines kept in RAM {gib(nbytes)}")
-    except Exception:
-        pass
-    return ", ".join(p for p in parts if p)
+    parts = [f"{owner} {gib(n)}" for owner, n in gpu.by_owner()]
+    activations = sum(a.memory.numel() for a in list(Arena.instances) if a.memory is not None)
+    if activations:
+        parts.append(f"activations {gib(activations)}")
+    return ", ".join(parts)
 
 
 def _ram() -> str:
-    """The RAM the system could hand over without paging anything out, as the engines kept in RAM count it
-    (refits.memory), of all there is; and what's in swap, if anything is."""
-    try:
-        from . import refits
+    """The RAM free (as refits.memory counts it), what this extension holds there, and what's in swap."""
+    from . import refits, strips
 
-        supply, _, total = refits.memory()
-        swapped = ""
-        if sys.platform.startswith("linux"):
-            m = refits._meminfo()
-            out = m.get("SwapTotal", 0) - m.get("SwapFree", 0)
-            swapped = f", {gib(out)} in swap" if out > 0 else ""
-        return f"RAM {gib(supply)} to spare of {gib(total)}{swapped}"
-    except Exception as e:
-        return f"RAM unreadable ({type(e).__name__}: {e})"
+    supply, _, total = refits.memory()
+    parts = [f"{gib(supply)} free of {gib(total)}"]
+    count, nbytes = refits.held()
+    if count:
+        parts.append(f"{count} engine{'s' if count > 1 else ''} kept ({gib(nbytes)})")
+    _, pinned, _ = strips.host_memory()
+    if pinned:
+        parts.append(f"{gib(pinned)} for VAE strips")
+    if sys.platform.startswith("linux"):
+        m = refits._meminfo()
+        swapped = m.get("SwapTotal", 0) - m.get("SwapFree", 0)
+        if swapped > 0:
+            parts.append(f"{gib(swapped)} in swap")
+    return "; ".join(parts)
 
 
-def memory(where: str, extra: str = ""):
-    """Logs who holds VRAM and RAM at this point (diagnostics: it reads counters, and changes nothing).
-    "Outside PyTorch" is VRAM that PyTorch's allocator doesn't hold: TensorRT's own allocations (engine
-    weights, refit memory), CUDA's context and kernels, and, where the driver can't count this process
-    alone, other processes."""
+def memory(when: str):
+    """Logs, at DEBUG, what holds VRAM and RAM `when` ("after loading ...")."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
     try:
         free, total = torch.cuda.mem_get_info()
         stats = torch.cuda.memory_stats()
-        allocated, active, reserved = (int(stats.get(f"{k}_bytes.all.current", 0)) for k in ("allocated", "active", "reserved"))
-        used, process = total - free, _process_vram()
-        if process is not None:
-            outside = f"outside PyTorch {gib(process - reserved)} (this process holds {gib(process)}; other processes {gib(used - process)})"
-        else:
-            outside = f"outside PyTorch {gib(used - reserved)} (other processes included)"
-        try:
-            backend = torch.cuda.get_allocator_backend()
-        except Exception:
-            backend = "?"
-        try:
-            counted = int(mm().get_free_memory(torch.device("cuda", torch.cuda.current_device())))
-        except Exception:
-            counted = free + reserved - active
-        if reserved >= allocated:
-            pool = f"PyTorch ({backend}) {gib(allocated)} allocated + {gib(reserved - allocated)} cached"
-        else:  # seen with --cuda-malloc: the driver's pool counts more in use than it holds (see gpu.py)
-            pool = f"PyTorch ({backend}) counts {gib(allocated)} allocated, {gib(allocated - reserved)} more than the {gib(reserved)} it holds"
-        parts = [
-            f"VRAM {gib(used)} used of {gib(total)}, {gib(free)} free (reForge counts {gib(counted)} free)",
-            pool,
-            outside,
-            f"loaded: {_loaded_models()}",
-            _ours(),
-            _ram(),
-            extra,
+        allocated, reserved = (int(stats.get(f"{k}_bytes.all.current", 0)) for k in ("allocated", "reserved"))
+        lines = [
+            f"VRAM      {gib(total - free)} used of {gib(total)}; PyTorch has {gib(allocated)} allocated, {gib(max(0, reserved - allocated))} cached",
+            f"Models    {_loaded_models()}",
         ]
-        log(f"mem | {where} | " + " | ".join(p for p in parts if p))
+        tensorrt = _tensorrt()
+        if tensorrt:
+            lines.append(f"TensorRT  {tensorrt}")
+        lines.append(f"RAM       {_ram()}")
+        logger.debug(f"Memory {when}:\n" + "\n".join("    " + line for line in lines))
     except Exception as e:
-        log(f"mem | {where} | unreadable ({type(e).__name__}: {e})")
+        logger.debug(f"Memory {when}: couldn't be read ({e})")

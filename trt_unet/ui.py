@@ -1,7 +1,6 @@
 import json
 import re
 import threading
-import traceback
 
 import gradio as gr
 
@@ -224,7 +223,7 @@ def _vae_status(arch) -> str:
             text += f"; encodes up to {record.encode_reach()}"
         return text + "."
     except Exception as e:
-        common.log(f"Could not describe the VAE's engines: {e}")
+        common.logger.debug(f"Couldn't describe the VAE engines: {e}")
         return ""
 
 
@@ -233,7 +232,7 @@ def _vae_part(draft) -> str:
     try:
         return vae_mod.needs_build(arch_mod.detect(), [Profile.from_dict(d) for d in draft])
     except Exception as e:
-        common.log(f"Could not check the VAE's engines: {e}")
+        common.logger.debug(f"Couldn't check which VAE engines are built: {e}")
         return ""
 
 
@@ -361,7 +360,7 @@ def choose_mode(label, draft, draft_arch):
         store.set_mode(_mode_of(label))
         SETTLED.set()
     except Exception as e:  # engines appeared meanwhile: they decide
-        common.log(f"Could not set the engine mode: {e}")
+        common.logger.warning(f"Couldn't set the engine mode: {e}")
     return refresh(draft, draft_arch)
 
 
@@ -375,7 +374,7 @@ def change_mode(label, draft, draft_arch):
         try:
             store.set_mode(_mode_of(label))
         except Exception as e:
-            common.log(f"Could not change the engine mode: {e}")
+            common.logger.warning(f"Couldn't change the engine mode: {e}")
     return refresh(draft, draft_arch)
 
 
@@ -465,13 +464,13 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
             message += " (TensorRT couldn't leave the weights out of some of them, so their files are as large as the UNet.)"
         if result.get("hack_errors"):
             retry = "Building again retries once." if any(r.retry_speed_hacks for r in result["records"]) else "That failed before too; to try again, delete the engines and build again."
-            message += f"\n\nSpeed Hacks couldn't be built (`{result['hack_errors'][-1]}`), so these engines run without them. The console has the details. {retry}"
+            message += f"\n\nSpeed Hacks couldn't be built (`{result['hack_errors'][-1]}`), so these engines run without them. {retry} TensorRT's own output is logged with `--loglevel DEBUG`."
     else:
         done = "The engines are unchanged." if merged else f"{_n(built, 'engine')} of {todo} built; the other engines are unchanged."
         if result.get("error") == "cancelled":
             message = f"### Build cancelled\n{done}"
         else:
-            message = f"### The build failed\n`{result.get('error')}`\n\nThe console has the details. {done}"
+            message = f"### The build failed\n`{result.get('error')}`\n\n{done} TensorRT's own output is logged with `--loglevel DEBUG`."
             if merged and "memory" in str(result.get("error")).lower():
                 message += (
                     f" A merged engine's build needs at least {MERGED_RAM} GB of RAM; per-profile engines build one profile at a "
@@ -495,7 +494,7 @@ def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
         elif vae_record.meta.get("encoder_error"):
             message += f" Its encoder's engines couldn't be built (`{vae_record.meta['encoder_error']}`), so it encodes on PyTorch."
     elif result.get("vae_error") and result["vae_error"] != "cancelled":
-        message += f"\n\nThe VAE's engines couldn't be built (`{result['vae_error']}`), so it runs on PyTorch. The console has the details."
+        message += f"\n\nThe VAE's engines couldn't be built (`{result['vae_error']}`), so it runs on PyTorch. TensorRT's own output is logged with `--loglevel DEBUG`."
     if result.get("memory_warnings"):
         message += (
             f"\n\nTensorRT skipped {result['memory_warnings']} kernels that need more VRAM than is free at a profile's largest sizes, "
@@ -535,7 +534,7 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
                 _refresh_unet_list()
                 message = _outcome(arch, len(todo), deleted, result, mode)
     except Exception as e:
-        traceback.print_exc()
+        common.logger.error(f"The build failed: {e}", exc_info=True)
         message = f"### The build failed\n`{e}`"
     finally:
         BUILDING.clear()
@@ -550,7 +549,7 @@ def cancel_build():
     from . import export
 
     export.CANCEL.set()
-    common.log("Cancelling the engine build...")
+    common.logger.info("Cancelling the build.")
 
 
 def delete_engine(choice, draft, draft_arch):
@@ -563,7 +562,7 @@ def delete_engine(choice, draft, draft_arch):
             store.delete(group)
             vae_mod.delete_for(group[0].meta["arch"]["id"], group[0].meta["gpu"], group[0].meta["trt"])
             sd_unet.list_unets()
-        common.log(f"Deleted the {len(group)} engines of {choice}")
+        common.logger.info(f"Deleted {_n(len(group), 'engine')}: {choice}.")
     return refresh(draft, draft_arch)
 
 

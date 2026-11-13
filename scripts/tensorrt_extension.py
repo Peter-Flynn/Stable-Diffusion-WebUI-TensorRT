@@ -1,6 +1,7 @@
 from modules import script_callbacks, scripts
 
 from trt_unet import runtime, ui
+from trt_unet.common import logger
 
 
 class TensorRT(scripts.Script):
@@ -20,7 +21,7 @@ class TensorRT(scripts.Script):
 try:
     runtime.install_hooks()
 except Exception as e:
-    print(f"[TensorRT] This extension needs reForge: {e}", flush=True)
+    logger.error(f"This extension needs reForge: {e}")
 script_callbacks.on_list_unets(runtime.list_unets)
 script_callbacks.on_ui_tabs(ui.on_ui_tabs)
 script_callbacks.on_ui_settings(ui.on_ui_settings)
