@@ -49,7 +49,6 @@ import contextlib
 import gc
 import glob
 import hashlib
-import inspect
 import json
 import math
 import os
@@ -63,7 +62,6 @@ import torch
 from . import common, gpu, store, strips
 from .common import log, notify
 
-FORMAT = 1
 PRE, POST = "pre", "post"
 ENCODE_PRE, ENCODE_POST = "encode-pre", "encode-post"
 ENCODER = (ENCODE_PRE, ENCODE_POST)
@@ -466,20 +464,13 @@ class Record:
 
     @property
     def strips_dtype(self):
-        """The precision of the engines for strips (the whole-image ones', in records from before they
-        could differ)."""
-        return getattr(torch, self.meta.get("strips_dtype") or self.meta["dtype"])
+        """The precision of the engines for strips."""
+        return getattr(torch, self.meta["strips_dtype"])
 
     @property
     def scaled(self) -> bool:
         """Whether the engines for strips run scaled (FP16 ones do)."""
         return scaled(self.strips_dtype)
-
-    @property
-    def runs(self) -> bool:
-        """Whether its whole-image engines are ones this version runs: not the FP16 ones older versions
-        built (scaled graphs). Such a record's engines for strips are kept when it's built again."""
-        return self.meta["dtype"] != "float16"
 
     @property
     def loadable(self) -> bool:
@@ -578,28 +569,22 @@ def _kinds_cover(kinds: dict, found: list, w: int) -> bool:
     return True
 
 
-def records(arch_id: str, donors: bool = False) -> list:
-    """This GPU's and TensorRT version's VAE engines for an architecture: those this version runs, or with
-    `donors`, also those whose whole-image engines it doesn't (a build keeps their engines for strips)."""
+def records(arch_id: str) -> list:
+    """This GPU's and TensorRT version's VAE engines for an architecture."""
     found = []
     for path in glob.glob(glob.escape(_prefix(arch_id)) + "-*.json"):
         try:
             with open(path, encoding="utf-8") as f:
                 meta = json.load(f)
             r = Record(path[: -len(".json")], meta)
-            if meta.get("vae_format") == FORMAT and r.loadable and all(os.path.isfile(r.plan(p)) for p in (PRE, POST)):
+            if r.loadable and all(os.path.isfile(r.plan(p)) for p in (PRE, POST)):
                 if not all(os.path.isfile(r.strip_plan(k)) for k in r.strips):
                     meta["strips"] = {}  # decodes on the post engine only; the tab asks to build them again
                 if r.encoder is not None and not all(os.path.isfile(r.plan(p)) for p in ENCODER):
                     meta["encoder"] = None  # likewise: it encodes on PyTorch
                 if r.encoder is not None and not all(os.path.isfile(r.encoder_strip_plan(k)) for k in r.encoder_strips):
                     meta["encoder"]["strips"] = {}  # encodes whole only; likewise
-                if r.runs or donors:
-                    found.append(r)
-                elif r.base not in _told:
-                    _told.add(r.base)
-                    log("The VAE's whole-image engines were built in FP16, which this version doesn't run them in (their GroupNorms are slow there): "
-                        "build again in the TensorRT tab. Its engines for strips are kept.")
+                found.append(r)
         except Exception as e:
             log(f"Ignoring {path}: {e}")
     return found
@@ -682,13 +667,6 @@ def _matching(arch_id: str, vae, dtype, sdtype) -> list:
     return [r for r in records(arch_id) if r.meta.get("digest") == wanted and (r.dtype, r.strips_dtype) == (dtype, sdtype)]
 
 
-def _donor(arch_id: str, vae, sdtype):
-    """A record for this VAE's decoder whose whole-image engines this version doesn't run but whose engines
-    for strips are in this precision: a build keeps those. None if there's none."""
-    wanted = digest(vae)
-    return next((r for r in records(arch_id, donors=True) if not r.runs and r.meta.get("digest") == wanted and r.strips_dtype == sdtype), None)
-
-
 def _strips_wanted(vae, profiles: list, cfg: dict, dtype, encoding: bool = False) -> dict:
     """The kinds of the decode in strips (or the encode's) and their shapes for the profiles ({} if it can't
     run for this VAE)."""
@@ -699,24 +677,23 @@ def _strips_wanted(vae, profiles: list, cfg: dict, dtype, encoding: bool = False
     return {} if any(strips.supported(found) for found in lists) else strip_shapes(profiles, lists, dtype)
 
 
-def _missing(record: Record, shapes: dict, strip_wanted: dict, enc_wanted: dict = None, whole: bool = True) -> list:
+def _missing(record: Record, shapes: dict, strip_wanted: dict, enc_wanted: dict = None) -> list:
     """The parts (PRE, POST, the ENCODER's two together, the decode in strips' kind names, the encode's
-    prefixed ENCODE_STRIP) a record lacks for these shapes; all of its whole-image engines, if not `whole`
-    (they can't be kept: Record.runs). A post or encoder engine that had to be built smaller than asked
-    counts as built (its "asked"), and so do the encoder's or the kinds' whose build failed for these
-    shapes. The kinds for encoding in strips are kept whatever becomes of the encoder's two, as long as
-    they're for the same encoder."""
+    prefixed ENCODE_STRIP) a record lacks for these shapes. A post or encoder engine that had to be built
+    smaller than asked counts as built (its "asked"), and so do the encoder's or the kinds' whose build
+    failed for these shapes. The kinds for encoding in strips are kept whatever becomes of the encoder's
+    two, as long as they're for the same encoder."""
     meta = record.meta
     out = []
-    if not whole or not _covers(meta["shapes"], {PRE: shapes[PRE]}):
+    if not _covers(meta["shapes"], {PRE: shapes[PRE]}):
         out.append(PRE)
-    if not whole or not _covers(meta.get("asked", meta["shapes"]), {POST: shapes[POST]}):
+    if not _covers(meta["asked"], {POST: shapes[POST]}):
         out.append(POST)
     if enc_wanted is not None:
         have = record.encoder
         same = have is not None and have.get("digest") == enc_wanted["digest"]
-        built = whole and same and _covers(have.get("asked", have["shapes"]), enc_wanted["shapes"])
-        tried = meta.get("encoder_asked") if whole and meta.get("encoder_error") else None
+        built = same and _covers(have["asked"], enc_wanted["shapes"])
+        tried = meta.get("encoder_asked") if meta.get("encoder_error") else None
         if not built and not (tried and tried.get("digest") == enc_wanted["digest"] and _covers(tried["shapes"], enc_wanted["shapes"])):
             out += list(ENCODER)
         if same:  # its strips' kinds, unless built or their build failed for these shapes
@@ -853,28 +830,32 @@ def fresh_encoder(cfg: dict, device, dtype):
     return module.to(device=device, dtype=dtype).eval()
 
 
-def _export(module, halves: dict, work: str, dtype, device, first, loaded: dict) -> dict:
+def _randomize(module):
+    """Random weights: tracing doesn't depend on them, and distinct values keep the exporter from merging
+    identical ones (GroupNorm's)."""
+    for t in module.state_dict(keep_vars=True).values():
+        if t.is_floating_point():
+            t.normal_(0, 0.02)
+    return module
+
+
+def _export(module, halves: dict, work: str, first, loaded: dict) -> dict:
     """Traces a fresh module's two halves ({part: (the half's class, its inputs' names, its outputs', their
     dynamic axes)}, the first one fed `first`, the second its first output and one like it) to
     work/vae_<part>.onnx: {part: {weight name: shape}}."""
     from . import export
 
-    for t in module.state_dict(keep_vars=True).values():  # random: tracing doesn't depend on the weights, and
-        if t.is_floating_point():  # distinct values keep the exporter from merging identical ones (GroupNorm's)
-            t.normal_(0, 0.02)
+    _randomize(module)
     (one, two), parts = list(halves), {part: spec[0](module) for part, spec in halves.items()}
     x = parts[one](first)[0]
     args = {one: (first,), two: (x, torch.randn_like(x))}
-    kwargs = dict(export_params=False, opset_version=17, do_constant_folding=False)
-    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
-        kwargs["dynamo"] = False
     exported = {k: list(v.shape) for k, v in module.state_dict(keep_vars=True).items()}
     result = {}
     for part, (_, inputs, outputs, axes) in halves.items():
         path = os.path.join(work, f"vae_{part}.onnx")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", torch.jit.TracerWarning)
-            torch.onnx.export(parts[part], args[part], path, input_names=inputs, output_names=outputs, dynamic_axes=axes, **kwargs)
+            torch.onnx.export(parts[part], args[part], path, input_names=inputs, output_names=outputs, dynamic_axes=axes, **export.ONNX_KWARGS)
         result[part] = export._weightless_graph(path, inputs, (exported, loaded))
     return result
 
@@ -893,7 +874,7 @@ def export_onnx(vae, work: str, dtype, device) -> dict:
     }
     latent = torch.randn(1, cfg["latent_channels"], 32, 32, dtype=dtype, device=device)
     loaded = {k: list(v.shape) for k, v in vae.first_stage_model.state_dict(keep_vars=True).items() if _relevant(k)}
-    return {"config": cfg, **_export(fresh(cfg, device, dtype), halves, work, dtype, device, latent, loaded)}
+    return {"config": cfg, **_export(fresh(cfg, device, dtype), halves, work, latent, loaded)}
 
 
 @common.inference_mode
@@ -907,7 +888,7 @@ def export_encoder_onnx(vae, work: str, dtype, device) -> dict:
     }
     image = torch.randn(1, cfg["in_channels"], 128, 128, dtype=dtype, device=device)
     loaded = {k: list(v.shape) for k, v in vae.first_stage_model.state_dict(keep_vars=True).items() if _encoder_relevant(k)}
-    return {"config": cfg, **_export(fresh_encoder(cfg, device, dtype), halves, work, dtype, device, image, loaded)}
+    return {"config": cfg, **_export(fresh_encoder(cfg, device, dtype), halves, work, image, loaded)}
 
 
 @common.inference_mode
@@ -923,14 +904,9 @@ def export_strips(vae, work: str, dtype, device, names, encoding: bool = False) 
     else:
         cfg = config(vae)
         module, every_way, prefix, key = fresh(cfg, device, dtype), strips.every_way, "strip-", ""
-    for t in module.state_dict(keep_vars=True).values():  # random, as in export_onnx
-        if t.is_floating_point():
-            t.normal_(0, 0.02)
+    _randomize(module)
     found = [s for each in every_way(module, cfg["padding"]) for s in each]
     loaded = vae.first_stage_model.state_dict(keep_vars=True)
-    kwargs = dict(export_params=False, opset_version=17, do_constant_folding=False)
-    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
-        kwargs["dynamo"] = False
     result = {}
     for name in names:
         stage = next(s for s in found if s.kind.name == name)
@@ -940,7 +916,7 @@ def export_strips(vae, work: str, dtype, device, names, encoding: bool = False) 
             warnings.simplefilter("ignore", torch.jit.TracerWarning)
             torch.onnx.export(
                 part, strips.example_inputs(kind, dtype, device), path, input_names=list(kind.inputs()),
-                output_names=list(kind.outputs()), dynamic_axes=strips.dynamic_axes(kind), **kwargs,
+                output_names=list(kind.outputs()), dynamic_axes=strips.dynamic_axes(kind), **export.ONNX_KWARGS,
             )
         own = {k: list(v.shape) for k, v in part.state_dict(keep_vars=True).items()}
         theirs = {k: list(loaded[stage.weights[k]].shape) for k in own}
@@ -959,9 +935,8 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
     """Builds the VAE engines these profiles' sizes lack, for the loaded VAE and its precisions
     (engine_dtype, strip_dtype): the decoder's pre and post engines, the encoder's two, and those that
     decode and encode in strips (strips.py), keeping what this GPU's and TensorRT version's engines for the
-    architecture have that covers them (of a record whose whole-image engines this version doesn't run,
-    its engines for strips), and deleting the rest. Returns (the Record or None, why it failed or None, how many kernels TensorRT skipped for want of
-    VRAM). If only the encoder's engines or the stripped decode's fail, the record has the others (and says
+    architecture have that covers them, and deleting the rest. Returns (the Record or None, why it failed
+    or None, how many kernels TensorRT skipped for want of VRAM). If only the encoder's engines or the stripped decode's fail, the record has the others (and says
     why in "encoder_error" or "strips_error")."""
     from . import export
 
@@ -978,8 +953,8 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         enc_wanted = _encoder_wanted(vae, profiles, dtype, sdtype, vram)
         enc_kinds = [ENCODE_STRIP + k for k in enc_wanted["strips"]] if enc_wanted else []
         everything = [PRE, POST] + (list(ENCODER) if enc_wanted else []) + enc_kinds + list(strip_wanted)
-        old = next(iter(_matching(arch.id, vae, dtype, sdtype)), None) or _donor(arch.id, vae, sdtype)
-        todo = _missing(old, asked, strip_wanted, enc_wanted, old.runs) if old is not None else list(everything)
+        old = next(iter(_matching(arch.id, vae, dtype, sdtype)), None)
+        todo = _missing(old, asked, strip_wanted, enc_wanted) if old is not None else list(everything)
         if old is not None and old.meta.get("strips_error"):  # building anyway: try those again
             todo += [k for k in strip_wanted if k not in old.strips and k not in todo]
         if old is not None and old.meta.get("encoder_error") and enc_wanted and ENCODE_PRE not in todo:
@@ -994,7 +969,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             if PRE not in todo:
                 shapes[PRE] = old.meta["shapes"][PRE]
             if POST not in todo:
-                shapes[POST], post_asked = old.meta["shapes"][POST], old.meta.get("asked", old.meta["shapes"])[POST]
+                shapes[POST], post_asked = old.meta["shapes"][POST], old.meta["asked"][POST]
         if POST in todo:
             wanted_h, wanted_w = max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8
             b, _, h, w = asked[POST]["x"][2]
@@ -1146,7 +1121,6 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         key = hashlib.sha1(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:10]
         weights = {part: sorted(graphs[part]) if part in built else old.meta["weights"][part] for part in (PRE, POST)}
         meta = {
-            "vae_format": FORMAT,
             "key": key,
             "arch_id": arch.id,
             "digest": digest(vae),
@@ -1576,7 +1550,7 @@ class VaeModel:
 
 
 _models = {}  # Record.base -> VaeModel
-_told = set()  # what was logged once already: records with another precision, architectures without engines
+_told = set()  # what was logged once already: records in another precision, architectures without engines
 _exponents = {}  # the key of a VAE's decoder's or encoder's weights -> its exponent, where it outgrew EXPONENT (None: every one)
 
 
@@ -1643,20 +1617,18 @@ def _fit(model: VaeModel, top: int, need_for, engines: bool, load) -> tuple:
     it, once."""
     model.beside = not engines
     model.release()
-    counted = need_for
-
     def room_for(n):  # what n hold, with the buffer on top
-        return common.padded(counted(n)[0])
+        return common.padded(need_for(n)[0])
 
     for loaded in (False, True):
         can = model.obtainable(engines)
         beside = model.obtainable(engines=False)
         n = next((n for n in range(top, 0, -1) if room_for(n) <= beside), 0) or (1 if room_for(1) <= can else 0)
         if not n:
-            return 0, *counted(1), can
+            return 0, *need_for(1), can
         if not loaded:
             load()
-    need, act = counted(n)
+    need, act = need_for(n)
     free = model.make_room(room_for(n))
     if free < room_for(n):
         log(f"Making room for {common.gib(room_for(n))} left {common.gib(free)} free: the models loaded hold more than reForge counts.")
@@ -1977,11 +1949,10 @@ def _run(model: VaeModel, vae, samples_in, n: int):
     side, record = model.decoder, model.record
     dtype, device = record.dtype, model.load_device
     stream = torch.cuda.current_stream().cuda_stream
-    to_latent = getattr(vae, "_to_vae_latent", lambda t: t)  # SD and SDXL VAEs: as is
     pre, post = side.engine(PRE), side.engine(POST)
     pixels = None
     for start in range(0, samples_in.shape[0], n):
-        z = to_latent(samples_in[start:start + n]).to(device=device, dtype=dtype)
+        z = vae._to_vae_latent(samples_in[start:start + n]).to(device=device, dtype=dtype)
         mid = pre.infer({"latent": z}, 0, stream)
         del z
         h = _attention(model, vae, mid.pop("q"), mid.pop("k"), mid.pop("v"))
@@ -2007,7 +1978,6 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
     side, record = model.decoder, model.record
     dtype, sdtype, device = record.dtype, record.strips_dtype, model.load_device
     stream = torch.cuda.current_stream().cuda_stream
-    to_latent = getattr(vae, "_to_vae_latent", lambda t: t)
     cfg = record.meta["config"]
     decoder = strips.Decode(vae.first_stage_model, cfg["padding"], side.runner_for, sdtype, device, _copy_stream(device), model.arena, side.activations, set(side.kinds), side.scale)
     b, _, h, w = samples_in.shape
@@ -2030,7 +2000,7 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
         else:  # the image before's strips are freed: back to the driver, for this one's part before them
             model.release()
             common.trim()
-        z = to_latent(samples_in[i:i + 1]).to(device=device, dtype=dtype)
+        z = vae._to_vae_latent(samples_in[i:i + 1]).to(device=device, dtype=dtype)
         mid = side.engine(PRE).infer({"latent": z}, 0, stream)
         del z
         x = mid.pop("x")
@@ -2158,7 +2128,7 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
                             if latent is None:
                                 return None
                             out = latent.to(vae.output_device).float()
-                            out = vae._from_vae_latent(out) if hasattr(vae, "_from_vae_latent") else out
+                            out = vae._from_vae_latent(out)
                             if samples is None:
                                 samples = torch.empty((b,) + tuple(out.shape[1:]), device=vae.output_device)
                             samples[at:at + n] = out
@@ -2266,7 +2236,7 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
             notify(f"The VAE encoder engines produced NaN/Inf values in {label(record.meta['dtype'])}; encoding on PyTorch")
             return None, ""
         out = fsm.regularization(moments.float())[0].to(vae.output_device).float()
-        out = vae._from_vae_latent(out) if hasattr(vae, "_from_vae_latent") else out
+        out = vae._from_vae_latent(out)
         if samples is None:
             samples = torch.empty((b,) + tuple(out.shape[1:]), device=vae.output_device)
         samples[i:i + 1] = out

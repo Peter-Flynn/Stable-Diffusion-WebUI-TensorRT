@@ -32,6 +32,7 @@ GroupNorms are that much smaller than the VAE makes them. Here that takes three 
 is multiplied by the scale where rows are kept or zeroed anyway ("keep"), the attention's output is
 scaled as it comes in, and a GroupNorm's epsilon is scaled with the variance it's added to."""
 
+import contextlib
 import math
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -748,8 +749,7 @@ class Plan:
     moved: int = 0  # bytes copied between RAM and VRAM, counted as the decode runs
     times: dict = field(default_factory=dict)  # stage -> CUDA events around it, for the log
     acts: list = field(default_factory=list)  # each stage's activation memory as planned, for the diagnostics
-    free: int = 0  # the VRAM free it was planned for, and the budget made of that (diagnostics)
-    budget: int = 0
+    free: int = 0  # the VRAM it was planned for (diagnostics)
 
     @property
     def vram(self) -> int:
@@ -900,11 +900,11 @@ class Decode:
         plan = Plan(dict(modes), found, runners, rows, set(host), {**offsets, **host_offsets}, peak, host_bytes, in_place, io, act, acts=acts)
         return plan, at, sizes
 
-    def plan(self, h: int, w: int, free: int, force_host: bool = False, force_modes: dict = None, ram: bool = True):
+    def plan(self, h: int, w: int, free: int, ram: bool = True):
         """_plan, with what it was planned for noted on it (diagnostics)."""
-        plan = self._plan(h, w, free, force_host, force_modes, ram)
+        plan = self._plan(h, w, free, ram)
         if plan is not None:
-            plan.free = plan.budget = free
+            plan.free = free
         return plan
 
     def memory_report(self, plan: Plan) -> str:
@@ -928,21 +928,14 @@ class Decode:
         ))
         return " | ".join(parts)
 
-    def _plan(self, h: int, w: int, free: int, force_host: bool = False, force_modes: dict = None, ram: bool = True):
-        """The Plan for latents of h x w in `free` bytes of VRAM, or None if not even the smallest strips
-        fit (or, if not `ram`, none that holds every tensor in VRAM does). The fastest that fits: every block STORE with strips as large as fit (down to an 8th of what the
-        engines take); else, of the tensors held at the VRAM's peak, the largest one a block could do
-        without (a first conv's output: that block RECOMPUTE; an upsampling's: the block after it FUSED)
-        gone, and so on; else the tensors held at the peak moved to RAM, the largest first. Every size it
-        weighs is exact (the held tensors', the working ones', TensorRT's activation memory), so `free` is
-        all it plans for."""
-        budget = free
-        if force_host or force_modes is not None:
-            modes = force_modes or {}
-            found, _ = self._stages(modes)
-            host = {n for n, st in enumerate(found) if st.keep} if force_host else set()
-            result = self._evaluate(modes, 1, host, h, w)
-            return result[0] if result else None
+    def _plan(self, h: int, w: int, budget: int, ram: bool = True):
+        """The Plan for latents of h x w in `budget` bytes of VRAM, or None if not even the smallest strips
+        fit (or, if not `ram`, none that holds every tensor in VRAM does). The fastest that fits: every
+        block STORE with strips as large as fit (down to an 8th of what the engines take); else, of the
+        tensors held at the VRAM's peak, the largest one a block could do without (a first conv's output:
+        that block RECOMPUTE; an upsampling's: the block after it FUSED) gone, and so on; else the tensors
+        held at the peak moved to RAM, the largest first. Every size it weighs is exact (the held tensors',
+        the working ones', TensorRT's activation memory), so `budget` is all it plans for."""
         modes = {b: ways[0] for b, ways in enumerate(self.ways)}
         while True:
             result = None
@@ -1113,7 +1106,7 @@ class Decode:
                 parts.append(("x", src, source_rows(stage, a, b, rows_in), x_stage[slot]))
             if res_stage:
                 parts.append(("res", res, list(range(a, b)), res_stage[slot]))
-            with (torch.cuda.stream(copy) if copy is not None else _nothing()):
+            with (torch.cuda.stream(copy) if copy is not None else contextlib.nullcontext()):
                 if copy is not None and consumed[slot] is not None:
                     copy.wait_event(consumed[slot])  # the strip two back is done with this staging
                 views = {}
@@ -1257,41 +1250,6 @@ class Encode(Decode):
 
         held, stats = self._run(plan, h, w, fill, timed)
         return self._out(held[len(plan.stages) - 1].t), stats
-
-
-class _nothing:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-class TorchRunner:
-    """A stage on PyTorch (for checks, and where no engine runs it)."""
-
-    engines = ()  # nothing to load (see EngineRunner)
-
-    def __init__(self, module: StageModule):
-        self.module = module
-
-    def __call__(self, feed: dict, outputs: dict, last: bool = False) -> dict:
-        kind = self.module.kind
-        with torch.no_grad():
-            result = dict(zip(kind.outputs(), self.module(*[feed[n] for n in kind.inputs()])))
-        if "out" in result and "out" in outputs:
-            outputs["out"].copy_(result["out"])
-            result["out"] = outputs["out"]
-        return result
-
-    def activation(self, shapes: dict) -> int:
-        return 0
-
-    def took(self):
-        return None
-
-    def rows(self, width: int) -> int:
-        return max_rows(self.module.kind, width)
 
 
 class EngineRunner:

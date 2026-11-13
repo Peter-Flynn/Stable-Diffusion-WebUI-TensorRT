@@ -37,6 +37,11 @@ DYNAMIC_AXES = {
     "y": {0: "batch"},
     "latent": {0: "batch", 2: "height", 3: "width"},
 }
+# Every graph's export: without weights, or constant folding (which would rename them), on the TorchScript
+# exporter (PyTorch's dynamo one is the default where there's a choice)
+ONNX_KWARGS = dict(export_params=False, opset_version=17, do_constant_folding=False)
+if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+    ONNX_KWARGS["dynamo"] = False
 
 
 def _attention(q, k, v, mask=None, upcast=False, scale=None):
@@ -76,7 +81,7 @@ def _traceable_attention():
     import ldm_patched.ldm.modules.attention as attention
 
     swaps = [(F, "scaled_dot_product_attention", _sdpa)]
-    swaps += [(attention, name, _optimized_attention) for name in ("optimized_attention", "optimized_attention_masked") if hasattr(attention, name)]
+    swaps += [(attention, name, _optimized_attention) for name in ("optimized_attention", "optimized_attention_masked")]
     originals = [(owner, name, getattr(owner, name)) for owner, name, _ in swaps]
     for owner, name, fn in swaps:
         setattr(owner, name, fn)
@@ -188,9 +193,6 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
     if arch.adm_channels:
         inputs.append(torch.randn(2, arch.adm_channels, dtype=dtype, device=device))
     paths = {"unet": os.path.join(folder, "unet.onnx"), "shallow": os.path.join(folder, "shallow.onnx")}
-    common_kwargs = dict(export_params=False, opset_version=17, do_constant_folding=False)
-    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
-        common_kwargs["dynamo"] = False
     axes = {k: v for k, v in DYNAMIC_AXES.items() if k in names or k == "latent"}
     log(f"Exporting the {arch.name} UNet graphs...")
     shallow = True
@@ -203,7 +205,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
             axes["deep"] = {0: "batch", 2: "height", 3: "width"} if scale == 1 else {0: "batch", 2: "deep_height", 3: "deep_width"}
             info = {"channels": int(deep.shape[1]), "scale": int(scale), "branch": speed.BRANCH}
             unet.forward = types.MethodType(_as_full, unet)  # the parameters keep their names
-            torch.onnx.export(unet, tuple(inputs), paths["unet"], input_names=names, output_names=["latent", "deep"], dynamic_axes=axes, **common_kwargs)
+            torch.onnx.export(unet, tuple(inputs), paths["unet"], input_names=names, output_names=["latent", "deep"], dynamic_axes=axes, **ONNX_KWARGS)
         except Exception as e:  # the UNet as reForge runs it, without Speed Hacks
             traceback.print_exc()
             log(f"Could not export the UNet with its deep feature ({e}); exporting it without Speed Hacks.")
@@ -211,12 +213,12 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
             with contextlib.suppress(AttributeError):
                 del unet.forward
             axes.pop("deep", None)
-            torch.onnx.export(unet, tuple(inputs), paths["unet"], input_names=names, output_names=["latent"], dynamic_axes=axes, **common_kwargs)
+            torch.onnx.export(unet, tuple(inputs), paths["unet"], input_names=names, output_names=["latent"], dynamic_axes=axes, **ONNX_KWARGS)
         try:
             if shallow:
                 unet.forward = types.MethodType(_as_shallow, unet)
                 torch.onnx.export(
-                    unet, (*inputs, deep), paths["shallow"], input_names=names + ["deep"], output_names=["latent"], dynamic_axes=axes, **common_kwargs
+                    unet, (*inputs, deep), paths["shallow"], input_names=names + ["deep"], output_names=["latent"], dynamic_axes=axes, **ONNX_KWARGS
                 )
         except Exception as e:
             traceback.print_exc()
@@ -404,7 +406,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
     folder = store.work_dir(arch)
     shutil.rmtree(folder, ignore_errors=True)
     os.makedirs(folder)
-    records, result, warnings, hack_errors = [], {"ok": True}, 0, []
+    records, result, memory_warnings, hack_errors = [], {"ok": True}, 0, []
     before = {r.engine_key: r for r in store.engines(arch.id)}  # what these builds replace
     vae_part = vae_mod.needs_build(arch, profiles) if profiles else ""
     merged = mode == store.MERGED
@@ -444,7 +446,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             }
             log(f"Building the {arch.label} {what}, {detail}; the first build takes several minutes.")
             result = _build_plan(job, folder, step)
-            warnings += result.get("memory_warnings") or 0
+            memory_warnings += result.get("memory_warnings") or 0
             if not result["ok"]:
                 break
             hacks = shallow_plan = hack_error = None
@@ -458,7 +460,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 }
                 log(f"Building its Speed Hacks part, the shallow UNet ({len(shallow_job['weights'])} of {len(job['weights'])} weights).")
                 shallow = _build_plan(shallow_job, folder, shallow_step)
-                warnings += shallow.get("memory_warnings") or 0
+                memory_warnings += shallow.get("memory_warnings") or 0
                 if shallow.get("error") == "cancelled" or CANCEL.is_set():
                     result = {"ok": False, "error": "cancelled"}
                     break
@@ -494,7 +496,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             if hacks:
                 meta["speed_hacks"] = hacks
             else:
-                meta["speed_hacks_error"] = hack_error  # built since Speed Hacks, without them: not outdated
+                meta["speed_hacks_error"] = hack_error
                 replaced = before.get(store.merged_key([p for _, p in group]) if merged else store.profile_key(group[0][1]))
                 meta["speed_hacks_retried"] = replaced is not None and "speed_hacks_error" in replaced.meta
             records.append(store.save(arch, job["plan"], meta, shallow_plan))
@@ -504,13 +506,13 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             log(f"Building the {arch.label} engines for {vae_part}.")
             step = (lambda f, t: progress((len(groups) + f) / total, f"VAE: {t}")) if progress else None
             vae_record, vae_error, skipped = vae_mod.build(arch, profiles, folder, optimization_level, step)
-            warnings += skipped
+            memory_warnings += skipped
             if vae_record is not None:
                 log(f"Built the VAE's engines in {time.time() - start:.0f}s")
             elif vae_error == "cancelled" or CANCEL.is_set():
                 result = {"ok": False, "error": "cancelled"}
             else:
                 log(f"Building the VAE's engines failed ({vae_error}); the VAE runs on PyTorch.")
-        return {**result, "records": records, "memory_warnings": warnings, "hack_errors": hack_errors, "vae": vae_record, "vae_error": vae_error}
+        return {**result, "records": records, "memory_warnings": memory_warnings, "hack_errors": hack_errors, "vae": vae_record, "vae_error": vae_error}
     finally:
         shutil.rmtree(folder, ignore_errors=True)

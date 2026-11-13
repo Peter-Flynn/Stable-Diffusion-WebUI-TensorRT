@@ -71,7 +71,7 @@ class TrtModel:
         mm = common.mm()
         self.record = record
         self.owner = f"{record.arch.label} {record.label}"  # whose TensorRT memory it is (gpu.py)
-        self.hacks = record.speed_hacks  # read once: it checks the disk, and model_size() is called often
+        self.hacks = record.speed_hacks
         self.model = TensorRTUNet()
         self.load_device = mm.get_torch_device()
         self.offload_device = torch.device("cpu")
@@ -80,7 +80,6 @@ class TrtModel:
         self.shallow_failed = False  # its load failed: not tried again until this engine loads again
         self.weights = None  # EffectiveWeights the engines should run with
         self.applied = {}  # "unet" / "shallow" -> {weight name: signature of what's in that engine}
-        store.forget_sizes(record)
         self._plan_bytes = {}  # "unet" / "shallow" -> its plan file's size (read once: model_size() is called often)
         self.took = {}  # a pass's sizes (batch, height, width of its latents) -> what TensorRT turned out to take for its calls, where that didn't fit
         self.keep = True  # whether unloading keeps the engines in RAM as they are (refits.py)
@@ -481,15 +480,6 @@ class TrtUnet(sd_unet.SdUnet):
 
 def list_unets(options: list):
     options.append(SpeedHacksOption())
-    try:  # an engine per architecture had an entry of its own before ("[TRT] SDXL (...)")
-        from modules import shared
-
-        saved = shared.opts.data.get("sd_unet")
-        if isinstance(saved, str) and saved.startswith("[TRT] "):
-            shared.opts.data["sd_unet"] = AUTOMATIC
-            log(f"SD Unet was set to {saved}; engines don't have entries of their own anymore, so it's {AUTOMATIC} now.")
-    except Exception:
-        pass
 
 
 def _unsupported(patcher) -> str:
@@ -843,14 +833,10 @@ def _engine_records(patcher, x):
         notify(f"No profile of the {arch.label} engines covers {w * 8}x{h * 8} at batch size {b}; using PyTorch for this pass. Add one in the TensorRT tab.")
         return None, False
     hacks = chosen == SPEED_HACKS and any(r.speed_hacks for r in records)
-    if chosen == SPEED_HACKS:
-        outdated = sum(r.outdated for r in records)
-        failed = sum(not r.speed_hacks and not r.outdated for r in records)
-        if outdated:
-            notify(f"{outdated} of the {arch.label} engines were built before Speed Hacks, and run without them; build them again in the TensorRT tab.")
-        if failed:
-            retry = " Building them again in the TensorRT tab retries once." if any(r.retry_speed_hacks for r in records) else ""
-            notify(f"Speed Hacks couldn't be built for {failed} of the {arch.label} engines (the build's console output says why), so they run without them.{retry}")
+    failed = sum(not r.speed_hacks for r in records) if chosen == SPEED_HACKS else 0
+    if failed:
+        retry = " Building them again in the TensorRT tab retries once." if any(r.retry_speed_hacks for r in records) else ""
+        notify(f"Speed Hacks couldn't be built for {failed} of the {arch.label} engines (the build's console output says why), so they run without them.{retry}")
     return records, hacks
 
 

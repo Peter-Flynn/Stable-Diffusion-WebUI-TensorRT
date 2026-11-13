@@ -180,13 +180,10 @@ def register(model):
     minimum for inference, 0.8 GiB beside the reserve): an engine model makes exactly the room it needs as it
     loads, and as it runs. Raises what loading it raises, holding nothing then."""
     m = mm()
-    if not hasattr(m, "LoadedModel"):  # a reForge without it: its own way
-        m.load_models_gpu([model])
-        return
     entry = next((lm for lm in m.current_loaded_models if lm.model is model), None)
     if entry is not None:
         m.current_loaded_models.remove(entry)
-        if getattr(entry, "model_finalizer", None) is not None:
+        if entry.model_finalizer is not None:
             entry.model_finalizer.detach()  # model_load makes a new one
             entry.model_finalizer = None
     else:

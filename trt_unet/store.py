@@ -17,10 +17,8 @@ from . import common
 from .arch import Arch
 from .profiles import Profile
 
-FORMAT = 2  # an engine holds one profile, or (with "mode": "merged") several
 PER_PROFILE, MERGED = "per_profile", "merged"
 SHALLOW = ".shallow.plan"
-SIZES = ".sizes"  # an earlier version's file beside a plan: removed where found
 MODES = (PER_PROFILE, MERGED)
 
 
@@ -100,7 +98,7 @@ class Record:
 
     @property
     def mode(self) -> str:
-        return MERGED if self.meta.get("mode") == MERGED else PER_PROFILE
+        return self.meta["mode"]
 
     @property
     def merged(self) -> bool:
@@ -136,20 +134,15 @@ class Record:
     @property
     def speed_hacks(self):
         """{"deep": the deep feature's channels and scale, "shapes": each profile's shallow UNet input shapes,
-        "weights", "weight_bytes", ...}, or None if it was built without them (or before them)."""
-        hacks = self.meta.get("speed_hacks")
-        return hacks if hacks and os.path.isfile(self.shallow_plan) else None
-
-    @property
-    def outdated(self) -> bool:
-        """Built before Speed Hacks: building again adds them. (One whose Speed Hacks part failed to build isn't.)"""
-        return self.speed_hacks is None and "speed_hacks_error" not in self.meta
+        "weights", "weight_bytes", ...}, or None if its Speed Hacks part failed to build ("speed_hacks_error"
+        says why)."""
+        return self.meta.get("speed_hacks")
 
     @property
     def retry_speed_hacks(self) -> bool:
         """Its Speed Hacks part failed to build, and building again retries it, once: a failure that
         repeats likely always will."""
-        return self.speed_hacks is None and "speed_hacks_error" in self.meta and not self.meta.get("speed_hacks_retried")
+        return self.speed_hacks is None and not self.meta.get("speed_hacks_retried")
 
     @property
     def label(self) -> str:
@@ -199,19 +192,13 @@ class Record:
 
 
 def _read(meta_path: str):
+    """The engine described at meta_path, or None if it's incomplete (a plan missing: building again makes it)."""
     plan = meta_path[: -len(".json")] + ".plan"
     try:
         with open(meta_path, encoding="utf-8") as f:
-            meta = json.load(f)
-        if meta.get("format") == FORMAT and os.path.isfile(plan):
-            record = Record(plan, meta)
-            if len(record.profiles) != len(record.indexes) or len(record.profile_shapes) != len(record.indexes) or not record.indexes:
-                raise ValueError("its profiles, their shapes and their indexes don't match")
+            record = Record(plan, json.load(f))
+        if os.path.isfile(plan) and (record.shallow_plan is None or os.path.isfile(record.shallow_plan)):
             record.arch  # complete
-            hacks = meta.get("speed_hacks")
-            if hacks and (not isinstance(hacks.get("plan"), str) or len(hacks.get("shapes") or []) != len(record.indexes)):
-                common.log(f"Ignoring the Speed Hacks part of {meta_path}: its plan or shapes are missing")
-                meta.pop("speed_hacks")  # building again adds it
             return record
     except Exception as e:
         common.log(f"Ignoring {meta_path}: {e}")
@@ -240,12 +227,6 @@ def profiles_of(records: list) -> list:
     return [r.profiles[j] for r, j in slots(records)]
 
 
-def forget_sizes(record: Record):
-    """Removes the sizes an earlier version kept beside the record's plan."""
-    with contextlib.suppress(OSError):
-        os.remove(record.plan[: -len(".plan")] + SIZES)
-
-
 def _write_meta(base: str, meta: dict):
     with open(base + ".json.tmp", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=1)
@@ -255,12 +236,11 @@ def _write_meta(base: str, meta: dict):
 def save(arch: Arch, plan_tmp: str, meta: dict, shallow_tmp: str = None) -> Record:
     """meta has the mode and, per-profile, the profile (as a dict) and its index, or, merged, the profiles
     and their indexes, among the rest; with `shallow_tmp`, the shallow engine's "speed_hacks"."""
-    record = Record("", {"format": FORMAT, "arch": arch.to_dict(), **meta})
+    record = Record("", {"arch": arch.to_dict(), **meta})
     base = f"{_prefix(arch.id)}-{record.engine_key}"
     os.makedirs(os.path.dirname(base), exist_ok=True)
-    for old in (base + SHALLOW, base + SIZES):  # an older build's
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(old)
+    with contextlib.suppress(FileNotFoundError):  # the engine's last build's
+        os.remove(base + SHALLOW)
     if shallow_tmp:
         os.replace(shallow_tmp, base + SHALLOW)
         record.meta["speed_hacks"] = {**record.meta["speed_hacks"], "plan": os.path.basename(base) + SHALLOW}
@@ -278,25 +258,24 @@ def wanted_keys(profiles: list, mode_: str) -> set:
 
 def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
     """Deletes this GPU's and TensorRT version's engines for the architecture that these profiles don't
-    make in this mode (older formats' files too) and puts the others' profiles in the list's order.
-    Returns how many engines it deleted."""
+    make in this mode, and puts the others' profiles in the list's order. Returns how many engines it
+    deleted."""
     position = {profile_key(p): i for i, p in enumerate(profiles)}
     wanted = wanted_keys(profiles, mode_)
     prefix = _prefix(arch_id)
     deleted = 0
-    for path in glob.glob(glob.escape(prefix) + ".plan") + glob.glob(glob.escape(prefix) + "-*.plan"):
+    for path in glob.glob(glob.escape(prefix) + "-*.plan"):
         if path.endswith(SHALLOW):  # goes with its engine
             continue
         base = path[: -len(".plan")]
-        key = base[len(prefix) + 1:] if base != prefix else None
-        if key in wanted:
+        if base[len(prefix) + 1:] in wanted:
             record = _read(base + ".json")
             if record is not None:
                 indexes = [position[profile_key(p)] for p in record.profiles]
                 if indexes != record.indexes:
                     _write_meta(base, record.renumbered(indexes))
             continue
-        for stale in (path, base + ".json", base + SHALLOW, base + SIZES):
+        for stale in (path, base + ".json", base + SHALLOW):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stale)
         deleted += 1
@@ -307,7 +286,7 @@ def delete(group: list):
     """Deletes these engines (Records)."""
     for record in group:
         base = record.plan[: -len(".plan")]
-        for path in (record.plan, base + ".json", base + SHALLOW, base + SIZES):
+        for path in (record.plan, base + ".json", base + SHALLOW):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(path)
     for folder in {os.path.dirname(r.plan) for r in group}:

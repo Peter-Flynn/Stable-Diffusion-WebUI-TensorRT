@@ -158,7 +158,7 @@ def _plan(draft, records, mode):
     profiles that have no engine; merged, all of them unless the merged engine holds just these."""
     keys = _keys(draft)
     wanted = store.wanted_keys([Profile.from_dict(d) for d in draft], mode) if draft else set()
-    built = {r.engine_key for r in records if not r.outdated and not r.retry_speed_hacks}  # built again: from before Speed Hacks, or retrying them
+    built = {r.engine_key for r in records if not r.retry_speed_hacks}  # built again: retrying Speed Hacks
     if mode == store.MERGED:
         todo = list(range(len(draft))) if draft and not wanted <= built else []
     else:
@@ -205,10 +205,7 @@ def _status(sd_model, arch, records, asking=False) -> str:
     vae_engines = _vae_status(arch)
     if vae_engines:
         lines.append(vae_engines)
-    outdated = [r for r in records if r.outdated]
-    failed = [r for r in records if r.speed_hacks is None and not r.outdated]
-    if outdated:
-        lines.append(f"**{_n(len(outdated), 'engine')} {'was' if len(outdated) == 1 else 'were'} built before Speed Hacks:** build again to add them.")
+    failed = [r for r in records if r.speed_hacks is None]
     if failed:
         retry = "building again retries once" if any(r.retry_speed_hacks for r in failed) else "to try again, delete them and build again"
         lines.append(f"Speed Hacks couldn't be built for {_n(len(failed), 'engine')} (`{failed[0].meta['speed_hacks_error']}`), so they run without them; {retry}.")
@@ -262,7 +259,7 @@ def _draft_view(draft: list, records, mode, vae_part: str = "") -> str:
     rows = ["| # | Width | Height | Batch size | Prompt tokens | Engine |", "|:-:|:-:|:-:|:-:|:-:|:-:|"]
     for i, (d, key) in enumerate(zip(draft, _keys(draft))):
         p = Profile.from_dict(d)
-        again = (keys or {key}) <= exists  # built before Speed Hacks, or retrying them
+        again = (keys or {key}) <= exists  # retrying Speed Hacks
         state = ("**to rebuild** (Speed Hacks)" if again else "**to build**") if i in todo else "built"
         rows.append(f"| {i + 1} | {_span(p.width)} | {_span(p.height)} | {_span(p.batch)} | {_span(p.tokens)} | {state} |")
     rows.append("\n*Ranges show min-max (optimal).*")

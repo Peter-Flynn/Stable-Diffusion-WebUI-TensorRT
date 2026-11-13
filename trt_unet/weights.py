@@ -124,9 +124,7 @@ class EffectiveWeights:
         if convert is not None:
             weight = convert(weight, inplace=True)
         if patches:
-            try:
-                from ldm_patched.modules.lora import calculate_weight as calculate
-            except ImportError:
-                calculate = self.patcher.calculate_weight
-            weight = calculate(patches, weight, PREFIX + name)
+            from ldm_patched.modules.lora import calculate_weight
+
+            weight = calculate_weight(patches, weight, PREFIX + name)
         return weight.to(torch.float16).to(device)

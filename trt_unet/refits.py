@@ -119,10 +119,6 @@ def memory(reads: int = 1) -> tuple:
             time.sleep(0.2)
 
 
-def _supply() -> int:
-    return memory()[0]
-
-
 _windows_signal = None  # Windows: the low-memory notification's handle
 _stalls = collections.deque()  # Linux: (when, microseconds every task was stalled on memory at once, in all) at each look, the first the base of the window
 _settled = 0.0  # when (time.monotonic) an engine was last dropped: the window starts over
