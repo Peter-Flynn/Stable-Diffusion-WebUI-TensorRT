@@ -401,12 +401,13 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
     builder process of its own: per-profile, an engine for each, one at a time, so a build only ever holds
     one profile; merged, one engine holding them all. Each engine gets a shallow engine for Speed Hacks
     (speed.py) beside it; if that one can't be built, the engine is kept without it. Then, if the VAE's
-    engines (vae.py) don't cover `profiles` (all of the architecture's), it builds those. Returns the last
+    engines (vae_build.py) don't cover `profiles` (all of the architecture's), it builds those. Returns the last
     builder result, with "records": the engines saved, those before a failure or cancel included,
     "hack_errors": why shallow engines couldn't be built, and "vae": the VAE engines' Record, or
     "vae_error": why they couldn't be built."""
     from . import runtime
     from . import vae as vae_mod
+    from . import vae_build
 
     common.trt_version()  # installed and new enough
     runtime.release_all()
@@ -516,7 +517,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             start = time.time()
             logger.info(f"Building the engines for {vae_part}.")
             step = (lambda f, t: progress((len(groups) + f) / total, f"VAE: {t}")) if progress else None
-            vae_record, vae_error, skipped = vae_mod.build(arch, profiles, folder, optimization_level, step)  # (says why it failed)
+            vae_record, vae_error, skipped = vae_build.build(arch, profiles, folder, optimization_level, step)  # (says why it failed)
             memory_warnings += skipped
             if vae_record is not None:
                 logger.info(f"Built the VAE engines in {duration(time.time() - start)}.")

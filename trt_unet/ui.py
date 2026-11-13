@@ -4,7 +4,7 @@ import threading
 
 import gradio as gr
 
-from modules import sd_unet, shared
+from modules import shared
 from modules.ui_common import refresh_symbol
 from modules.ui_components import ToolButton
 
@@ -378,13 +378,11 @@ def change_mode(label, draft, draft_arch):
     return refresh(draft, draft_arch)
 
 
-def _refresh_unet_list():
+def _release_engines():
+    """Unloads every engine, and forgets them: before their files change."""
     from . import runtime
 
     runtime.release_all()
-    if hasattr(sd_unet.current_unet, "option") and isinstance(sd_unet.current_unet.option, runtime.SpeedHacksOption):
-        sd_unet.current_unet = sd_unet.current_unet_option = None
-    sd_unet.list_unets()
 
 
 def select_profile(draft, choice):
@@ -524,14 +522,13 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
                 profile_list = [Profile.from_dict(d) for d in draft]
                 todo, _ = _plan(draft, records, mode)
                 vae_part = _vae_part(draft)
-                _refresh_unet_list()
+                _release_engines()
                 result = {"ok": True, "records": []}
                 if todo or vae_part:
                     result = export.build(
                         arch, patcher, [(i, profile_list[i]) for i in todo], int(optimization_level), lambda f, t: progress(f, desc=t), mode, profiles=profile_list,
                     )
                 deleted = store.keep_only(arch.id, profile_list, mode) if result["ok"] else 0
-                _refresh_unet_list()
                 message = _outcome(arch, len(todo), deleted, result, mode)
     except Exception as e:
         common.logger.error(f"The build failed: {e}", exc_info=True)
@@ -558,10 +555,9 @@ def delete_engine(choice, draft, draft_arch):
     group = _groups().get(choice) if choice else None
     if group:
         with queue_lock:  # not while a generation uses them
-            _refresh_unet_list()
+            _release_engines()
             store.delete(group)
             vae_mod.delete_for(group[0].meta["arch"]["id"], group[0].meta["gpu"], group[0].meta["trt"])
-            sd_unet.list_unets()
         common.logger.info(f"Deleted {_n(len(group), 'engine')}: {choice}.")
     return refresh(draft, draft_arch)
 

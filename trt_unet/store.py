@@ -186,17 +186,12 @@ class Record:
                 total += os.path.getsize(path)
         return total
 
-    def describe(self) -> str:
-        what = f"merged, {len(self.indexes)} profiles" if self.merged else self.profiles[0].describe()
-        return f"{self.arch.label} · {what} · {self.meta['gpu']}, TensorRT {self.meta['trt']} · {common.gib(self.disk_bytes)}"
-
 
 def _read(meta_path: str):
     """The engine described at meta_path, or None if it's incomplete (a plan missing: building again makes it)."""
     plan = meta_path[: -len(".json")] + ".plan"
     try:
-        with open(meta_path, encoding="utf-8") as f:
-            record = Record(plan, json.load(f))
+        record = Record(plan, common.read_json(meta_path))
         if os.path.isfile(plan) and (record.shallow_plan is None or os.path.isfile(record.shallow_plan)):
             record.arch  # complete
             return record

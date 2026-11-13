@@ -339,10 +339,10 @@ class Engine:
             raise RuntimeError("TensorRT could not serialize the engine" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
         return serialized
 
-    def refit(self, names, tensor_for) -> dict:
+    def refit(self, names, tensor_for) -> float:
         """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name, "cpu")`: the
         weights in RAM, which TensorRT copies into its own memory, the only copy of them in VRAM. Returns the
-        seconds spent getting the weights ("weights") and in TensorRT ("tensorrt")."""
+        seconds it took."""
         refitter = trt.Refitter(self.engine, LOGGER)
         for setting, value in REFITTER_SETTINGS.items():
             try:
@@ -351,20 +351,16 @@ class Engine:
                 if setting not in _unsettable:
                     _unsettable.add(setting)
                     logger.debug(f"Couldn't set the refitter's {setting}: {e}")
-        keep, seconds = [], {"weights": 0.0, "tensorrt": 0.0}
+        keep, start = [], time.perf_counter()
 
         def put(name):
-            start = time.perf_counter()
             proto = refitter.get_weights_prototype(name)
             t = tensor_for(name, "cpu").to(dtype=torch_dtype(proto.dtype)).contiguous()
             if t.numel() != proto.size:
                 raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
             keep.append(t)
-            given = time.perf_counter()
-            seconds["weights"] += given - start
             if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), trt.TensorLocation.HOST):
                 raise RuntimeError(f"TensorRT rejected weight {name}")
-            seconds["tensorrt"] += time.perf_counter() - given
 
         LOGGER.clear()
         try:
@@ -372,18 +368,16 @@ class Engine:
                 put(name)
             for name in refitter.get_missing_weights():
                 put(name)
-            start = time.perf_counter()
             with self._taking():
                 try:
                     ok = refitter.refit_cuda_engine()
                 finally:
                     refitter.release_refit_resources()  # else the refit's scratch memory stays allocated as long as the engine
-            seconds["tensorrt"] += time.perf_counter() - start
         finally:
             keep.clear()  # an error's traceback keeps this frame, and would keep the weights (GBs)
         if not ok:
             raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
-        return seconds
+        return time.perf_counter() - start
 
     def _set_shapes(self, profile: int, shapes: dict, stream: int):
         """Selects the profile and input shapes on the context. What's recorded is only what TensorRT

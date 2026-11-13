@@ -135,14 +135,23 @@ PRESETS = {
         "512-768, batch 1-4": _p((512, 512, 768), (512, 512, 768), (1, 1, 4)),
     },
 }
+# Every base resolution, and Hires. fix up to 2x of them: what most generations need. The Hires. fix profile
+# starts at the smallest base size, since an upscaled portrait or landscape (e.g. 640x1536 at 1.5x: 960x2304)
+# is wider than the base profile on one side only.
+DEFAULTS = {
+    "xl": ("640-1536 (every SDXL resolution)", "640-3072 (Hires. fix up to 2x of every SDXL resolution)"),
+    "sd": ("512-768 (every SD 1.5 resolution)", "512-1536 (Hires. fix up to 2x of every SD 1.5 resolution)"),
+}
+
+
+def _family(adm_channels: int) -> str:
+    return "xl" if adm_channels else "sd"
 
 
 def presets_for(adm_channels: int) -> dict:
-    return PRESETS["xl" if adm_channels else "sd"]
+    return PRESETS[_family(adm_channels)]
 
 
 def default_profiles(adm_channels: int) -> list:
-    """Every base resolution, and Hires. fix up to 2x of them: what most generations need. The Hires. fix
-    profile starts at the smallest base size, since an upscaled portrait or landscape (e.g. 640x1536 at
-    1.5x: 960x2304) is wider than the base profile on one side only."""
-    return [p for name, p in presets_for(adm_channels).items() if "every" in name]
+    family = _family(adm_channels)
+    return [PRESETS[family][name] for name in DEFAULTS[family]]

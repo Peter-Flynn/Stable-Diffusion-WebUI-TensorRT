@@ -27,7 +27,7 @@ from modules import sd_unet
 
 from . import arch as arch_mod
 from . import common, gpu, profiles, refits, speed, store, working
-from . import vae as vae_mod
+from . import vae_run
 from .common import inference_mode, logger, notify
 from .weights import EffectiveWeights
 
@@ -359,7 +359,7 @@ class TrtModel:
             torch.cuda.current_stream().synchronize()  # no inference in flight while the weights change
             seconds = engine.refit(changed, weights.tensor)
             self.applied[role] = wanted
-            refit = {"seconds": sum(seconds.values()), "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
+            refit = {"seconds": seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
             total = refit if total is None else {k: total[k] + refit[k] for k in refit}
         if total is not None and not quiet:
             logger.debug(f"The {self.name} {_refit_times(total)}.")
@@ -405,7 +405,7 @@ def release_all():
         _unload(model, keep=False)
     _models.clear()
     _last_used.clear()
-    vae_mod.release_all()
+    vae_run.release_all()
     refits.clear()
     common.mm().soft_empty_cache(force=True)
 
@@ -471,8 +471,11 @@ class TrtUnet(sd_unet.SdUnet):
         raise RuntimeError("TensorRT engines run through the UNet's own forward")
 
 
+_SPEED_HACKS_OPTION = SpeedHacksOption()  # one: reForge tells options apart by identity, and would switch between copies
+
+
 def list_unets(options: list):
-    options.append(SpeedHacksOption())
+    options.append(_SPEED_HACKS_OPTION)
 
 
 def _unsupported(patcher) -> str:
@@ -618,7 +621,7 @@ class Pass:
     the pass falls back to PyTorch, with the UNet loaded the way reForge would have."""
 
     def __init__(self, records: list, patcher, x, hacks: bool = False):
-        self.records, self.patcher = records, patcher
+        self.patcher = patcher
         self.schedule = speed.Schedule(*speed_settings()) if hacks else None
         self.slots = store.slots(records)  # (record, optimization profile in it), in the profiles' order
         self.model = None
@@ -994,6 +997,19 @@ def _wrap_cleanup(original):
     return sampling_cleanup
 
 
+def _wrap_close(original):
+    """reForge closes a generation's processing object however the generation ended: one that failed
+    mid-pass never cleaned its pass up, which would keep holding the engine and the UNet against every
+    load until the next generation."""
+
+    def close(self, *args, **kwargs):
+        end_pass()
+        return original(self, *args, **kwargs)
+
+    close._trt_original = original
+    return close
+
+
 def _wrap_denoiser(original):
     """reForge's CFG denoiser runs one evaluation of the sampler (its UNet calls for every cond): tells the
     pass's Speed Hacks schedule which one, out of how many, at which latent."""
@@ -1015,7 +1031,7 @@ def _wrap_denoiser(original):
 
 
 def _wrap_vae_decode(original):
-    """Decodes on the VAE decoder's engines when SD Unet runs the engines (vae.py), with the room it needs
+    """Decodes on the VAE decoder's engines when SD Unet runs the engines (vae_run.py), with the room it needs
     made by reForge's manager like any model's (the UNet engines are evicted last, and only if that makes
     the room); anything else decodes on PyTorch, as reForge would."""
 
@@ -1024,7 +1040,7 @@ def _wrap_vae_decode(original):
         # while the generation's thread samples on the UNet engine.
         if not vae_options and setting() in (AUTOMATIC, SPEED_HACKS) and threading.get_ident() == _generation_thread:
             try:
-                pixels = vae_mod.decode(self, samples_in)
+                pixels = vae_run.decode(self, samples_in)
                 if pixels is not None:
                     return pixels
             except Exception as e:
@@ -1042,7 +1058,7 @@ def _wrap_vae_encode(original):
     def encode(self, pixel_samples):
         if setting() in (AUTOMATIC, SPEED_HACKS) and threading.get_ident() == _generation_thread:
             try:
-                latents = vae_mod.encode(self, pixel_samples)
+                latents = vae_run.encode(self, pixel_samples)
                 if latents is not None:
                     return latents
             except Exception as e:
@@ -1078,10 +1094,13 @@ def _hook_failed(message: str):
 def install_hooks():
     """Idempotent."""
     from ldm_patched.ldm.modules.diffusionmodules import openaimodel
+    from modules import processing
     from modules_forge import forge_sampler
 
     if not hasattr(openaimodel.UNetModel.forward, "_trt_original"):
         openaimodel.UNetModel.forward = _wrap_forward(openaimodel.UNetModel.forward)
+    if not hasattr(processing.StableDiffusionProcessing.close, "_trt_original"):
+        processing.StableDiffusionProcessing.close = _wrap_close(processing.StableDiffusionProcessing.close)
     _rebind(forge_sampler, "sampling_prepare", _wrap_prepare)
     _rebind(forge_sampler, "sampling_cleanup", _wrap_cleanup)
     _rebind(common.mm(), "free_memory", _wrap_free_memory)
@@ -1133,7 +1152,7 @@ def new_generation(p=None):
         for model in list(_models.values()):
             if model.loaded:
                 _unload(model, keep=False)
-        vae_mod.release_all()
+        vae_run.release_all()
         refits.clear()
     else:
         refits.trim()

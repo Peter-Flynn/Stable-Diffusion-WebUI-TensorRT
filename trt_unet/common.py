@@ -1,5 +1,7 @@
 import functools
+import json
 import logging
+import os
 import sys
 
 import torch
@@ -74,6 +76,22 @@ def trt_version() -> str:
 
 def trt_tag(version: str = None) -> str:
     return "trt" + ".".join((version or trt_version()).split(".")[:2])
+
+
+_json = {}  # path -> (what identifies the file's version, its contents)
+
+
+def read_json(path: str):
+    """A JSON file's contents, parsed once for each version of the file: engines' files are read on every
+    sampling pass and decode. Each version is a new file (they're written beside and moved into place), so
+    its inode, modification time and size tell it apart. Shared between callers, so never changed."""
+    stat = os.stat(path)
+    version = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+    cached = _json.get(path)
+    if cached is None or cached[0] != version:
+        with open(path, encoding="utf-8") as f:
+            cached = _json[path] = (version, json.load(f))
+    return cached[1]
 
 
 def gib(n: float) -> str:

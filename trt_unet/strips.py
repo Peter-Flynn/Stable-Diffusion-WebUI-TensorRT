@@ -1200,7 +1200,7 @@ class Encode(Decode):
         def fill(held):
             held[-1].t.copy_(image[0].permute(1, 0, 2))
             if self.scale != 1.0:
-                held[-1].t.mul_(self.scale)  # as the scaled encoder takes it (vae._EncodePre)
+                held[-1].t.mul_(self.scale)  # as the scaled encoder takes it (vae_build._EncodePre)
 
         held, stats = self._run(plan, h, w, fill)
         return self._out(held[len(plan.stages) - 1].t), stats

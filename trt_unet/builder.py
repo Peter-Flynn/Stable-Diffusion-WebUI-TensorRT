@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 
 import tensorrt as trt
 from tqdm import tqdm
@@ -218,23 +219,24 @@ def _exit_with_parent():
 
 
 def main(job_path):
-    with open(job_path, encoding="utf-8") as f:
-        job = json.load(f)
     _exit_with_parent()
-    logger = Logger()
-    strip = job.get("strip", True)
+    logger, strip = Logger(), True
     result = {"ok": False, "error": None}
     try:
+        with open(job_path, encoding="utf-8") as f:
+            job = json.load(f)
+        strip = job.get("strip", True)
         log("DEBUG", f"Building {os.path.basename(job['plan'])} with TensorRT {trt.__version__}.")
         build(job, logger, Progress(_progress_sender()), strip=strip)
         result["ok"] = True
     except Exception as e:  # export.py says it
-        result["error"] = str(e)
+        result["error"] = str(e) or type(e).__name__
+        if not isinstance(e, RuntimeError):  # (TensorRT's own failures say it all)
+            log("DEBUG", f"The build failed:\n{traceback.format_exc().rstrip()}")
         # TensorRT refusing to strip the weights: export.py builds again without, in a new process (this
         # one still holds what the failed build left behind)
         result["retry_without_strip"] = strip and isinstance(e, NoEngine) and any(w in " ".join(logger.errors).lower() for w in ("refit", "strip", "weight"))
     result["memory_warnings"] = logger.memory_warnings
-    result["memory_example"] = logger.memory_example
     _send(RESULT, result)
     return 0 if result["ok"] else 1
 
