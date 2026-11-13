@@ -1,12 +1,10 @@
-"""reForge runs every extension's preload.py before any extension's scripts. TensorRT's Python bindings look up
-TensorRT's functions once, when they're imported, and take a TensorRT that's visible to the whole process over
-their own: another extension that loads one that way first (e.g. sd-forge-nvidia-vfx, with TensorRT 10) would
-leave this extension calling it, and no engine would load. Importing TensorRT here binds the bindings to their
-own TensorRT first. It stays private to them, so other extensions keep using theirs."""
-
+# reForge runs every extension's preload.py before any extension's scripts. Importing tensorrt here, first,
+# binds its Python bindings to this extension's own libnvinfer. If another extension (e.g. sd-forge-nvidia-vfx,
+# with TensorRT 10) loads a different libnvinfer into the process before that import, the bindings resolve to
+# it instead, and no engine deserializes.
 import importlib
 
 try:
     importlib.import_module("tensorrt")
-except Exception:  # not installed yet: install.py installs it, and the tab says so
+except Exception:
     pass

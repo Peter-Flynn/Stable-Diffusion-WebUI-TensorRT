@@ -6,15 +6,12 @@ import sys
 
 import torch
 
-# Everything this extension says goes through here, at reForge's --loglevel and in its format.
 logger = logging.getLogger("TensorRT")
 
 _notified = set()
 
 
 def notify(message: str, error: BaseException = None):
-    """A warning in the console and in the UI, once per generation. With an unexpected `error`, an error
-    in the console, with its traceback."""
     if message in _notified:
         return
     _notified.add(message)
@@ -30,7 +27,7 @@ def notify(message: str, error: BaseException = None):
         pass
 
 
-generation = 0  # counts generations, for what's computed once per generation
+generation = 0
 
 
 def new_generation():
@@ -46,9 +43,8 @@ def mm():
 
 
 def inference_mode(fn):
-    """reForge creates and moves its weights in inference mode; moving them outside it leaves weights
-    restored after a LoRA unusable ("Inference tensors do not track version counter")."""
-
+    # reForge creates and moves its weights under torch.inference_mode(). Loading or unloading a model outside it
+    # breaks weights restored after a LoRA ("Inference tensors do not track version counter").
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         with torch.inference_mode():
@@ -66,7 +62,6 @@ MIN_TRT = 11
 
 
 def trt_version() -> str:
-    """The installed TensorRT's version; raises if it's missing or older than this extension needs."""
     import tensorrt
 
     if int(tensorrt.__version__.split(".")[0]) < MIN_TRT:
@@ -78,13 +73,13 @@ def trt_tag(version: str = None) -> str:
     return "trt" + ".".join((version or trt_version()).split(".")[:2])
 
 
-_json = {}  # path -> (what identifies the file's version, its contents)
+_json = {}
 
 
 def read_json(path: str):
-    """A JSON file's contents, parsed once for each version of the file: engines' files are read on every
-    sampling pass and decode. Each version is a new file (they're written beside and moved into place), so
-    its inode, modification time and size tell it apart. Shared between callers, so never changed."""
+    # Engine metadata is read on every sampling pass and decode, so parsed once per version of the file. Every write
+    # is a new file renamed into place, so (inode, mtime, size) identifies a version. The returned dict is shared:
+    # never mutate it.
     stat = os.stat(path)
     version = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
     cached = _json.get(path)
@@ -99,7 +94,6 @@ def gib(n: float) -> str:
 
 
 def duration(seconds: float) -> str:
-    """For people: "0.4s", "12s", "3m 05s"."""
     if seconds < 10:
         return f"{seconds:.1f}s"
     if seconds < 60:
@@ -107,35 +101,27 @@ def duration(seconds: float) -> str:
     return f"{int(seconds // 60)}m {int(seconds % 60):02d}s"
 
 
-# --- Making room in VRAM: exact sizes, through reForge's model manager
-
-
-BUFFER = 0.10  # added to every estimate of VRAM something is about to take, before it's weighed or room is made
+BUFFER = 0.10
 
 
 def padded(nbytes: int) -> int:
-    """An estimate with the buffer on top."""
     return int(nbytes * (1 + BUFFER))
 
 
 def usable(room: int) -> int:
-    """What an estimate may be for it to fit `room` with the buffer on top."""
     return int(room / (1 + BUFFER))
 
 
 def pooled() -> bool:
-    """Whether what PyTorch has freed is only reliably usable once it's back with the driver: with
-    --cuda-malloc it stays in the driver's pool in the blocks it was freed in, which a later request of
-    another size often can't have (seen: 1.7 GiB unused and a 0.5 GiB request failing); and TensorRT on
-    its own allocator can't have PyTorch's cache at all."""
+    # True when memory PyTorch has freed can only be relied on after empty_cache() returns it to the driver. With
+    # --cuda-malloc it stays in the driver's pool in the block sizes it was freed in (seen: 1.7 GiB unused, a 0.5 GiB
+    # request failing). With TensorRT on its own allocator, TensorRT can't use PyTorch's cache at all.
     from . import gpu
 
     return not gpu.attached() or gpu.backend() != "native"
 
 
 def trim():
-    """Gives what PyTorch holds unused back to the driver, where it has to be to be used (pooled). (It waits
-    for the GPU to be done with it first.)"""
     if pooled():
         try:
             torch.cuda.empty_cache()
@@ -144,8 +130,6 @@ def trim():
 
 
 def reserve() -> int:
-    """The VRAM reForge keeps free for what no allocator counts (other applications, CUDA's own code): its
-    --reserve-vram, or its default for the OS. The only margin anything here keeps."""
     try:
         return int(mm().extra_reserved_memory())
     except Exception:
@@ -153,11 +137,6 @@ def reserve() -> int:
 
 
 def _free_now(device) -> int:
-    """VRAM an allocation could have now: what the driver has free, and, with PyTorch's native allocator,
-    what it holds unused in its cache. Otherwise (pooled) that goes back to the driver first, and what's
-    still unused then isn't counted: it's pieces of blocks still in use, which nothing can have (seen: 130
-    to 340 MiB). reForge counts the driver's free memory plus PyTorch's reserved less its active whatever
-    the allocator. reForge's count is used where the device isn't CUDA's."""
     try:
         if torch.device(device).type == "cuda":
             cached = 0
@@ -173,14 +152,10 @@ def _free_now(device) -> int:
 
 
 def free(device) -> int:
-    """VRAM free beside the reserve (_free_now)."""
     return _free_now(device) - reserve()
 
 
 def obtainable(device, keep=(), engines: bool = True) -> int:
-    """The most VRAM making room could give: what's free now (PyTorch's unused cache included, which
-    TensorRT allocates from too), and what every loaded model but those in `keep` holds; UNet engines' too
-    (models `evicted_last`) unless not `engines`."""
     m = mm()
     held = sum(
         lm.model_loaded_memory()
@@ -192,16 +167,14 @@ def obtainable(device, keep=(), engines: bool = True) -> int:
 
 
 def register(model):
-    """Has reForge's manager hold `model` as loaded and the most recently used, as load_models_gpu does but
-    without the room that makes first by its own estimate (1.3 times the model's size, and at least its
-    minimum for inference, 0.8 GiB beside the reserve): an engine model makes exactly the room it needs as it
-    loads, and as it runs. Raises what loading it raises, holding nothing then."""
+    # What load_models_gpu does, minus its free_memory call, which would evict by reForge's own estimate (1.3x the
+    # model's size, at least 0.8 GiB). Engine models make exactly the room they need inside partially_load.
     m = mm()
     entry = next((lm for lm in m.current_loaded_models if lm.model is model), None)
     if entry is not None:
         m.current_loaded_models.remove(entry)
         if entry.model_finalizer is not None:
-            entry.model_finalizer.detach()  # model_load makes a new one
+            entry.model_finalizer.detach()  # model_load() creates a new one
             entry.model_finalizer = None
     else:
         entry = m.LoadedModel(model)
@@ -211,27 +184,20 @@ def register(model):
 
 
 def make_room(nbytes: int, device, keep_loaded=()) -> int:
-    """Has reForge's manager evict models (least recently used first; engines last, see runtime.py) until
-    `nbytes` are free beside the reserve: nothing, if they are already; again while it's short and the
-    asking freed something (a model reForge unloads in part gives back a little less than it was asked
-    for). Returns what's free then, beside the reserve."""
     m = mm()
     had = free(device)
     for _ in range(16):
         if had >= nbytes:
             break
-        with torch.inference_mode():  # models unloaded outside it are left unusable (see inference_mode)
-            # By reForge's own count, which can be short of what's free (_free_now): what it counts free
-            # now, and the shortfall more
+        # Loops because a model reForge unloads partially frees a little less than asked. The request is in reForge's
+        # own count of free memory, which can be lower than free().
+        with torch.inference_mode():
             m.free_memory(m.get_free_memory(device) + nbytes - had, device, keep_loaded=list(keep_loaded))
         now = free(device)
-        if now <= had:  # nothing more goes
+        if now <= had:
             break
         had = now
     return had
-
-
-# --- Memory diagnostics, at DEBUG: they only read counters, and change nothing.
 
 
 def _loaded_models() -> str:
@@ -245,7 +211,6 @@ def _loaded_models() -> str:
 
 
 def _tensorrt() -> str:
-    """What TensorRT holds in VRAM through PyTorch's allocator, by owner, and its activation memory."""
     from . import gpu
     from .engine import Arena
 
@@ -257,7 +222,6 @@ def _tensorrt() -> str:
 
 
 def _ram() -> str:
-    """The RAM free (as refits.memory counts it), what this extension holds there, and what's in swap."""
     from . import refits, strips
 
     supply, _, total = refits.memory()
@@ -277,7 +241,6 @@ def _ram() -> str:
 
 
 def memory(when: str):
-    """Logs, at DEBUG, what holds VRAM and RAM `when` ("after loading ...")."""
     if not logger.isEnabledFor(logging.DEBUG):
         return
     try:

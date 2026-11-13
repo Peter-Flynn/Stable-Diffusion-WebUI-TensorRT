@@ -1,16 +1,13 @@
-"""Tidies the traced ONNX graph before TensorRT gets it. The export runs without constant folding, to keep
-the weights' names, so the tracer writes out every computation it sees: constants and arithmetic on them,
-and the shape bookkeeping around each reshape, which TensorRT would make layers of their own (SDXL's graph
-has about 14,000 nodes, half of them that). Weights still enter as reForge stores them: entering the Linear
-ones transposed would take a transposed copy of most of the weights at every load."""
-
+# Cleans up the traced ONNX graph before TensorRT parses it. Export runs without constant folding (folding would
+# rename the weights), so the graph holds every constant computation the tracer saw, including the shape arithmetic
+# around each reshape, which TensorRT would turn into layers (about half of SDXL's ~14,000 nodes).
 import collections
 
 import numpy as np
 import onnx
 from onnx import helper, numpy_helper
 
-MAX_FOLDED = 1 << 16  # elements: larger constant results stay computed, so the graph file stays small
+MAX_FOLDED = 1 << 16  # elements: larger constant results stay as nodes, keeping the .onnx file small
 _FOLDABLE = {
     "Abs", "Add", "Cast", "Ceil", "Concat", "ConstantOfShape", "Cos", "Div", "Equal", "Exp", "Expand", "Flatten", "Floor",
     "Gather", "Greater", "Identity", "Less", "Log", "Max", "Min", "Mul", "Neg", "Not", "Pow", "Range", "Reciprocal",
@@ -19,18 +16,16 @@ _FOLDABLE = {
 
 
 def tidy(model, weights) -> tuple:
-    """Rewrites `model` (opset 17) in place; `weights` are the graph inputs the checkpoint provides. Returns
-    the number of nodes before and after."""
     graph = model.graph
     start = len(graph.node)
     _unsqueezed_weights(graph, set(weights))
-    for _ in range(4):  # each pass knows more sizes, from the shapes the last one made constant
+    for _ in range(4):  # each pass makes more shapes constant, which lets the next fold more
         before = len(graph.node)
         _fold(model, graph)
         _drop_unused(graph)
         if len(graph.node) == before:
             break
-    del graph.value_info[:]  # the tracer's, partly about tensors that are gone now
+    del graph.value_info[:]
     return start, len(graph.node)
 
 
@@ -50,9 +45,9 @@ def _constants(graph) -> dict:
 
 
 def _unsqueezed_weights(graph, weights):
-    """A weight that only feeds an Unsqueeze (GroupNorm's scale and shift), or a chain of them, becomes the
-    result: the graph input takes the unsqueezed shape. The values' layout is the same, so the checkpoint's
-    weight goes in as it is (TensorRT counts a weight's values, not its dims)."""
+    # A weight whose only use is an Unsqueeze (GroupNorm's scale and shift) becomes a graph input of the unsqueezed
+    # shape instead. Same values in the same order, and TensorRT only checks a refitted weight's element count, so
+    # the checkpoint's tensor still refits it as is.
     inputs = {i.name: i for i in graph.input}
     consts = _constants(graph)
     while True:
@@ -85,8 +80,6 @@ def _unsqueezed_weights(graph, weights):
 
 
 def _dims(model) -> dict:
-    """Each tensor's dims as ONNX shape inference sees them: an int if static, a symbol name if not, None
-    if unknown. Empty if inference fails."""
     try:
         inferred = onnx.shape_inference.infer_shapes(model, data_prop=True).graph
     except Exception:
@@ -106,10 +99,9 @@ def _evaluate(node, values):
 
 
 def _fold(model, graph):
-    """Computes what doesn't depend on the inputs' values: constant arithmetic, the static sizes in shape
-    computations, and reshapes whose only dynamic sizes are ones they keep (written as 0, "same as the input")."""
     dims, values = _dims(model), _constants(graph)
-    # Shape outputs -> their input; a dynamic size, as a scalar or a 1-element list -> (tensor, axis); Concat parts
+    # shape_of: Shape output -> its input. scalar_size_of / size_of: a dynamic dim as a scalar / 1-element list ->
+    # (tensor, axis). parts_of: Concat output -> its parts, ints or (tensor, axis).
     shape_of, scalar_size_of, size_of, parts_of = {}, {}, {}, {}
     folded, new_nodes = set(), []
     for node in graph.node:
@@ -132,7 +124,7 @@ def _fold(model, graph):
                 if all(isinstance(x, int) for x in picked):
                     values[out] = np.array(picked, dtype=np.int64).reshape(index.shape)
                     folded.add(out)
-                elif index.ndim == 1 and index.size == 1:  # like an unsqueezed scalar gather
+                elif index.ndim == 1 and index.size == 1:
                     size_of[out] = (source, int(index[0]) % len(d))
                 elif index.ndim == 0:
                     scalar_size_of[out] = (source, int(index) % len(d))
@@ -181,8 +173,8 @@ def _fold(model, graph):
 
 
 def _keep_dynamic(parts, data_dims, dims):
-    """A constant shape for a reshape whose dynamic sizes are each the input's size at the same position
-    (0 in an ONNX reshape), or None."""
+    # A constant Reshape target, possible when each dynamic dim equals the input's dim at the same position: ONNX
+    # Reshape reads 0 as "keep the input's dim".
     if data_dims is None:
         return None
     shape = []

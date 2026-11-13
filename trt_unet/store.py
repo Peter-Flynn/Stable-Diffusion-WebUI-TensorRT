@@ -1,10 +1,9 @@
-"""Engines on disk: models/Unet-trt/<arch id>/<gpu>-<trt>-<key>.plan, with a .json describing it and, for
-Speed Hacks (speed.py), the shallow UNet's engine as <...>.shallow.plan beside it. In
-per-profile mode an architecture has an engine per profile (the key is the profile's); in merged mode, one
-engine holding all of its profiles (the key is "merged-" and the profiles'). Plans hold no weights, so
-they're small; weights come from whatever checkpoint is loaded. The mode is for every engine: it can only
-change while there are none (models/Unet-trt/settings.json keeps the choice)."""
-
+# Engines on disk: models/Unet-trt/<arch id>/<gpu>-<trt>-<key>.plan, a .json of its metadata beside it, and for Speed
+# Hacks the shallow UNet's engine as <...>.shallow.plan. Per-profile mode: one engine per profile, keyed by the
+# profile. Merged mode: one engine holding all the architecture's profiles, keyed "merged-" + a hash of their keys.
+# A record's "index"/"indexes" are its profiles' positions in the architecture's profile list. Plans hold no weights:
+# they're refitted from the loaded checkpoint. The mode applies to every engine and can only change while none exist
+# (models/Unet-trt/settings.json).
 import contextlib
 import glob
 import hashlib
@@ -43,7 +42,6 @@ def profile_key(profile: Profile) -> str:
 
 
 def merged_key(profiles: list) -> str:
-    """A merged engine's key: its profiles', in any order (reordering them only renumbers them)."""
     return "merged-" + hashlib.sha1(json.dumps(sorted(profile_key(p) for p in profiles)).encode()).hexdigest()[:10]
 
 
@@ -61,7 +59,6 @@ def _saved_mode():
 
 
 def mode() -> str:
-    """The engine mode: that of the engines on disk if there are any, else the one chosen last, else per-profile."""
     found = {r.mode for r in records()}
     if len(found) == 1:
         return found.pop()
@@ -69,7 +66,6 @@ def mode() -> str:
 
 
 def set_mode(new: str):
-    """Only while there are no engines at all: the engines on disk decide the mode otherwise."""
     if new not in MODES:
         raise ValueError(f"Unknown engine mode {new!r}")
     if records():
@@ -80,15 +76,11 @@ def set_mode(new: str):
 
 
 def _prefix(arch_id: str) -> str:
-    """Where this GPU's and TensorRT version's engines for an architecture are, but for their profile key."""
     return os.path.join(root(), arch_id, f"{common.gpu_tag()}-{common.trt_tag()}")
 
 
 @dataclass
 class Record:
-    """An engine: one profile of an architecture (per-profile mode), or all of them (merged mode). Its
-    optimization profiles are in `profiles` order; `indexes` says where each is in the architecture's list."""
-
     plan: str
     meta: dict = field(repr=False)
 
@@ -110,7 +102,6 @@ class Record:
 
     @property
     def profile_shapes(self) -> list:
-        """Each profile's UNet input shapes."""
         return self.meta["shapes"] if self.merged else [self.meta["shapes"]]
 
     @property
@@ -119,7 +110,6 @@ class Record:
 
     @property
     def index(self) -> int:
-        """Where its first profile is in the architecture's list."""
         return min(self.indexes)
 
     @property
@@ -133,25 +123,18 @@ class Record:
 
     @property
     def speed_hacks(self):
-        """{"deep": the deep feature's channels and scale, "shapes": each profile's shallow UNet input shapes,
-        "weights", "weight_bytes", ...}, or None if its Speed Hacks part failed to build ("speed_hacks_error"
-        says why)."""
         return self.meta.get("speed_hacks")
 
     @property
     def retry_speed_hacks(self) -> bool:
-        """Its Speed Hacks part failed to build, and building again retries it, once: a failure that
-        repeats likely always will."""
         return self.speed_hacks is None and not self.meta.get("speed_hacks_retried")
 
     @property
     def label(self) -> str:
-        """For people: "engine for profile 2", "merged engine (3 profiles)"."""
         n = len(self.indexes)
         return f"merged engine ({n} profile{'' if n == 1 else 's'})" if self.merged else f"engine for profile {self.indexes[0] + 1}"
 
     def renumbered(self, indexes: list) -> dict:
-        """Its meta with its profiles at these places in the architecture's list."""
         return {**self.meta, "indexes": list(indexes)} if self.merged else {**self.meta, "index": indexes[0]}
 
     @property
@@ -168,7 +151,6 @@ class Record:
 
     @property
     def group(self) -> tuple:
-        """The engines built together: one architecture's, for one GPU and TensorRT version."""
         return self.meta["arch"]["id"], self.meta["gpu"], common.trt_tag(self.meta["trt"])
 
     @property
@@ -188,12 +170,11 @@ class Record:
 
 
 def _read(meta_path: str):
-    """The engine described at meta_path, or None if it's incomplete (a plan missing: building again makes it)."""
     plan = meta_path[: -len(".json")] + ".plan"
     try:
         record = Record(plan, common.read_json(meta_path))
         if os.path.isfile(plan) and (record.shallow_plan is None or os.path.isfile(record.shallow_plan)):
-            record.arch  # complete
+            record.arch
             return record
     except Exception as e:
         common.logger.debug(f"Ignoring {meta_path}, which couldn't be read: {e}")
@@ -201,24 +182,19 @@ def _read(meta_path: str):
 
 
 def records() -> list:
-    """Every engine, each architecture's in its profiles' order."""
     found = [r for r in (_read(p) for p in glob.glob(os.path.join(root(), "*", "*.json"))) if r is not None]
     return sorted(found, key=lambda r: (r.group, r.index))
 
 
 def engines(arch_id: str) -> list:
-    """This GPU's and TensorRT version's engines for an architecture, in their profiles' order."""
     return [r for r in records() if r.meta["arch"]["id"] == arch_id and r.loadable]
 
 
 def slots(records: list) -> list:
-    """(Record, optimization profile in it) for every profile these engines hold, in the architecture's
-    profile order."""
     return sorted(((r, j) for r in records for j in range(len(r.indexes))), key=lambda s: s[0].indexes[s[1]])
 
 
 def profiles_of(records: list) -> list:
-    """The Profiles these engines hold, in the architecture's order."""
     return [r.profiles[j] for r, j in slots(records)]
 
 
@@ -229,12 +205,10 @@ def _write_meta(base: str, meta: dict):
 
 
 def save(arch: Arch, plan_tmp: str, meta: dict, shallow_tmp: str = None) -> Record:
-    """meta has the mode and, per-profile, the profile (as a dict) and its index, or, merged, the profiles
-    and their indexes, among the rest; with `shallow_tmp`, the shallow engine's "speed_hacks"."""
     record = Record("", {"arch": arch.to_dict(), **meta})
     base = f"{_prefix(arch.id)}-{record.engine_key}"
     os.makedirs(os.path.dirname(base), exist_ok=True)
-    with contextlib.suppress(FileNotFoundError):  # the engine's last build's
+    with contextlib.suppress(FileNotFoundError):
         os.remove(base + SHALLOW)
     if shallow_tmp:
         os.replace(shallow_tmp, base + SHALLOW)
@@ -247,20 +221,16 @@ def save(arch: Arch, plan_tmp: str, meta: dict, shallow_tmp: str = None) -> Reco
 
 
 def wanted_keys(profiles: list, mode_: str) -> set:
-    """The engine keys these profiles make in this mode."""
     return {merged_key(profiles)} if mode_ == MERGED else {profile_key(p) for p in profiles}
 
 
 def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
-    """Deletes this GPU's and TensorRT version's engines for the architecture that these profiles don't
-    make in this mode, and puts the others' profiles in the list's order. Returns how many engines it
-    deleted."""
     position = {profile_key(p): i for i, p in enumerate(profiles)}
     wanted = wanted_keys(profiles, mode_)
     prefix = _prefix(arch_id)
     deleted = 0
     for path in glob.glob(glob.escape(prefix) + "-*.plan"):
-        if path.endswith(SHALLOW):  # goes with its engine
+        if path.endswith(SHALLOW):
             continue
         base = path[: -len(".plan")]
         if base[len(prefix) + 1:] in wanted:
@@ -278,7 +248,6 @@ def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
 
 
 def delete(group: list):
-    """Deletes these engines (Records)."""
     for record in group:
         base = record.plan[: -len(".plan")]
         for path in (record.plan, base + ".json", base + SHALLOW):

@@ -18,9 +18,10 @@ NEW = "New profile"
 FIELD_LABELS = {"width": "Width", "height": "Height", "batch": "Batch size", "tokens": "Prompt tokens"}
 LEVEL_LABELS = {"min": "min", "opt": "optimal", "max": "max"}
 BUILDING = threading.Event()
-SETTLED = threading.Event()  # the engine mode was chosen (or engines were there) since the WebUI started
+# Per process: each WebUI start with no engines asks for the mode again, even if one was saved before.
+SETTLED = threading.Event()
 MODE_LABELS = {store.PER_PROFILE: "Per-profile engines", store.MERGED: "Merged engine"}
-MERGED_VRAM, MERGED_RAM = 24, 64  # GB a merged engine needs
+MERGED_VRAM, MERGED_RAM = 24, 64
 HELP = """
 **Engines** are compiled for a UNet architecture, not a checkpoint: every checkpoint with that architecture (fine-tunes, merges, v-prediction ones) runs on the same engines with its own weights, LoRAs included. Engine files hold no weights.
 
@@ -48,7 +49,6 @@ def _n(count: int, word: str) -> str:
 
 
 def _machine():
-    """(total VRAM, total RAM) in bytes; either may be None."""
     vram = ram = None
     try:
         import torch
@@ -59,7 +59,7 @@ def _machine():
     try:
         from . import refits
 
-        ram = refits.memory()[2]  # (on Linux from the kernel's own counts, without psutil)
+        ram = refits.memory()[2]
     except Exception:
         pass
     return vram, ram
@@ -89,9 +89,7 @@ def _mode_of(label) -> str:
 
 
 def _mode_outputs(selected=None):
-    """The engine mode panel, and whether the rest of the tab shows: when the WebUI starts with no engines,
-    the tab first asks for the mode; while there are engines, it can't change."""
-    have = bool(store.records())  # any architecture's, built for any GPU or TensorRT version
+    have = bool(store.records())
     if have:
         SETTLED.set()
     mode = store.mode()
@@ -113,18 +111,14 @@ def _mode_outputs(selected=None):
 
 
 def _preset_values():
-    """{name: the 12 form values} of every family's presets (their names are distinct)."""
     return {name: [v for f in FIELDS for v in getattr(p, f)] for presets in PRESETS.values() for name, p in presets.items()}
 
 
 def _preset_choices(arch):
-    """The loaded architecture's presets."""
     return list(_preset_values()) if arch is None else list(presets_for(arch.adm_channels))
 
 
 def _current():
-    """(sd_model, patcher, arch, records) for the loaded checkpoint: records are its architecture's engines
-    (maybe none); the others may be None."""
     sd_model = arch_mod.loaded_model()
     patcher = arch_mod.unet_patcher(sd_model)
     arch = arch_mod.detect(patcher) if patcher is not None else None
@@ -138,7 +132,6 @@ def _current():
 
 
 def _stale(arch) -> list:
-    """Engines for this architecture that were built for another GPU or TensorRT version (one such build's)."""
     if arch is None:
         return []
     try:
@@ -153,11 +146,9 @@ def _keys(draft) -> list:
 
 
 def _plan(draft, records, mode):
-    """(indexes of the draft's profiles to build, how many engines building deletes): per-profile, the
-    profiles that have no engine; merged, all of them unless the merged engine holds just these."""
     keys = _keys(draft)
     wanted = store.wanted_keys([Profile.from_dict(d) for d in draft], mode) if draft else set()
-    built = {r.engine_key for r in records if not r.retry_speed_hacks}  # built again: retrying Speed Hacks
+    built = {r.engine_key for r in records if not r.retry_speed_hacks}
     if mode == store.MERGED:
         todo = list(range(len(draft))) if draft and not wanted <= built else []
     else:
@@ -212,7 +203,6 @@ def _status(sd_model, arch, records, asking=False) -> str:
 
 
 def _vae_status(arch) -> str:
-    """What the loaded VAE's engines run, for the status ("" if it has none)."""
     try:
         vae = vae_mod.loaded_vae()
         record = vae_mod.record_for(arch.id, vae) if vae is not None and not vae_mod.unsupported(vae) else None
@@ -228,7 +218,6 @@ def _vae_status(arch) -> str:
 
 
 def _vae_part(draft) -> str:
-    """What building the draft builds of the VAE's engines (vae.needs_build), "" if nothing."""
     try:
         return vae_mod.needs_build(arch_mod.detect(), [Profile.from_dict(d) for d in draft])
     except Exception as e:
@@ -237,7 +226,6 @@ def _vae_part(draft) -> str:
 
 
 def _vae_line(part: str) -> str:
-    """The profile table's note on the VAE's engines; `part` is what building builds of them (_vae_part)."""
     if not vae_mod.available():
         return ""
     if part:
@@ -258,7 +246,7 @@ def _draft_view(draft: list, records, mode, vae_part: str = "") -> str:
     rows = ["| # | Width | Height | Batch size | Prompt tokens | Engine |", "|:-:|:-:|:-:|:-:|:-:|:-:|"]
     for i, (d, key) in enumerate(zip(draft, _keys(draft))):
         p = Profile.from_dict(d)
-        again = (keys or {key}) <= exists  # retrying Speed Hacks
+        again = (keys or {key}) <= exists
         state = ("**to rebuild** (Speed Hacks)" if again else "**to build**") if i in todo else "built"
         rows.append(f"| {i + 1} | {_span(p.width)} | {_span(p.height)} | {_span(p.batch)} | {_span(p.tokens)} | {state} |")
     rows.append("\n*Ranges show min-max (optimal).*")
@@ -285,7 +273,6 @@ def _index(choice):
 
 
 def _draft_outputs(draft, records, select=None):
-    """Profile table, profile selector and build button for a draft."""
     mode = store.mode()
     choices = [NEW] + [_label(i, d) for i, d in enumerate(draft)]
     selected = _label(select, draft[select]) if select is not None and select < len(draft) else NEW
@@ -305,7 +292,6 @@ def _draft_outputs(draft, records, select=None):
 
 
 def _groups() -> dict:
-    """{label: the engines one architecture has for one GPU and TensorRT version}."""
     groups = {}
     for r in store.records():
         groups.setdefault(f"{r.arch.label} · {r.meta['gpu_name']}, TensorRT {r.meta['trt']}", []).append(r)
@@ -327,8 +313,6 @@ def _engines_view(arch) -> str:
 
 
 def refresh(draft=None, draft_arch=None, selected=None):
-    """Everything on the tab, for the loaded checkpoint. Profiles being edited stay unless the architecture
-    changed; `selected` is the engine mode picked but not chosen yet."""
     sd_model, _, arch, records = _current()
     form = [gr.update()] * (len(FIELDS) * 3)
     if arch is not None and (draft is None or draft_arch != arch.id):
@@ -355,19 +339,15 @@ def refresh(draft=None, draft_arch=None, selected=None):
 
 
 def choose_mode(label, draft, draft_arch):
-    """The first-start prompt's answer."""
     try:
         store.set_mode(_mode_of(label))
         SETTLED.set()
-    except Exception as e:  # engines appeared meanwhile: they decide
+    except Exception as e:
         common.logger.warning(f"Couldn't set the engine mode: {e}")
     return refresh(draft, draft_arch)
 
 
 def change_mode(label, draft, draft_arch):
-    """The mode picked in the panel: saved right away once the first-start prompt is answered (only while
-    there are no engines; the panel hides otherwise), kept as a pick until then. Not during a build: its
-    engines will decide the mode."""
     if not SETTLED.is_set():
         return refresh(draft, draft_arch, selected=label)
     if _mode_of(label) != store.mode() and not BUILDING.is_set():
@@ -379,7 +359,6 @@ def change_mode(label, draft, draft_arch):
 
 
 def _release_engines():
-    """Unloads every engine, and forgets them: before their files change."""
     from . import runtime
 
     runtime.release_all()
@@ -394,7 +373,6 @@ def select_profile(draft, choice):
 
 
 def _read_profile(values):
-    """(Profile, note) from the form, or (None, error)."""
     try:
         numbers = [int(v) for v in values]
     except (TypeError, ValueError):
@@ -409,8 +387,6 @@ def _read_profile(values):
 
 
 def _same_as(draft, profile, skip=None):
-    """The index of the draft's profile equal to `profile`, `skip` aside, or None: profiles are one engine
-    each, so each is listed once."""
     key = store.profile_key(profile)
     return next((i for i, k in enumerate(_keys(draft)) if k == key and i != skip), None)
 
@@ -509,11 +485,11 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
     export.CANCEL.clear()
     BUILDING.set()
     try:
-        with queue_lock:  # not during a generation
+        with queue_lock:
             _, patcher, arch, records = _current()
             if arch is None:
                 raise RuntimeError("Load a checkpoint TensorRT engines can run first.")
-            if arch.id != draft_arch:  # the checkpoint changed since the tab showed these profiles
+            if arch.id != draft_arch:
                 message, draft = "### Nothing built\nThe loaded checkpoint has another architecture now. Check its profiles, then build.", None
             elif not draft:
                 raise RuntimeError("Add at least one profile.")
@@ -535,11 +511,11 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
         message = f"### The build failed\n`{e}`"
     finally:
         BUILDING.clear()
-    return message, draft  # the rest of the tab is refreshed next, without progress shown on all of it
+    return message, draft
 
 
 def _build_started():
-    return gr.update(interactive=False), gr.update(visible=True), "", gr.update(interactive=False)  # the mode too, until its engines exist
+    return gr.update(interactive=False), gr.update(visible=True), "", gr.update(interactive=False)
 
 
 def cancel_build():
@@ -554,7 +530,7 @@ def delete_engine(choice, draft, draft_arch):
 
     group = _groups().get(choice) if choice else None
     if group:
-        with queue_lock:  # not while a generation uses them
+        with queue_lock:
             _release_engines()
             store.delete(group)
             vae_mod.delete_for(group[0].meta["arch"]["id"], group[0].meta["gpu"], group[0].meta["trt"])
@@ -563,7 +539,6 @@ def delete_engine(choice, draft, draft_arch):
 
 
 def on_ui_settings():
-    """Speed Hacks' full steps, in Settings, Stable Diffusion, TensorRT."""
     from . import runtime, speed
 
     section, slider = ("tensorrt", "TensorRT"), {"minimum": 0, "maximum": 100, "step": 1}
@@ -624,13 +599,14 @@ def on_ui_tabs():
         draft_outputs = [draft, table, selector, build_button]
         mode_outputs = [mode_title, mode_radio, mode_help, mode_confirm, main]
         outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, cancel_button, *mode_outputs]
-        # In the browser; the preset menu empties again so the same preset can be picked twice.
+        # Outputs null to the preset menu last, emptying it, so picking the same preset again still fires .change.
         preset.change(
             None, [preset], [*numbers, preset],
             **{JS: f"(name, ...current) => [...(({json.dumps(presets)})[name] || current.slice(0, {len(numbers)})), null]"},
         )
-        quiet = {"show_progress": "hidden"}  # quick updates: no progress overlay on every component they touch
-        refresh_button.click(refresh, [draft, draft_arch], outputs, **quiet)  # also clicked when the tab opens (javascript/tensorrt.js)
+        quiet = {"show_progress": "hidden"}
+        # javascript/tensorrt.js clicks this button whenever the tab is opened: the loaded checkpoint may have changed.
+        refresh_button.click(refresh, [draft, draft_arch], outputs, **quiet)
         tab.load(refresh, None, outputs, **quiet)
         mode_confirm.click(choose_mode, [mode_radio, draft, draft_arch], outputs, **quiet)
         mode_radio.change(change_mode, [mode_radio, draft, draft_arch], outputs, **quiet)
@@ -638,7 +614,6 @@ def on_ui_tabs():
         add_button.click(add_profile, [draft, *numbers], [*draft_outputs, note], **quiet)
         save_button.click(save_profile, [draft, selector, *numbers], [*draft_outputs, note], **quiet)
         remove_button.click(remove_profile, [draft, selector], [*draft_outputs, note], **quiet)
-        # The build's progress shows once, in its result.
         build_button.click(_build_started, None, [build_button, cancel_button, result, mode_radio], queue=False, **quiet).then(
             build, [draft, draft_arch, level], [result, draft]
         ).then(refresh, [draft, draft_arch], outputs, **quiet)

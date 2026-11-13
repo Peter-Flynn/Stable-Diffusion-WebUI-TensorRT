@@ -1,18 +1,9 @@
-"""Running reForge's UNet on a TensorRT engine.
-
-An architecture has an engine per profile, or one merged engine holding them all (store.py), and a sampling
-pass loads the one for its sizes; only one is in VRAM at a time. Each is a model of reForge's own model
-manager, held like any other (it makes exactly its room as it loads), but evicted only as a last resort
-(_wrap_free_memory): an engine comes back without its weights. One that's unloaded
-is kept in RAM as it is, weights and all, while RAM allows (refits.py), and comes back from there for the
-same weights; otherwise every weight is refitted. While a sampling pass runs on an engine, the PyTorch UNet
-stays in RAM (its patches still apply, it just isn't loaded).
-
-Whether a pass fits is worked out before anything loads (_fits), from what it will take: the engine, which
-is its weights and its plan, and the working memory of its UNet calls, which is the image's size: so many
-bytes for each pixel of each image of the batch, by the UNet's architecture (working.py). One that doesn't fit runs on
-PyTorch, with the figures said. Nothing of this is kept on disk."""
-
+# Runs reForge's UNet on TensorRT engines. A hook on UNetModel.forward sends each UNet call of a sampling pass (a Pass)
+# to the engine whose profile fits its shapes; anything an engine can't run falls back to PyTorch for the rest of the
+# pass. Each engine is a model in reForge's model manager (TrtModel). Only one is in VRAM at a time, and the manager
+# evicts engines only as a last resort, because loading one means refitting every weight (or restoring it from RAM,
+# refits.py). Before anything loads, _fits checks the engine and the pass's working memory (working.py) can fit in
+# VRAM at all; if not, the pass runs on PyTorch. During a pass the PyTorch UNet stays patched but unloaded, in RAM.
 import contextlib
 import math
 import os
@@ -31,9 +22,9 @@ from . import vae_run
 from .common import inference_mode, logger, notify
 from .weights import EffectiveWeights
 
-_models = {}  # Record.key -> TrtModel
-_last_used = {}  # arch id -> Record.key of the engine the batch being generated last ran on (see new_batch)
-_pass = None  # the sampling pass running on an engine
+_models = {}
+_last_used = {}
+_pass = None
 
 
 class Fallback(Exception):
@@ -41,48 +32,42 @@ class Fallback(Exception):
 
 
 class TensorRTUNet:
-    """What the model manager holds for an engine (its name shows in reForge's log)."""
+    pass
 
 
 def call_bytes(model, patcher, x) -> int:
-    """The working VRAM a pass on latents `x` takes for its UNet calls: by the architecture and the images'
-    size (working.py), for as many images as a call runs at once (both halves of the guidance where a
-    profile of the engine takes them, padded to the profile's least: _call_shapes)."""
     found = _call_shapes(model, x)
     batch = found[1]["sample"][0] if found is not None else 2 * x.shape[0]
     return working.call_bytes(model.record.arch, patcher, batch, x.shape[3] * 8, x.shape[2] * 8)
 
 
 class DoesNotFit(RuntimeError):
-    """A pass's engine and calls can't be in VRAM together: said with the figures."""
+    pass
 
 
 class TrtModel:
-    """An engine as reForge's model manager sees a model (the parts of ModelPatcher it uses), with its
-    shallow partner for Speed Hacks (speed.py), loaded only for passes that use them. The two share their
-    activation memory, since they never run at once. Loaded, its size is what its engines hold in VRAM
-    (gpu.py); before that, what they will (full)."""
-
+    # Implements the parts of ModelPatcher that reForge's LoadedModel calls, so the model manager can hold an engine
+    # (and its Speed Hacks partner) like any model. Its size is what gpu.py measured once loaded, an estimate before.
     parent = None
-    evicted_last = True  # by reForge's manager (_wrap_free_memory), and not counted on for room otherwise (common.obtainable)
+    evicted_last = True
 
     def __init__(self, record: store.Record):
         mm = common.mm()
         self.record = record
-        self.owner = f"{record.arch.label} {record.label}"  # whose TensorRT memory it is (gpu.py)
-        self.name = f"{record.arch.name} {record.label}"  # for people
+        self.owner = f"{record.arch.label} {record.label}"  # key into gpu.py's per-owner accounting: must be unique
+        self.name = f"{record.arch.name} {record.label}"
         self.hacks = record.speed_hacks
         self.model = TensorRTUNet()
         self.load_device = mm.get_torch_device()
         self.offload_device = torch.device("cpu")
         self.engine = self.shallow = None
-        self.want_shallow = False  # load the shallow engine with this one
-        self.shallow_failed = False  # its load failed: not tried again until this engine loads again
-        self.weights = None  # EffectiveWeights the engines should run with
-        self.applied = {}  # "unet" / "shallow" -> {weight name: signature of what's in that engine}
-        self._plan_bytes = {}  # "unet" / "shallow" -> its plan file's size (read once: model_size() is called often)
-        self.took = {}  # a pass's sizes (batch, height, width of its latents) -> what TensorRT turned out to take for its calls, where that didn't fit
-        self.keep = True  # whether unloading keeps the engines in RAM as they are (refits.py)
+        self.want_shallow = False
+        self.shallow_failed = False
+        self.weights = None
+        self.applied = {}
+        self._plan_bytes = {}
+        self.took = {}  # latent (batch, h, w) -> VRAM TensorRT actually needed to run it, recorded when it didn't fit
+        self.keep = True  # whether unloading serializes the engine to RAM first (refits.py)
 
     def _engines(self):
         if self.engine is None:
@@ -96,12 +81,10 @@ class TrtModel:
 
     @property
     def opened(self) -> bool:
-        """Whether its engine is in VRAM, with or without weights."""
         return self.engine is not None and self.engine.loaded
 
     @property
     def loaded(self) -> bool:
-        """Whether its engine is in VRAM with weights in it."""
         return self.opened and bool(self.applied.get("unet"))
 
     @property
@@ -109,8 +92,6 @@ class TrtModel:
         return self.shallow is not None and self.shallow.loaded
 
     def full(self, shallow: bool, kept=None) -> int:
-        """What the engines hold in VRAM once loaded: their weights and their plans' size, or, as kept in
-        RAM with their weights, that serialized engine's bytes."""
         total = 0
         for role in ("unet", "shallow") if shallow else ("unet",):
             blob = kept.blobs.get(role) if kept is not None else None
@@ -141,22 +122,18 @@ class TrtModel:
         return other is self
 
     def partially_load(self, device, extra_memory=0, force_patch_weights=False):
-        """Loads the engines, with room made for what that takes (full). A load that fails is tried once
-        more: on TensorRT's own allocator if PyTorch's could be why
-        (engine.own_allocator), else with all the room there is, if it ran out (or, without PyTorch's
-        allocator, for all that's known)."""
         from . import engine as engine_mod
 
         if self.loaded:
             return 0
-        if self.weights is None:  # a load outside a sampling pass: the loaded checkpoint's weights
+        if self.weights is None:  # loaded by reForge outside a sampling pass: use the loaded checkpoint's weights
             patcher = arch_mod.unet_patcher()
             if patcher is None:
                 raise RuntimeError("no checkpoint to take the engine's weights from")
             self.weights = EffectiveWeights(patcher)
         shallow = bool(self.hacks and self.want_shallow)
         start, need = time.time(), 0
-        if self.opened:  # in VRAM without its weights (a refit that failed): from the start
+        if self.opened:  # in VRAM without weights, after a failed refit
             self._discard()
         for attempt in (0, 1):
             load, failures = {}, gpu.failures()
@@ -174,15 +151,15 @@ class TrtModel:
                 plan_seconds += more
                 break
             except Exception as e:
-                past = self.opened  # it deserialized, and failed past that
+                past = self.opened
                 if not attempt:
-                    e.__traceback__ = None  # it holds the failed load's frames, and through them what TensorRT allocated for it
+                    e.__traceback__ = None  # its frames reference what TensorRT allocated for the failed load
                 self._discard()
                 if attempt:
                     raise
                 if past and engine_mod.own_allocator(failures, self.owner, e):
                     continue
-                if gpu.attached() and not load.get("failures") and gpu.failures() == failures:  # it didn't run out: more room changes nothing
+                if gpu.attached() and not load.get("failures") and gpu.failures() == failures:  # didn't run out: more room won't help
                     raise
                 logger.debug(f"Loading the {self.name} ran out of VRAM with {common.gib(need)} freed ({e}); freeing all there is and trying again.")
         refits.used(self.record.key)
@@ -193,22 +170,19 @@ class TrtModel:
         return self.model_size()
 
     def _load_engines(self, kept) -> tuple:
-        """With the UNet engine deserialized: (what refitting took, None if they came as they were kept; the
-        seconds loading the shallow engine took; what was kept in RAM of them, if they came from there.)"""
         plan_seconds = 0.0
         kept = kept if "unet" in self.applied else None
         if self.want_shallow and self.shallow is not None:
             try:
                 plan_seconds += self._load("shallow", self.shallow, kept)
-            except Exception as e:  # the engine runs without it
+            except Exception as e:
                 notify(f"Couldn't load the Speed Hacks part of the {self.name}, so it runs without Speed Hacks: {e}")
                 self.shallow.unload()
                 self.want_shallow, self.shallow_failed = False, True
-        refit = self.sync(quiet=True)  # what isn't in them yet: everything, unless they came as they were kept
+        refit = self.sync(quiet=True)
         return refit, plan_seconds, kept
 
     def _discard(self):
-        """Unloads what a failed load left, keeping nothing of it in RAM."""
         self.keep = False
         try:
             self.detach()
@@ -217,8 +191,6 @@ class TrtModel:
         gpu.forget(self.owner)
 
     def _load(self, role: str, engine, kept) -> float:
-        """Loads one of the engines: as kept in RAM with its weights, if it is (what it holds then goes to
-        `applied`, so nothing is refitted), else its plan, without weights. Returns the seconds it took."""
         blob = kept.blobs.get(role) if kept is not None else None
         self.applied.pop(role, None)
         if blob is not None:
@@ -233,8 +205,6 @@ class TrtModel:
         return engine.load()
 
     def _kept(self):
-        """This engine as kept in RAM (refits.Kept), if what's kept holds the weights wanted now. One kept
-        for other weights is dropped: the engine will be kept again, as it is then, when it's next unloaded."""
         entry = refits.get(self.record.key)
         if entry is None:
             return None
@@ -245,8 +215,6 @@ class TrtModel:
         return None
 
     def _keep(self):
-        """Before the engines unload: they go to RAM as they are, weights and all (refits.py), unless they're
-        kept with these weights already, the weights aren't the loaded checkpoint's anymore, or RAM is short."""
         loaded = {role: e for role, e in (("unet", self.engine), ("shallow", self.shallow)) if e is not None and e.loaded and self.applied.get(role)}
         if "unet" not in loaded or not self._current():
             why = "it holds no weights" if "unet" not in loaded else "its weights aren't the loaded checkpoint's"
@@ -264,7 +232,7 @@ class TrtModel:
             logger.debug(f"Not keeping the {label} in RAM: {refits.explain()}.")
             return
         start = time.time()
-        torch.cuda.current_stream().synchronize()  # no inference in flight
+        torch.cuda.current_stream().synchronize()
         blobs = dict(entry.blobs) if entry is not None else {}
         signatures = dict(entry.signatures) if entry is not None else {}
         for role in todo:
@@ -275,8 +243,6 @@ class TrtModel:
         logger.debug(f"Kept the {label} in RAM ({common.gib(kept.nbytes)}, {time.time() - start:.1f}s); {count} kept in all, {common.gib(total)}.")
 
     def _serialized_size(self, role: str) -> int:
-        """About what serializing an engine with its weights takes in RAM: its plan (kernels and all, without
-        weights) and its weights."""
         plan, weights = (self.record.plan, self.record.weight_bytes) if role == "unet" else (self.record.shallow_plan, self.hacks["weight_bytes"])
         if role not in self._plan_bytes:
             try:
@@ -286,13 +252,9 @@ class TrtModel:
         return weights + self._plan_bytes[role]
 
     def _source(self):
-        """() -> the UNet module the engine's weights are from, or None once it's gone: its signatures' weak
-        reference to it."""
         return next(iter(self.applied["unet"].values()))[0][0].ref
 
     def _current(self) -> bool:
-        """Whether the weights in the engine are the loaded checkpoint's UNet's (another checkpoint's
-        would never be asked for again)."""
         try:
             module = self._source()()
             return module is not None and module is arch_mod.unet_patcher().model.diffusion_model
@@ -300,7 +262,6 @@ class TrtModel:
             return False
 
     def load_shallow(self):
-        """The shallow engine, for an engine loaded without it, with room made for what it takes (full)."""
         if not self.loaded or self.shallow is None or self.shallow.loaded:
             return
         kept = self._kept() if self.weights is not None else None
@@ -325,7 +286,7 @@ class TrtModel:
             if self.keep and self.loaded:
                 try:
                     self._keep()
-                except Exception as e:  # unloads all the same: loading again refits
+                except Exception as e:
                     logger.warning(f"Couldn't keep the {self.name} in RAM, so loading it again will refit it: {e}")
             if self.shallow is not None:
                 self.shallow.unload()
@@ -339,23 +300,19 @@ class TrtModel:
         return self.model
 
     def sync(self, quiet=False):
-        """Refits the weights whose source changed, in each loaded engine: all of them for a new engine or
-        checkpoint, the patched ones when LoRAs change. Returns what _refit_times reports, or None if
-        nothing changed."""
         weights = self.weights
         weights.refresh()
         total = None
         for role, engine in (("unet", self.engine), ("shallow", self.shallow)):
             if engine is None or not engine.loaded:
                 continue
-            # The UNet's weights; anything else refittable keeps what the plan holds.
             wanted = {name: weights.signature(name) for name in engine.weight_names if weights.has(name)}
             applied = self.applied.get(role, {})
             changed = [name for name in wanted if applied.get(name) != wanted[name]]
             if not changed:
                 continue
             self.applied[role] = {}
-            refits.drop(self.record.key, role)  # what's kept in RAM of it holds other weights than it will now
+            refits.drop(self.record.key, role)  # the copy kept in RAM holds the old weights
             torch.cuda.current_stream().synchronize()  # no inference in flight while the weights change
             seconds = engine.refit(changed, weights.tensor)
             self.applied[role] = wanted
@@ -372,14 +329,11 @@ def _refit_times(refit: dict) -> str:
 
 
 def _loaded_entries(*models):
-    """The manager's entries for these models (or clones of them)."""
     return [lm for lm in common.mm().current_loaded_models if lm.model is not None and any(lm.model is m or m.is_clone(lm.model) for m in models)]
 
 
 @inference_mode
 def _unload(model: TrtModel, keep: bool = True):
-    """Unloads an engine: kept in RAM as it is, to come back without a refit (refits.py), unless `keep` is
-    False (it's being cleared out, not making room)."""
     mm = common.mm()
     model.keep = keep
     try:
@@ -392,7 +346,6 @@ def _unload(model: TrtModel, keep: bool = True):
 
 
 def end_pass():
-    """Ends the sampling pass running on an engine, if any: its hooks on the model manager go."""
     global _pass
     p, _pass = _pass, None
     if p is not None:
@@ -400,7 +353,7 @@ def end_pass():
 
 
 def release_all():
-    end_pass()  # a generation that failed mid-pass left its hooks in place
+    end_pass()
     for model in list(_models.values()):
         _unload(model, keep=False)
     _models.clear()
@@ -413,7 +366,7 @@ def release_all():
 def model_for(record: store.Record) -> TrtModel:
     model = _models.get(record.key)
     if model is None or model.record.meta != record.meta:
-        if model is not None:  # built again
+        if model is not None:
             _unload(model, keep=False)
             refits.drop(record.key)
         model = _models[record.key] = TrtModel(record)
@@ -424,8 +377,6 @@ AUTOMATIC, SPEED_HACKS = "Automatic", "Speed Hacks"
 
 
 def setting() -> str:
-    """SD Unet: "Automatic" runs the loaded checkpoint's architecture's engines, "Speed Hacks" runs them with
-    Speed Hacks (speed.py), anything else (reForge's "None") runs PyTorch."""
     try:
         from modules import shared
 
@@ -434,29 +385,24 @@ def setting() -> str:
         return AUTOMATIC
 
 
-# Settings (Stable Diffusion, TensorRT; ui.py adds them): the percentage of a pass's steps that Speed Hacks
-# run in full at its start and at its end.
 FULL_START, FULL_END = "trt_speed_hacks_full_start", "trt_speed_hacks_full_end"
 
 
 def speed_settings() -> tuple:
-    """(share at the start, share at the end), as speed.Schedule takes them."""
     from modules import shared
 
     def share(key, default):
         try:
             return min(max(float(getattr(shared.opts, key)) / 100, 0.0), 1.0)
-        except Exception:  # not registered (e.g. a settings UI that failed to load)
+        except Exception:
             return default
 
     return share(FULL_START, speed.WARMUP), share(FULL_END, speed.TAIL)
 
 
 class SpeedHacksOption(sd_unet.SdUnetOption):
-    """SD Unet's "Speed Hacks" entry. "Automatic" needs none: the engines run whenever it's chosen."""
-
     label = SPEED_HACKS
-    model_name = None  # never what "Automatic" picks
+    model_name = None  # so "Automatic" never selects it
 
     def create_unet(self):
         return TrtUnet(self)
@@ -471,7 +417,7 @@ class TrtUnet(sd_unet.SdUnet):
         raise RuntimeError("TensorRT engines run through the UNet's own forward")
 
 
-_SPEED_HACKS_OPTION = SpeedHacksOption()  # one: reForge tells options apart by identity, and would switch between copies
+_SPEED_HACKS_OPTION = SpeedHacksOption()  # one instance: reForge compares options by identity when re-listing them
 
 
 def list_unets(options: list):
@@ -515,8 +461,8 @@ def _no_free_memory(memory_required, device, keep_loaded=[]):
 
 @contextlib.contextmanager
 def _keeping(*models):
-    """Model loads in here don't unload these models: unloading the UNet mid-pass would undo its patches
-    (e.g. its model sampling), which the pass still needs while the engine runs."""
+    # Loads inside this block can't evict these models. During a pass the UNet must stay loaded (unloading it undoes its
+    # patches, e.g. model sampling, which the pass still uses) and so must the engine (it would reload on the next step).
     mm = common.mm()
     original = mm.free_memory
 
@@ -530,13 +476,11 @@ def _keeping(*models):
         mm.free_memory = original
 
 
-_evicting = 0  # > 0 while loads may evict engines like any other model (see _evictable)
+_evicting = 0  # > 0 inside _evictable(): loads for PyTorch's UNet and unload_all_models evict engines normally
 
 
 @contextlib.contextmanager
 def _evictable():
-    """Loads in here evict engines the way reForge evicts any model: a pass on PyTorch's UNet doesn't use
-    them, and unloading every model means them too."""
     global _evicting
     _evicting += 1
     try:
@@ -546,13 +490,9 @@ def _evictable():
 
 
 def _wrap_free_memory(original):
-    """reForge makes room for a load by evicting models until its estimate of what the load needs fits. An
-    engine is the costliest model to bring back (every weight refitted, where PyTorch's UNet is copied
-    back), so it's evicted last, and only if that makes the estimate fit: a worst-case estimate that nothing
-    could meet (e.g. the VAE decode's, at large sizes or in FP32) no longer takes it along. The load makes do
-    with what's free, as it does anyway when the estimate isn't met (reForge's VAE decode loads the VAE
-    partially, and decodes in tiles if it runs out)."""
-
+    # reForge evicts models until its estimate of a load's needs fits. Engines are the costliest to bring back, so they
+    # go last, and only if evicting them makes the estimate fit: a worst-case estimate nothing could meet (e.g. a large
+    # VAE decode in FP32) no longer takes the engine along; the load makes do with what's free, as it does anyway.
     def free_memory(memory_required, device, keep_loaded=[]):
         mm = common.mm()
         engines = []
@@ -571,13 +511,9 @@ def _wrap_free_memory(original):
 
 
 def _wrap_get_free_memory(original):
-    """reForge counts free VRAM as what the driver has free plus what PyTorch holds unused (its reserved
-    less its active). With --cuda-malloc PyTorch reads both off the driver's pool, whose count of memory in
-    use has been seen above what it holds (by 1.3 GiB: gpu.py takes TensorRT off that pool's books, which is
-    where it came from; this is for whatever else may do it). reForge then counts that much less free than
-    there is: it loaded its UNet partially where it fit, and gave its VAE 128 MiB. Never less than the
-    driver's own free memory: that much is free whatever PyTorch counts."""
-
+    # Never report less than the driver's free memory. With --cuda-malloc, PyTorch reads its counts from the driver's
+    # pool, whose in-use count has been seen 1.3 GiB above what it holds, and reForge then loaded its UNet partially
+    # and gave its VAE 128 MiB.
     def get_free_memory(dev=None, torch_free_too=False):
         result = original(dev, torch_free_too)
         try:
@@ -614,16 +550,10 @@ def _load_torch_unet(patcher, shape):
 
 
 class Pass:
-    """One sampling pass on an architecture's engines: each UNet call runs in the profile that fits it best,
-    on the engine holding it, loaded (in place of another) when it isn't. A merged engine holds every
-    profile, so it only ever changes profiles. With Speed Hacks, each evaluation's UNet calls run on the
-    engine or its shallow partner as `schedule` says (speed.py). On anything no engine can run, the rest of
-    the pass falls back to PyTorch, with the UNet loaded the way reForge would have."""
-
     def __init__(self, records: list, patcher, x, hacks: bool = False):
         self.patcher = patcher
         self.schedule = speed.Schedule(*speed_settings()) if hacks else None
-        self.slots = store.slots(records)  # (record, optimization profile in it), in the profiles' order
+        self.slots = store.slots(records)
         self.model = None
         self.weights = EffectiveWeights(patcher)
         self.module = patcher.model.diffusion_model
@@ -633,13 +563,11 @@ class Pass:
         self.channels, self.context_dim = arch.in_channels, arch.context_dim
         self.shape = (x.shape[0] * 2, *x.shape[1:])
         self.fallback = None
-        self.checked = self.shallow_checked = False  # whether the engine's, and its shallow partner's, first output was finite
+        self.checked = self.shallow_checked = False
         self._keep = None
         self._hint_batching()
 
     def use(self, record):
-        """Loads the engine for `record` with the pass's weights, unloading any other engine first: one
-        engine in VRAM at a time."""
         model = model_for(record)
         if model is not self.model or not model.loaded:
             for other in list(_models.values()):
@@ -649,10 +577,8 @@ class Pass:
             model.weights = self.weights
             model.want_shallow = model.want_shallow or (self.schedule is not None and model.hacks is not None and not model.shallow_failed)
             with torch.inference_mode(), _keeping(self.patcher):
-                common.register(model)  # it makes exactly its room as it loads
+                common.register(model)
             self.model = model
-            # Other loads mid-pass (e.g. a live preview's decoder) unload other models first: unloading
-            # the engine would mean reloading it on the next step, the UNet would lose its patches.
             self._hold(_keeping(model, self.patcher))
         _last_used[self.arch_id] = record.key
         if self.schedule is not None and model.hacks and not model.shallow_loaded and not model.shallow_failed:
@@ -660,16 +586,12 @@ class Pass:
             try:
                 with torch.inference_mode():
                     model.load_shallow()
-            except Exception as e:  # the pass runs in full
+            except Exception as e:
                 notify(f"Couldn't load the Speed Hacks part of the {model.name}, so it runs without Speed Hacks: {e}")
         model.sync()
         return model
 
     def preferred(self) -> set:
-        """The profiles of the engine this batch's earlier passes ran on, which this pass stays on while it
-        fits, even if another engine's profile suits the sizes better: loading another means bringing all
-        its weights to VRAM (from RAM as it was kept, or by refitting them). A merged engine holds them all,
-        so it changes to whichever fits best."""
         key = _last_used.get(self.arch_id)
         return {i for i, (r, _) in enumerate(self.slots) if r.key == key}
 
@@ -686,14 +608,13 @@ class Pass:
         self._hold(None)
         if self.model is not None and self.model.loaded:
             self.model.engine.release_activations()
-        if self.schedule is not None:  # its deep features' VRAM, for PyTorch or whatever runs next
+        if self.schedule is not None:
             self.schedule.release()
 
     def _hint_batching(self):
-        """reForge decides how many conds (cond and uncond) to batch into one UNet call by the PyTorch
-        UNet's memory estimate. With the engine's activations already allocated, batch whatever a profile
-        runs: the whole batch, and prompts padded to the length reForge would pad them to (their least
-        common multiple). Batches no profile runs are split, so each prompt runs at its own length."""
+        # reForge decides how many conds to batch into one UNet call from the UNet's memory_required(). Overridden for
+        # the pass: 0 for any batch some profile runs (the engine's memory is already allocated), infinite otherwise,
+        # which makes reForge split the batch.
         shapes = self.shapes
 
         def memory_required(input_shape, cond_shapes={}):
@@ -705,7 +626,6 @@ class Pass:
         self.patcher.model.memory_required = memory_required
 
     def end(self):
-        """Undoes what the pass changed; the engine stays loaded for the next one."""
         self._restore()
         common.memory("after the sampling pass")
         from .engine import profile_report
@@ -720,10 +640,9 @@ class Pass:
                 model.weights = None  # don't keep this checkpoint alive
 
     def fall_back(self, reason: str, error: Exception = None):
-        """Runs the rest of the pass on PyTorch, saying why (with the traceback of an unexpected `error`)."""
         self.fallback = reason
         notify(f"{reason}, so the rest of this pass runs on PyTorch.", error)
-        self._restore()  # PyTorch's UNet may need the engine's VRAM
+        self._restore()
         _load_torch_unet(self.patcher, self.shape)
         raise Fallback(reason)
 
@@ -750,14 +669,14 @@ class Pass:
             feed["y"] = y
         if padded > b:
             feed = {k: v.repeat(-(-padded // b), *([1] * (v.dim() - 1)))[:padded] for k, v in feed.items()}
-        if self.model is None or self.model.record.key != record.key or not self.model.loaded:  # another profile, or unloaded mid-pass (e.g. for a VAE encode)
+        if self.model is None or self.model.record.key != record.key or not self.model.loaded:
             try:
                 if self.model is not None and self.model.loaded:
                     self.model.engine.release_activations()
                 self.use(record)
             except Exception as e:
                 failed = _models.get(record.key)
-                if failed is not None and failed.opened and not failed.loaded:  # its refit failed: PyTorch's UNet needs that VRAM
+                if failed is not None and failed.opened and not failed.loaded:
                     _unload(failed, keep=False)
                 self.fall_back(f"Couldn't load the {record.arch.name} {record.label} ({e})", _unexpected(e))
         stream = torch.cuda.current_stream().cuda_stream
@@ -778,7 +697,6 @@ class Pass:
         return out[:b].to(x.dtype)
 
     def _infer_with_room(self, feed, profile, stream, slot=None, deep=None):
-        """_infer, again after unloading other models if it ran out of VRAM."""
         try:
             return self._infer(feed, profile, stream, slot, deep)
         except torch.cuda.OutOfMemoryError:
@@ -791,8 +709,6 @@ class Pass:
                 self.fall_back("The engine ran out of VRAM")
 
     def _infer(self, feed, profile, stream, slot=None, deep=None):
-        """The engine's output, or with a deep feature, its shallow partner's. The engine's deep feature is
-        kept for the call's slot."""
         try:
             if deep is not None:
                 return self.model.shallow.infer({**feed, "deep": deep}, profile, stream)["latent"]
@@ -807,13 +723,12 @@ class Pass:
 
 
 def _engine_records(patcher, x):
-    """(the engines to run this pass on, whether with Speed Hacks), or (None, False) for PyTorch."""
     chosen = setting()
     if chosen not in (AUTOMATIC, SPEED_HACKS):
         return None, False
     arch = arch_mod.detect(patcher)
     records = store.engines(arch.id) if arch is not None else []
-    if not records:  # e.g. a refiner of another architecture: with SD Unet on Automatic, that's expected
+    if not records:  # with "Automatic" that's normal (e.g. a refiner of another architecture), so no warning
         if chosen == SPEED_HACKS and arch is None:
             notify("TensorRT engines can't run this model, so it runs on PyTorch.")
         elif chosen == SPEED_HACKS:
@@ -836,15 +751,12 @@ def _engine_records(patcher, x):
 
 
 def _begin(records, hacks, patcher, x, prepare):
-    """sampling_prepare for a pass on the engines: the Pass, or None if it runs on PyTorch (said why). The
-    engine for the likeliest sizes (cond and uncond batched, the shortest prompts) loads now, the others
-    when needed; if it and the pass's calls can't fit (_fits), no weights go to VRAM at all."""
-
     mm = common.mm()
     with torch.inference_mode():
         _unload_torch_unet(patcher)
         state = mm.vram_state, mm.free_memory
-        mm.vram_state, mm.free_memory = mm.VRAMState.NO_VRAM, _no_free_memory  # patches applied, weights stay in RAM
+        # reForge's sampling_prepare applies the UNet's patches; NO_VRAM keeps its weights in RAM while it does
+        mm.vram_state, mm.free_memory = mm.VRAMState.NO_VRAM, _no_free_memory
         try:
             prepare(patcher, x)
         finally:
@@ -853,6 +765,7 @@ def _begin(records, hacks, patcher, x, prepare):
         try:
             b, _, h, w = x.shape
             prefer = p.preferred()
+            # Load the engine for the likeliest first call: cond and uncond batched, shortest prompts
             choice = profiles.select(p.shapes, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK, prefer) or profiles.select(p.shapes, b, h, w, profiles.CONTEXT_PER_CHUNK, prefer)
             index = choice[0] if choice else next(i for i, s in enumerate(p.shapes) if profiles.covers_size([s], h, w, b))
             record = p.slots[index][0]
@@ -871,17 +784,11 @@ def _sizes(x) -> str:
     return f"{x.shape[3] * 8}x{x.shape[2] * 8}" + (f", batch size {x.shape[0]}" if x.shape[0] > 1 else "")
 
 
-def _unexpected(error):
-    """`error`, for its traceback, unless it's a RuntimeError: those this extension raises, or TensorRT's, whose
-    message says it all."""
+def _unexpected(error):  # the error, for its traceback, unless a RuntimeError: those messages are complete on their own
     return None if isinstance(error, RuntimeError) else error
 
 
 def _fits(model: TrtModel, p: Pass, x):
-    """Before anything loads: raises DoesNotFit, with the figures, if the engine and the working memory of a
-    pass's UNet calls at these sizes can't be in VRAM whatever else is evicted; says them if they can. The
-    engine is what TrtModel.full gives, or what it holds if it's loaded; the calls are the image's size
-    (call_bytes), or what TensorRT turned out to take at these sizes this session, where that didn't fit."""
     shallow = bool(model.hacks and (model.want_shallow or (p.schedule is not None and not model.shallow_failed)))
     calls = max(call_bytes(model, p.patcher, x), model.took.get(tuple(x.shape[i] for i in (0, 2, 3)), 0))
     held = gpu.held(model.owner)
@@ -891,7 +798,7 @@ def _fits(model: TrtModel, p: Pass, x):
         model.weights = p.weights
         engine = model.full(shallow, model._kept())
     room = common.obtainable(model.load_device, keep=[model]) - common.reserve() + held
-    need = held + common.padded(engine - held + calls)  # the buffer on what isn't in VRAM yet
+    need = held + common.padded(engine - held + calls)  # margin only on what isn't in VRAM yet
     logger.debug(
         f"The {model.name} at {_sizes(x)} needs {common.gib(need)} of VRAM ({common.gib(engine)} for the engine, {common.gib(calls)} "
         f"to run it, {common.gib(need - engine - calls)} margin); {common.gib(room)} can be freed."
@@ -901,11 +808,6 @@ def _fits(model: TrtModel, p: Pass, x):
 
 
 def _make_room_for_activations(model: TrtModel, patcher, x):
-    """Makes room for what the pass's UNet calls hold beside the engine: what the image's size gives
-    (call_bytes), or what TensorRT takes now that the engine is loaded (its activation memory is allocated
-    as it asks, with its inputs and outputs) if that's more, which is said. Raises RuntimeError if there
-    can't be that much: the pass runs on PyTorch before it starts, and these sizes are weighed by what
-    TensorRT takes from now on (_fits)."""
     try:
         takes = _call_bytes(model, x)
     except Exception as e:
@@ -920,13 +822,11 @@ def _make_room_for_activations(model: TrtModel, patcher, x):
     need = common.padded(max(takes, counted))
     free = common.make_room(need, model.load_device, _loaded_entries(model, patcher))
     if free < need:
-        model.took[tuple(x.shape[i] for i in (0, 2, 3))] = takes
+        model.took[tuple(x.shape[i] for i in (0, 2, 3))] = takes  # so _fits rejects these sizes before loading next time
         raise RuntimeError(f"running it at {_sizes(x)} needs {common.gib(need)} of VRAM besides the engine, and only {common.gib(free)} could be freed")
 
 
 def _call_shapes(model: TrtModel, x):
-    """(The profile of the engine a UNet call at the likeliest shapes runs in (cond and uncond batched, or
-    one at a time if no profile can batch them), its inputs' shapes there), or None if none runs it."""
     b, c, h, w = x.shape
     held = model.record.profile_shapes
     choice = profiles.select(held, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select(held, b, h, w, profiles.CONTEXT_PER_CHUNK)
@@ -945,8 +845,6 @@ def _call_shapes(model: TrtModel, x):
 
 
 def _call_bytes(model: TrtModel, x) -> int:
-    """What a UNet call at the likeliest shapes holds beside the loaded engine, as TensorRT has it: its
-    activation memory, its inputs as the engine takes them and its outputs."""
     found = _call_shapes(model, x)
     if found is None:
         return 0
@@ -979,7 +877,7 @@ def _wrap_prepare(original):
         global _pass
         end_pass()
         records, hacks = _engine_records(unet, x)
-        if records is None:  # PyTorch's UNet: engines can make room for it as usual
+        if records is None:
             with _evictable():
                 return original(unet, x, *args, **kwargs)
         _pass = _begin(records, hacks, unet, x, lambda u, v: original(u, v, *args, **kwargs))
@@ -998,10 +896,8 @@ def _wrap_cleanup(original):
 
 
 def _wrap_close(original):
-    """reForge closes a generation's processing object however the generation ended: one that failed
-    mid-pass never cleaned its pass up, which would keep holding the engine and the UNet against every
-    load until the next generation."""
-
+    # reForge closes the processing object however a generation ended. One that failed mid-pass never reached
+    # sampling_cleanup, and its pass would keep the engine and UNet unevictable until the next generation.
     def close(self, *args, **kwargs):
         end_pass()
         return original(self, *args, **kwargs)
@@ -1011,9 +907,6 @@ def _wrap_close(original):
 
 
 def _wrap_denoiser(original):
-    """reForge's CFG denoiser runs one evaluation of the sampler (its UNet calls for every cond): tells the
-    pass's Speed Hacks schedule which one, out of how many, at which latent."""
-
     def forward(self, x, *args, **kwargs):
         p = _pass
         if p is not None and p.schedule is not None and p.fallback is None:
@@ -1031,13 +924,9 @@ def _wrap_denoiser(original):
 
 
 def _wrap_vae_decode(original):
-    """Decodes on the VAE decoder's engines when SD Unet runs the engines (vae_run.py), with the room it needs
-    made by reForge's manager like any model's (the UNet engines are evicted last, and only if that makes
-    the room); anything else decodes on PyTorch, as reForge would."""
-
     def decode(self, samples_in, vae_options={}):
-        # Not from another thread: reForge's progress endpoint decodes "Full" live previews on its own,
-        # while the generation's thread samples on the UNet engine.
+        # Only on the generation's thread: reForge's progress endpoint decodes "Full" live previews on another thread
+        # while this one is sampling on the UNet engine.
         if not vae_options and setting() in (AUTOMATIC, SPEED_HACKS) and threading.get_ident() == _generation_thread:
             try:
                 pixels = vae_run.decode(self, samples_in)
@@ -1052,9 +941,6 @@ def _wrap_vae_decode(original):
 
 
 def _wrap_vae_encode(original):
-    """Encodes on the VAE encoder's engines likewise (an img2img's image, a Hires. fix's upscaled one);
-    anything they pass on encodes on PyTorch, as reForge would."""
-
     def encode(self, pixel_samples):
         if setting() in (AUTOMATIC, SPEED_HACKS) and threading.get_ident() == _generation_thread:
             try:
@@ -1069,8 +955,7 @@ def _wrap_vae_encode(original):
     return encode
 
 
-def _rebind(owner, name, wrap):
-    """Wraps owner.name, also where modules imported it by name."""
+def _rebind(owner, name, wrap):  # also replaces references other modules took with `from ... import name`
     current = getattr(owner, name)
     if hasattr(current, "_trt_original"):
         return
@@ -1082,7 +967,7 @@ def _rebind(owner, name, wrap):
             setattr(module, name, replacement)
 
 
-_hook_failures = set()  # said already: install_hooks runs again every generation
+_hook_failures = set()  # install_hooks runs every generation: log each failure once
 
 
 def _hook_failed(message: str):
@@ -1092,7 +977,6 @@ def _hook_failed(message: str):
 
 
 def install_hooks():
-    """Idempotent."""
     from ldm_patched.ldm.modules.diffusionmodules import openaimodel
     from modules import processing
     from modules_forge import forge_sampler
@@ -1106,7 +990,7 @@ def install_hooks():
     _rebind(common.mm(), "free_memory", _wrap_free_memory)
     _rebind(common.mm(), "get_free_memory", _wrap_get_free_memory)
     _rebind(common.mm(), "unload_all_models", _wrap_unload_all)
-    try:  # the VAE's engines: it decodes and encodes on PyTorch without them
+    try:
         from ldm_patched.modules import sd as ldm_sd
 
         if not hasattr(ldm_sd.VAE.decode, "_trt_original"):
@@ -1115,7 +999,7 @@ def install_hooks():
             ldm_sd.VAE.encode = _wrap_vae_encode(ldm_sd.VAE.encode)
     except Exception as e:
         _hook_failed(f"Couldn't hook reForge's VAE, so it always runs on PyTorch: {e}")
-    try:  # Speed Hacks only: the engines run without it
+    try:
         from modules import sd_samplers_cfg_denoiser
 
         denoiser = sd_samplers_cfg_denoiser.CFGDenoiser
@@ -1125,15 +1009,12 @@ def install_hooks():
         _hook_failed(f"Couldn't hook reForge's CFG denoiser, so Speed Hacks never skip a step: {e}")
 
 
-def new_batch():
-    """A batch's first pass runs on the engine whose profile fits it best, and its later passes (e.g. its
-    Hires. fix) stay on that engine while it covers their sizes. The next batch starts afresh, so nothing
-    keeps running on an engine picked for other sizes."""
+def new_batch():  # each batch starts on the engine that fits it best, not the one the last batch ended on
     _last_used.clear()
 
 
-_generation = None  # weakref to the generation's processing object, for its infotext
-_generation_thread = None  # the thread generations run in
+_generation = None
+_generation_thread = None
 
 
 def _note_speed_hacks():
@@ -1144,11 +1025,11 @@ def _note_speed_hacks():
 
 def new_generation(p=None):
     global _generation, _generation_thread
-    end_pass()  # a generation that failed mid-pass never cleaned up
+    end_pass()
     common.new_generation()
     _generation = weakref.ref(p) if p is not None else None
     _generation_thread = threading.get_ident()
-    if setting() not in (AUTOMATIC, SPEED_HACKS):  # SD Unet is None: give their VRAM back, and the RAM
+    if setting() not in (AUTOMATIC, SPEED_HACKS):
         for model in list(_models.values()):
             if model.loaded:
                 _unload(model, keep=False)

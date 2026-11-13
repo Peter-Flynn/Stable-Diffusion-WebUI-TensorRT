@@ -1,37 +1,24 @@
-"""Tensor Stripped: the VAE decoder's "post" part (vae.py) in horizontal strips, for decodes too large for its
-post engine in the VRAM there can be; and the encoder up to its mid block's attention likewise, for encodes too
-large for its engines. Same results as the whole decode or encode, up to rounding.
-
-The post part is cut into stages at its GroupNorms, which need statistics of their whole input: each stage
-outputs, with every strip, its output's mean and spread over the strip for each group, which add up (Chan
-et al.'s parallel variance) to the next GroupNorm's over the whole image. So a stage finishes before the
-next starts, and what's between stages is held whole. A stage runs on one strip of rows at a time, given
-its input's rows with as many more on each side as its 3x3 convolutions reach (the image's padding there:
-zeros, or reflected, replicated or wrapped rows, as the convolutions pad).
-
-Each resnet block runs in one of three ways, the plan (Decode.plan) choosing for each the fastest that
-fits in the VRAM free:
-- STORE: a stage for its first conv, whose output is held, and one for its second (plus its shortcut);
-- RECOMPUTE: the first conv's stage only for its statistics, then a BLOCK stage computing both convs from
-  the block's input, so nothing but the block's input is held (the first conv runs twice);
-- FUSED, for a block right after an upsampling: the upsampling's stage only for its statistics, an UPCONV
-  stage for the first conv's, and an UPBLOCK stage computing the upsampling and both convs from what's
-  upsampled, so the upsampled tensor (the largest, at the image's size) is never held at all.
-What can't be held in VRAM even so goes to pinned RAM, copied in and out while the engine works on the
-strip before.
-
-Stages with the same layout share an engine plan ("kind"), each loaded with its own weights.
-
-The encoder (Encode) runs the same way, from the image: its first conv (IN, on the image's rows), its resnet
-blocks (as the decoder's, STORE or RECOMPUTE), and its downsamplings (DOWN: a 3x3 conv with stride 2 on its
-input padded with a row and a column of zeros at the bottom and the right), through its mid block's first
-resnet block, whose output and statistics (for the attention's GroupNorm) it returns.
-
-In FP16 the decoder runs scaled by a power of two (vae.py says why and how): the tensors between its
-GroupNorms are that much smaller than the VAE makes them. Here that takes three things: each conv's input
-is multiplied by the scale where rows are kept or zeroed anyway ("keep"), the attention's output is
-scaled as it comes in, and a GroupNorm's epsilon is scaled with the variance it's added to."""
-
+# Runs the VAE decoder's "post" part (vae.py) in horizontal strips, for decodes too large to run whole, and the encoder
+# up to its mid-block attention likewise. Results match the whole decode/encode up to rounding.
+#
+# The network is cut into stages at its GroupNorms, which need statistics over their whole input. Each stage outputs,
+# per strip, the mean and sum of squared deviations of its output per group; these combine across strips (Chan et
+# al.'s parallel variance, Stats) into the next GroupNorm's statistics over the whole image. So a stage finishes before
+# the next starts, and the tensors between stages are held whole (in a VRAM slab, or pinned RAM when VRAM is short,
+# copied in and out on a side stream while the engine computes the previous strip). A stage computes one strip of rows
+# at a time from its input's rows plus the `halo` rows its 3x3 convs reach on each side.
+#
+# Each resnet block runs one of three ways, chosen by Decode.plan as the fastest that fits:
+#   STORE: one stage per conv; the first conv's output is held.
+#   RECOMPUTE: the first conv's stage runs only for its statistics, then a BLOCK stage computes both convs from the
+#     block's input, so only the input is held (the first conv runs twice).
+#   FUSED (a block right after an upsampling): UP and UPCONV stages run only for statistics, then UPBLOCK computes the
+#     upsampling and both convs, so the upsampled tensor, the largest in the decoder, is never held.
+# Stages with the same layout share one engine plan (a Kind), each loaded with its own weights.
+#
+# In FP16, tensors between GroupNorms are multiplied by `scale` (a power of two; vae.py explains why that's exact): conv
+# inputs are multiplied through the `keep` row masks, the attention output is scaled on the way in, and each
+# GroupNorm's epsilon is scaled with the variance it's added to (Stats.affine).
 import contextlib
 import math
 import time
@@ -40,34 +27,33 @@ from dataclasses import asdict, dataclass, replace
 import torch
 import torch.nn.functional as F
 
-STRIP_BYTES = 128 * 2**20  # the most a strip of a stage's largest tensor takes: what kinds are built for
+STRIP_BYTES = 128 * 2**20  # a strip of a stage's largest tensor is at most this; engines' profiles are sized from it
 CONV, UP, PROJ, OUT, BLOCK, UPCONV, UPBLOCK = "conv", "up", "proj", "out", "block", "upconv", "upblock"
-IN, DOWN = "in", "down"  # the encoder's
-CONVS = {PROJ: 0, CONV: 1, OUT: 1, UP: 1, BLOCK: 2, UPCONV: 2, UPBLOCK: 3, IN: 1, DOWN: 1}  # 3x3 convs in a row: the rows of halo
+IN, DOWN = "in", "down"
+CONVS = {PROJ: 0, CONV: 1, OUT: 1, UP: 1, BLOCK: 2, UPCONV: 2, UPBLOCK: 3, IN: 1, DOWN: 1}  # 3x3 convs in a row = halo rows
 UPSAMPLING = (UP, UPCONV, UPBLOCK)
 TWO_NORMS = (BLOCK, UPBLOCK)
 PADDINGS = ("zeros", "reflect", "replicate", "circular")
-CHAINED = ("zeros", "circular")  # paddings the kinds with several 3x3 convs in a row take
+CHAINED = ("zeros", "circular")  # the paddings that compose across several 3x3 convs in one stage
 STORE, RECOMPUTE, FUSED = "store", "recompute", "fused"
 
 
 @dataclass(frozen=True)
 class Kind:
-    """What one engine computes. With x normalized by a GroupNorm (given as center, scale and shift), then
-    SiLU and a 3x3 conv: CONV, plus a residual ("res" channels, through a 1x1 conv when that's not cout);
-    OUT, the image. UP: nearest 2x upsampling and a 3x3 conv. PROJ: a 1x1 conv plus a residual. BLOCK: a
-    resnet block (a GroupNorm, SiLU and 3x3 conv twice, plus its shortcut). UPCONV: UP, then the first
-    GroupNorm, SiLU and conv of the block after it, for their statistics only. UPBLOCK: UP and that block.
-    The encoder's: IN, a 3x3 conv on the image; DOWN, a 3x3 conv with stride 2 on x padded with zeros at the
-    bottom and the right (its halo: the row below the strip's last).
-    With groups, the output's mean and spread ("m2", the sum of squared deviations) per group."""
-
+    # One engine plan. "GN" below is GroupNorm (statistics given as center/scale/shift inputs) + SiLU.
+    #   CONV: GN, 3x3 conv, plus a residual ("res" channels, through the 1x1 nin_shortcut if res != cout).
+    #   OUT: GN, the final 3x3 conv to the image.  PROJ: 1x1 conv + residual.  UP: nearest 2x upsample, 3x3 conv.
+    #   BLOCK: a whole resnet block: GN, conv, GN, conv, plus shortcut.
+    #   UPCONV: UP, then the next block's first GN and conv; outputs only statistics.  UPBLOCK: UP, then the whole block.
+    #   Encoder: IN: the first 3x3 conv on the image.  DOWN: 3x3 stride-2 conv, input zero-padded at bottom and right.
+    # With `groups`, also outputs per-group mean and m2 (sum of squared deviations). `pad` is the convs' horizontal
+    # padding; vertical padding comes from the rows each strip is given.
     op: str
     cin: int
     cout: int
     res: int = 0
     groups: int = 0
-    pad: str = "zeros"  # the 3x3 convs' padding across (their padding down is the strips' rows)
+    pad: str = "zeros"
 
     @property
     def name(self) -> str:
@@ -84,12 +70,10 @@ class Kind:
 
     @property
     def halo(self) -> int:
-        """Rows beyond a strip's on each side that its 3x3 convs reach, at the output's size."""
         return CONVS[self.op]
 
     @property
     def step(self) -> int:
-        """Strips' rows come in multiples of this (an upsampling's, whole source rows)."""
         return 2 if self.op in UPSAMPLING else 1
 
     def inputs(self) -> tuple:
@@ -114,14 +98,15 @@ class Kind:
 @dataclass
 class Stage:
     kind: Kind
-    weights: dict  # the engine's weight name -> the decoder's (in the first stage model's state dict)
-    scale: int  # the output's size in latents (1 at the mid block, 8 at the image)
-    src: int  # the buffer of its input: the index of the stage that makes it (-2: the mid block's input, -1: its attention)
-    res: int = None  # the buffer of its residual (CONV, PROJ)
-    norms: tuple = ()  # ((GroupNorm module name, the stage whose output's statistics it takes), ...)
-    pad: str = "zeros"  # its convs' padding, which the strips' rows give down the image
-    keep: bool = True  # whether its output is held for the stages after it (else only its statistics are)
-    block: int = None  # the resnet block it's part of (an upsampling: of the block after it)
+    weights: dict
+    scale: int
+    src: int  # held tensor key of its input: the index of the stage that made it, or -2/-1 (decoder: mid-block input /
+    # attention output; encoder: -1 is the image)
+    res: int = None
+    norms: tuple = ()  # ((GroupNorm module name, key of the stage whose output statistics it uses), ...)
+    pad: str = "zeros"
+    keep: bool = True  # whether its output is held for later stages (False: only its statistics are used)
+    block: int = None  # index of the resnet block it belongs to (an upsampling belongs to the block after it)
 
     @property
     def in_scale(self) -> int:
@@ -131,13 +116,10 @@ class Stage:
 
     @property
     def identity(self) -> tuple:
-        """What its engine is: its kind's plan with its weights."""
         return (self.kind.name, tuple(sorted(self.weights.items())))
 
 
 def blocks(fsm) -> list:
-    """The decoder's resnet blocks after its attention, in order: [(prefix, module, its output's scale, the
-    prefix of the upsampling right before it or None)]."""
     d = fsm.decoder
     found, scale, up = [("decoder.mid.block_2.", d.mid.block_2, 1, None)], 1, None
     for i in reversed(range(d.num_resolutions)):
@@ -150,8 +132,6 @@ def blocks(fsm) -> list:
 
 
 def choices(fsm, padding: dict) -> list:
-    """For each block, the ways it can run (STORE always; RECOMPUTE and FUSED when its convs pad with zeros or
-    wrap the same way, FUSED only right after an upsampling), from fastest to holding the least."""
     pad = lambda name: padding.get(name, "zeros")  # noqa: E731
     out = []
     for prefix, blk, _, up in blocks(fsm):
@@ -165,8 +145,6 @@ def choices(fsm, padding: dict) -> list:
 
 
 def stages(fsm, padding: dict, modes: dict = None) -> list:
-    """The post part's stages for a first stage model (or what vae.fresh makes), the config's padding, and
-    each block's way ({block: STORE, RECOMPUTE or FUSED}; STORE where not given)."""
     d = fsm.decoder
     modes = modes or {}
     pad = lambda name: padding.get(name, "zeros")  # noqa: E731
@@ -211,27 +189,22 @@ def stages(fsm, padding: dict, modes: dict = None) -> list:
 
 
 def _groups(found: list, fsm, last: str = None):
-    """Each output's statistics are for the GroupNorm that reads them; outputs no GroupNorm reads (before an
-    upsampling) still give them, so stages of the same layout share a kind. The last stage's are for the
-    GroupNorm `last` (the encoder's attention's), unless it's the decoder's OUT, which has none."""
     modules = dict(fsm.named_modules())
     for n, stage in enumerate(found):
         if stage.kind.op == OUT:
             continue
         reader = next((name for s in found[n + 1:] for name, key in s.norms if key == n), None)
         if reader is None:
-            # the next GroupNorm (the same groups in these VAEs)
+            # No GroupNorm reads this output (it precedes an upsampling); still give it the next GroupNorm's groups so
+            # that stages of the same layout share a Kind
             reader = next((name for s in found[n + 1:] for name, _ in s.norms), last)
         stage.kind = replace(stage.kind, groups=int(modules[reader].num_groups))
 
 
-ATTENTION_NORM = "encoder.mid.attn_1.norm"  # what reads the encoder's last stage's statistics
+ATTENTION_NORM = "encoder.mid.attn_1.norm"
 
 
 def encoder_blocks(fsm) -> list:
-    """The encoder's resnet blocks up to its attention, in order: [(prefix, module, its output's scale, the
-    prefix of the downsampling right after it or None)]. Raises ValueError for an encoder with attention
-    before its mid block."""
     e = fsm.encoder
     scale, found = 2 ** (e.num_resolutions - 1), []
     for i in range(e.num_resolutions):
@@ -248,8 +221,6 @@ def encoder_blocks(fsm) -> list:
 
 
 def encoder_choices(fsm, padding: dict) -> list:
-    """For each of the encoder's blocks, the ways it can run: STORE always; RECOMPUTE when its convs pad with
-    zeros or wrap the same way."""
     pad = lambda name: padding.get(name, "zeros")  # noqa: E731
     out = []
     for prefix, blk, _, _ in encoder_blocks(fsm):
@@ -260,8 +231,6 @@ def encoder_choices(fsm, padding: dict) -> list:
 
 
 def encoder_stages(fsm, padding: dict, modes: dict = None) -> list:
-    """The encoder's stages up to its attention, from the image (the buffer -1), for a first stage model
-    (or what vae.fresh_encoder makes), the config's padding, and each block's way."""
     e = fsm.encoder
     modes = modes or {}
     pad = lambda name: padding.get(name, "zeros")  # noqa: E731
@@ -288,14 +257,13 @@ def encoder_stages(fsm, padding: dict, modes: dict = None) -> list:
         else:
             h = add(CONV, cin, cout, {"conv": prefix + "conv1"}, scale, x, b, norms=((prefix + "norm1", x),), keep=False)
             x = add(BLOCK, cin, cout, {"conv1": prefix + "conv1", "conv2": prefix + "conv2", **tail}, scale, x, b, norms=((prefix + "norm1", x), (prefix + "norm2", h)))
-        if down is not None:  # its padding is its own (zeros, at the bottom and the right), whatever the convs'
+        if down is not None:
             x = add(DOWN, cout, cout, {"conv": down + "conv"}, scale // 2, x, b, padded="zeros")
     _groups(found, fsm, ATTENTION_NORM)
     return found
 
 
 def encoder_every_way(fsm, padding: dict) -> list:
-    """Stage lists that together have every kind the encoder's blocks can run as."""
     lists = [encoder_stages(fsm, padding)]
     ways = encoder_choices(fsm, padding)
     if any(RECOMPUTE in w for w in ways):
@@ -304,7 +272,6 @@ def encoder_every_way(fsm, padding: dict) -> list:
 
 
 def every_way(fsm, padding: dict) -> list:
-    """Stage lists that together have every kind the decoder's blocks can run as."""
     ways = choices(fsm, padding)
     lists = [stages(fsm, padding)]
     if any(RECOMPUTE in w for w in ways):
@@ -315,7 +282,6 @@ def every_way(fsm, padding: dict) -> list:
 
 
 def kinds(found) -> dict:
-    """{kind name: (Kind, [the scales of its stages' outputs])}, for a stage list or several."""
     lists = found if found and isinstance(found[0], list) else [found]
     out = {}
     for each in lists:
@@ -325,7 +291,6 @@ def kinds(found) -> dict:
 
 
 def supported(found: list) -> str:
-    """Why the stripped decode can't run these stages ("" if it can)."""
     for s in found:
         if s.pad not in PADDINGS:
             return f"{s.pad} padding"
@@ -334,24 +299,19 @@ def supported(found: list) -> str:
     return ""
 
 
-# --- The stages' computation, on PyTorch (exported to ONNX for the engines)
-
-
 def _conv3(x, conv, pad: str):
-    """A 3x3 conv over x's rows as given (the strip's own and one more on each side), padded across."""
     if pad == "zeros":
         return F.conv2d(x, conv.weight, conv.bias, padding=(0, 1))
     if pad == "reflect":
         x = torch.cat([x[..., 1:2], x, x[..., -2:-1]], dim=-1)
     elif pad == "replicate":
         x = torch.cat([x[..., :1], x, x[..., -1:]], dim=-1)
-    else:  # circular
+    else:
         x = torch.cat([x[..., -1:], x, x[..., :1]], dim=-1)
     return F.conv2d(x, conv.weight, conv.bias)
 
 
-def _normed(x, center, scale, shift, keep):
-    """GroupNorm (in FP32, as PyTorch's), SiLU, and the rows outside the image zeroed (as a conv pads)."""
+def _normed(x, center, scale, shift, keep):  # `keep` zeroes rows outside the image, as a zero-padded conv would see them
     return F.silu(((x.float() - center) * scale + shift).to(x.dtype)) * keep
 
 
@@ -362,8 +322,6 @@ def _stats(out, groups: int):
 
 
 class StageModule(torch.nn.Module):
-    """A stage of a decoder: its convs are the decoder's own modules (named as Stage.weights has them)."""
-
     def __init__(self, stage: Stage, fsm):
         super().__init__()
         self.kind = stage.kind
@@ -378,7 +336,7 @@ class StageModule(torch.nn.Module):
         if k.op == IN:
             out = _conv3(x, self.conv, k.pad)
         elif k.op == DOWN:
-            out = F.conv2d(F.pad(x, (0, 1)), self.conv.weight, self.conv.bias, stride=2)  # the bottom row: given, zeros
+            out = F.conv2d(F.pad(x, (0, 1)), self.conv.weight, self.conv.bias, stride=2)
         elif k.op == PROJ:
             out = feed["res"] + F.conv2d(x, self.conv.weight, self.conv.bias)
         elif k.op in UPSAMPLING:
@@ -408,18 +366,17 @@ class StageModule(torch.nn.Module):
 
 
 def feed_shapes(kind: Kind, rows: int, width: int) -> dict:
-    """The inputs' shapes for `rows` rows of output `width` wide."""
     k = kind.halo
     shapes = {}
     for name in kind.inputs():
         if name == "x":
-            if kind.op == DOWN:  # twice the rows and one more below, twice as wide
+            if kind.op == DOWN:  # twice the rows, plus the row below for the stride-2 conv's reach
                 shapes[name] = (1, kind.cin, 2 * rows + 1, 2 * width)
             elif kind.op in UPSAMPLING:
                 shapes[name] = (1, kind.cin, rows // 2 + 2 * ((k + 1) // 2), width // 2)
             else:
                 shapes[name] = (1, kind.cin, rows + 2 * k, width)
-        elif name == "keep":  # the rows of what the first GroupNorm normalizes: x, or the upsampled conv's output
+        elif name == "keep":
             shapes[name] = (1, 1, rows + 2 * (k - 1 if kind.op in (UPCONV, UPBLOCK) else k), 1)
         elif name == "keep2":
             shapes[name] = (1, 1, rows + 2, 1)
@@ -427,13 +384,12 @@ def feed_shapes(kind: Kind, rows: int, width: int) -> dict:
             shapes[name] = (1, kind.cin, 1, 1)
         elif name in ("center2", "scale2", "shift2"):
             shapes[name] = (1, kind.cout, 1, 1)
-        else:  # res
+        else:
             shapes[name] = (1, kind.res or kind.cin, rows, width)
     return shapes
 
 
 def example_inputs(kind: Kind, dtype, device, rows: int = 4, width: int = 8) -> tuple:
-    """Inputs for tracing: `rows` of output, `width` of input."""
     shapes = feed_shapes(kind, rows, width * 2 if kind.op in UPSAMPLING else width // 2 if kind.op == DOWN else width)
     out = []
     for name in kind.inputs():
@@ -458,24 +414,17 @@ def dynamic_axes(kind: Kind) -> dict:
     return axes
 
 
-def min_rows(kind: Kind) -> int:
-    """The fewest output rows a strip of this kind has: a step, and two for BLOCK (whose output may take
-    over its input's memory a strip behind, so a strip must be at least its halo)."""
+def min_rows(kind: Kind) -> int:  # BLOCK: 2, since its output can overwrite its input one strip behind (Decode._in_place)
     return 2 if kind.op == BLOCK else kind.step
 
 
 def max_rows(kind: Kind, width: int, itemsize: int = 4) -> int:
-    """The most output rows a strip of this kind can have at this output width, by STRIP_BYTES in a
-    precision of `itemsize` bytes."""
-    channels = max(kind.cin, kind.cout, kind.res) * (4 if kind.op == DOWN else 1)  # DOWN's input: 4 times its output
+    channels = max(kind.cin, kind.cout, kind.res) * (4 if kind.op == DOWN else 1)  # DOWN's input is 4x its output
     rows = max(1, STRIP_BYTES // itemsize // max(1, channels * width))
     return max(min_rows(kind), rows - rows % kind.step)
 
 
 def kind_shapes(kind: Kind, scales: list, lo_w: int, opt: tuple, hi: tuple, itemsize: int = 4) -> dict:
-    """The engine's profile ({input: [min, opt, max]}) for strips of its stages' outputs at these scales,
-    for latents from lo_w wide to hi = (h, w), optimal at opt = (h, w): any number of rows up to a strip's
-    (STRIP_BYTES at the widest, in a precision of `itemsize` bytes), across any width in that range."""
     hi_scale, lo_scale = max(scales), min(scales)
     lo_width, hi_width = lo_w * lo_scale, hi[1] * hi_scale
     hi_rows = max(min(hi[0] * s, max_rows(kind, hi[1] * s, itemsize)) for s in scales)
@@ -489,13 +438,11 @@ def kind_shapes(kind: Kind, scales: list, lo_w: int, opt: tuple, hi: tuple, item
 
 
 def covers(shapes: dict, kind: Kind, rows: int, width: int) -> bool:
-    """Whether an engine of these profile shapes runs strips of `rows` output rows `width` wide."""
     want = feed_shapes(kind, rows, width)
     return all(all(lo <= w <= hi for lo, w, hi in zip(shapes[n][0], want[n], shapes[n][2])) for n in kind.inputs())
 
 
 def engine_rows(shapes: dict, kind: Kind, width: int) -> int:
-    """The most output rows of a strip `width` wide the engine with these shapes runs (0: none)."""
     x_lo, _, x_hi = shapes["x"]
     up, down = kind.op in UPSAMPLING, kind.op == DOWN
     if not x_lo[3] <= (width // 2 if up else width * 2 if down else width) <= x_hi[3]:
@@ -511,12 +458,7 @@ def engine_rows(shapes: dict, kind: Kind, width: int) -> int:
     return rows if rows >= min_rows(kind) else 0
 
 
-# --- Running
-
-
 class Stats:
-    """A GroupNorm's statistics over an image, added up strip by strip (in FP64)."""
-
     def __init__(self):
         self.n, self.mean, self.m2 = 0, None, None
 
@@ -532,9 +474,6 @@ class Stats:
         self.n = n
 
     def affine(self, norm, scaled: float = 1.0) -> tuple:
-        """(center, scale, shift), each (1, channels, 1, 1) in FP32, that apply the GroupNorm `norm` (whose
-        weight and bias are given in FP64) as (x - center) * scale + shift. `scaled`: what the tensor was
-        multiplied by, so the epsilon keeps its size beside the variance."""
         weight, bias, eps, groups = norm
         per = weight.numel() // groups
         rstd = torch.rsqrt(self.m2 / self.n + eps * scaled * scaled)
@@ -545,12 +484,10 @@ class Stats:
 
 
 def norms(fsm, found: list, device) -> dict:
-    """{GroupNorm module name: (weight, bias in FP64, eps, groups)} for the stages."""
     return norms_of(fsm, [name for s in found for name, _ in s.norms], device)
 
 
 def norms_of(fsm, names, device) -> dict:
-    """{GroupNorm module name: (weight, bias in FP64, eps, groups)} for these GroupNorms."""
     modules = dict(fsm.named_modules())
     out = {}
     for name in names:
@@ -561,7 +498,6 @@ def norms_of(fsm, names, device) -> dict:
 
 
 def _row(r: int, rows: int, pad: str):
-    """Row r of a tensor `rows` high padded with `pad`: the row it takes, or None for zeros."""
     if 0 <= r < rows:
         return r
     if pad == "zeros":
@@ -570,35 +506,30 @@ def _row(r: int, rows: int, pad: str):
         return -r if r < 0 else 2 * rows - 2 - r
     if pad == "replicate":
         return 0 if r < 0 else rows - 1
-    return r % rows  # circular
+    return r % rows
 
 
 def source_rows(stage: Stage, a: int, b: int, rows_in: int) -> list:
-    """For output rows [a, b) of a stage: the rows of its input to give it (None: zeros), its halo included.
-    For an upsampling, the input's rows whose upsampling gives the first conv its rows, padded as the
-    upsampled image is."""
     k = stage.kind.halo
-    if stage.kind.op == DOWN:  # rows 2a to 2b; past the bottom, the zeros it's padded with
+    if stage.kind.op == DOWN:
         return [r if r < rows_in else None for r in range(2 * a, 2 * b + 1)]
     if stage.kind.op not in UPSAMPLING:
         return [_row(r, rows_in, stage.pad) for r in range(a - k, b + k)]
-    lo, hi = a - k, b + k  # the upsampled rows the first conv reads
+    lo, hi = a - k, b + k
     out = []
     for r in range(lo // 2, (hi - 1) // 2 + 1):
         if 0 <= r < rows_in:
             out.append(r)
         elif k == 1:
-            # One of r's two upsampled rows is read (the inner one): map it through the upsampled padding
+            # Only one of r's two upsampled rows is read (the one nearer the image): map it through the upsampled padding
             mapped = _row(2 * r + 1 if r < 0 else 2 * r, rows_in * 2, stage.pad)
             out.append(None if mapped is None else mapped // 2)
-        else:  # zeros or wrapped (CHAINED): both of r's upsampled rows map alike
+        else:
             out.append(None if stage.pad == "zeros" else r % rows_in)
     return out
 
 
 def _keep_rows(stage: Stage, a: int, b: int, rows_out: int, second: bool = False) -> list:
-    """Which rows of what a stage's GroupNorm (or second GroupNorm) normalizes are in the image: as a conv
-    pads with zeros, those outside count as zeros (other paddings: as given or computed)."""
     k = stage.kind.halo
     if second:
         reach = 1
@@ -610,7 +541,6 @@ def _keep_rows(stage: Stage, a: int, b: int, rows_out: int, second: bool = False
 
 
 def _runs(rows: list):
-    """[(dst start, src start, length)] for the runs of consecutive rows, and the indexes of zero rows."""
     runs, zeros, i = [], [], 0
     while i < len(rows):
         if rows[i] is None:
@@ -625,7 +555,7 @@ def _runs(rows: list):
     return runs, zeros
 
 
-ALIGN = 256  # bytes: where each tensor in a slab starts
+ALIGN = 256
 
 
 def _align(n: int) -> int:
@@ -633,12 +563,9 @@ def _align(n: int) -> int:
 
 
 def _layout(events: list, sizes: dict) -> tuple:
-    """Offsets in one slab for tensors allocated and freed in the order of `events` ([(key, what)]: True to
-    allocate, False to free, or the key of a tensor that takes over the memory of `what`, which stays
-    allocated until freed too): ({key: offset}, the slab's size, the key allocated when the most bytes
-    were live). A tensor and those taking over its memory are placed together (at one offset, each as large
-    as it is while it lives), largest first, at the lowest offset clear of the others alive at the same
-    time: about as small as the most bytes alive at once."""
+    # Packs tensors into one slab. `events` in order: (key, True) allocates, (key, False) frees, (key, other_key)
+    # allocates `key` in `other_key`'s memory (an in-place output; other_key stays allocated until freed itself).
+    # Returns ({key: offset}, slab size, the key allocated at peak usage).
     members, group_of, groups, t = {}, {}, {}, 0
     for key, what in events:
         t += 1
@@ -651,7 +578,6 @@ def _layout(events: list, sizes: dict) -> tuple:
     for m in members.values():
         if m["end"] is None:
             m["end"] = t + 1
-    # The most bytes alive at once (a group's members sharing memory count as its largest alive)
     most, at = -1, None
     for key, what in events:
         if what is False:
@@ -663,7 +589,7 @@ def _layout(events: list, sizes: dict) -> tuple:
             live += max(alive, default=0)
         if live > most:
             most, at = live, key
-    placed, offsets, size = [], {}, 0  # placed: (offset, member)
+    placed, offsets, size = [], {}, 0
     for first, keys in sorted(groups.items(), key=lambda g: (-max(members[k]["size"] for k in g[1]), members[g[0]]["start"])):
         mine = [members[k] for k in keys]
         candidates = sorted({0} | {o + m["size"] for o, m in placed})
@@ -681,8 +607,8 @@ _pinned = {"tensor": None, "kind": None, "seconds": 0.0}
 
 
 def _host_slab(nbytes: int):
-    """RAM of at least nbytes for held tensors, pinned if it can be (registered with CUDA, not PyTorch's
-    pinned allocator, which rounds up to a power of two), kept for the next decode (release_pinned)."""
+    # Pinned by cudaHostRegister, not PyTorch's pinned allocator, which rounds up to a power of two. Kept for the next
+    # decode until release_pinned().
     t = _pinned["tensor"]
     if t is not None and t.numel() >= nbytes:
         return t
@@ -697,7 +623,7 @@ def _host_slab(nbytes: int):
     if kind == "pageable":
         try:
             t, kind = torch.empty(max(nbytes, 1), dtype=torch.uint8, pin_memory=True), "pinned"
-        except RuntimeError:  # not enough RAM to pin: copies wait for the CPU
+        except RuntimeError:
             pass
     _pinned.update(tensor=t, kind=kind, seconds=time.perf_counter() - start)
     return t
@@ -715,26 +641,17 @@ def release_pinned():
 
 
 def host_memory() -> tuple:
-    """(How the RAM for held tensors was had: "registered", "pinned" or "pageable"; its bytes; seconds)."""
     t = _pinned["tensor"]
     return _pinned["kind"], 0 if t is None else t.numel(), _pinned["seconds"]
 
 
 class Held:
-    """A tensor held between stages, rows first (rows, channels, width), in a slab in VRAM or in RAM."""
-
     def __init__(self, t, host: bool):
         self.t, self.host = t, host
 
 
 @dataclass
 class Plan:
-    """How a stripped decode runs, decided before it starts so it never runs out of VRAM: each block's way,
-    the stages and their runners that makes; each stage's rows per strip; which held tensors are in RAM;
-    where each is in its slab (one in VRAM, one in pinned RAM); which stages' outputs take over their
-    input's memory and how many strips behind; each stage's working tensors' bytes; the engines'
-    activations at most."""
-
     modes: dict
     stages: list
     runners: list
@@ -752,20 +669,15 @@ class Plan:
         return self.device_bytes + max(self.io) + self.act
 
     def describe(self) -> str:
-        """For the log: the blocks' ways other than STORE."""
         words = {RECOMPUTE: "recomputing their first conv", FUSED: "fused with their upsampling"}
         counts = {mode: sum(1 for m in self.modes.values() if m == mode) for mode in words}
         return ", ".join(f"{n} block{'s' if n > 1 else ''} {words[mode]}" for mode, n in counts.items() if n)
 
 
 class Decode:
-    """One image's post part in strips, for a first stage model. `runner_for(stage)` gives what runs a
-    stage: runner(feed, outputs, last) -> outputs (the strip's output written to outputs["out"]; `last`: the
-    shorter last strip), runner.rows(width) -> its most output rows at that width (0: none),
-    runner.activation(shapes) -> TensorRT's activation memory for those shapes. `cache` keeps TensorRT's answers between decodes ({(kind, rows, width):
-    bytes}): they're the engines' own, for as long as their plans are the same."""
-
-    inputs = (-2, -1)  # the held tensors a run starts with: the mid block's input and its attention's output
+    # runner_for(stage) returns an object with: __call__(feed, outputs, last) running one strip (`last`: the shorter
+    # final strip), rows(width) -> max output rows at that width, activation(shapes) -> TensorRT activation bytes.
+    inputs = (-2, -1)
 
     @staticmethod
     def _choices(fsm, padding: dict) -> list:
@@ -778,11 +690,11 @@ class Decode:
     def __init__(self, fsm, padding: dict, runner_for, dtype, device, copy_stream=None, arena=None, cache=None, available=None, scale: float = 1.0):
         self.fsm, self.padding, self.runner_for = fsm, padding, runner_for
         self.dtype, self.device, self.copy_stream, self.arena = dtype, torch.device(device), copy_stream, arena
-        self.scale = scale  # what the tensors between GroupNorms are multiplied by (the engines' biases too)
+        self.scale = scale
         self.size = torch.tensor([], dtype=dtype).element_size()
         self.cache = cache if cache is not None else {}
         self.ways = self._choices(fsm, padding)
-        if available is not None:  # only the ways whose kinds have engines
+        if available is not None:
             for b, ways in enumerate(self.ways):
                 self.ways[b] = tuple(m for m in ways if all(s.kind.name in available for s in self._list(fsm, padding, {b: m}) if s.block == b))
         self._lists = {}
@@ -806,13 +718,11 @@ class Decode:
 
     @staticmethod
     def geometry(stage: Stage, h: int, w: int) -> tuple:
-        """(output rows, output width, input rows) for latents of h x w."""
         return h * stage.scale, w * stage.scale, h * stage.in_scale
 
     def _shapes(self, found: list, h: int, w: int) -> dict:
-        """{held tensor: its shape, rows first}."""
         first = found[0]
-        if self.inputs == (-1,):  # the encoder's image
+        if self.inputs == (-1,):
             shapes = {-1: (h * first.in_scale, first.kind.cin, w * first.in_scale)}
         else:
             shapes = {-2: (h, first.kind.cin, w), -1: (h, first.kind.cin, w)}
@@ -823,10 +733,9 @@ class Decode:
         return shapes
 
     def _in_place(self, found: list, host: set) -> dict:
-        """{stage: strips behind} for the outputs that take over their input's memory as they go: its last use,
-        a row of the output no larger than one of it, held in the same place. Read without a halo (a
-        residual), right away; with a halo of 2 (BLOCK's input), a strip behind, so the next strip has read
-        the rows it overwrites."""
+        # {stage: strips behind} for outputs that can overwrite their input's memory as they're written: the input's
+        # last use, no wider per row, held in the same place (VRAM or RAM). A residual (no halo) is overwritten in step;
+        # BLOCK's input (halo 2) one strip behind, after the next strip has read the rows it needs.
         last = self.last_use(found)
         out = {}
         for n, st in enumerate(found):
@@ -835,7 +744,7 @@ class Decode:
             if st.res is not None and last[st.res] == n and st.kind.cout <= st.kind.res and (n in host) == (st.res in host):
                 out[n] = 0
             elif st.kind.op == BLOCK and st.pad == "zeros" and last[st.src] == n and st.kind.cout <= st.kind.cin and (n in host) == (st.src in host):
-                out[n] = 1  # (wrapped, the last strip reads the first rows, which the first strips overwrote)
+                out[n] = 1  # zero padding only: wrapped, the last strip reads rows the first strips overwrote
         return out
 
     def _events(self, found: list, in_place: dict) -> list:
@@ -851,17 +760,12 @@ class Decode:
         return events
 
     def _activation(self, runner, kind: Kind, rows: int, width: int) -> int:
-        """The activation memory a strip of this kind takes: TensorRT's own figure for its shapes (asked once
-        per shape, then kept)."""
         key = (kind.name, rows, width)
         if key not in self.cache:
             self.cache[key] = int(runner.activation(feed_shapes(kind, rows, width)))
         return self.cache[key]
 
     def _io(self, st: Stage, n: int, rows: int, width: int, host: set, lag: int) -> int:
-        """Bytes of a stage's working tensors: its input, residual and output for a strip (the output twice
-        when it's stored a strip behind; two strips' worth of staging for those held in RAM), and the rows
-        to keep."""
         shapes = feed_shapes(st.kind, rows, width)
         x = math.prod(shapes["x"]) * self.size
         res = math.prod(shapes["res"]) * self.size if "res" in shapes else 0
@@ -896,13 +800,9 @@ class Decode:
         return plan, at, sizes
 
     def plan(self, h: int, w: int, budget: int, ram: bool = True):
-        """The Plan for latents of h x w in `budget` bytes of VRAM, or None if not even the smallest strips
-        fit (or, if not `ram`, none that holds every tensor in VRAM does). The fastest that fits: every
-        block STORE with strips as large as fit (down to an 8th of what the engines take); else, of the
-        tensors held at the VRAM's peak, the largest one a block could do without (a first conv's output:
-        that block RECOMPUTE; an upsampling's: the block after it FUSED) gone, and so on; else the tensors
-        held at the peak moved to RAM, the largest first. Every size it weighs is exact (the held tensors',
-        the working ones', TensorRT's activation memory), so `budget` is all it plans for."""
+        # The fastest plan within `budget` bytes of VRAM, or None. Tries, in order: every block STORE with strips as
+        # tall as the engines take (down to 1/8 of that); then repeatedly switching the block whose held tensor is
+        # largest at peak usage to RECOMPUTE or FUSED; then (if `ram`) moving the largest tensors held at peak to RAM.
         modes = {b: ways[0] for b, ways in enumerate(self.ways)}
         while True:
             result = None
@@ -920,9 +820,9 @@ class Decode:
                     continue
                 ways, now = self.ways[st.block], modes[st.block]
                 if st.kind.op == CONV and st.res is None and st.keep:
-                    want = RECOMPUTE  # a first conv's output
+                    want = RECOMPUTE
                 elif st.kind.op == UP and st.keep:
-                    want = FUSED  # an upsampling's output
+                    want = FUSED
                 else:
                     continue
                 if want in ways and ways.index(want) > ways.index(now):
@@ -949,7 +849,6 @@ class Decode:
         return None
 
     def _live_at(self, plan: Plan, at) -> list:
-        """The held tensors in VRAM alive when `at` was allocated."""
         if at is None:
             return []
         events = self._events(plan.stages, plan.in_place)
@@ -966,10 +865,6 @@ class Decode:
         return list(live)
 
     def run(self, x, attention, plan: Plan):
-        """The image (1, out channels, H, W) for the mid block's input x and its attention's output (each
-        (1, channels, h, w), in VRAM, in any precision, scaled as the decoder runs scaled: by whoever has
-        them in a precision that holds them unscaled)."""
-
         def fill(held):
             held[-2].t.copy_(x[0].permute(1, 0, 2))
             held[-1].t.copy_(attention[0].permute(1, 0, 2))
@@ -978,22 +873,18 @@ class Decode:
         return self._out(held[len(plan.stages) - 1].t)
 
     def _out(self, t):
-        """A held tensor (rows, channels, width), in VRAM or RAM, as (1, channels, rows, width) in VRAM: one
-        copy there, however it's held (the size VaeModel counts beside the plan)."""
         out = torch.empty((1, t.shape[1], t.shape[0], t.shape[2]), dtype=t.dtype, device=self.device)
         out[0].copy_(t.permute(1, 0, 2))
         return out
 
     def _run(self, plan: Plan, h: int, w: int, fill) -> tuple:
-        """Runs the plan's stages for latents of h x w, `fill(held)` having put the tensors it starts with in.
-        Returns (the held tensors, the last stage's output's statistics)."""
         found = plan.stages
         shapes = self._shapes(found, h, w)
         slab = torch.empty(max(plan.device_bytes, 1), dtype=torch.uint8, device=self.device)
         ram = _host_slab(plan.host_bytes) if plan.host else None
         io = torch.empty(max(max(plan.io), 1), dtype=torch.uint8, device=self.device)
         if self.arena is not None:
-            self.arena.get(plan.act)  # once, at its largest: every engine binds it as is
+            self.arena.get(plan.act)  # once, at the largest any stage needs, so no engine rebinds it
         held = {}
         for key, shape in shapes.items():
             base = ram if key in plan.host else slab
@@ -1025,7 +916,7 @@ class Decode:
         shapes_r = feed_shapes(kind, rows, width)
         offset = [0]
 
-        def take(elements):  # a flat view of the working slab
+        def take(elements):
             nbytes = elements * self.size
             view = io[offset[0]:offset[0] + nbytes].view(self.dtype)
             offset[0] += _align(nbytes)
@@ -1050,11 +941,11 @@ class Decode:
         copy = self.copy_stream if (x_stage or res_stage or out_stage) else None
         compute = torch.cuda.current_stream(self.device) if copy is not None else None
         if copy is not None:
-            copy.wait_stream(compute)  # the working slab's last users (the stage before) are done
+            copy.wait_stream(compute)  # the previous stage is done with the working slab
         loaded, consumed, stored = {}, [None, None], [None, None]
         rows_in = src.t.shape[0]
 
-        def load(k):  # what's in RAM, into staging on the copy stream (a strip ahead)
+        def load(k):
             a, b = strips[k]
             slot = k % 2
             parts = []
@@ -1064,7 +955,7 @@ class Decode:
                 parts.append(("res", res, list(range(a, b)), res_stage[slot]))
             with (torch.cuda.stream(copy) if copy is not None else contextlib.nullcontext()):
                 if copy is not None and consumed[slot] is not None:
-                    copy.wait_event(consumed[slot])  # the strip two back is done with this staging
+                    copy.wait_event(consumed[slot])  # staging is double-buffered: wait for the strip two back
                 views = {}
                 for name, held_t, want, flat in parts:
                     view = flat[:len(want) * held_t.t[0].numel()].view((len(want),) + tuple(held_t.t.shape[1:]))
@@ -1080,7 +971,7 @@ class Decode:
                     event.record(copy)
             loaded[k] = (views, event)
 
-        def gather(dst, held_t, want):  # rows of a tensor in VRAM, straight into the strip's input
+        def gather(dst, held_t, want):
             runs, zeros = _runs(want)
             for d, start, length in runs:
                 dst[0, :, d:d + length, :].copy_(held_t.t[start:start + length].permute(1, 0, 2))
@@ -1095,7 +986,7 @@ class Decode:
             slot = k % 2
             staging = out_stage[slot][:(b - a) * kind.cout * width].view(b - a, kind.cout, width)
             if compute is not None and stored[slot] is not None:
-                compute.wait_event(stored[slot])  # its last copy out is done
+                compute.wait_event(stored[slot])
             staging.copy_(rows_first)
             if copy is None:
                 out.t[a:b].copy_(staging)
@@ -1110,7 +1001,7 @@ class Decode:
 
         if x_stage or res_stage:
             load(0)
-        pending = None  # a strip's output to store once the next strip has read its input (in place, a strip behind)
+        pending = None  # an in-place output, stored only after the next strip has read the input rows it overwrites
         for k, (a, b) in enumerate(strips):
             r = b - a
             sh = feed_shapes(kind, r, width)
@@ -1119,7 +1010,7 @@ class Decode:
             staged = {}
             if x_stage or res_stage:
                 if k + 1 < len(strips):
-                    load(k + 1)  # its copies run while this strip computes
+                    load(k + 1)
                 staged, event = loaded.pop(k)
                 if event is not None:
                     compute.wait_event(event)
@@ -1145,7 +1036,7 @@ class Decode:
             for name, flat in keep_flats.items():
                 keep_list = _keep_rows(stage, a, b, out_rows, second=name == "keep2")
                 keep = flat[:len(keep_list)].view(1, 1, -1, 1)
-                keep.fill_(1.0 if kind.op == OUT else self.scale)  # the image itself isn't scaled
+                keep.fill_(1.0 if kind.op == OUT else self.scale)
                 for i, inside in enumerate(keep_list):
                     if not inside:
                         keep[:, :, i].zero_()
@@ -1170,7 +1061,6 @@ class Decode:
         return result_stats
 
     def _out_size(self, stage: Stage, src: Held) -> tuple:
-        """(output rows, output width) from the input's size."""
         rows, width = src.t.shape[0], src.t.shape[2]
         if stage.kind.op == DOWN:
             return rows // 2, width // 2
@@ -1178,9 +1068,7 @@ class Decode:
 
 
 class Encode(Decode):
-    """The encoder up to its mid block's attention, in strips: as Decode, from an image."""
-
-    inputs = (-1,)  # the image
+    inputs = (-1,)
 
     @staticmethod
     def _choices(fsm, padding: dict) -> list:
@@ -1191,26 +1079,21 @@ class Encode(Decode):
         return encoder_stages(fsm, padding, modes)
 
     def run(self, image, plan: Plan) -> tuple:
-        """(The mid block's first resnet block's output (1, channels, h, w) in VRAM, scaled as the encoder runs
-        scaled; its statistics, for the attention's GroupNorm) for an image (1, channels, H, W) in VRAM, as
-        the encoder takes it (-1..1)."""
         first = plan.stages[0]
         h, w = image.shape[2] // first.in_scale, image.shape[3] // first.in_scale
 
         def fill(held):
             held[-1].t.copy_(image[0].permute(1, 0, 2))
             if self.scale != 1.0:
-                held[-1].t.mul_(self.scale)  # as the scaled encoder takes it (vae_build._EncodePre)
+                held[-1].t.mul_(self.scale)
 
         held, stats = self._run(plan, h, w, fill)
         return self._out(held[len(plan.stages) - 1].t), stats
 
 
 class EngineRunner:
-    """A stage on its kind's engine (engine.py's Engine), loaded with the stage's weights when it first
-    runs (`load()` -> (its context for strips, its context for the shorter last one), so neither changes
-    shapes from one decode of a size to the next); activation sizes from the kind's probe context."""
-
+    # load() returns two execution contexts on the stage's engine: one for full strips, one for the shorter last strip,
+    # so neither changes shapes between decodes of the same size.
     def __init__(self, load, probe, shapes: dict, kind: Kind):
         self.load, self.probe, self.shapes, self.kind = load, probe, shapes, kind
         self.engines = None

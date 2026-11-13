@@ -1,7 +1,3 @@
-"""Building the VAE's engines (vae.py): its decoder's and its encoder's two parts, traced from fresh modules
-of the loaded VAE's layout to weightless ONNX graphs, and the stages of decoding and encoding in strips
-(strips.py), each built in export.py's builder process. What the engines on disk already cover is kept."""
-
 import contextlib
 import gc
 import glob
@@ -23,8 +19,6 @@ from .vae import (
 
 
 class _Pre(torch.nn.Module):
-    """The decoder up to its mid-block attention: (that attention's input, its queries, keys, values)."""
-
     def __init__(self, fsm):
         super().__init__()
         self.post_quant_conv = getattr(fsm, "post_quant_conv", None)
@@ -40,8 +34,6 @@ class _Pre(torch.nn.Module):
 
 
 class _Post(torch.nn.Module):
-    """The rest of the decoder, from the mid-block attention's input and output: the image."""
-
     def __init__(self, fsm):
         super().__init__()
         self.decoder = fsm.decoder
@@ -55,12 +47,10 @@ class _Post(torch.nn.Module):
             if i_level != 0:
                 h = d.up[i_level].upsample(h)
         h = d.norm_out(h)
-        return d.conv_out(h * torch.sigmoid(h))  # reForge's nonlinearity
+        return d.conv_out(h * torch.sigmoid(h))
 
 
 class _EncodePre(torch.nn.Module):
-    """The encoder up to its mid-block attention: (that attention's input, its queries, keys, values)."""
-
     def __init__(self, fsm):
         super().__init__()
         self.encoder = fsm.encoder
@@ -80,9 +70,6 @@ class _EncodePre(torch.nn.Module):
 
 
 class _EncodePost(torch.nn.Module):
-    """The rest of the encoder, from the mid-block attention's input and output, and quant_conv where the
-    first stage model applies it: the latent's distribution ("moments"), as it is."""
-
     def __init__(self, fsm):
         super().__init__()
         self.encoder = fsm.encoder
@@ -92,12 +79,11 @@ class _EncodePost(torch.nn.Module):
         e = self.encoder
         h = e.mid.block_2(x + e.mid.attn_1.proj_out(attention), None)
         h = e.norm_out(h)
-        h = e.conv_out(h * torch.sigmoid(h))  # reForge's nonlinearity
+        h = e.conv_out(h * torch.sigmoid(h))
         return self.quant_conv(h) if self.quant_conv is not None else h
 
 
-def fresh(cfg: dict, device, dtype):
-    """A decoder of this layout from reForge's own classes, with none of a loaded one's offloading hooks."""
+def fresh(cfg: dict, device, dtype):  # traced instead of the loaded VAE, which carries reForge's offloading hooks
     import ldm_patched.modules.ops as ops
     from ldm_patched.ldm.modules.diffusionmodules.model import Decoder
 
@@ -115,7 +101,6 @@ def fresh(cfg: dict, device, dtype):
 
 
 def fresh_encoder(cfg: dict, device, dtype):
-    """An encoder of this layout from reForge's own classes, likewise (with quant_conv where it's applied)."""
     import ldm_patched.modules.ops as ops
     from ldm_patched.ldm.modules.diffusionmodules.model import Encoder
 
@@ -132,9 +117,7 @@ def fresh_encoder(cfg: dict, device, dtype):
     return module.to(device=device, dtype=dtype).eval()
 
 
-def _randomize(module):
-    """Random weights: tracing doesn't depend on them, and distinct values keep the exporter from merging
-    identical ones (GroupNorm's)."""
+def _randomize(module):  # identical tensors (GroupNorm's ones/zeros) get merged by the exporter, losing weight names
     for t in module.state_dict(keep_vars=True).values():
         if t.is_floating_point():
             t.normal_(0, 0.02)
@@ -142,9 +125,6 @@ def _randomize(module):
 
 
 def _export(module, halves: dict, work: str, first, loaded: dict) -> dict:
-    """Traces a fresh module's two halves ({part: (the half's class, its inputs' names, its outputs', their
-    dynamic axes)}, the first one fed `first`, the second its first output and one like it) to
-    work/vae_<part>.onnx: {part: {weight name: shape}}."""
     from . import export
 
     _randomize(module)
@@ -167,7 +147,6 @@ _LARGER = {0: "batch", 2: "image_height", 3: "image_width"}
 
 @common.inference_mode
 def export_onnx(vae, work: str, dtype, device) -> dict:
-    """Writes work/vae_pre.onnx and work/vae_post.onnx; returns {part: {weight name: shape}, "config"}."""
     cfg = config(vae)
     halves = {
         PRE: (_Pre, ["latent"], ["x", "q", "k", "v"], {n: _AXES for n in ("latent", "x", "q", "k", "v")}),
@@ -180,8 +159,6 @@ def export_onnx(vae, work: str, dtype, device) -> dict:
 
 @common.inference_mode
 def export_encoder_onnx(vae, work: str, dtype, device) -> dict:
-    """Writes work/vae_encode-pre.onnx and work/vae_encode-post.onnx; returns {part: {weight name: shape},
-    "config"}."""
     cfg = encoder_config(vae)
     halves = {
         ENCODE_PRE: (_EncodePre, ["image"], ["x", "q", "k", "v"], {"image": _LARGER, **{n: _AXES for n in ("x", "q", "k", "v")}}),
@@ -194,9 +171,6 @@ def export_encoder_onnx(vae, work: str, dtype, device) -> dict:
 
 @common.inference_mode
 def export_strips(vae, work: str, dtype, device, names, encoding: bool = False) -> dict:
-    """Writes the ONNX graphs of the kinds named, of the decode in strips (work/strip-<kind>.onnx) or the
-    encode's (work/encode-strip-<kind>.onnx); returns {kind name (prefixed so, for the encode's): {weight name:
-    shape}}. Each from a stage of that kind in a fresh decoder or encoder of the VAE's layout."""
     from . import export
 
     if encoding:
@@ -226,13 +200,6 @@ def export_strips(vae, work: str, dtype, device, names, encoding: bool = False) 
 
 
 def build(arch, profiles: list, work: str, optimization_level=None, progress=None, vae=None):
-    """Builds the VAE engines these profiles' sizes lack, for the loaded VAE and its precisions
-    (engine_dtype, strip_dtype): the decoder's pre and post engines, the encoder's two, and those that
-    decode and encode in strips (strips.py), keeping what this GPU's and TensorRT version's engines for the
-    architecture have that covers them, and deleting the rest. Returns (the Record or None, why it failed
-    or None, how many kernels TensorRT skipped for want of VRAM); a failure is logged here. If only the
-    encoder's engines or the stripped decode's fail, the record has the others (and says why in
-    "encoder_error" or "strips_error")."""
     from . import export
 
     vae = vae if vae is not None else loaded_vae()
@@ -250,11 +217,11 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         everything = [PRE, POST] + (list(ENCODER) if enc_wanted else []) + enc_kinds + list(strip_wanted)
         old = next(iter(records_matching(arch.id, vae, dtype, sdtype)), None)
         todo = parts_missing(old, asked, strip_wanted, enc_wanted) if old is not None else list(everything)
-        if old is not None and old.meta.get("strips_error"):  # building anyway: try those again
+        if old is not None and old.meta.get("strips_error"):
             todo += [k for k in strip_wanted if k not in old.strips and k not in todo]
         if old is not None and old.meta.get("encoder_error") and enc_wanted and ENCODE_PRE not in todo:
             todo += list(ENCODER) + [k for k in enc_kinds if k not in todo]
-        if old is not None and enc_wanted and (old.encoder or {}).get("strips_error"):  # likewise
+        if old is not None and enc_wanted and (old.encoder or {}).get("strips_error"):
             todo += [k for k in enc_kinds if k[len(ENCODE_STRIP):] not in old.encoder_strips and k not in todo]
         enc_kinds_todo = [k[len(ENCODE_STRIP):] for k in todo if k.startswith(ENCODE_STRIP)]
         kinds_todo = [k for k in todo if k not in (PRE, POST) + ENCODER and not k.startswith(ENCODE_STRIP)]
@@ -300,9 +267,9 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             graphs.update(export_strips(vae, work, sdtype, device, kinds_todo))
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()  # the trace's VRAM back to the driver, for the builder's process
+            torch.cuda.empty_cache()  # the trace's VRAM, back to the driver for the builder process
         built, done, tries = {}, 0, 0
-        total = len(todo)  # engines to build
+        total = len(todo)
 
         def job(part, plan_shapes):
             onnx_name = f"strip-{part}" if part in kinds_todo else part if part.startswith(ENCODE_STRIP) else f"vae_{part}"
@@ -320,9 +287,6 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             return (lambda f, t: progress((n + f) / max(1, total), f"{what}: {t}")) if progress else None
 
         def build_kinds(kinds: dict, prefix: str, what: str) -> tuple:
-            """Builds the engines of these kinds ({name: shapes}) for `what` in strips, their graphs and plans
-            named `prefix` and the kind: ({name: its meta} of those built, why one failed or None, stopping
-            there). Raises _Cancelled."""
             nonlocal done, total, skipped
             metas = {}
             for i, name in enumerate(kinds):
@@ -342,7 +306,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                 done += 1
             return metas, None
 
-        parts = [p for p in (POST, PRE) if p in todo]  # the post engine first: TensorRT may find no kernels for it
+        parts = [p for p in (POST, PRE) if p in todo]  # post first: it may need a retry at a smaller size
         while parts:
             part = parts[0]
             result = export._build_plan(job(part, shapes[part]), work, step(f"{part} engine"))
@@ -360,7 +324,6 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             built[part] = result
             parts.pop(0)
             done += 1
-        # The encoder's: kept if they cover these sizes, else built, the pre one again smaller like the post
         enc_meta = old.encoder if old is not None and enc_wanted and ENCODE_PRE not in todo else None
         enc_error = None
         if ENCODE_PRE in todo:
@@ -396,20 +359,20 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                     "digest": enc_wanted["digest"],
                     "config": enc_wanted["config"],
                     "shapes": enc_shapes,
-                    "asked": enc_wanted["shapes"],  # what they were built for: the shapes, unless TensorRT had to go smaller
+                    "asked": enc_wanted["shapes"],  # what was requested; "shapes" is what TensorRT managed
                     "weights": {part: sorted(graphs[part]) for part in ENCODER},
                     "weight_bytes": weight_bytes(vae, sorted(set(graphs[ENCODE_PRE]) | set(graphs[ENCODE_POST])), dtype),
                     "stripped": {part: built[part]["stripped"] for part in ENCODER},
                     "strips": dict(old.encoder_strips) if old is not None and (old.encoder or {}).get("digest") == enc_wanted["digest"] else {},
                 }
-        if enc_meta is not None:  # the encode in strips' kinds: those kept that are wanted, and those it lacks
+        if enc_meta is not None:
             kinds = enc_wanted["strips"]
             enc_meta = dict(enc_meta, strips={k: v for k, v in (enc_meta.get("strips") or {}).items() if k in kinds and k not in enc_kinds_todo})
             if enc_kinds_todo:
                 enc_meta.pop("strips_error", None)
                 enc_meta.pop("strips_asked", None)
                 got, error = build_kinds({k: kinds[k] for k in enc_kinds_todo}, ENCODE_STRIP, "encoding")
-                if error:  # encodes run whole only: one in strips needs every kind
+                if error:
                     enc_meta.update(strips={}, strips_error=error, strips_asked=kinds)
                 else:
                     enc_meta["strips"].update(got)
@@ -417,7 +380,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         built_kinds, strips_error = build_kinds({name: strip_wanted[name] for name in kinds_todo}, "", "decoding")
         strip_meta.update(built_kinds)
         if strips_error:
-            strip_meta = {}  # a stripped decode needs every kind
+            strip_meta = {}  # decoding in strips needs every kind
         identity = [digest(vae), dtype_name(dtype), dtype_name(sdtype), shapes, sorted((k, v["shapes"]) for k, v in strip_meta.items())]
         if enc_meta is not None:
             identity.append([enc_meta["digest"], enc_meta["shapes"], sorted((k, v["shapes"]) for k, v in (enc_meta.get("strips") or {}).items())])
@@ -427,11 +390,11 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             "key": key,
             "arch_id": arch.id,
             "digest": digest(vae),
-            "dtype": dtype_name(dtype),  # the whole-image engines'
-            "strips_dtype": dtype_name(sdtype),  # the engines' for strips (scaled, if FP16)
+            "dtype": dtype_name(dtype),
+            "strips_dtype": dtype_name(sdtype),
             "config": cfg,
             "shapes": shapes,
-            "asked": {PRE: shapes[PRE], POST: post_asked},  # what they were built for: the shapes, unless TensorRT had to go smaller
+            "asked": {PRE: shapes[PRE], POST: post_asked},
             "weights": weights,
             "weight_bytes": weight_bytes(vae, weights[PRE] + weights[POST], dtype),
             "stripped": {part: built[part]["stripped"] if part in built else old.meta["stripped"][part] for part in (PRE, POST)},
@@ -461,10 +424,10 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             source = os.path.join(work, f"{ENCODE_STRIP}{name}.plan") if ENCODE_STRIP + name in built else old.encoder_strip_plan(name)
             if source != new.encoder_strip_plan(name):
                 os.replace(source, new.encoder_strip_plan(name))
-        for path in glob.glob(glob.escape(path_prefix(arch.id)) + "-*.json"):  # what these replace
+        for path in glob.glob(glob.escape(path_prefix(arch.id)) + "-*.json"):
             if path[: -len(".json")] != base:
                 remove_record(path[: -len(".json")])
-        for path in glob.glob(glob.escape(base) + ".strip-*.plan"):  # this record's own, from before, it no longer has
+        for path in glob.glob(glob.escape(base) + ".strip-*.plan"):
             if path[len(base) + len(".strip-"): -len(".plan")] not in strip_meta:
                 os.remove(path)
         for path in glob.glob(glob.escape(base) + f".{ENCODE_STRIP}*.plan"):
@@ -486,4 +449,4 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
 
 
 class _Cancelled(Exception):
-    """The build was cancelled."""
+    pass

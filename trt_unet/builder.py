@@ -1,7 +1,6 @@
-"""Builds a weightless engine, in a process of its own so all the VRAM the builder holds goes back to the
-driver when it ends. Run by export.py; reports progress, what it has to say (export.py logs it) and its
-result on stdout, and shows a progress bar on stderr. Doesn't import torch."""
-
+# Builds one engine in a subprocess, so all the VRAM the builder used returns to the driver when it exits. Talks to
+# export.run_builder over stdout (PROGRESS, LOG and RESULT lines) and draws a progress bar on stderr. Must not import
+# torch.
 import contextlib
 import json
 import os
@@ -18,20 +17,16 @@ PROGRESS = "@@trt-progress "
 LOG = "@@trt-log "
 RESULT = "@@trt-result "
 _MEMORY_HINTS = ("insufficient memory", "memory is insufficient", "could not be allocated", "out of memory")
-_ALLOCATION_FAILED = ("outofmemory (requested size",)  # TensorRT 11's error for a kernel's memory it then does without
+# TensorRT 11 reports kernels it skips for lack of VRAM as errors ("Error Code 2: OutOfMemory (Requested size was
+# ...)"), though the build continues. Counted, not logged: a build can produce thousands.
+_ALLOCATION_FAILED = ("outofmemory (requested size",)
 
 
 def log(level: str, message: str):
-    """Logged by export.py, at `level` ("DEBUG", "INFO", "WARNING", ...)."""
     _send(LOG, {"level": level, "message": message})
 
 
 class Logger(trt.ILogger):
-    """TensorRT's errors and warnings, at DEBUG (each warning once: the error that ends a build is in its
-    result), and the number of out-of-memory messages TensorRT gives when it has to skip kernels, with the
-    first one: a build can give a great many. TensorRT 11 gives them as errors ("Error Code 2: OutOfMemory
-    (Requested size was ...)"), though the build goes on without those kernels."""
-
     def __init__(self):
         trt.ILogger.__init__(self)
         self.errors, self._seen = [], set()
@@ -55,8 +50,6 @@ class Logger(trt.ILogger):
 
 
 class Progress(trt.IProgressMonitor):
-    """A tqdm bar for the build's top phase, and `callback(fraction, text)` for it and its active sub-phase."""
-
     def __init__(self, callback, max_depth=1):
         trt.IProgressMonitor.__init__(self)
         self.callback, self.max_depth = callback, max_depth
@@ -139,10 +132,10 @@ class NoEngine(RuntimeError):
 
 def build(job, logger, progress, strip=True):
     builder = trt.Builder(logger)
-    network = builder.create_network(0)  # strongly typed: precision comes from the FP16 graph
+    network = builder.create_network(0)  # strongly typed: layer precisions come from the FP16 ONNX graph
     parser = trt.OnnxParser(network, logger)
-    # The parser opens files through narrow paths, which on Windows can't hold every character (e.g. a
-    # user folder named in Japanese): parse from the model's folder with an ASCII relative path.
+    # The ONNX parser opens files through narrow (ANSI) paths on Windows, which fail on e.g. a Japanese user folder name:
+    # parse from the file's folder by a relative name.
     cwd, (folder, name) = os.getcwd(), os.path.split(os.path.abspath(job["onnx"]))
     os.chdir(folder)
     try:
@@ -157,13 +150,13 @@ def build(job, logger, progress, strip=True):
         raise RuntimeError(f"{len(unmarked)} of the model's weights aren't in the TensorRT network (e.g. {unmarked[0]})")
 
     config = builder.create_builder_config()
-    config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)  # only the model's weights: they come from the checkpoint
+    config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)
     if strip:
         config.set_flag(trt.BuilderFlag.STRIP_PLAN)
     if job.get("optimization_level") is not None:
         config.builder_optimization_level = int(job["optimization_level"])
     if any(lo != hi for shapes in job["profiles"] for lo, _, hi in shapes.values()):
-        config.set_preview_feature(trt.PreviewFeature.RUNTIME_ACTIVATION_RESIZE_10_10, True)  # activation memory sized for the shapes in use
+        config.set_preview_feature(trt.PreviewFeature.RUNTIME_ACTIVATION_RESIZE_10_10, True)
     config.progress_monitor = progress
 
     cache_path = job.get("timing_cache")
@@ -176,10 +169,10 @@ def build(job, logger, progress, strip=True):
     except Exception as e:
         log("WARNING", f"The timing cache couldn't be read, so this build starts without it: {e}")
         cache = config.create_timing_cache(b"")
-    del data  # TensorRT has its own copy; the file can be large (it keeps compiled kernels from every build)
+    del data
     config.set_timing_cache(cache, ignore_mismatch=True)
 
-    present = {network.get_input(i).name for i in range(network.num_inputs)}  # e.g. SDXL's shallow UNet takes no prompt
+    present = {network.get_input(i).name for i in range(network.num_inputs)}  # SDXL's shallow UNet has no prompt input
     for shapes in job["profiles"]:
         profile = builder.create_optimization_profile()
         for name, (lo, opt, hi) in shapes.items():
@@ -189,7 +182,7 @@ def build(job, logger, progress, strip=True):
 
     plan = builder.build_serialized_network(network, config)
     if plan is None:
-        said = logger.errors[-1] if logger.errors else logger.memory_example  # e.g. nothing fit in the VRAM free
+        said = logger.errors[-1] if logger.errors else logger.memory_example
         raise NoEngine("TensorRT returned no engine" + (f": {said}" if said else ""))
     with open(job["plan"], "wb") as f:
         f.write(memoryview(plan))
@@ -201,9 +194,8 @@ def build(job, logger, progress, strip=True):
 
 
 def _exit_with_parent():
-    """The parent holds our stdin open: EOF means it's gone, and nobody would use the engine. Anything this
-    process started goes too, if it leads its process group (export.py starts it that way on POSIX)."""
-
+    # The parent holds this process's stdin open and never writes to it, so EOF means the parent died. Kills the whole
+    # process group too (export.py starts this process as a group leader on POSIX).
     def watch():
         try:
             while sys.stdin.read(4096):
@@ -229,12 +221,10 @@ def main(job_path):
         log("DEBUG", f"Building {os.path.basename(job['plan'])} with TensorRT {trt.__version__}.")
         build(job, logger, Progress(_progress_sender()), strip=strip)
         result["ok"] = True
-    except Exception as e:  # export.py says it
+    except Exception as e:
         result["error"] = str(e) or type(e).__name__
-        if not isinstance(e, RuntimeError):  # (TensorRT's own failures say it all)
+        if not isinstance(e, RuntimeError):
             log("DEBUG", f"The build failed:\n{traceback.format_exc().rstrip()}")
-        # TensorRT refusing to strip the weights: export.py builds again without, in a new process (this
-        # one still holds what the failed build left behind)
         result["retry_without_strip"] = strip and isinstance(e, NoEngine) and any(w in " ".join(logger.errors).lower() for w in ("refit", "strip", "weight"))
     result["memory_warnings"] = logger.memory_warnings
     _send(RESULT, result)

@@ -1,10 +1,8 @@
-"""Shape profiles: what an engine accepts, in image terms for people and in UNet input shapes for TensorRT."""
-
 import math
 from dataclasses import dataclass
 
 TOKENS_PER_CHUNK = 75
-CONTEXT_PER_CHUNK = 77
+CONTEXT_PER_CHUNK = 77  # 75 prompt tokens + CLIP's start and end tokens
 FIELDS = ("width", "height", "batch", "tokens")
 
 
@@ -14,10 +12,10 @@ def context_length(tokens: int) -> int:
 
 @dataclass(frozen=True)
 class Profile:
-    width: tuple  # (min, opt, max) in pixels
+    width: tuple
     height: tuple
-    batch: tuple  # images per batch
-    tokens: tuple  # prompt tokens
+    batch: tuple
+    tokens: tuple
 
     @classmethod
     def from_dict(cls, d: dict) -> "Profile":
@@ -27,9 +25,6 @@ class Profile:
         return {f: list(getattr(self, f)) for f in FIELDS}
 
     def validated(self, multiple: int) -> "Profile":
-        """Snapped to the sizes the model takes (outward, so the range still covers what was asked),
-        each range ordered and containing its optimum."""
-
         def fix(values, step, lowest):
             lo, opt, hi = values
             lo, opt, hi = (max(lowest, v * step) for v in (math.floor(lo / step), round(opt / step), math.ceil(hi / step)))
@@ -44,7 +39,6 @@ class Profile:
 
     @property
     def fixed_size(self) -> bool:
-        """One size and batch size: the fastest kind (a prompt length range costs next to nothing)."""
         return all(getattr(self, f)[0] == getattr(self, f)[2] for f in ("width", "height", "batch"))
 
     def describe(self) -> str:
@@ -58,8 +52,8 @@ class Profile:
         return f"{size}, batch {span(self.batch)}, {span(self.tokens)} tokens{' (fixed size)' if self.fixed_size else ''}"
 
     def unet_shapes(self, in_channels: int, context_dim: int, adm_channels: int) -> dict:
-        """{input: [min, opt, max] shapes}. The UNet batch holds cond and uncond (2 per image), or one
-        per image at CFG 1 (Lightning/DMD2/Turbo), which a batch fixed at 2 would pad to double the work."""
+        # Cond and uncond make 2 UNet rows per image. The minimum stays at 1 so CFG-1 samplers (Lightning, DMD2,
+        # Turbo), which send 1 row per image, aren't padded to 2.
         lo, opt, hi = self.batch
         batch = (lo, 2 * opt, 2 * hi)
         shapes = {
@@ -73,9 +67,8 @@ class Profile:
 
 
 def fit(shapes: dict, batch: int, height: int, width: int, context: int):
-    """(score, padded batch, context repeats) if the profile can run these UNet inputs, else None.
-    Smaller batches are padded by repetition and the output sliced back; a context repeated k times
-    gives the same cross-attention, so it can stand in for a longer one."""
+    # A batch below the profile's minimum is padded by repeating it (the caller slices the output back). A context
+    # shorter than the minimum is tiled k times, which leaves cross-attention's output unchanged.
     (b_lo, _, h_lo, w_lo), (b_opt, _, h_opt, w_opt), (b_hi, _, h_hi, w_hi) = shapes["sample"]
     if not (h_lo <= height <= h_hi and w_lo <= width <= w_hi and batch <= b_hi):
         return None
@@ -84,20 +77,18 @@ def fit(shapes: dict, batch: int, height: int, width: int, context: int):
     if repeats * context > c_hi:
         return None
     padded = max(batch, b_lo)
-    spread = math.log(h_hi * w_hi / (h_lo * w_lo)) + math.log(b_hi / b_lo) + math.log(c_hi / c_lo)  # narrower ranges run faster
+    spread = math.log(h_hi * w_hi / (h_lo * w_lo)) + math.log(b_hi / b_lo) + math.log(c_hi / c_lo)
     score = (padded / batch, repeats, abs(math.log(height * width / (h_opt * w_opt))), abs(math.log(padded / b_opt)), spread)
     return score, padded, repeats
 
 
 def select(profile_shapes: list, batch: int, height: int, width: int, context: int, prefer=()):
-    """(profile index, padded batch, context repeats) of the best profile for these inputs, or None. The
-    `prefer`red profiles (the engine in use's) win whenever one fits with no more padding or context
-    repeats than the best: switching means loading another engine, which takes far longer than running
-    these sizes on a profile tuned for others (e.g. a Hires. fix the first pass's profile also covers)."""
     fits = [(f, i) for i, s in enumerate(profile_shapes) if (f := fit(s, batch, height, width, context))]
     if not fits:
         return None
     best = min(fits)
+    # A profile of the engine already loaded wins unless the best needs less padding or fewer repeats: loading
+    # another engine costs far more than running on a profile tuned for other sizes.
     preferred = [f for f in fits if f[1] in prefer]
     if preferred and min(preferred)[0][0][:2] <= best[0][0][:2]:
         best = min(preferred)
@@ -112,8 +103,7 @@ def covers_size(profile_shapes: list, height: int, width: int, batch: int = 1) -
     )
 
 
-def _p(w, h, batch=(1, 1, 1), tokens=(75, 300, 750)):
-    """Prompts of up to 750 tokens, tuned for 300: a prompt length range barely affects speed."""
+def _p(w, h, batch=(1, 1, 1), tokens=(75, 300, 750)):  # a wide prompt-length range costs almost nothing
     return Profile(w if isinstance(w, tuple) else (w,) * 3, h if isinstance(h, tuple) else (h,) * 3, batch, tokens)
 
 
@@ -135,9 +125,8 @@ PRESETS = {
         "512-768, batch 1-4": _p((512, 512, 768), (512, 512, 768), (1, 1, 4)),
     },
 }
-# Every base resolution, and Hires. fix up to 2x of them: what most generations need. The Hires. fix profile
-# starts at the smallest base size, since an upscaled portrait or landscape (e.g. 640x1536 at 1.5x: 960x2304)
-# is wider than the base profile on one side only.
+# The Hires. fix profiles start at the smallest base size, not the largest: an upscaled portrait or landscape
+# (640x1536 at 1.5x is 960x2304) only exceeds the base profile on one side.
 DEFAULTS = {
     "xl": ("640-1536 (every SDXL resolution)", "640-3072 (Hires. fix up to 2x of every SDXL resolution)"),
     "sd": ("512-768 (every SD 1.5 resolution)", "512-1536 (Hires. fix up to 2x of every SD 1.5 resolution)"),

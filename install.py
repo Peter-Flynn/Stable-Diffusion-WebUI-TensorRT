@@ -10,14 +10,12 @@ logger = logging.getLogger("TensorRT")
 
 
 def installed_tensorrt():
-    """(package, version) of the installed TensorRT, whichever CUDA build it is (tensorrt, tensorrt-cu12, ...),
-    or (None, None)."""
     found = []
     for dist in metadata.distributions():
         name = (dist.metadata.get("Name") or "").lower().replace("_", "-")
         match = re.fullmatch(r"(tensorrt(?:-cu\d+)?)(-bindings)?", name)
         if match:
-            found.append((match.group(2) is not None, match.group(1), dist.version))  # the package before its bindings
+            found.append((match.group(2) is not None, match.group(1), dist.version))  # False first: min() prefers a package over its -bindings
     return min(found)[1:] if found else (None, None)
 
 
@@ -29,7 +27,7 @@ def install():
         launch.run_pip("install tensorrt", "tensorrt", live=True)
     elif tuple(map(int, re.findall(r"\d+", version)[:2])) < MIN_TRT:
         logger.info(f"Updating {package} {version}: this extension needs TensorRT {MIN_TRT[0]} or later.")
-        launch.run_pip(f"install -U {package}", package, live=True)  # the same CUDA build
+        launch.run_pip(f"install -U {package}", package, live=True)
     if not launch.is_installed("onnx"):
         launch.run_pip("install onnx", "onnx", live=True)
 

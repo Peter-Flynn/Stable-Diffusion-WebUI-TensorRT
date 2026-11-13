@@ -1,14 +1,11 @@
-"""A UNet's architecture: what engines are compiled for. Every checkpoint with the same architecture
-(fine-tunes, merges, v-prediction variants) runs on the same engines with its own weights."""
-
 import hashlib
 import json
 import weakref
 from dataclasses import asdict, dataclass
 
 _IGNORED_CONFIG = {"dtype", "device", "operations", "disable_unet_model_creation"}
-# Scaled FP8 checkpoints' per-layer scales: the engine gets the weights with them applied (weights.py),
-# so these checkpoints run on the same engines as the others of their architecture.
+# Left out of the architecture hash: scaled-FP8 checkpoints carry these per-layer scales, which weights.py folds
+# into the weights before refitting, so those checkpoints share engines with unscaled ones.
 _IGNORED_WEIGHTS = (".scale_weight", ".scale_input")
 NAMES = {"SD15": "SD 1.5", "SD20": "SD 2.x", "SDXL": "SDXL", "SDXLRefiner": "SDXL Refiner", "SSD1B": "SSD-1B"}
 _cache = {}
@@ -21,11 +18,10 @@ class Arch:
     in_channels: int
     context_dim: int
     adm_channels: int
-    multiple: int  # image sizes are multiples of this
+    multiple: int
 
     @property
     def name(self) -> str:
-        """For people: "SD 1.5", "SDXL", ... (reForge's model config class otherwise)."""
         return NAMES.get(self.family, self.family)
 
     @property
@@ -41,7 +37,6 @@ class Arch:
 
 
 def loaded_model():
-    """The loaded checkpoint, without loading one."""
     from modules import sd_models
 
     return getattr(getattr(sd_models, "model_data", None), "sd_model", None)
@@ -63,7 +58,6 @@ def _supported(module) -> bool:
 
 
 def detect(patcher=None):
-    """The Arch of a UNet patcher (default: the loaded checkpoint's), or None if engines can't run it."""
     patcher = patcher if patcher is not None else unet_patcher()
     module = getattr(getattr(patcher, "model", None), "diffusion_model", None)
     if module is None:
@@ -84,7 +78,7 @@ def detect(patcher=None):
             in_channels=int(config["in_channels"]),
             context_dim=int(config.get("context_dim") or 0),
             adm_channels=int(adm),
-            multiple=8 * 2 ** (len(config.get("channel_mult", (1, 2, 4, 4))) - 1),
+            multiple=8 * 2 ** (len(config.get("channel_mult", (1, 2, 4, 4))) - 1),  # VAE 8x, then 2x per UNet downsampling
         )
     _cache.clear()
     _cache[id(module)] = (weakref.ref(module), arch)

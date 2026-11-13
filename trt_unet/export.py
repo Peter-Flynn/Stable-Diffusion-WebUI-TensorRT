@@ -1,6 +1,3 @@
-"""Exporting an architecture to a weightless engine: trace a fresh FP16 UNet to an ONNX graph whose
-weights are placeholders, then build it in builder.py's process."""
-
 import contextlib
 import copy
 import gc
@@ -27,9 +24,9 @@ from .arch import Arch, unet_config
 from .common import duration, gib, logger
 
 INPUTS = ("sample", "timesteps", "encoder_hidden_states", "y")
-PLACEHOLDER_STRIDE = 256  # bytes between the placeholder weights' starts
+PLACEHOLDER_STRIDE = 256
 CANCEL = threading.Event()
-MEMORY_RESERVE = 2 * 2**30  # a build stops when less RAM and swap than this (or 5% of the RAM, if more) is free
+MEMORY_RESERVE = 2 * 2**30
 DYNAMIC_AXES = {
     "sample": {0: "batch", 2: "height", 3: "width"},
     "timesteps": {0: "batch"},
@@ -37,8 +34,8 @@ DYNAMIC_AXES = {
     "y": {0: "batch"},
     "latent": {0: "batch", 2: "height", 3: "width"},
 }
-# Every graph's export: without weights, or constant folding (which would rename them), on the TorchScript
-# exporter (PyTorch's dynamo one is the default where there's a choice)
+# Constant folding would rename the weights. dynamo=False keeps the TorchScript exporter, no longer the default in
+# newer PyTorch.
 ONNX_KWARGS = dict(export_params=False, opset_version=17, do_constant_folding=False)
 if "dynamo" in inspect.signature(torch.onnx.export).parameters:
     ONNX_KWARGS["dynamo"] = False
@@ -46,8 +43,6 @@ if "dynamo" in inspect.signature(torch.onnx.export).parameters:
 
 @contextlib.contextmanager
 def quiet_warnings():
-    """Python warnings raised in here (PyTorch's exporter has a few for every graph) are logged at DEBUG,
-    each once, instead of printed."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         try:
@@ -58,8 +53,8 @@ def quiet_warnings():
 
 
 def _attention(q, k, v, mask=None, upcast=False, scale=None):
-    """Matmul + softmax, which ONNX exports and TensorRT fuses. q and k are each scaled by the square
-    root of the scale, so q.k can't overflow in FP16."""
+    # Exported as plain matmul + softmax, which TensorRT fuses. q and k are each multiplied by sqrt(scale) rather than
+    # the product by scale, so q.k can't overflow FP16.
     root = math.sqrt(scale if scale is not None else 1 / math.sqrt(q.shape[-1]))
     if upcast:
         q, k = q.float(), k.float()
@@ -106,8 +101,8 @@ def _traceable_attention():
 
 
 def _fresh_unet(config: dict, device, dtype=torch.float16):
-    """The architecture with random weights: tracing doesn't depend on them, and distinct values keep
-    the exporter from merging identical tensors."""
+    # Random weights: tracing doesn't depend on values, and identical tensors (e.g. all-zero) get merged by the exporter,
+    # losing weight names.
     import ldm_patched.modules.ops as ops
     from ldm_patched.ldm.modules.diffusionmodules.openaimodel import UNetModel
 
@@ -119,12 +114,10 @@ def _fresh_unet(config: dict, device, dtype=torch.float16):
 
 
 def _weightless_graph(onnx_path: str, input_names, agree_with, quiet: bool = False) -> dict:
-    """Checks the exported weights' shapes against each {name: shape} in `agree_with`, tidies the graph
-    (graph.py), and turns the weight inputs into initializers that read a small file of zeros, so the graph
-    stays small: TensorRT only needs their shapes, the checkpoint provides the values. TensorRT tells
-    weights apart by their memory (the parser maps the file once), so each starts at its own offset;
-    their ranges overlap, so the file is about as large as the largest weight. Returns {weight name:
-    shape in the checkpoint}."""
+    # Turns the weight inputs into initializers backed by one small sparse file of zeros: TensorRT needs only their
+    # shapes, and refitting supplies the values. The parser maps that file once and TensorRT identifies weights by
+    # their address, so each starts PLACEHOLDER_STRIDE bytes after the previous; their ranges overlap, which keeps the
+    # file about as large as the largest weight.
     import onnx
 
     from . import graph as graph_mod
@@ -145,15 +138,15 @@ def _weightless_graph(onnx_path: str, input_names, agree_with, quiet: bool = Fal
         raise RuntimeError(f"{len(wrong)} exported weights don't match the loaded model's (e.g. {wrong[0]})")
     start = time.time()
     try:
-        tidied = copy.deepcopy(model)  # small: the weights aren't in it yet
+        tidied = copy.deepcopy(model)
         before, after = graph_mod.tidy(tidied, shapes)
         model, graph = tidied, tidied.graph
         if not quiet:
             logger.debug(f"Tidied {os.path.basename(onnx_path)} from {before:,} to {after:,} nodes in {duration(time.time() - start)}.")
-    except Exception as e:  # the graph as exported runs the same, with more layers
+    except Exception as e:
         logger.warning(f"Couldn't tidy {os.path.basename(onnx_path)}, so it's built as exported: {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
     used = {name for node in graph.node for name in node.input}
-    for value in [i for i in graph.input if i.name in shapes and i.name not in used]:  # TensorRT couldn't mark it refittable
+    for value in [i for i in graph.input if i.name in shapes and i.name not in used]:  # unused weights can't be marked refittable
         graph.input.remove(value)
         del shapes[value.name]
 
@@ -163,7 +156,7 @@ def _weightless_graph(onnx_path: str, input_names, agree_with, quiet: bool = Fal
     for index, value in enumerate([i for i in graph.input if i.name in shapes]):
         graph.input.remove(value)
         t = value.type.tensor_type
-        dims = [d.dim_value for d in t.shape.dim]  # as the graph takes it: GroupNorm's unsqueezed
+        dims = [d.dim_value for d in t.shape.dim]  # the graph's shape, which can differ from the checkpoint's (see graph._unsqueezed_weights)
         nbytes = math.prod(dims) * sizes[t.elem_type]
         offset = index * PLACEHOLDER_STRIDE
         end = max(end, offset + nbytes)
@@ -190,16 +183,12 @@ def _as_shallow(unet, x, timesteps, context, *rest):
 
 @common.inference_mode
 def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float16) -> dict:
-    """Writes folder/unet.onnx, the UNet, which also outputs its deep feature, and folder/shallow.onnx, its
-    outermost blocks, which take that feature (speed.py). Returns {"unet": {weight name: shape in the
-    checkpoint}, "shallow": the same for the shallow graph, or None if it couldn't be exported, "deep":
-    {"channels", "scale": the latent's size over the feature's, "branch"}}."""
     device = device or common.mm().get_torch_device()
     unet = _fresh_unet(unet_config(patcher), device, dtype)
     names = [n for n in INPUTS if n != "y" or arch.adm_channels]
     inputs = [
         torch.randn(2, arch.in_channels, 64, 64, dtype=dtype, device=device),
-        torch.rand(2, device=device) * 999,  # timesteps stay FP32: FP16 can't hold fractional ones near 1000
+        torch.rand(2, device=device) * 999,  # FP32: FP16 can't represent fractional timesteps near 1000
         torch.randn(2, 77, arch.context_dim, dtype=dtype, device=device),
     ]
     if arch.adm_channels:
@@ -214,9 +203,9 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
             scale = inputs[0].shape[2] // deep.shape[2]
             axes["deep"] = {0: "batch", 2: "height", 3: "width"} if scale == 1 else {0: "batch", 2: "deep_height", 3: "deep_width"}
             info = {"channels": int(deep.shape[1]), "scale": int(scale), "branch": speed.BRANCH}
-            unet.forward = types.MethodType(_as_full, unet)  # the parameters keep their names
+            unet.forward = types.MethodType(_as_full, unet)  # on the UNet itself so the weights keep their names
             torch.onnx.export(unet, tuple(inputs), paths["unet"], input_names=names, output_names=["latent", "deep"], dynamic_axes=axes, **ONNX_KWARGS)
-        except Exception as e:  # the UNet as reForge runs it, without Speed Hacks
+        except Exception as e:
             logger.warning(f"Couldn't export the UNet for Speed Hacks, so these engines are built without them: {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
             shallow, deep, info = False, None, None
             with contextlib.suppress(AttributeError):
@@ -251,8 +240,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
 
 
 def _builder_env() -> dict:
-    """Unbuffered UTF-8 output, the WebUI's GPU as the only visible device, and the system's memory allocator:
-    the tcmalloc webui.sh preloads is slow to give memory the build frees back to the system."""
+    # Drops tcmalloc from LD_PRELOAD (webui.sh preloads it): it's slow to return the memory a build frees to the system.
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
     preload = [p for p in re.split(r"[\s:]+", env.get("LD_PRELOAD", "")) if p]
     if any("tcmalloc" in os.path.basename(p) for p in preload):
@@ -275,11 +263,10 @@ def _builder_env() -> dict:
 
 
 def _memory_short():
-    """Why the build has to stop, if the system is about to run out of memory, else None."""
     try:
         from . import refits
 
-        available, swap, total = refits.memory()  # (on Linux from the kernel's own counts, without psutil)
+        available, swap, total = refits.memory()
     except Exception:
         return None
     free = available + swap
@@ -289,30 +276,27 @@ def _memory_short():
 
 
 def _exited(proc, block=False) -> bool:
-    """Whether the builder has exited. On POSIX it isn't reaped: until it is, no other process can get its ID,
-    which is also its process group's, so the group can still be killed."""
+    # WNOWAIT: doesn't reap the builder, so its PID, which is also its process group's ID, can't be reused yet, and
+    # os.killpg(proc.pid) can still safely kill whatever it started.
     if os.name == "nt":
         return (proc.wait() if block else proc.poll()) is not None
     try:
         return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG)) is not None
-    except ChildProcessError:  # reaped already
+    except ChildProcessError:
         return True
 
 
 def _kill_tree(proc):
-    """The builder and whatever it started."""
     if os.name == "nt":
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with contextlib.suppress(OSError):
             proc.kill()
     else:
-        with contextlib.suppress(OSError):  # nothing left
+        with contextlib.suppress(OSError):
             os.killpg(proc.pid, signal.SIGKILL)
 
 
 def run_builder(job_path: str, progress=None) -> dict:
-    """Runs builder.py on the job, as the leader of a process group of its own (on POSIX). When the builder
-    exits, is cancelled, or the system is about to run out of memory, everything in the group is killed."""
     from . import builder
 
     proc = subprocess.Popen(
@@ -324,7 +308,7 @@ def run_builder(job_path: str, progress=None) -> dict:
 
     def stop(reason=None):
         with lock:
-            if "code" not in state:  # not reaped yet
+            if "code" not in state:
                 if reason:
                     state.setdefault("reason", reason)
                 _kill_tree(proc)
@@ -334,7 +318,7 @@ def run_builder(job_path: str, progress=None) -> dict:
             if CANCEL.wait(0.5):
                 return stop("cancelled")
             if _exited(proc):
-                return stop()  # anything it left running
+                return stop()
             short = _memory_short()
             if short:
                 return stop(short)
@@ -355,7 +339,7 @@ def run_builder(job_path: str, progress=None) -> dict:
             elif line.startswith(builder.RESULT):
                 with contextlib.suppress(ValueError):
                     result = json.loads(line[len(builder.RESULT):])
-            elif line.strip():  # anything else the builder's libraries printed
+            elif line.strip():
                 logger.debug(f"Builder: {line.rstrip()}")
         ended = True
     finally:
@@ -380,7 +364,6 @@ def run_builder(job_path: str, progress=None) -> dict:
 
 
 def _build_plan(job: dict, folder: str, step) -> dict:
-    """Runs the builder on a job, again without stripping the weights if TensorRT can't strip them."""
     for strip in (True, False):
         with open(os.path.join(folder, "job.json"), "w", encoding="utf-8") as f:
             json.dump({**job, "strip": strip}, f)
@@ -388,28 +371,19 @@ def _build_plan(job: dict, folder: str, step) -> dict:
         result["stripped"] = strip
         if not result.get("retry_without_strip"):
             return result
-        # Without stripping, the plan holds placeholder weights (GBs) but runs the same way.
         logger.info("TensorRT couldn't leave the weights out of the engine, so it's building one with placeholder weights: a larger file, as fast.")
     return result
 
 
-SHALLOW_SHARE = 0.15  # of each engine's build progress, for its shallow engine
+SHALLOW_SHARE = 0.15
 
 
 def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=None, mode=store.PER_PROFILE, profiles=None) -> dict:
-    """Exports the UNet graphs once and builds the engines for the (index, Profile)s in `todo`, each in a
-    builder process of its own: per-profile, an engine for each, one at a time, so a build only ever holds
-    one profile; merged, one engine holding them all. Each engine gets a shallow engine for Speed Hacks
-    (speed.py) beside it; if that one can't be built, the engine is kept without it. Then, if the VAE's
-    engines (vae_build.py) don't cover `profiles` (all of the architecture's), it builds those. Returns the last
-    builder result, with "records": the engines saved, those before a failure or cancel included,
-    "hack_errors": why shallow engines couldn't be built, and "vae": the VAE engines' Record, or
-    "vae_error": why they couldn't be built."""
     from . import runtime
     from . import vae as vae_mod
     from . import vae_build
 
-    common.trt_version()  # installed and new enough
+    common.trt_version()
     runtime.release_all()
     common.inference_mode(common.mm().unload_all_models)()
     common.mm().soft_empty_cache(force=True)
@@ -417,11 +391,11 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
     shutil.rmtree(folder, ignore_errors=True)
     os.makedirs(folder)
     records, result, memory_warnings, hack_errors = [], {"ok": True}, 0, []
-    before = {r.engine_key: r for r in store.engines(arch.id)}  # what these builds replace
+    before = {r.engine_key: r for r in store.engines(arch.id)}
     vae_part = vae_mod.needs_build(arch, profiles) if profiles else ""
     merged = mode == store.MERGED
-    groups = ([todo] if todo else []) if merged else [[item] for item in todo]  # the profiles of each engine
-    total = len(groups) + (1 if vae_part else 0)  # parts of the build's progress
+    groups = ([todo] if todo else []) if merged else [[item] for item in todo]
+    total = len(groups) + (1 if vae_part else 0)
     vae_record = vae_error = None
     try:
         graphs = shapes = None
@@ -517,7 +491,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             start = time.time()
             logger.info(f"Building the engines for {vae_part}.")
             step = (lambda f, t: progress((len(groups) + f) / total, f"VAE: {t}")) if progress else None
-            vae_record, vae_error, skipped = vae_build.build(arch, profiles, folder, optimization_level, step)  # (says why it failed)
+            vae_record, vae_error, skipped = vae_build.build(arch, profiles, folder, optimization_level, step)
             memory_warnings += skipped
             if vae_record is not None:
                 logger.info(f"Built the VAE engines in {duration(time.time() - start)}.")

@@ -1,29 +1,8 @@
-"""The working VRAM of a UNet call, from the architecture up.
-
-A call's working memory is its activations: every tensor the UNet makes on the way, for as long as something
-still needs it. Their sizes follow from the architecture and the image's size alone, so they're counted
-here without an engine, without weights and without VRAM: reForge's own UNet is built from its
-configuration on PyTorch's meta device (shapes only), one call is run through it, and the bytes of every
-tensor alive at each point are added up. The most that was alive at once, for each pixel of each image the
-call runs, is the architecture's figure (`per_pixel`). It's the same at every image size, batch size and
-prompt length (every tensor that matters scales with the image), which is why one figure does for all of
-them. A call runs the two halves of the guidance as one batch where a profile takes them, so twice the
-images of the pass (runtime.call_bytes has how many).
-
-Where it comes from: the most is alive in the feed-forward layer of the first transformer block of the up
-path, at the highest resolution that has attention (it widens to eight times the level's channels), with
-the skip connections the up path hasn't used yet. In FP16, for each image a call runs: SDXL (attention
-from half resolution down), 157.5 bytes a pixel; SD 1.5 (attention at full resolution), 260.
-
-Attention is counted as one operation, as TensorRT runs it: its output, and no map of every query against
-every key (which would grow with the square of the image; an engine's memory doesn't).
-
-That figure is the least a call can do with. A pass takes more (CALL_FACTOR), as seen for SDXL at
-1024x1472 (batch sizes 1 and 2) and 1536x2208: the engine's activation memory is 1.28 times it (TensorRT
-plans its memory its own way, and runs normalizations in FP32), its inputs and outputs bring that to
-1.31, and what the sampler holds of its own between calls to 1.45 to 1.48 at its most. CALL_FACTOR and the
-buffer on every estimate (common.BUFFER) together cover that: 1.40 x 1.10 = 1.54."""
-
+# Working VRAM of a UNet call, measured from the architecture alone: reForge's UNet is built on the meta device
+# (shapes, no memory), run once, and the bytes of all tensors alive at once are tracked. The peak per pixel per image
+# is the same at every size, batch and prompt length, so one figure per architecture (per_pixel) serves for all. It
+# peaks in the first up-path transformer's feed-forward at the highest-resolution attention level: FP16 SDXL 157.5
+# bytes/pixel, SD 1.5 260. Attention counts as one op with no score matrix, as TensorRT fuses it.
 import threading
 import weakref
 
@@ -32,23 +11,23 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from .common import logger
 
-CALL_FACTOR = 1.40  # a pass's working memory, as a multiple of its UNet's activations (see the module)
-FALLBACK = 260  # bytes a pixel where the architecture can't be run through: the most of those that have been (SD 1.5's), so it errs towards PyTorch
-PROBE = 64  # the latent's side the architecture is run through at (the figure doesn't depend on it)
+# Measured on SDXL (1024x1472 at batch 1 and 2, 1536x2208): TensorRT's activation memory is 1.28x the figure, 1.31x with
+# inputs and outputs, and up to 1.48x with what the sampler holds between calls. 1.40 x common.BUFFER (1.10) = 1.54.
+CALL_FACTOR = 1.40
+FALLBACK = 260  # bytes/pixel if measuring fails: the highest measured (SD 1.5), so errors lean towards PyTorch
+PROBE = 64
 
-_figures = {}  # architecture id -> bytes a pixel of image, for each image a call runs
+_figures = {}
 _lock = threading.Lock()
 
 
 class _Alive(TorchDispatchMode):
-    """Adds up the bytes of the tensors alive as operations make them: `most` is the most at once. What an
-    operation returns that is (part of) what it was given, a view or its input changed in place (by the
-    operation's own declaration), is that tensor's memory, which stays alive as long as either does."""
-
+    # Tracks bytes alive at once. An op output declared as aliasing its input (a view, an in-place op) shares that
+    # input's memory block, which is freed when the last tensor using it is.
     def __init__(self):
         super().__init__()
         self.now = self.most = 0
-        self.blocks = {}  # id of a tensor alive -> its memory: [bytes, the tensors alive that are (parts of) it]
+        self.blocks = {}
 
     def _holds(self, t, block):
         block[1] += 1
@@ -82,14 +61,11 @@ class _Alive(TorchDispatchMode):
         return out
 
 
-def _attention(q, k, v, heads, *args, **kwargs):
-    """Attention as one operation: its output (a value for every query, as wide as the queries)."""
+def _attention(q, k, v, heads, *args, **kwargs):  # stand-in: just the output's memory, like TensorRT's fused attention
     return torch.empty(q.shape, dtype=q.dtype, device=q.device)
 
 
 def measure(config: dict, in_channels: int, context_dim: int, adm_channels: int, dtype=torch.float16) -> float:
-    """The architecture's figure: the bytes a UNet call has alive at its most, for each pixel of each image
-    it runs. Takes no VRAM, and a few hundred milliseconds."""
     import ldm_patched.ldm.modules.attention as attention
     import ldm_patched.modules.ops as ops
     from ldm_patched.ldm.modules.diffusionmodules.openaimodel import UNetModel
@@ -114,7 +90,6 @@ def measure(config: dict, in_channels: int, context_dim: int, adm_channels: int,
 
 
 def per_pixel(arch, patcher) -> float:
-    """The architecture's figure (measure), worked out once for each architecture."""
     with _lock:
         if arch.id not in _figures:
             from .arch import unet_config
@@ -132,6 +107,4 @@ def per_pixel(arch, patcher) -> float:
 
 
 def call_bytes(arch, patcher, batch: int, width: int, height: int) -> int:
-    """The working VRAM of a pass whose UNet calls run `batch` images of width x height at once: the
-    architecture's figure for them, and what a pass holds around its calls (CALL_FACTOR)."""
     return int(batch * width * height * per_pixel(arch, patcher) * CALL_FACTOR)

@@ -1,12 +1,3 @@
-"""A deserialized TensorRT engine: weights refitted from PyTorch tensors in RAM (or the engine brought back
-as it was serialized with them), several optimization profiles in one execution context, and activation
-memory from PyTorch's allocator sized for the shapes in use.
-
-The engine's weights are the only copy of them in VRAM: a refit gives TensorRT the weights where PyTorch
-keeps them, in RAM, and TensorRT copies them into its own memory. All of TensorRT's memory comes from
-PyTorch's allocator (gpu.py), under the engine's owner; if an engine can't load or refit that way before
-any has run that way, TensorRT gets its own allocator back (_deserialize, own_allocator)."""
-
 import atexit
 import contextlib
 import ctypes
@@ -22,15 +13,14 @@ import torch
 from . import gpu
 from .common import gib, logger
 
-# Refitting prepares weights given in RAM for the GPU on the CPU, by default on one thread. Weights come
-# straight from PyTorch's FP16 tensors, and the engine's first output is checked for NaN/Inf, so
-# TensorRT's own pass over every weight is skipped.
+# The refitter prepares host weights on one CPU thread by default, and scans every weight for NaN/Inf. The weights are
+# PyTorch's own FP16 tensors and each pass checks the engine's first output for NaN/Inf, so the scan is skipped.
 REFITTER_SETTINGS = {"max_threads": os.cpu_count() or 1, "weights_validation": False}
 _unsettable = set()
-# TRT_EXTENSION_PROFILE=1: each engine's layers timed by TensorRT's own profiler (every run waits for the GPU,
-# so everything is slower), logged after each sampling pass, decode and encode (profile_report)
+# TRT_EXTENSION_PROFILE=1: per-layer GPU times from TensorRT's profiler, logged after each sampling pass, decode and
+# encode. Every engine run then waits for the GPU, so everything is slower.
 PROFILE = os.environ.get("TRT_EXTENSION_PROFILE", "").lower() in ("1", "true", "yes")
-_layer_times = {}  # plan file -> {layer: milliseconds, added up since the last report}
+_layer_times = {}
 
 
 _DTYPES = {
@@ -51,9 +41,6 @@ def torch_dtype(dtype):
 
 
 class Logger(trt.ILogger):
-    """TensorRT's runtime messages, at DEBUG (its errors reach the console in the errors raised from them);
-    keeps them, but for the verbose ones, to explain a failure."""
-
     def __init__(self):
         trt.ILogger.__init__(self)
         self.errors = []
@@ -74,12 +61,10 @@ class Logger(trt.ILogger):
 
 LOGGER = Logger()
 _runtime = None
-_set_aside = []  # a runtime with PyTorch's allocator that an engine failed to load on (_deserialize), kept alive
+_set_aside = []  # runtimes replaced after an allocator failure, kept alive: engines may still belong to them
 
 
 class _LayerTimes(trt.IProfiler):
-    """A context's layers' times on the GPU, added up under its plan file (TRT_EXTENSION_PROFILE)."""
-
     def __init__(self, plan_path: str):
         trt.IProfiler.__init__(self)
         self.times = _layer_times.setdefault(plan_path, {})
@@ -89,7 +74,6 @@ class _LayerTimes(trt.IProfiler):
 
 
 def profile_report(where: str, top: int = 12):
-    """Logs, per plan, the layers' time since the last report, the longest first, and forgets it."""
     if not PROFILE:
         return
     for plan, times in sorted(_layer_times.items(), key=lambda kv: -sum(kv[1].values())):
@@ -108,14 +92,11 @@ def runtime():
     global _runtime
     if _runtime is None:
         _runtime = trt.Runtime(LOGGER)
-        gpu.attach(_runtime)  # before anything is deserialized
+        gpu.attach(_runtime)  # must happen before the first deserialize
     return _runtime
 
 
 def _deserialize(plan, owner):
-    """The engine in `plan`, or None if TensorRT can't load it. One that fails with PyTorch's allocator before
-    any engine ran with it, and not for want of VRAM, is tried on a runtime with TensorRT's own allocator:
-    if it loads there, that runtime is used from now on (gpu.retire); if not, the allocator wasn't why."""
     global _runtime
     before = gpu.failures()
     with gpu.owner(owner):
@@ -133,10 +114,6 @@ def _deserialize(plan, owner):
 
 
 def own_allocator(failures_before: int, owner, error) -> bool:
-    """After `owner`'s engine loaded but failed past that (its refit, its execution context) with `error`
-    and was unloaded: if PyTorch's allocator could be why (gpu.suspect: none has run with it yet, it didn't
-    run out, nothing else is loaded through it), TensorRT allocates its own memory from now on. Returns
-    whether it changed, for the caller to load the engine again."""
     global _runtime
     if not gpu.suspect(failures_before, owner):
         return False
@@ -148,9 +125,7 @@ def own_allocator(failures_before: int, owner, error) -> bool:
 
 
 @atexit.register
-def _unload_all():
-    """Engines free their memory through PyTorch's allocator (gpu.py): before the interpreter takes PyTorch
-    and the allocator apart."""
+def _unload_all():  # engines free through PyTorch's allocator, which must happen before interpreter shutdown tears it down
     for engine in list(Engine.instances):
         try:
             engine.unload()
@@ -159,15 +134,13 @@ def _unload_all():
 
 
 def other_tensorrt(maps="/proc/self/maps") -> str:
-    """A TensorRT of another version that's visible to the whole process (Linux), or "". TensorRT's bindings
-    use it instead of their own if it was there before they were imported (preload.py imports them first)."""
-    if os.name == "nt":  # Windows binds each DLL to the libraries it names
+    if os.name == "nt":  # Windows binds each DLL to the libraries it names, so this can't happen
         return ""
     major = int(trt.__version__.split(".")[0])
     try:
         version = ctypes.CDLL(None).getInferLibVersion()
     except (AttributeError, OSError):
-        return ""  # none visible to the whole process
+        return ""
     if version // 10000 == major:
         return ""
     try:
@@ -184,11 +157,9 @@ def other_tensorrt(maps="/proc/self/maps") -> str:
 
 
 class Arena:
-    """Activation memory from PyTorch's allocator, shared by engines that never run at the same time (an
-    engine and its shallow partner): it only grows until it's released, and each engine binds it again
-    when it was reallocated."""
-
-    instances = weakref.WeakSet()  # every arena, for the memory diagnostics (common.memory)
+    # Activation memory shared by engines that never run at once (an engine and its Speed Hacks partner). It only
+    # grows until released. `version` changes on every reallocation; an engine whose bound_version differs rebinds.
+    instances = weakref.WeakSet()
 
     def __init__(self):
         self.memory, self.version = None, 0
@@ -198,13 +169,13 @@ class Arena:
         if self.memory is None or self.memory.numel() < size:
             from . import common
 
-            self.release()  # a new version even if the allocation fails: nothing may stay bound to the old one
+            self.release()  # bumps the version even if the allocation below fails, so nothing stays bound to freed memory
             try:
                 self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=DEVICE)
             except torch.cuda.OutOfMemoryError:
                 if not common.pooled():
                     raise
-                common.trim()  # what PyTorch freed wasn't this request's to have: from the driver, then
+                common.trim()  # PyTorch's freed blocks may be unusable for this size until returned to the driver
                 self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=DEVICE)
             self.version += 1
         return self.memory
@@ -216,16 +187,14 @@ class Arena:
 
 
 class Engine:
-    """An engine and its execution context. Its TensorRT memory is `owner`'s (gpu.py); twins share both."""
-
-    instances = weakref.WeakSet()  # every engine, to unload before the interpreter exits
+    instances = weakref.WeakSet()
 
     def __init__(self, plan_path: str, arena: Arena = None, owner=None):
         self.plan_path = plan_path
         self.arena = arena or Arena()
         self.owner = owner
         self.engine = self.context = None
-        self.extra = 0  # what TensorRT took for it after it loaded (its context, its first run), by the ledger
+        self.extra = 0  # VRAM TensorRT took after load (context creation, first run), added to the owner's gpu._held
         self._reset_context_state()
         Engine.instances.add(self)
 
@@ -234,12 +203,11 @@ class Engine:
         self.shapes = {}
         self.memory_bound = False
         self.bound_version = None
-        self.size = None  # the activation memory the shapes set need
-        self.size_is_most = False  # TensorRT didn't say for the shapes: it's the most the profile's shapes take
-        self.ran = False  # whether the context has run: its first run is watched (infer)
+        self.size = None
+        self.size_is_most = False  # TensorRT gave no figure for these shapes: `size` is the profile's maximum
+        self.ran = False
 
-    def twin(self):
-        """Another execution context on the same engine (and weights), with shapes of its own."""
+    def twin(self):  # another execution context on the same engine and weights, so callers alternating shapes don't thrash one
         other = Engine(self.plan_path, self.arena, self.owner)
         other.engine, other.io, other.weight_names = self.engine, self.io, self.weight_names
         return other
@@ -249,8 +217,6 @@ class Engine:
         return self.engine is not None
 
     def load(self, serialized=None) -> float:
-        """Loads the plan, which holds no weights (refit puts them in), or `serialized`: the engine as
-        serialize() gave it, with the weights it had then. Returns the seconds it took."""
         start = time.perf_counter()
         LOGGER.clear()
         plan = serialized
@@ -260,7 +226,7 @@ class Engine:
         self.engine = _deserialize(plan, self.owner)
         if self.engine is None:
             said = LOGGER.errors[-1] if LOGGER.errors else "no reason given"
-            other = "" if any("OutOfMemory" in m for m in LOGGER.messages) else other_tensorrt()  # (not why it ran out)
+            other = "" if any("OutOfMemory" in m for m in LOGGER.messages) else other_tensorrt()
             what = os.path.basename(self.plan_path) + ("" if serialized is None else " as kept in RAM")
             raise RuntimeError(f"TensorRT {trt.__version__} couldn't load {what}: {said}" + (f" {other}" if other else ""))
         self.io = []
@@ -270,15 +236,14 @@ class Engine:
             self.io.append((name, is_input, torch_dtype(self.engine.get_tensor_dtype(name))))
         with gpu.owner(self.owner):
             self.weight_names = list(trt.Refitter(self.engine, LOGGER).get_all_weights())
-        self.context = None  # created once the weights are in
+        self.context = None  # created on first use, after the weights are refitted in
         self._reset_context_state()
         return time.perf_counter() - start
 
     @contextlib.contextmanager
     def _taking(self, what: str = None):
-        """What TensorRT allocates in here, after the engine loaded, is its owner's too (gpu.py's ledger
-        says how much: nothing, without PyTorch's allocator). Said if it's `what` and a lot."""
-        if gpu.counting(self.owner):  # a load under way counts it
+        # Inside gpu.loading for this owner, the load's own accounting already counts what's allocated here.
+        if gpu.counting(self.owner):
             with gpu.owner(self.owner):
                 yield
             return
@@ -309,7 +274,7 @@ class Engine:
                 try:
                     self._profiler = _LayerTimes(self.plan_path)  # TensorRT doesn't keep the Python object alive
                     self.context.profiler = self._profiler
-                    self.context.enqueue_emits_profile = False  # reported when asked, after the GPU is done
+                    self.context.enqueue_emits_profile = False  # report_to_profiler() after the GPU finishes instead
                 except Exception as e:
                     logger.warning(f"Couldn't profile {os.path.basename(self.plan_path)}: {e}")
             self._reset_context_state()
@@ -317,7 +282,7 @@ class Engine:
 
     def unload(self):
         with gpu.owner(self.owner):
-            self.context = None  # before its engine
+            self.context = None  # before the engine it belongs to
             self.engine = None
         self._reset_context_state()
         self.arena.release()
@@ -326,12 +291,9 @@ class Engine:
             self.extra = 0
 
     def serialize(self):
-        """The engine with the weights it holds now, still refittable: what load() takes in place of the plan
-        to bring it back as it is, with nothing to refit. TensorRT's own host memory (a buffer), about as
-        large as the weights."""
         config = self.engine.create_serialization_config()
-        config.clear_flag(trt.SerializationFlag.EXCLUDE_WEIGHTS)  # set for a plan built without its weights
-        config.set_flag(trt.SerializationFlag.INCLUDE_REFIT)  # else the weights could never change again
+        config.clear_flag(trt.SerializationFlag.EXCLUDE_WEIGHTS)  # inherited from the weight-stripped plan
+        config.set_flag(trt.SerializationFlag.INCLUDE_REFIT)  # without it, the reloaded engine can never be refitted again
         LOGGER.clear()
         with gpu.owner(self.owner):
             serialized = self.engine.serialize_with_config(config)
@@ -340,14 +302,11 @@ class Engine:
         return serialized
 
     def refit(self, names, tensor_for) -> float:
-        """Sets the weights `names` (and any TensorRT needs with them) from `tensor_for(name, "cpu")`: the
-        weights in RAM, which TensorRT copies into its own memory, the only copy of them in VRAM. Returns the
-        seconds it took."""
         refitter = trt.Refitter(self.engine, LOGGER)
         for setting, value in REFITTER_SETTINGS.items():
             try:
                 setattr(refitter, setting, value)
-            except (AttributeError, TypeError) as e:  # the Python API reference doesn't say they're settable
+            except (AttributeError, TypeError) as e:
                 if setting not in _unsettable:
                     _unsettable.add(setting)
                     logger.debug(f"Couldn't set the refitter's {setting}: {e}")
@@ -372,16 +331,14 @@ class Engine:
                 try:
                     ok = refitter.refit_cuda_engine()
                 finally:
-                    refitter.release_refit_resources()  # else the refit's scratch memory stays allocated as long as the engine
+                    refitter.release_refit_resources()  # otherwise the refit's scratch VRAM stays allocated for the engine's lifetime
         finally:
-            keep.clear()  # an error's traceback keeps this frame, and would keep the weights (GBs)
+            keep.clear()  # an exception's traceback holds this frame, and with it GBs of weights
         if not ok:
             raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
         return time.perf_counter() - start
 
     def _set_shapes(self, profile: int, shapes: dict, stream: int):
-        """Selects the profile and input shapes on the context. What's recorded is only what TensorRT
-        accepted, so a failure here makes the next call set everything again."""
         self._context()
         if profile != self.profile:
             self.profile, self.shapes, self.memory_bound, self.size = None, {}, False, None
@@ -404,10 +361,9 @@ class Engine:
             self.memory_bound, self.bound_version = True, self.arena.version
 
     def activation_bytes(self) -> int:
-        """For the profile and input shapes set on the context (asked of TensorRT once per shapes set)."""
         if self.size is None:
-            size = int(self.context.update_device_memory_size_for_shapes())  # 0 if it can't tell
-            self.size_is_most = size <= 0  # the most any shapes of the profile take, then
+            size = int(self.context.update_device_memory_size_for_shapes())
+            self.size_is_most = size <= 0
             self.size = size if size > 0 else int(self.engine.get_device_memory_size_for_profile_v2(self.profile))
         return self.size
 
@@ -416,12 +372,9 @@ class Engine:
         return self.activation_bytes()
 
     def io_bytes(self) -> dict:
-        """{input or output: its bytes} at the shapes set on the context (TensorRT's output shapes)."""
         return {name: math.prod(self.context.get_tensor_shape(name)) * torch.tensor([], dtype=dtype).element_size() for name, _, dtype in self.io}
 
     def infer(self, feed: dict, profile: int, stream: int, into: dict = None) -> dict:
-        """Runs on the inputs in `feed` that the engine takes (e.g. SDXL's shallow UNet takes no prompt);
-        outputs go into the tensors in `into` that have their shape and type, else new ones."""
         self._prepare(profile, {name: tuple(feed[name].shape) for name, is_input, _ in self.io if is_input}, stream)
         outputs = {}
         for name, is_input, dtype in self.io:
@@ -440,14 +393,14 @@ class Engine:
         LOGGER.clear()
         if self.ran:
             ran = self.context.execute_async_v3(stream)
-        else:  # what TensorRT takes only as a context first runs is counted too
-            with self._taking("as it first ran"):
+        else:
+            with self._taking("as it first ran"):  # a context allocates more on its first run
                 ran = self.context.execute_async_v3(stream)
         if not ran:
             raise RuntimeError("TensorRT inference failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
         if not self.ran:
             self.ran = True
-            gpu.proven()  # PyTorch's allocator works with these bindings
+            gpu.proven()
         if PROFILE:
             torch.cuda.current_stream().synchronize()
             try:
@@ -457,6 +410,5 @@ class Engine:
         return outputs
 
     def release_activations(self):
-        """Releases the arena, for every engine sharing it."""
         self.arena.release()
         self.memory_bound = False
