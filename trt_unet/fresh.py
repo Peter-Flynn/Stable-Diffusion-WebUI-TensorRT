@@ -64,8 +64,8 @@ SIGNATURE = {"inputs": 3, "window": WINDOW, "bins": BINS}
 
 HISTORY = [name for m in range(1, WINDOW + 1) for name in (f"hx{m}", f"hs{m}", f"he{m}", f"hr{m}")]
 SHALLOW_INPUTS = ["x", "sigma", "log_sigmas", "pred", *HISTORY, "power", "broken", "measure", "out"]
-# removed / unknown: this call's total and flags, for the next shallow calls (speed.Schedule ends a stretch when a flag
-# is set). error: the relative error of the denoised values latent gives, against out's.
+# removed / unknown: this call's total and flags, for the next shallow calls. error: the relative error of the denoised
+# values latent gives, against out's.
 SHALLOW_OUTPUTS = ["latent", "removed", "unknown", "power_out", "error"]
 
 
@@ -236,9 +236,7 @@ def shallow(run, sample, timesteps, x, sigma, log_sigmas, pred, history, power, 
     denoised = a * x + b * _blocks(x, out.float())
     difference = b * (_blocks(x, latent.float()) - _blocks(x, out.float()))
     error = ((difference * difference).sum() / (denoised * denoised).sum().clamp_min(1e-30)).sqrt().reshape(1)
-    # From where the removed share reaches RENOISE, the noise since the deep feature's call isn't separable any more.
-    unknown = (unknown > 0.5) | (variance >= RENOISE * s2)
-    return latent, removed, unknown.float(), power, error
+    return latent, removed, (unknown > 0.5).float(), power, error
 
 
 def group(names: list, values: list) -> dict:

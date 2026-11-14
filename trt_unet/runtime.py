@@ -651,7 +651,6 @@ class Pass:
         hacks = self.schedule
         if hacks is not None and hacks.shallow_calls:
             logger.debug(f"Speed Hacks ran {hacks.shallow_calls} of {hacks.shallow_calls + hacks.full_calls} UNet calls on the shallow engine.")
-            logger.debug(f"Speed Hacks pass: {hacks.summary()}")
             _note_speed_hacks()
         for model in _models.values():
             if model.weights is self.weights:
@@ -739,7 +738,6 @@ class Pass:
                 outputs = self.model.shallow.infer({**feed, "deep": deep, **extra}, profile, stream)
                 if tracking is not None:
                     self.tracker.after_shallow(tracking, outputs, origin)
-                    self.schedule.shallow_done(outputs["unknown"], origin)
                 return outputs["latent"]
             outputs = self.model.engine.infer(feed, profile, stream)
             out = outputs["latent"]
@@ -766,7 +764,7 @@ class Pass:
         if tracking is not None:
             self.tracker.after_full(tracking, out, outputs)
         if origin is not None:
-            self.schedule.checked(outputs["error"], self.schedule.index - origin)
+            self.schedule.checked(outputs["error"], origin)
 
 
 def _tracker(patcher):
