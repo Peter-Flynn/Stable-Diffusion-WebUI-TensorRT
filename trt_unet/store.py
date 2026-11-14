@@ -1,9 +1,9 @@
 # Engines on disk: models/Unet-trt/<arch id>/<gpu>-<trt>-<key>.plan, a .json of its metadata beside it, and for Speed
-# Hacks the shallow UNet's engine as <...>.shallow.plan. Per-profile mode: one engine per profile, keyed by the
-# profile. Merged mode: one engine holding all the architecture's profiles, keyed "merged-" + a hash of their keys.
-# A record's "index"/"indexes" are its profiles' positions in the architecture's profile list. Plans hold no weights:
-# they're refitted from the loaded checkpoint. The mode applies to every engine and can only change while none exist
-# (models/Unet-trt/settings.json).
+# Hacks the shallow UNet's engine as <...>.shallow.plan and fresh.py's probe as <...>.probe.plan. Per-profile mode: one
+# engine per profile, keyed by the profile. Merged mode: one engine holding all the architecture's profiles, keyed
+# "merged-" + a hash of their keys. A record's "index"/"indexes" are its profiles' positions in the architecture's
+# profile list. Plans hold no weights: they're refitted from the loaded checkpoint. The mode applies to every engine and
+# can only change while none exist (models/Unet-trt/settings.json).
 import contextlib
 import glob
 import hashlib
@@ -18,6 +18,7 @@ from .profiles import Profile
 
 PER_PROFILE, MERGED = "per_profile", "merged"
 SHALLOW = ".shallow.plan"
+PROBE = ".probe.plan"
 MODES = (PER_PROFILE, MERGED)
 
 
@@ -122,6 +123,11 @@ class Record:
         return os.path.join(os.path.dirname(self.plan), name) if name else None
 
     @property
+    def probe_plan(self):
+        name = (self.meta.get("speed_hacks") or {}).get("probe")
+        return os.path.join(os.path.dirname(self.plan), name) if name else None
+
+    @property
     def speed_hacks(self):
         return self.meta.get("speed_hacks")
 
@@ -163,7 +169,7 @@ class Record:
     @property
     def disk_bytes(self) -> int:
         total = 0
-        for path in (self.plan, self.shallow_plan):
+        for path in (self.plan, self.shallow_plan, self.probe_plan):
             with contextlib.suppress(OSError, TypeError):
                 total += os.path.getsize(path)
         return total
@@ -173,7 +179,7 @@ def _read(meta_path: str):
     plan = meta_path[: -len(".json")] + ".plan"
     try:
         record = Record(plan, common.read_json(meta_path))
-        if os.path.isfile(plan) and (record.shallow_plan is None or os.path.isfile(record.shallow_plan)):
+        if os.path.isfile(plan) and all(p is None or os.path.isfile(p) for p in (record.shallow_plan, record.probe_plan)):
             record.arch
             return record
     except Exception as e:
@@ -204,15 +210,19 @@ def _write_meta(base: str, meta: dict):
     os.replace(base + ".json.tmp", base + ".json")
 
 
-def save(arch: Arch, plan_tmp: str, meta: dict, shallow_tmp: str = None) -> Record:
+def save(arch: Arch, plan_tmp: str, meta: dict, shallow_tmp: str = None, probe_tmp: str = None) -> Record:
     record = Record("", {"arch": arch.to_dict(), **meta})
     base = f"{_prefix(arch.id)}-{record.engine_key}"
     os.makedirs(os.path.dirname(base), exist_ok=True)
-    with contextlib.suppress(FileNotFoundError):
-        os.remove(base + SHALLOW)
+    for suffix in (SHALLOW, PROBE):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(base + suffix)
     if shallow_tmp:
         os.replace(shallow_tmp, base + SHALLOW)
         record.meta["speed_hacks"] = {**record.meta["speed_hacks"], "plan": os.path.basename(base) + SHALLOW}
+        if probe_tmp:
+            os.replace(probe_tmp, base + PROBE)
+            record.meta["speed_hacks"]["probe"] = os.path.basename(base) + PROBE
     else:
         record.meta.pop("speed_hacks", None)
     os.replace(plan_tmp, base + ".plan")
@@ -230,7 +240,7 @@ def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
     prefix = _prefix(arch_id)
     deleted = 0
     for path in glob.glob(glob.escape(prefix) + "-*.plan"):
-        if path.endswith(SHALLOW):
+        if path.endswith(SHALLOW) or path.endswith(PROBE):
             continue
         base = path[: -len(".plan")]
         if base[len(prefix) + 1:] in wanted:
@@ -240,7 +250,7 @@ def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
                 if indexes != record.indexes:
                     _write_meta(base, record.renumbered(indexes))
             continue
-        for stale in (path, base + ".json", base + SHALLOW):
+        for stale in (path, base + ".json", base + SHALLOW, base + PROBE):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stale)
         deleted += 1
@@ -250,7 +260,7 @@ def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
 def delete(group: list):
     for record in group:
         base = record.plan[: -len(".plan")]
-        for path in (record.plan, base + ".json", base + SHALLOW):
+        for path in (record.plan, base + ".json", base + SHALLOW, base + PROBE):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(path)
     for folder in {os.path.dirname(r.plan) for r in group}:

@@ -9,6 +9,8 @@
 # the previous first-order one), the noise prediction barely changes. Here that test lets a due full evaluation wait,
 # in a pass's second half only: on SDXL a shallow call costs a few percent of a full one, so running it is as cheap as
 # reusing the last prediction, and more accurate.
+#
+# Samplers that add noise between calls (ancestral, SDE): fresh.py, built into the shallow engine and its probe.
 import torch
 
 BRANCH = 0  # shallow engine = input blocks 0..BRANCH and the output blocks from deep_block(BRANCH) on
@@ -91,15 +93,18 @@ class Schedule:
         # sigma", every other evaluation drops the unconds, so one slot alternates between two batch shapes.
         self.deep = {}
         self.shallow_calls = self.full_calls = 0
+        self._smooth_host = self._smooth_ready = None
+        self._smooth_pending = False
 
     def begin(self, index: int, total, steps, x):
         self.index, self.slot = index, 0
         self.latents = (self.latents + [x.detach().clone()])[-4:]
-        self.decision = self._decide(index, total, steps)
+        self.decision = self._decide(index, total, steps, self._collect())
         if self.decision == "full":
             self.last_full, self.stretched = index, 0
+        self._test()
 
-    def _decide(self, index, total, steps) -> str:
+    def _decide(self, index, total, steps, smooth: bool) -> str:
         if not total or not steps or steps < MIN_STEPS:
             return "full"
         if index < round(self.warmup * total) or index >= total - max(1, round(self.tail * total)) or self.last_full is None:
@@ -107,19 +112,31 @@ class Schedule:
         if index - self.last_full < INTERVAL:
             return "shallow"
         # total == steps: the test compares consecutive steps, so not for samplers that evaluate more than once per step
-        if index >= STRETCH_FROM * total and self.stretched < MAX_STRETCH and total == steps and self._smooth():
+        if index >= STRETCH_FROM * total and self.stretched < MAX_STRETCH and total == steps and smooth:
             self.stretched += 1
             return "shallow"
         return "full"
 
-    def _smooth(self) -> bool:
+    def _test(self):
+        # The smoothness test runs on the GPU and its answer is copied to pinned memory asynchronously; the next call
+        # reads it (_collect), one call late, so the CPU never waits for the GPU here. If the copy hasn't landed by
+        # then, the latents count as not smooth.
         if len(self.latents) < 4:
-            return False
+            return
         x3, x2, x1, x0 = self.latents  # oldest first: the paper's x_{i+2}, x_{i+1}, x_i, x_{i-1}
         previous = x1 - x2  # Eq. 4's threshold is relative to this difference, not the newest one
         third = (x0 - x1) - 2 * previous + (x2 - x3)
-        norms = torch.stack([third.float().norm(), previous.float().norm()]).tolist()
-        return norms[0] <= SMOOTHNESS * norms[1]
+        smooth = third.float().norm() <= SMOOTHNESS * previous.float().norm()
+        if self._smooth_host is None:
+            self._smooth_host = torch.zeros((), dtype=torch.bool, pin_memory=True)
+            self._smooth_ready = torch.cuda.Event()
+        self._smooth_host.copy_(smooth, non_blocking=True)
+        self._smooth_ready.record()
+        self._smooth_pending = True
+
+    def _collect(self) -> bool:
+        pending, self._smooth_pending = self._smooth_pending, False
+        return pending and self._smooth_ready.query() and bool(self._smooth_host)
 
     def call(self, shape) -> tuple:
         if self.index is None:
@@ -139,3 +156,4 @@ class Schedule:
     def release(self):
         self.deep.clear()
         self.latents = []
+        self._smooth_pending = False

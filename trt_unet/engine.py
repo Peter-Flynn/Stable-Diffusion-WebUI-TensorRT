@@ -157,8 +157,9 @@ def other_tensorrt(maps="/proc/self/maps") -> str:
 
 
 class Arena:
-    # Activation memory shared by engines that never run at once (an engine and its Speed Hacks partner). It only
-    # grows until released. `version` changes on every reallocation; an engine whose bound_version differs rebinds.
+    # Activation memory shared by engines that never run at once (an engine, its Speed Hacks partner and fresh.py's
+    # probe). It only grows until released. `version` changes on every reallocation; an engine whose bound_version
+    # differs rebinds.
     instances = weakref.WeakSet()
 
     def __init__(self):
@@ -235,7 +236,7 @@ class Engine:
             is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
             self.io.append((name, is_input, torch_dtype(self.engine.get_tensor_dtype(name))))
         with gpu.owner(self.owner):
-            self.weight_names = list(trt.Refitter(self.engine, LOGGER).get_all_weights())
+            self.weight_names = list(trt.Refitter(self.engine, LOGGER).get_all_weights()) if self.engine.refittable else []
         self.context = None  # created on first use, after the weights are refitted in
         self._reset_context_state()
         return time.perf_counter() - start
