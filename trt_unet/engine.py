@@ -157,9 +157,8 @@ def other_tensorrt(maps="/proc/self/maps") -> str:
 
 
 class Arena:
-    # Activation memory shared by engines that never run at once (an engine, its Speed Hacks partner and fresh.py's
-    # probe). It only grows until released. `version` changes on every reallocation; an engine whose bound_version
-    # differs rebinds.
+    # Activation memory shared by engines that never run at once (an engine and its Speed Hacks partner). It only grows
+    # until released. `version` changes on every reallocation; an engine whose bound_version differs rebinds.
     instances = weakref.WeakSet()
 
     def __init__(self):

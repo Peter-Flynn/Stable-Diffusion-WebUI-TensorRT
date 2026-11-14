@@ -1,28 +1,52 @@
-# Speed Hacks: DeepCache with its refresh interval stretched by AdaptiveDiffusion's smoothness test.
+# Speed Hacks: DeepCache with its refresh interval stretched while a measured error allows.
 #
 # DeepCache (Ma et al., 2023): the UNet's deep features change little between steps. Every engine is built twice: the
 # full UNet, which also outputs the input of output block deep_block() (the "deep" feature), and a shallow engine of
 # only the outermost blocks, which takes that feature as an input. Most evaluations run only the shallow engine, on
-# the deep feature from the last full evaluation.
+# the deep feature from the last full evaluation: INTERVAL - 1 in a row, more while checks allow.
 #
-# AdaptiveDiffusion (Ye et al., 2024): while the sampler's latents move smoothly (third-order difference small next to
-# the previous first-order one), the noise prediction barely changes. Here that test lets a due full evaluation wait,
-# in a pass's second half only: on SDXL a shallow call costs a few percent of a full one, so running it is as cheap as
-# reusing the last prediction, and more accurate.
+# Checks: a full call from CHECKS calls before the first shallow call until the full steps at the end also runs the
+# shallow engine as the shallow call at its index would have run, on the deep feature it replaces, and compares
+# (fresh.py). That is the error a shallow call of that age actually makes, for any sampler, noise included; it costs a
+# shallow call, a few percent of a full one on SDXL. A due full call waits while the error predicted at the age the deep
+# feature would reach stays within budget(quality) times that of the first two checks after warmup (the error
+# DeepCache's own interval made there), and while fresh.py can still separate the noise drawn since the deep feature's
+# call (an ancestral or SDE sampler replaces all of x's noise eventually). The prediction is the latest two checks'
+# error per call of age, times the age, times (age / the latest check's age)^(EXTRAPOLATION - 1) past that age. This
+# replaces AdaptiveDiffusion's test (Ye et al., 2024), which judged staleness from how smoothly x moves: noise the
+# sampler adds and the kink at each refresh both read as roughness.
 #
-# Samplers that add noise between calls (ancestral, SDE): fresh.py, built into the shallow engine and its probe.
+# Samplers that add noise between calls (ancestral, SDE): fresh.py, built into the shallow engine.
+import math
+
 import torch
 
 BRANCH = 0  # shallow engine = input blocks 0..BRANCH and the output blocks from deep_block(BRANCH) on
 INTERVAL = 3
-MAX_STRETCH = 2
-SMOOTHNESS = 0.01  # AdaptiveDiffusion's threshold for SD 1.5 and SDXL, tuned at 50 steps
-SMOOTHNESS_STEPS = 50
 WARMUP = 0.4
 TAIL = 0.05
-STRETCH_FROM = 0.5
+QUALITY = 0.9
+# Checked warmup calls before the first shallow call: fresh.py's noise share is measured at checks and averaged (EMA
+# 0.5). Simulated: the last 3 of 18 warmup calls gave 0.0065 distance to the all-full image, all 18 0.0059, the last 1
+# 0.0133.
+CHECKS = 3
+# Errors grow faster than linearly past the ages checks have measured: simulated (ancestral and SDE samplers, 30 Karras
+# steps) roughly as age^2.3 from age 3 to 7.
+EXTRAPOLATION = 2
 MIN_STEPS = 12
-MAX_AGE = INTERVAL - 1 + MAX_STRETCH
+
+
+def budget(quality: float) -> float:
+    # The error a stretched call may reach, as a multiple of the reference: 0 at quality 1, infinite at 0. The distance
+    # to the all-full image grew about 0.6 times DeepCache's own per doubling of the budget in simulation, so the budget
+    # is log-linear in quality: 0.5 at the default 0.9, 64 at 0.1. Simulated (13 samplers, Karras and DDIM schedules,
+    # 20 to 44 steps), the distance exceeded DeepCache alone's by +5% on average at 0.9, +1.2x at 0.5, +2.3x at 0.1 and
+    # +6x at 0.
+    if quality >= 1:
+        return 0.0
+    if quality <= 0:
+        return math.inf
+    return 5.66 * ((1 - quality) / quality) ** 1.1
 
 
 def deep_block(unet, branch: int = BRANCH) -> int:
@@ -82,87 +106,112 @@ def shallow_shapes(shapes: dict, deep: dict) -> dict:
 
 
 class Schedule:
-    def __init__(self, warmup: float = WARMUP, tail: float = TAIL):
+    def __init__(self, warmup: float = WARMUP, tail: float = TAIL, quality: float = QUALITY):
         self.warmup, self.tail = warmup, tail
+        self.budget = budget(quality)
         self.index = None
         self.decision = "full"
+        self.check = False
         self.last_full = None
-        self.stretched = 0
-        self.latents = []
         self.slot = 0
+        self.start = 0
         # (slot, sample shape) -> (deep feature, evaluation index). Keyed by shape too: with "Negative Guidance minimum
         # sigma", every other evaluation drops the unconds, so one slot alternates between two batch shapes.
         self.deep = {}
         self.shallow_calls = self.full_calls = 0
-        self._smooth_host = self._smooth_ready = None
-        self._smooth_pending = False
+        # Error per call of age of each check after warmup, in order, and the latest one's age. Averaging pairs evens out
+        # samplers whose calls alternate in kind (DPM++ SDE's: checks' errors alternated 1.09, 0.02 in simulation).
+        self.rates, self.verified = [], 0
+        self.lost = False  # fresh.py flagged the noise since the current deep feature's call as no longer separable
+        # (value in pinned memory, CUDA event, age of a check's error or None for a shallow call's flag, origin, index)
+        self._pending = []
+        # For the debug log: per call F (checked full), f (full), s (shallow), S (stretched shallow); (index, age, error)
+        # of each check after warmup.
+        self.trace, self.checks = [], []
 
-    def begin(self, index: int, total, steps, length, x):
-        # length: steps in the schedule this pass's sigmas come from; an img2img pass runs only its tail
+    def begin(self, index: int, total, steps):
         self.index, self.slot = index, 0
-        self.latents = (self.latents + [x.detach().clone()])[-4:]
-        self.decision = self._decide(index, total, steps, self._collect())
+        self._collect()
+        self.decision, self.check = self._decide(index, total, steps)
         if self.decision == "full":
-            self.last_full, self.stretched = index, 0
-        self._test(length)
+            self.trace.append("F" if self.check else "f")
+            self.last_full, self.lost = index, False
+        else:
+            self.trace.append("s" if index - self.last_full < INTERVAL else "S")
 
-    def _decide(self, index, total, steps, smooth: bool) -> str:
+    def _decide(self, index, total, steps) -> tuple:
+        # (decision, whether a full call is checked)
         if not total or not steps or steps < MIN_STEPS:
-            return "full"
-        if index < round(self.warmup * total) or index >= total - max(1, round(self.tail * total)) or self.last_full is None:
-            return "full"
-        if index - self.last_full < INTERVAL:
-            return "shallow"
-        # total == steps: the test compares consecutive steps, so not for samplers that evaluate more than once per step
-        if index >= STRETCH_FROM * total and self.stretched < MAX_STRETCH and total == steps and smooth:
-            self.stretched += 1
-            return "shallow"
-        return "full"
+            return "full", False
+        self.start, end = round(self.warmup * total), total - max(1, round(self.tail * total))
+        if index < self.start or index >= end or self.last_full is None:
+            return "full", self.start - CHECKS <= index < end
+        age = index - self.last_full
+        if age < INTERVAL:
+            return "shallow", False
+        if self.lost:
+            return "full", True
+        if self.budget == math.inf:
+            return "shallow", False
+        # A stretch ends in a checked full call, not in the full steps at the end: those aren't checked, and a stretch
+        # running into them went unmeasured. Simulated (DDIM, 20 steps, quality 0.6): DPM++ 2M SDE's distance to the
+        # all-full image grew 10.2x running into them, 3M SDE's 7.4x; ending one call earlier, -0.3x and 0.5x.
+        if self.budget > 0 and len(self.rates) >= 2 and index + 1 < end:
+            rate, reference = self.rates[-2] + self.rates[-1], self.rates[0] + self.rates[1]
+            if rate * age * max(1.0, age / self.verified) ** (EXTRAPOLATION - 1) <= self.budget * reference * INTERVAL:
+                return "shallow", False
+        return "full", True
 
-    def _test(self, length):
-        # The smoothness test runs on the GPU and its answer is copied to pinned memory asynchronously; the next call
-        # reads it (_collect), one call late, so the CPU never waits for the GPU here. If the copy hasn't landed by
-        # then, the latents count as not smooth.
-        if len(self.latents) < 4 or not length:
-            return
-        x3, x2, x1, x0 = self.latents  # oldest first: the paper's x_{i+2}, x_{i+1}, x_i, x_{i-1}
-        previous = x1 - x2  # Eq. 4's threshold is relative to this difference, not the newest one
-        third = (x0 - x1) - 2 * previous + (x2 - x3)
-        # A third difference shrinks with the step size cubed and a first difference with the step size, so the ratio
-        # goes with the step size squared; the paper only advises a higher threshold for fewer steps. Scaling it by
-        # (50 / length)^2 passes the same trajectories at any step count: on a toy model (an exact Wiener denoiser,
-        # SDXL's sigmas, reForge's DDIM scheduler), plain Euler's median ratio in a pass's second half stayed at
-        # 0.72-0.80 of the scaled threshold from 12 to 100 steps.
-        threshold = SMOOTHNESS * (SMOOTHNESS_STEPS / length) ** 2
-        smooth = third.float().norm() <= threshold * previous.float().norm()
-        if self._smooth_host is None:
-            self._smooth_host = torch.zeros((), dtype=torch.bool, pin_memory=True)
-            self._smooth_ready = torch.cuda.Event()
-        self._smooth_host.copy_(smooth, non_blocking=True)
-        self._smooth_ready.record()
-        self._smooth_pending = True
+    def checked(self, error, age: int):
+        if self.index >= self.start:  # warmup's checks are for fresh.py's noise share only
+            self._send(error, age)
 
-    def _collect(self) -> bool:
-        pending, self._smooth_pending = self._smooth_pending, False
-        return pending and self._smooth_ready.query() and bool(self._smooth_host)
+    def shallow_done(self, unknown, origin: int):
+        # unknown: the shallow call's per-image flags (fresh.py)
+        self._send(unknown.amax(), None, origin)
+
+    def _send(self, value, age, origin=None):
+        # Copied to pinned memory asynchronously and read once its event has completed (a call later at the earliest),
+        # so the CPU never waits for the GPU here; release() waits for the rest at the end of the pass.
+        host = torch.empty((), dtype=torch.float32, pin_memory=True)
+        host.copy_(value.reshape(()), non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self._pending.append((host, event, age, origin, self.index))
+
+    def _collect(self, wait=False):
+        while self._pending and (wait or self._pending[0][1].query()):
+            host, event, age, origin, index = self._pending.pop(0)
+            if wait:
+                event.synchronize()
+            if age is None:
+                self.lost = self.lost or (origin == self.last_full and float(host) > 0.5)
+            else:
+                self.rates.append(float(host) / age)
+                self.verified = age
+                self.checks.append((index, age, float(host)))
+
+    def summary(self) -> str:
+        checks = ", ".join(f"{i}:{a}:{e:.4f}" for i, a, e in self.checks)
+        return f"calls {''.join(self.trace)}; checks (call:age:error) {checks or 'none'}"
 
     def call(self, shape) -> tuple:
-        # (slot, deep feature or None, index of the full call that computed it)
+        # (slot, deep feature or None, index of the full call that computed it, (deep feature, index) this checked full
+        # call replaces or None)
         if self.index is None:
             self.full_calls += 1
-            return None, None, None
+            return None, None, None, None
         slot, self.slot = self.slot, self.slot + 1
         kept = self.deep.get((slot, tuple(shape)))
-        if self.decision == "shallow" and kept is not None and self.index - kept[1] <= MAX_AGE:
+        if self.decision == "shallow" and kept is not None:
             self.shallow_calls += 1
-            return slot, kept[0], kept[1]
+            return slot, kept[0], kept[1], None
         self.full_calls += 1
-        return slot, None, None
+        return slot, None, None, kept if self.check and slot == 0 else None
 
     def keep(self, slot: int, shape, deep):
         self.deep[(slot, tuple(shape))] = (deep, self.index)
 
     def release(self):
         self.deep.clear()
-        self.latents = []
-        self._smooth_pending = False
+        self._collect(wait=True)

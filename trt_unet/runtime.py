@@ -47,7 +47,7 @@ class DoesNotFit(RuntimeError):
 
 class TrtModel:
     # Implements the parts of ModelPatcher that reForge's LoadedModel calls, so the model manager can hold an engine
-    # (and its Speed Hacks partner and probe) like any model. Its size is what gpu.py measured once loaded, an estimate
+    # (and its Speed Hacks partner) like any model. Its size is what gpu.py measured once loaded, an estimate
     # before.
     parent = None
     evicted_last = True
@@ -64,7 +64,7 @@ class TrtModel:
         self.model = TensorRTUNet()
         self.load_device = mm.get_torch_device()
         self.offload_device = torch.device("cpu")
-        self.engine = self.shallow = self.probe = None
+        self.engine = self.shallow = None
         self.want_shallow = False
         self.shallow_failed = False
         self.weights = None
@@ -81,8 +81,6 @@ class TrtModel:
             self.engine = Engine(self.record.plan, arena, self.owner)
             if self.hacks:
                 self.shallow = Engine(self.record.shallow_plan, arena, self.owner)
-                if self._probe_plan:
-                    self.probe = Engine(self._probe_plan, arena, self.owner)
         return self.engine
 
     @property
@@ -98,12 +96,8 @@ class TrtModel:
         return self.shallow is not None and self.shallow.loaded
 
     @property
-    def _probe_plan(self):
-        return self.record.probe_plan if self.hacks and self.hacks.get("fresh") else None
-
-    @property
     def tracks(self) -> bool:
-        return self.shallow_loaded and self.probe is not None and self.probe.loaded
+        return self.shallow_loaded and self.shallow_takes_tracker
 
     @property
     def shallow_takes_tracker(self) -> bool:  # False for shallow engines built before fresh.py
@@ -114,8 +108,6 @@ class TrtModel:
         for role in ("unet", "shallow") if shallow else ("unet",):
             blob = kept.blobs.get(role) if kept is not None else None
             total += memoryview(blob).nbytes if blob is not None else self._serialized_size(role)
-        if shallow and self._probe_plan:
-            total += self._serialized_size("probe")
         return total
 
     def model_size(self):
@@ -199,8 +191,6 @@ class TrtModel:
                 notify(f"Couldn't load the Speed Hacks part of the {self.name}, so it runs without Speed Hacks: {e}")
                 self.shallow.unload()
                 self.want_shallow, self.shallow_failed = False, True
-            else:
-                self._load_probe()
         refit = self.sync(quiet=True)
         return refit, plan_seconds, kept
 
@@ -264,20 +254,10 @@ class TrtModel:
         count, total = refits.held()
         logger.debug(f"Kept the {label} in RAM ({common.gib(kept.nbytes)}, {time.time() - start:.1f}s); {count} kept in all, {common.gib(total)}.")
 
-    def _load_probe(self):
-        if self.probe is None or self.probe.loaded:
-            return
-        try:
-            self.probe.load()
-        except Exception as e:
-            logger.warning(f"Couldn't load the fresh-noise probe of the {self.name}, so its Speed Hacks don't correct ancestral and SDE samplers' noise: {e}")
-            self.probe.unload()
-
     def _serialized_size(self, role: str) -> int:
         plan, weights = {
             "unet": (self.record.plan, self.record.weight_bytes),
             "shallow": (self.record.shallow_plan, (self.hacks or {}).get("weight_bytes", 0)),
-            "probe": (self.record.probe_plan, 0),
         }[role]
         if role not in self._plan_bytes:
             try:
@@ -311,7 +291,6 @@ class TrtModel:
                 self.shallow.unload()
                 self.want_shallow, self.shallow_failed = False, True
                 raise
-            self._load_probe()
         logger.debug(f"Loaded the Speed Hacks part of the {self.name} in {time.time() - start:.1f}s; the engine holds {common.gib(gpu.held(self.owner))} of VRAM with it.")
 
     def partially_unload(self, device, memory_to_free=0):
@@ -324,9 +303,8 @@ class TrtModel:
                     self._keep()
                 except Exception as e:
                     logger.warning(f"Couldn't keep the {self.name} in RAM, so loading it again will refit it: {e}")
-            for engine in (self.shallow, self.probe):
-                if engine is not None:
-                    engine.unload()
+            if self.shallow is not None:
+                self.shallow.unload()
             self.engine.unload()
             self.applied, self.shallow_failed = {}, False
             left = gpu.ledger(self.owner)
@@ -422,19 +400,19 @@ def setting() -> str:
         return AUTOMATIC
 
 
-FULL_START, FULL_END = "trt_speed_hacks_full_start", "trt_speed_hacks_full_end"
+FULL_START, FULL_END, QUALITY = "trt_speed_hacks_full_start", "trt_speed_hacks_full_end", "trt_speed_hacks_quality"
 
 
 def speed_settings() -> tuple:
     from modules import shared
 
-    def share(key, default):
+    def setting(key, default, scale=1.0):
         try:
-            return min(max(float(getattr(shared.opts, key)) / 100, 0.0), 1.0)
+            return min(max(float(getattr(shared.opts, key)) / scale, 0.0), 1.0)
         except Exception:
             return default
 
-    return share(FULL_START, speed.WARMUP), share(FULL_END, speed.TAIL)
+    return setting(FULL_START, speed.WARMUP, 100), setting(FULL_END, speed.TAIL, 100), setting(QUALITY, speed.QUALITY)
 
 
 class SpeedHacksOption(sd_unet.SdUnetOption):
@@ -673,6 +651,7 @@ class Pass:
         hacks = self.schedule
         if hacks is not None and hacks.shallow_calls:
             logger.debug(f"Speed Hacks ran {hacks.shallow_calls} of {hacks.shallow_calls + hacks.full_calls} UNet calls on the shallow engine.")
+            logger.debug(f"Speed Hacks pass: {hacks.summary()}")
             _note_speed_hacks()
         for model in _models.values():
             if model.weights is self.weights:
@@ -719,14 +698,14 @@ class Pass:
                     _unload(failed, keep=False)
                 self.fall_back(f"Couldn't load the {record.arch.name} {record.label} ({e})", _unexpected(e))
         stream = torch.cuda.current_stream().cuda_stream
-        slot = deep = origin = tracking = None
+        slot = deep = origin = stale = tracking = None
         if self.schedule is not None and self.model.shallow_loaded:
-            slot, deep, origin = self.schedule.call(feed["sample"].shape)
+            slot, deep, origin, stale = self.schedule.call(feed["sample"].shape)
             if self.model.tracks:
                 tracking = self.tracker.call(feed["sample"], chunks, padded > b, slot, self.schedule.index)
         if self.tracker is not None:
             self.tracker.stash = None
-        out = self._infer_with_room(feed, profile, stream, slot, deep, origin, tracking)
+        out = self._infer_with_room(feed, profile, stream, slot, deep, origin, tracking, stale)
         if deep is None and not self.checked:
             self.checked = True
             if not torch.isfinite(out).all():
@@ -739,19 +718,19 @@ class Pass:
                 out = self._infer_with_room(feed, profile, stream)
         return out[:b].to(x.dtype)
 
-    def _infer_with_room(self, feed, profile, stream, slot=None, deep=None, origin=None, tracking=None):
+    def _infer_with_room(self, feed, profile, stream, slot=None, deep=None, origin=None, tracking=None, stale=None):
         try:
-            return self._infer(feed, profile, stream, slot, deep, origin, tracking)
+            return self._infer(feed, profile, stream, slot, deep, origin, tracking, stale)
         except torch.cuda.OutOfMemoryError:
             self.model.engine.release_activations()
             common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
             common.mm().soft_empty_cache(force=True)
             try:
-                return self._infer(feed, profile, stream, slot, deep, origin, tracking)
+                return self._infer(feed, profile, stream, slot, deep, origin, tracking, stale)
             except torch.cuda.OutOfMemoryError:
                 self.fall_back("The engine ran out of VRAM")
 
-    def _infer(self, feed, profile, stream, slot=None, deep=None, origin=None, tracking=None):
+    def _infer(self, feed, profile, stream, slot=None, deep=None, origin=None, tracking=None, stale=None):
         try:
             if deep is not None:
                 extra = {}
@@ -759,30 +738,35 @@ class Pass:
                     extra = self.tracker.shallow_inputs(tracking, origin) if tracking is not None else self.tracker.dummy_inputs(feed["sample"])
                 outputs = self.model.shallow.infer({**feed, "deep": deep, **extra}, profile, stream)
                 if tracking is not None:
-                    self.tracker.after_shallow(tracking, outputs)
+                    self.tracker.after_shallow(tracking, outputs, origin)
+                    self.schedule.shallow_done(outputs["unknown"], origin)
                 return outputs["latent"]
             outputs = self.model.engine.infer(feed, profile, stream)
+            out = outputs["latent"]
             if slot is not None and "deep" in outputs:
                 self.schedule.keep(slot, feed["sample"].shape, outputs["deep"])
+                if self.schedule.check and slot == 0 and self.model.shallow_takes_tracker and (stale is not None or tracking is not None):
+                    self._check(feed, profile, stream, tracking, out, outputs["deep"], stale)
+                    return out
             if tracking is not None:
-                self._probe(tracking, outputs["latent"], profile, stream)
-            return outputs["latent"]
+                self.tracker.after_full(tracking, out)
+            return out
         except torch.cuda.OutOfMemoryError:
             raise
         except Exception as e:
             self.fall_back(f"The engine failed ({e})", _unexpected(e))
 
-    def _probe(self, tracking, out, profile, stream):
-        outputs, inputs = None, self.tracker.probe_inputs(tracking, out)
-        if inputs is not None:
-            try:
-                outputs = self.model.probe.infer(inputs, profile, stream)
-            except torch.cuda.OutOfMemoryError:
-                raise
-            except Exception as e:
-                logger.warning(f"The fresh-noise probe failed ({e}), so the rest of this pass doesn't correct the noise its sampler adds.")
-                self.tracker.active = False
-        self.tracker.after_full(tracking, out, outputs)
+    def _check(self, feed, profile, stream, tracking, out, deep, stale):
+        # stale: (deep feature, index) this full call replaces, on which the shallow engine runs as the shallow call at
+        # this index would have. Without one (no full call before it), on this call's own deep feature, for the noise
+        # share alone.
+        origin = stale[1] if stale is not None else None
+        extra = self.tracker.shallow_inputs(tracking, origin, out) if tracking is not None else self.tracker.dummy_inputs(feed["sample"], out)
+        outputs = self.model.shallow.infer({**feed, "deep": stale[0] if stale is not None else deep, **extra}, profile, stream)
+        if tracking is not None:
+            self.tracker.after_full(tracking, out, outputs)
+        if origin is not None:
+            self.schedule.checked(outputs["error"], self.schedule.index - origin)
 
 
 def _tracker(patcher):
@@ -985,13 +969,7 @@ def _wrap_denoiser(original):
             try:
                 from modules import shared
 
-                steps = length = shared.state.sampling_steps
-                # img2img and hires fix run the last steps of a schedule about steps / strength long
-                # (sd_samplers_common.setup_img2img_steps); init_latent is set only for those passes.
-                strength = getattr(self.p, "denoising_strength", None) if getattr(self, "init_latent", None) is not None else None
-                if strength and 0 < strength < 1:
-                    length = steps / strength
-                p.schedule.begin(int(self.step), self.total_steps, steps, length, x)
+                p.schedule.begin(int(self.step), self.total_steps, shared.state.sampling_steps)
                 # Inpainting blends x with the image outside the mask, which isn't in fresh.py's linear chain.
                 if p.tracker is not None and getattr(self, "mask", None) is not None:
                     p.tracker.active = False

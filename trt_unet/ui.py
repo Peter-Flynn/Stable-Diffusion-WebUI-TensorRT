@@ -35,7 +35,7 @@ HELP = """
 
 **The VAE** gets engines too, for its decoder and its encoder, built with the UNet's for the sizes its profiles cover. Those that take a whole image run in the precision reForge runs the VAE in (BF16 where the GPU has it, else FP32). Larger decodes (a Hires. fix's) run in strips on engines of their own, in FP16 on GPUs without BF16: half the VRAM, the VAE scaled down by a power of two between its normalizations so none overflows there. A decode takes the first way there can be room for: whole beside the UNet engine, in strips beside it, then either with the UNet engine evicted. It's the same image either way. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines the same way. PyTorch does the rest.
 
-**Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache), and, late in a pass, wait longer between full steps while the image changes smoothly (AdaptiveDiffusion). With samplers that add noise every step (ancestral ones like Euler a, and SDE ones), the engines find that noise and keep it out of what's reused, so it doesn't build up in the image; engines built before this was added need rebuilding for it. The first 40% and last 5% of steps run in full, so composition and detail stay close (both shares are in Settings, Stable Diffusion, TensorRT). Passes of 12 steps or more should run roughly 1.6x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
+**Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache). Some full steps also check how far off that shortcut would have been, and later full steps wait while the error they measure stays within what the quality setting allows. With samplers that add noise every step (ancestral ones like Euler a, and SDE ones), the engines find that noise and keep it out of what's reused, so it doesn't build up in the image; engines built before this was added need rebuilding for it. The first 40% and last 5% of steps run in full, so composition and detail stay close (these shares and the quality are in Settings, Stable Diffusion, TensorRT, and in the X/Y/Z plot script). Passes of 12 steps or more should run roughly 1.6x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
 """
 
 
@@ -548,6 +548,29 @@ def on_ui_settings():
     shared.opts.add_option(runtime.FULL_END, shared.OptionInfo(
         round(speed.TAIL * 100), "Speed Hacks: share of steps at the end that run in full (%)", gr.Slider, slider, section=section, category_id="sd",
     ).info("where fine detail settles; the last step always runs in full"))
+    shared.opts.add_option(runtime.QUALITY, shared.OptionInfo(
+        speed.QUALITY, "Speed Hacks: quality", gr.Slider, {"minimum": 0, "maximum": 1, "step": 0.01}, section=section, category_id="sd",
+    ).info("1 keeps every full step DeepCache would run; lower lets more of them wait while the measured error allows; 0 skips all of them between the shares above"))
+
+
+def add_xyz_axes():
+    # reForge's X/Y/Z plot script lists the axes in its module's axis_options. apply_override puts the value in
+    # p.override_settings, which processing.process_images applies for that generation and restores after.
+    from modules import scripts
+
+    from . import runtime
+
+    xyz = next((s.module for s in scripts.scripts_data if s.script_class.__module__ == "xyz_grid.py"), None)
+    if xyz is None:
+        return
+    labels = {o.label for o in xyz.axis_options}
+    for label, kind, key in (
+        ("[TensorRT] Speed Hacks: full steps at the start (%)", int, runtime.FULL_START),
+        ("[TensorRT] Speed Hacks: full steps at the end (%)", int, runtime.FULL_END),
+        ("[TensorRT] Speed Hacks: quality", float, runtime.QUALITY),
+    ):
+        if label not in labels:
+            xyz.axis_options.append(xyz.AxisOption(label, kind, xyz.apply_override(key)))
 
 
 def on_ui_tabs():

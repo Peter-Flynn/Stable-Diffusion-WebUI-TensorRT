@@ -184,15 +184,10 @@ def _as_shallow(unet, x, timesteps, context, *rest):
     if not tracker:
         return run(x, timesteps)
     inputs = fresh.group(fresh.SHALLOW_INPUTS, tracker)
-    history, found = fresh.unpack(inputs)
-    return fresh.shallow(run, x, timesteps, inputs["x"], inputs["sigma"], inputs["log_sigmas"], inputs["pred"], history, found, inputs["power"], inputs["broken"])
-
-
-class _Probe(torch.nn.Module):
-    def forward(self, *tracker):
-        inputs = fresh.group(fresh.PROBE_INPUTS, tracker)
-        history, _ = fresh.unpack(inputs)
-        return fresh.probe(inputs["x"], inputs["sigma"], inputs["pred"], inputs["out"], history, inputs["power"])
+    return fresh.shallow(
+        run, x, timesteps, inputs["x"], inputs["sigma"], inputs["log_sigmas"], inputs["pred"], fresh.unpack(inputs), inputs["power"], inputs["broken"],
+        inputs["measure"], inputs["out"],
+    )
 
 
 @common.inference_mode
@@ -207,7 +202,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
     ]
     if arch.adm_channels:
         inputs.append(torch.randn(2, arch.adm_channels, dtype=dtype, device=device))
-    paths = {name: os.path.join(folder, f"{name}.onnx") for name in ("unet", "shallow", "probe")}
+    paths = {name: os.path.join(folder, f"{name}.onnx") for name in ("unet", "shallow")}
     axes = {k: v for k, v in DYNAMIC_AXES.items() if k in names or k == "latent"}
     logger.debug(f"Exporting the {arch.name} UNet to ONNX.")
     shallow = tracked = True
@@ -229,14 +224,10 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
         if shallow:
             unet.forward = types.MethodType(_as_shallow, unet)
             try:
-                tracker = fresh.example_inputs(inputs[0], shallow_graph=True)
+                tracker = fresh.example_inputs(inputs[0])
                 torch.onnx.export(
                     unet, (*inputs, deep, *tracker), paths["shallow"], input_names=names + ["deep", *fresh.SHALLOW_INPUTS],
-                    output_names=fresh.SHALLOW_OUTPUTS, dynamic_axes={**axes, **fresh.dynamic_axes(True)}, **ONNX_KWARGS,
-                )
-                torch.onnx.export(
-                    _Probe(), tuple(fresh.example_inputs(inputs[0], shallow_graph=False)), paths["probe"], input_names=fresh.PROBE_INPUTS,
-                    output_names=fresh.PROBE_OUTPUTS, dynamic_axes=fresh.dynamic_axes(False), **ONNX_KWARGS,
+                    output_names=fresh.SHALLOW_OUTPUTS, dynamic_axes={**axes, **fresh.dynamic_axes()}, **ONNX_KWARGS,
                 )
             except Exception as e:
                 logger.warning(
@@ -265,9 +256,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
     if shallow:
         try:
             result["shallow"] = _weightless_graph(paths["shallow"], names + ["deep"] + (fresh.SHALLOW_INPUTS if tracked else []), (exported, loaded))
-            if tracked:
-                _weightless_graph(paths["probe"], fresh.PROBE_INPUTS, ())
-                result["tracked"] = True
+            result["tracked"] = tracked
         except Exception as e:
             logger.warning(f"Couldn't prepare the UNet's Speed Hacks part, so these engines are built without it: {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
             result["shallow"] = None
@@ -470,7 +459,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 if result.get("error") != "cancelled":
                     logger.error(f"Couldn't build the {what}: {result.get('error')}")
                 break
-            hacks = shallow_plan = probe_plan = hack_error = None
+            hacks = shallow_plan = hack_error = None
             if graphs["shallow"] is not None:
                 tracked = graphs["tracked"]
                 shallow_job = {
@@ -478,7 +467,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                     "onnx": os.path.join(folder, "shallow.onnx"),
                     "plan": os.path.join(folder, "shallow.plan"),
                     "weights": sorted(graphs["shallow"]),
-                    "profiles": [{**speed.shallow_shapes(s, graphs["deep"]), **(fresh.input_shapes(s, True) if tracked else {})} for s in unet_shapes],
+                    "profiles": [{**speed.shallow_shapes(s, graphs["deep"]), **(fresh.input_shapes(s) if tracked else {})} for s in unet_shapes],
                     "exact_fp32": tracked,
                 }
                 logger.debug(f"Building the {what}'s Speed Hacks part.")
@@ -498,23 +487,6 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                     }
                     if tracked:
                         hacks["fresh"] = fresh.SIGNATURE
-                        probe_job = {
-                            **job,
-                            "onnx": os.path.join(folder, "probe.onnx"),
-                            "plan": os.path.join(folder, "probe.plan"),
-                            "weights": [],
-                            "profiles": [fresh.input_shapes(s, False) for s in unet_shapes],
-                            "exact_fp32": True,
-                        }
-                        logger.debug(f"Building the {what}'s fresh-noise probe.")
-                        probe = _build_plan(probe_job, folder, None)
-                        if probe.get("error") == "cancelled" or CANCEL.is_set():
-                            result = {"ok": False, "error": "cancelled"}
-                            break
-                        if probe["ok"]:
-                            probe_plan = probe_job["plan"]
-                        else:
-                            logger.warning(f"Couldn't build the {what}'s fresh-noise probe, so its Speed Hacks don't correct ancestral and SDE samplers' noise: {probe.get('error')}")
                 else:
                     hack_error = str(shallow.get("error"))
                     logger.warning(f"Couldn't build the {what}'s Speed Hacks part, so it runs without Speed Hacks: {hack_error}")
@@ -541,7 +513,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 meta["speed_hacks_error"] = hack_error
                 replaced = before.get(store.merged_key([p for _, p in group]) if merged else store.profile_key(group[0][1]))
                 meta["speed_hacks_retried"] = replaced is not None and "speed_hacks_error" in replaced.meta
-            records.append(store.save(arch, job["plan"], meta, shallow_plan, probe_plan))
+            records.append(store.save(arch, job["plan"], meta, shallow_plan))
             logger.info(f"Built the {what} in {duration(time.time() - start)} ({gib(records[-1].disk_bytes)}).")
         if vae_part and result["ok"] and not CANCEL.is_set():
             start = time.time()
