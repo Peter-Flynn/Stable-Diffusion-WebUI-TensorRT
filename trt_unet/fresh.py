@@ -8,28 +8,32 @@
 # squares on WINDOW previous calls' x and the denoised values of their first and last block of UNet rows (cond and
 # uncond); the residual is that noise. The fit is classical Gram-Schmidt applied twice (CGS2) in FP32: the columns are
 # nearly dependent (condition numbers ~1e8, simulated), which rules out normal equations. A residual that isn't white
-# is structure outside the fit's span: the chain of calls is then "broken" until the next full call, and shallow calls
-# get the plain shallow UNet's output.
+# is structure outside the fit's span: the call is flagged "structured", and shallow calls whose deep feature predates
+# it get the plain shallow UNet's output.
 #
-# Shallow call: x minus the noises found since the last full call, each scaled to its amount in x (_remove), is where
-# the sampler would be without them, at noise level sigma_eff = sqrt(sigma^2 - removed variance). The shallow UNet
-# runs there, at the timestep model_sampling.timestep() gives sigma_eff (nearest in reForge's log-sigma table). The
-# share of the removed noise that a full UNet's denoised output would contain is added back to the shallow UNet's
-# denoised value, per radial frequency band (DFTs as matrix products: TensorRT has no FFT). The output is the eps that
-# gives that denoised value at the call's real x and sigma.
+# Shallow call: the shallow engine reuses the deep feature of an earlier full call (speed.Schedule keeps one per UNet
+# batch shape, so with reForge's "Negative Guidance minimum sigma" it can predate the latest full call). x minus the
+# noises found at every call since that one, each scaled to its amount in x (_remove), is where the sampler would be
+# without them, at noise level sigma_eff = sqrt(sigma^2 - removed variance). The shallow UNet runs there, at the
+# timestep model_sampling.timestep() gives sigma_eff (nearest in reForge's log-sigma table). The share of the removed
+# noise that a full UNet's denoised output would contain is added back to the shallow UNet's denoised value, per radial
+# frequency band (DFTs as matrix products: TensorRT has no FFT). The output is the eps that gives that denoised value
+# at the call's real x and sigma.
 #
-# Probe (its own small engine, run after each full call): the same fit finds the noise drawn just before the full call.
-# Regressing the full call's denoised rows on it, band by band, measures the share S of that noise in them (unbiased:
-# the noise is independent of everything else in them). S is stored as signal power P = S sigma^2 / (1 - S), the
-# Wiener relation, averaged over full calls, and converted back to S = P / (P + sigma^2) at a shallow call's sigma.
+# Probe (its own small engine, run after each full call): the same fit finds the noise drawn just before the full call
+# (kept for shallow calls whose deep feature is older). Regressing the full call's denoised rows on it, band by band,
+# measures the share S of that noise in them (unbiased: the noise is independent of everything else in them). S is
+# stored as signal power P = S sigma^2 / (1 - S), the Wiener relation, averaged over full calls, and converted back to
+# S = P / (P + sigma^2) at a shallow call's sigma.
 #
 # "Simulated" figures below: transcriptions of reForge's sampler update rules (Euler a, Euler a CFG++, DPM++ 2M SDE,
 # DPM++ 3M SDE, DPM++ SDE, DPM++ 2S a, Euler with churn, DPM++ 2M, Heun) run against an exact Wiener denoiser,
 # 1x4x128x128 latents, 20 Karras steps, CFG with cond and uncond rows.
 #
 # Engine inputs, per image (B = UNet rows / row blocks): x and sigma as reForge's apply_model received them (FP32),
-# hx/hs/he<m> the m-th previous call's x, sigma and UNet output rows, found<f> the noise found by the shallow calls
-# since the last full call (zeros if none), power (B, BINS + 1): P per band and the number of measurements, broken.
+# hx/hs/he<m> the m-th previous call's x, sigma and UNet output rows, found<f>/flag<f> the noise found at a call since
+# the deep feature's and that call's "structured" flag (zeros if fewer calls), power (B, BINS + 1): P per band and the
+# number of measurements, broken: 1 if a call since the deep feature's went untracked (Tracker.gap).
 import math
 from collections import deque
 
@@ -38,7 +42,7 @@ import torch
 from .speed import MAX_AGE
 
 WINDOW = 5  # iPNDM's 4th-order steps use the last 4 calls' x and denoised values; one more as a margin
-FOUND = MAX_AGE  # speed.Schedule runs at most MAX_AGE shallow calls between two full calls
+FOUND = MAX_AGE - 1  # speed.Schedule reuses a deep feature up to MAX_AGE calls later, so MAX_AGE - 1 calls lie between
 BINS = 48  # simulated: 24 bands overshot the high frequencies of steep spectra, 48 didn't
 FLOOR = 1e-4  # residual / |x|: deterministic samplers' (FP32 rounding) simulated at ~3e-7, fresh noise's above 1e-2
 WHITE = 0.1  # lag-1 autocorrelation / energy of the residual: ~1 / sqrt(pixels) for noise, near 1 for image structure
@@ -50,13 +54,16 @@ DROP = 1e-4
 RENOISE = 0.99
 EMA = 0.5  # weight of earlier measurements in P; simulated slightly better than 0 (latest measurement only)
 SHARE_MAX = 0.999  # P = S sigma^2 / (1 - S) is infinite at S = 1
-SIGNATURE = {"window": WINDOW, "found": FOUND, "bins": BINS}
+# Engines record this; a shallow graph built with another signature takes other inputs. "inputs" changes with the
+# graphs' inputs or outputs.
+SIGNATURE = {"inputs": 2, "window": WINDOW, "found": FOUND, "bins": BINS}
 
 HISTORY = [name for m in range(1, WINDOW + 1) for name in (f"hx{m}", f"hs{m}", f"he{m}")]
-SHALLOW_INPUTS = ["x", "sigma", "log_sigmas", "pred", *HISTORY, *(f"found{f}" for f in range(1, FOUND + 1)), "power", "broken"]
-SHALLOW_OUTPUTS = ["latent", "noise", "broken_out"]
-PROBE_INPUTS = ["x", "sigma", "pred", "out", *HISTORY, "power", "broken"]
-PROBE_OUTPUTS = ["power_out"]
+FOUND_INPUTS = [name for f in range(1, FOUND + 1) for name in (f"found{f}", f"flag{f}")]
+SHALLOW_INPUTS = ["x", "sigma", "log_sigmas", "pred", *HISTORY, *FOUND_INPUTS, "power", "broken"]
+SHALLOW_OUTPUTS = ["latent", "noise", "structured"]
+PROBE_INPUTS = ["x", "sigma", "pred", "out", *HISTORY, "power"]
+PROBE_OUTPUTS = ["power_out", "noise", "structured"]
 
 
 def coefficients(sigma, pred):
@@ -100,12 +107,13 @@ def _history_residual(x, pred, history):
     return _residual(x, [t for hx, hs, he in history for t in (hx, *_ends(hx, hs, pred, he))])
 
 
-def _classify(x, r, broken):
+def _noise(x, r):  # (r where it's fresh noise, else zeros; "structured" flag as 1.0 or 0.0)
     energy = (r * r).sum((1, 2, 3))
     lag = torch.maximum((r[:, :, 1:] * r[:, :, :-1]).sum((1, 2, 3)).abs(), (r[..., 1:] * r[..., :-1]).sum((1, 2, 3)).abs())
     significant = energy > FLOOR * FLOOR * (x * x).sum((1, 2, 3))
     white = lag < WHITE * energy
-    return significant & white & (broken < 0.5), significant & ~white
+    noise = torch.where((significant & white).reshape(-1, 1, 1, 1), r, torch.zeros_like(r))
+    return noise, (significant & ~white).float()
 
 
 def _dft(n, like):
@@ -135,33 +143,34 @@ def _bands(h, w, like):  # (h * w, BINS): one-hot radial band of each DFT freque
     return (band.reshape(-1, 1) == torch.arange(BINS, dtype=torch.float32, device=like.device)).float()
 
 
-def _measure(first, last, r, sigma, drawn, power):
-    n, c, h, w = r.shape
-    ch, sh = _dft(h, r)
-    cw, sw = _dft(w, r)
-    re, im = _dft2(torch.cat([first, last, r]).reshape(-1, h, w), ch, sh, cw, sw)
+def _measure(first, last, noise, sigma, power):
+    n, c, h, w = noise.shape
+    ch, sh = _dft(h, noise)
+    cw, sw = _dft(w, noise)
+    re, im = _dft2(torch.cat([first, last, noise]).reshape(-1, h, w), ch, sh, cw, sw)
     re, im = re.reshape(3, n, c, h, w), im.reshape(3, n, c, h, w)
-    onehot = _bands(h, w, r)
+    onehot = _bands(h, w, noise)
     cross = ((re[0] + re[1]) * re[2] + (im[0] + im[1]) * im[2]).sum(1).reshape(n, -1) @ onehot
     energy = (2 * (re[2] * re[2] + im[2] * im[2])).sum(1).reshape(n, -1) @ onehot
     share = (cross / energy.clamp_min(1e-30)).clamp(max=SHARE_MAX)
     measured = share * (sigma * sigma).reshape(-1, 1) / (1 - share)
     power_, count = power[:, :BINS], power[:, BINS:]
     averaged = torch.where(count > 0, EMA * power_ + (1 - EMA) * measured, measured)
-    drawn = drawn.reshape(-1, 1)
+    drawn = ((noise * noise).sum((1, 2, 3)) > 0).reshape(-1, 1)
     return torch.cat([torch.where(drawn, averaged, power_), count + drawn.float()], 1)
 
 
-def _remove(x, sigma, noises, power):
-    # Each noise's amount in x by generalized least squares, each DFT frequency weighted by 1 / (P + sigma^2): image
-    # content is uncorrelated with the noises and adds to the estimate's error with spectrum P. Simulated: up to a third
-    # less distance to the all-full image than plain inner products. Returns (the noises' total in x, the share of that
-    # total a full UNet's denoised output would contain).
+def _remove(x, sigma, noise, found, power):
+    # The noise of this call is in x exactly once (x = the fit + it). Each earlier noise's amount in x is estimated by
+    # generalized least squares, each DFT frequency weighted by 1 / (P + sigma^2): image content is uncorrelated with
+    # the noises and adds to the estimate's error with spectrum P. Simulated: up to a third less distance to the
+    # all-full image than plain inner products. Returns (the noises' total in x, the share of that total a full UNet's
+    # denoised output would contain).
     n, c, h, w = x.shape
     ch, sh = _dft(h, x)
     cw, sw = _dft(w, x)
     onehot = _bands(h, w, x)
-    re, im = _dft2(torch.cat([x, *noises]).reshape(-1, h, w), ch, sh, cw, sw)
+    re, im = _dft2(torch.cat([x, noise, *found]).reshape(-1, h, w), ch, sh, cw, sw)
     re, im = re.reshape(-1, n, c, h, w), im.reshape(-1, n, c, h, w)
     s2 = (sigma * sigma).reshape(-1, 1)
     power_ = power[:, :BINS].clamp_min(0)
@@ -170,23 +179,25 @@ def _remove(x, sigma, noises, power):
     keep = torch.where(measured, power_ / (power_ + s2), torch.zeros_like(power_))
     weight = (weight @ onehot.t()).reshape(n, 1, h, w)
     keep = (keep @ onehot.t()).reshape(n, 1, h, w)
-    amount = (weight * (re[:1] * re[1:] + im[:1] * im[1:])).sum((2, 3, 4), keepdim=True)
-    amount = amount / (weight * (re[1:] * re[1:] + im[1:] * im[1:])).sum((2, 3, 4), keepdim=True).clamp_min(1e-30)
-    removed = (amount * torch.stack(noises)).sum(0)
-    kept_re, kept_im = ((amount * re[1:]).sum(0) * keep).reshape(-1, h, w), ((amount * im[1:]).sum(0) * keep).reshape(-1, h, w)
+    amount = (weight * (re[:1] * re[2:] + im[:1] * im[2:])).sum((2, 3, 4), keepdim=True)
+    amount = amount / (weight * (re[2:] * re[2:] + im[2:] * im[2:])).sum((2, 3, 4), keepdim=True).clamp_min(1e-30)
+    removed = noise + (amount * torch.stack(found)).sum(0)
+    kept_re = ((re[1] + (amount * re[2:]).sum(0)) * keep).reshape(-1, h, w)
+    kept_im = ((im[1] + (amount * im[2:]).sum(0)) * keep).reshape(-1, h, w)
     return removed, _idft2(kept_re, kept_im, ch, sh, cw, sw).reshape(x.shape)
 
 
 # run(sample, timesteps) returns the shallow UNet's eps rows. history: [(x, sigma, UNet output rows)], latest first.
+# found: [(noise, structured flag)] of the calls since the deep feature's.
 def shallow(run, sample, timesteps, x, sigma, log_sigmas, pred, history, found, power, broken):
-    r = _history_residual(x, pred, history)
-    drawn, structured = _classify(x, r, broken)
-    broken_out = (broken > 0.5) | structured
-    noise = torch.where(drawn.reshape(-1, 1, 1, 1), r, torch.zeros_like(r))
-    removed, kept = _remove(x, sigma, [*found, noise], power)
+    noise, structured = _noise(x, _history_residual(x, pred, history))
+    unknown = broken + structured
+    for _, flag in found:
+        unknown = unknown + flag
+    removed, kept = _remove(x, sigma, noise, [f for f, _ in found], power)
     variance = (removed * removed).mean((1, 2, 3))
     s2 = sigma * sigma
-    apply = ~broken_out & (variance > 0) & (variance < RENOISE * s2)
+    apply = (unknown < 0.5) & (variance > 0) & (variance < RENOISE * s2)
     sigma_eff = (s2 - variance).clamp_min(1e-20).sqrt()
     x_det = x - removed
     t_eff = (sigma_eff.log()[:, None] - log_sigmas[None, :]).abs().argmin(1).to(timesteps.dtype)
@@ -200,14 +211,13 @@ def shallow(run, sample, timesteps, x, sigma, log_sigmas, pred, history, found, 
     target = a_eff * x_det + kept - a * x
     fixed = (target.unsqueeze(0) + b_eff * _blocks(x, eps.float())) / b
     latent = torch.where(lanes, fixed.to(eps.dtype), _blocks(x, eps)).reshape(eps.shape)
-    return latent, noise, broken_out.float()
+    return latent, noise, structured
 
 
-def probe(x, sigma, pred, out, history, power, broken):
-    r = _history_residual(x, pred, history)
-    drawn, _ = _classify(x, r, broken)
+def probe(x, sigma, pred, out, history, power):
+    noise, structured = _noise(x, _history_residual(x, pred, history))
     first, last = _ends(x, sigma, pred, out)
-    return _measure(first, last, r, sigma, drawn, power)
+    return _measure(first, last, noise, sigma, power), noise, structured
 
 
 def group(names: list, values: list) -> dict:
@@ -216,20 +226,21 @@ def group(names: list, values: list) -> dict:
 
 def unpack(inputs: dict):
     history = [(inputs[f"hx{m}"], inputs[f"hs{m}"], inputs[f"he{m}"]) for m in range(1, WINDOW + 1)]
-    found = [inputs[f"found{f}"] for f in range(1, FOUND + 1)] if "found1" in inputs else []
+    found = [(inputs[f"found{f}"], inputs[f"flag{f}"]) for f in range(1, FOUND + 1)] if "found1" in inputs else []
     return history, found
 
 
 def dynamic_axes(shallow_graph: bool) -> dict:
-    image = {0: "images", 2: "height", 3: "width"}
-    axes = {"x": image, "sigma": {0: "images"}, "power": {0: "images"}, "broken": {0: "images"}}
+    image, vector = {0: "images", 2: "height", 3: "width"}, {0: "images"}
+    axes = {"x": image, "sigma": vector, "power": vector, "noise": image, "structured": vector}
     for m in range(1, WINDOW + 1):
-        axes.update({f"hx{m}": image, f"hs{m}": {0: "images"}, f"he{m}": {0: f"rows{m}", 2: "height", 3: "width"}})
+        axes.update({f"hx{m}": image, f"hs{m}": vector, f"he{m}": {0: f"rows{m}", 2: "height", 3: "width"}})
     if shallow_graph:
-        axes.update({"log_sigmas": {0: "steps"}, "noise": image, "broken_out": {0: "images"}})
+        axes.update({"log_sigmas": {0: "steps"}, "broken": vector})
         axes.update({f"found{f}": image for f in range(1, FOUND + 1)})
+        axes.update({f"flag{f}": vector for f in range(1, FOUND + 1)})
     else:
-        axes.update({"out": {0: "batch", 2: "height", 3: "width"}, "power_out": {0: "images"}})
+        axes.update({"out": {0: "batch", 2: "height", 3: "width"}, "power_out": vector})
     return axes
 
 
@@ -245,7 +256,7 @@ def example_inputs(sample, shallow_graph: bool) -> list:
     for m in range(1, WINDOW + 1):
         values.update({f"hx{m}": image(), f"hs{m}": sigma(), f"he{m}": torch.randn(rows, c, h, w, dtype=sample.dtype, **kw)})
     for f in range(1, FOUND + 1):
-        values[f"found{f}"] = image()
+        values.update({f"found{f}": image(), f"flag{f}": torch.zeros(n, **kw)})
     return [values[name] for name in (SHALLOW_INPUTS if shallow_graph else PROBE_INPUTS)]
 
 
@@ -257,12 +268,12 @@ def input_shapes(unet_shapes: dict, shallow_graph: bool) -> dict:
     image = [[1, c, h_lo, w_lo], [i_opt, c, h_opt, w_opt], [r_hi, c, h_hi, w_hi]]
     rows = [[1, c, h_lo, w_lo], [r_opt, c, h_opt, w_opt], [r_hi, c, h_hi, w_hi]]
     vector = [[1], [i_opt], [r_hi]]
-    shapes = {"x": image, "sigma": vector, "pred": [[1]] * 3, "power": [[1, BINS + 1], [i_opt, BINS + 1], [r_hi, BINS + 1]], "broken": vector}
+    shapes = {"x": image, "sigma": vector, "pred": [[1]] * 3, "power": [[1, BINS + 1], [i_opt, BINS + 1], [r_hi, BINS + 1]]}
     for m in range(1, WINDOW + 1):
         shapes.update({f"hx{m}": image, f"hs{m}": vector, f"he{m}": rows})
     if shallow_graph:
-        shapes["log_sigmas"] = [[2], [1000], [4096]]
-        shapes.update({f"found{f}": image for f in range(1, FOUND + 1)})
+        shapes.update({"log_sigmas": [[2], [1000], [4096]], "broken": vector})
+        shapes.update({name: image if name.startswith("found") else vector for name in FOUND_INPUTS})
     else:
         shapes["out"] = [list(s) for s in unet_shapes["sample"]]
     return shapes
@@ -276,21 +287,22 @@ def supported(model_sampling):
         return None
     if getattr(model_sampling, "sigma_data", None) != 1.0 or not isinstance(model_sampling, ms.EPS):
         return None
-    if isinstance(model_sampling, (ms.EDM, ms.X0)):
+    if isinstance(model_sampling, tuple(c for c in (getattr(ms, "EDM", None), getattr(ms, "X0", None)) if c is not None)):
         return None
     return 1.0 if isinstance(model_sampling, ms.V_PREDICTION) else 0.0
 
 
 class Call:
-    __slots__ = ("x", "sigma")
+    __slots__ = ("x", "sigma", "index")
 
-    def __init__(self, x, sigma):
-        self.x, self.sigma = x, sigma
+    def __init__(self, x, sigma, index):
+        self.x, self.sigma, self.index = x, sigma, index
 
 
 class Tracker:
     # One sampling pass's state between engine calls: references to tensors only. Every computation on them is in the
-    # engines' graphs (shallow, probe), so none runs in Python or on the CPU.
+    # engines' graphs (shallow, probe), so none runs in Python or on the CPU. Calls are numbered by speed.Schedule's
+    # index, as the deep features' origins are.
     def __init__(self, log_sigmas, pred, device):
         self.active = pred is not None
         self.device = device
@@ -298,51 +310,40 @@ class Tracker:
             self.log_sigmas = log_sigmas.to(device=device, dtype=torch.float32)
             self.pred = torch.full((1,), float(pred), device=device)
         self.history = deque(maxlen=WINDOW)  # (x, sigma, UNet output rows), newest last
+        self.found = deque(maxlen=MAX_AGE)  # (call index, noise, structured flag), newest last
+        self.gap_at = None  # index of the latest call whose noise is unknown
         self.key = None
-        self.found = []
         self.power = None
-        self.broken = None
         self.stash = None  # (x, sigma) of the UNet rows, from BaseModel.apply_model
-        self._zeros = {}
+        self._constants = {}
 
-    def zeros(self, shape, dtype=torch.float32):
-        key = (tuple(shape), dtype)
-        if key not in self._zeros:
-            self._zeros[key] = torch.zeros(shape, dtype=dtype, device=self.device)
-        return self._zeros[key]
+    def _constant(self, shape, value=0.0, dtype=torch.float32):
+        key = (tuple(shape), value, dtype)
+        if key not in self._constants:
+            self._constants[key] = torch.full(shape, value, dtype=dtype, device=self.device)
+        return self._constants[key]
 
-    def ones(self, shape):
-        key = (tuple(shape), "ones")
-        if key not in self._zeros:
-            self._zeros[key] = torch.ones(shape, dtype=torch.float32, device=self.device)
-        return self._zeros[key]
-
-    def gap(self):
+    def gap(self, index):
         self.history.clear()
-        self.found = []
-        self.broken = None
+        self.found.clear()
+        self.gap_at = index
 
-    def call(self, sample, chunks: int, padded: bool, slot):
+    def call(self, sample, chunks: int, padded: bool, slot, index):
         stash, self.stash = self.stash, None
         rows, c, h, w = sample.shape
         if not self.active or stash is None or padded or slot not in (None, 0) or not chunks or rows % chunks:
-            self.gap()
+            self.gap(index)
             return None
         x, sigma = stash
         images = rows // chunks
         if tuple(x.shape) != (rows, c, h, w) or sigma.shape[0] != rows:
-            self.gap()
+            self.gap(index)
             return None
         key = (images, c, h, w)
         if key != self.key:
-            self.gap()
+            self.gap(index)
             self.key = key
-        x, sigma = x[:images], sigma[:images]
-        if x.dtype != torch.float32:
-            x = x.float()
-        if sigma.dtype != torch.float32:
-            sigma = sigma.float()
-        return Call(x, sigma)
+        return Call(x[:images].float(), sigma[:images].float(), index)
 
     def _history(self, call) -> dict:
         n, c, h, w = call.x.shape
@@ -352,56 +353,54 @@ class Tracker:
             if m <= len(recent):
                 hx, hs, he = recent[m - 1]
             else:
-                hx, hs, he = self.zeros((n, c, h, w)), self.zeros((n,)), self.zeros((n, c, h, w), torch.float16)
+                hx, hs, he = self._constant((n, c, h, w)), self._constant((n,)), self._constant((n, c, h, w), dtype=torch.float16)
             values.update({f"hx{m}": hx, f"hs{m}": hs, f"he{m}": he})
         return values
 
-    def _state(self, n):
-        power = self.power if self.power is not None and self.power.shape[0] == n else self.zeros((n, BINS + 1))
-        broken = self.broken if self.broken is not None and self.broken.shape[0] == n else self.ones((n,))
-        return power, broken
+    def _power(self, n):
+        return self.power if self.power is not None and self.power.shape[0] == n else self._constant((n, BINS + 1))
 
-    def shallow_inputs(self, call) -> dict:
+    def shallow_inputs(self, call, origin) -> dict:
         n, c, h, w = call.x.shape
-        power, broken = self._state(n)
-        values = {"x": call.x, "sigma": call.sigma, "log_sigmas": self.log_sigmas, "pred": self.pred, "power": power, "broken": broken}
+        since = [(noise, flag) for i, noise, flag in self.found if i > origin]
+        unknown = (self.gap_at is not None and self.gap_at > origin) or len(since) > FOUND
+        values = {"x": call.x, "sigma": call.sigma, "log_sigmas": self.log_sigmas, "pred": self.pred, "power": self._power(n)}
+        values["broken"] = self._constant((n,), 1.0 if unknown else 0.0)
         values.update(self._history(call))
         for f in range(1, FOUND + 1):
-            values[f"found{f}"] = self.found[f - 1] if f <= len(self.found) else self.zeros((n, c, h, w))
+            noise, flag = since[f - 1] if f <= len(since) else (self._constant((n, c, h, w)), self._constant((n,)))
+            values.update({f"found{f}": noise, f"flag{f}": flag})
         return values
 
     def dummy_inputs(self, sample) -> dict:
         # For a shallow call without tracking: one image per UNet row and broken = 1, for which fresh.shallow returns
         # the plain shallow UNet's output.
         rows, c, h, w = sample.shape
-        image, vector = self.zeros((rows, c, h, w)), self.ones((rows,))
-        values = {"x": image, "sigma": vector, "log_sigmas": self.zeros((2,)), "pred": self.zeros((1,)), "power": self.zeros((rows, BINS + 1)), "broken": vector}
+        image, zeros, ones = self._constant((rows, c, h, w)), self._constant((rows,)), self._constant((rows,), 1.0)
+        values = {"x": image, "sigma": ones, "log_sigmas": self._constant((2,)), "pred": self._constant((1,))}
+        values.update({"power": self._constant((rows, BINS + 1)), "broken": ones})
         for m in range(1, WINDOW + 1):
-            values.update({f"hx{m}": image, f"hs{m}": vector, f"he{m}": self.zeros((rows, c, h, w), torch.float16)})
-        values.update({f"found{f}": image for f in range(1, FOUND + 1)})
+            values.update({f"hx{m}": image, f"hs{m}": ones, f"he{m}": self._constant((rows, c, h, w), dtype=torch.float16)})
+        for f in range(1, FOUND + 1):
+            values.update({f"found{f}": image, f"flag{f}": zeros})
         return values
 
     def after_shallow(self, call, outputs: dict):
         self.history.append((call.x, call.sigma, outputs["latent"]))
-        if len(self.found) >= FOUND:
-            self.gap()
-            return
-        self.found.append(outputs["noise"])
-        self.broken = outputs["broken_out"]
+        self.found.append((call.index, outputs["noise"], outputs["structured"]))
 
     def probe_inputs(self, call, out):
         if not self.history:
             return None
-        n = call.x.shape[0]
-        power, _ = self._state(n)
-        values = {"x": call.x, "sigma": call.sigma, "pred": self.pred, "out": out, "power": power, "broken": self.zeros((n,))}
+        values = {"x": call.x, "sigma": call.sigma, "pred": self.pred, "out": out, "power": self._power(call.x.shape[0])}
         values.update(self._history(call))
         return values
 
-    def after_full(self, call, out, power=None):
-        n = call.x.shape[0]
-        if power is not None:
-            self.power = power
+    def after_full(self, call, out, outputs=None):
+        # outputs: the probe's, or None if it didn't run, which leaves the noise drawn before this call unknown
         self.history.append((call.x, call.sigma, out))
-        self.found = []
-        self.broken = self.zeros((n,))
+        if outputs is None:
+            self.gap_at = call.index
+            return
+        self.power = outputs["power_out"]
+        self.found.append((call.index, outputs["noise"], outputs["structured"]))

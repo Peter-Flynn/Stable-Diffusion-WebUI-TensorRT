@@ -192,7 +192,7 @@ class _Probe(torch.nn.Module):
     def forward(self, *tracker):
         inputs = fresh.group(fresh.PROBE_INPUTS, tracker)
         history, _ = fresh.unpack(inputs)
-        return fresh.probe(inputs["x"], inputs["sigma"], inputs["pred"], inputs["out"], history, inputs["power"], inputs["broken"])
+        return fresh.probe(inputs["x"], inputs["sigma"], inputs["pred"], inputs["out"], history, inputs["power"])
 
 
 @common.inference_mode
@@ -497,6 +497,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                         "stripped": shallow["stripped"],
                     }
                     if tracked:
+                        hacks["fresh"] = fresh.SIGNATURE
                         probe_job = {
                             **job,
                             "onnx": os.path.join(folder, "probe.onnx"),
@@ -512,7 +513,6 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                             break
                         if probe["ok"]:
                             probe_plan = probe_job["plan"]
-                            hacks["fresh"] = fresh.SIGNATURE
                         else:
                             logger.warning(f"Couldn't build the {what}'s fresh-noise probe, so its Speed Hacks don't correct ancestral and SDE samplers' noise: {probe.get('error')}")
                 else:

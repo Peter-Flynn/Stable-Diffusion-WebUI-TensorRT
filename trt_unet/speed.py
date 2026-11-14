@@ -139,16 +139,17 @@ class Schedule:
         return pending and self._smooth_ready.query() and bool(self._smooth_host)
 
     def call(self, shape) -> tuple:
+        # (slot, deep feature or None, index of the full call that computed it)
         if self.index is None:
             self.full_calls += 1
-            return None, None
+            return None, None, None
         slot, self.slot = self.slot, self.slot + 1
         kept = self.deep.get((slot, tuple(shape)))
         if self.decision == "shallow" and kept is not None and self.index - kept[1] <= MAX_AGE:
             self.shallow_calls += 1
-            return slot, kept[0]
+            return slot, kept[0], kept[1]
         self.full_calls += 1
-        return slot, None
+        return slot, None, None
 
     def keep(self, slot: int, shape, deep):
         self.deep[(slot, tuple(shape))] = (deep, self.index)

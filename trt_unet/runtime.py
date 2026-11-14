@@ -58,6 +58,9 @@ class TrtModel:
         self.owner = f"{record.arch.label} {record.label}"  # key into gpu.py's per-owner accounting: must be unique
         self.name = f"{record.arch.name} {record.label}"
         self.hacks = record.speed_hacks
+        if self.hacks and self.hacks.get("fresh") not in (None, fresh.SIGNATURE):
+            notify(f"The {self.name} was built by an older version of Speed Hacks, so it runs without them until it's rebuilt in the TensorRT tab.")
+            self.hacks = None
         self.model = TensorRTUNet()
         self.load_device = mm.get_torch_device()
         self.offload_device = torch.device("cpu")
@@ -78,8 +81,8 @@ class TrtModel:
             self.engine = Engine(self.record.plan, arena, self.owner)
             if self.hacks:
                 self.shallow = Engine(self.record.shallow_plan, arena, self.owner)
-                if self.record.probe_plan and self.hacks.get("fresh") == fresh.SIGNATURE:
-                    self.probe = Engine(self.record.probe_plan, arena, self.owner)
+                if self._probe_plan:
+                    self.probe = Engine(self._probe_plan, arena, self.owner)
         return self.engine
 
     @property
@@ -95,19 +98,23 @@ class TrtModel:
         return self.shallow is not None and self.shallow.loaded
 
     @property
+    def _probe_plan(self):
+        return self.record.probe_plan if self.hacks and self.hacks.get("fresh") else None
+
+    @property
     def tracks(self) -> bool:
         return self.shallow_loaded and self.probe is not None and self.probe.loaded
 
     @property
     def shallow_takes_tracker(self) -> bool:  # False for shallow engines built before fresh.py
-        return self.shallow_loaded and any(name == "x" for name, is_input, _ in self.shallow.io if is_input)
+        return bool(self.hacks and self.hacks.get("fresh"))
 
     def full(self, shallow: bool, kept=None) -> int:
         total = 0
         for role in ("unet", "shallow") if shallow else ("unet",):
             blob = kept.blobs.get(role) if kept is not None else None
             total += memoryview(blob).nbytes if blob is not None else self._serialized_size(role)
-        if shallow and self.record.probe_plan:
+        if shallow and self._probe_plan:
             total += self._serialized_size("probe")
         return total
 
@@ -712,14 +719,14 @@ class Pass:
                     _unload(failed, keep=False)
                 self.fall_back(f"Couldn't load the {record.arch.name} {record.label} ({e})", _unexpected(e))
         stream = torch.cuda.current_stream().cuda_stream
-        slot = deep = tracking = None
+        slot = deep = origin = tracking = None
         if self.schedule is not None and self.model.shallow_loaded:
-            slot, deep = self.schedule.call(feed["sample"].shape)
+            slot, deep, origin = self.schedule.call(feed["sample"].shape)
             if self.model.tracks:
-                tracking = self.tracker.call(feed["sample"], chunks, padded > b, slot)
+                tracking = self.tracker.call(feed["sample"], chunks, padded > b, slot, self.schedule.index)
         if self.tracker is not None:
             self.tracker.stash = None
-        out = self._infer_with_room(feed, profile, stream, slot, deep, tracking)
+        out = self._infer_with_room(feed, profile, stream, slot, deep, origin, tracking)
         if deep is None and not self.checked:
             self.checked = True
             if not torch.isfinite(out).all():
@@ -732,24 +739,24 @@ class Pass:
                 out = self._infer_with_room(feed, profile, stream)
         return out[:b].to(x.dtype)
 
-    def _infer_with_room(self, feed, profile, stream, slot=None, deep=None, tracking=None):
+    def _infer_with_room(self, feed, profile, stream, slot=None, deep=None, origin=None, tracking=None):
         try:
-            return self._infer(feed, profile, stream, slot, deep, tracking)
+            return self._infer(feed, profile, stream, slot, deep, origin, tracking)
         except torch.cuda.OutOfMemoryError:
             self.model.engine.release_activations()
             common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
             common.mm().soft_empty_cache(force=True)
             try:
-                return self._infer(feed, profile, stream, slot, deep, tracking)
+                return self._infer(feed, profile, stream, slot, deep, origin, tracking)
             except torch.cuda.OutOfMemoryError:
                 self.fall_back("The engine ran out of VRAM")
 
-    def _infer(self, feed, profile, stream, slot=None, deep=None, tracking=None):
+    def _infer(self, feed, profile, stream, slot=None, deep=None, origin=None, tracking=None):
         try:
             if deep is not None:
                 extra = {}
                 if self.model.shallow_takes_tracker:
-                    extra = self.tracker.shallow_inputs(tracking) if tracking is not None else self.tracker.dummy_inputs(feed["sample"])
+                    extra = self.tracker.shallow_inputs(tracking, origin) if tracking is not None else self.tracker.dummy_inputs(feed["sample"])
                 outputs = self.model.shallow.infer({**feed, "deep": deep, **extra}, profile, stream)
                 if tracking is not None:
                     self.tracker.after_shallow(tracking, outputs)
@@ -766,16 +773,16 @@ class Pass:
             self.fall_back(f"The engine failed ({e})", _unexpected(e))
 
     def _probe(self, tracking, out, profile, stream):
-        power, inputs = None, self.tracker.probe_inputs(tracking, out)
+        outputs, inputs = None, self.tracker.probe_inputs(tracking, out)
         if inputs is not None:
             try:
-                power = self.model.probe.infer(inputs, profile, stream)["power_out"]
+                outputs = self.model.probe.infer(inputs, profile, stream)
             except torch.cuda.OutOfMemoryError:
                 raise
             except Exception as e:
                 logger.warning(f"The fresh-noise probe failed ({e}), so the rest of this pass doesn't correct the noise its sampler adds.")
                 self.tracker.active = False
-        self.tracker.after_full(tracking, out, power)
+        self.tracker.after_full(tracking, out, outputs)
 
 
 def _tracker(patcher):

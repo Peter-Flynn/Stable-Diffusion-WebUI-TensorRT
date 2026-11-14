@@ -236,7 +236,7 @@ class Engine:
             is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
             self.io.append((name, is_input, torch_dtype(self.engine.get_tensor_dtype(name))))
         with gpu.owner(self.owner):
-            self.weight_names = list(trt.Refitter(self.engine, LOGGER).get_all_weights()) if self.engine.refittable else []
+            self.weight_names = list(trt.Refitter(self.engine, LOGGER).get_all_weights()) if getattr(self.engine, "refittable", True) else []
         self.context = None  # created on first use, after the weights are refitted in
         self._reset_context_state()
         return time.perf_counter() - start
