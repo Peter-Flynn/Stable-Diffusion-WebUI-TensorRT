@@ -197,7 +197,7 @@ def _status(sd_model, arch, records, asking=False) -> str:
         lines.append(vae_engines)
     stale = [r for r in records if r.stale_speed_hacks]
     if stale:
-        lines.append(f"{_n(len(stale), 'engine')} {'has' if len(stale) == 1 else 'have'} a Speed Hacks part from another version of this extension, so they run without Speed Hacks; building again rebuilds them.")
+        lines.append(f"Speed Hacks are off for {_n(len(stale), 'engine')}: their Speed Hacks part is from another version of this extension. Building again rebuilds them.")
     failed = [r for r in records if r.speed_hacks is None and not r.stale_speed_hacks]
     if failed:
         retry = "building again retries once" if any(r.retry_speed_hacks for r in failed) else "to try again, delete them and build again"

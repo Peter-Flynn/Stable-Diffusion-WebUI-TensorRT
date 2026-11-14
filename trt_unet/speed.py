@@ -122,7 +122,10 @@ class Schedule:
         # (decision, whether a full call is checked)
         if not total or not steps or steps < MIN_STEPS:
             return "full", False
-        start, end = round(self.warmup * total), total - max(1, round(self.tail * total))
+        per = max(1, total // steps)
+        # Samplers that call the UNet twice per step (Heun, DPM++ SDE, DPM++ 2S a) call it once at their last step, so
+        # their final call is at total - 2.
+        start, end = round(self.warmup * total), total - max(per, round(self.tail * total))
         if index < start or index >= end or self.last_full is None:
             return "full", False
         age = index - self.last_full
@@ -132,7 +135,7 @@ class Schedule:
             return "full", False
         if self.rate is not None and self.rate * age <= self.budget * self.reference * INTERVAL:
             return "shallow", False
-        return "full", index % max(1, total // steps) == 0
+        return "full", index % per == 0
 
     def checked(self, error, age: int):
         # The error is copied to pinned memory asynchronously and read once its event has completed, a call or more
