@@ -177,17 +177,9 @@ def _as_full(unet, x, timesteps, context, y=None):
 
 
 def _as_shallow(unet, x, timesteps, context, *rest):
-    count = len(fresh.SHALLOW_INPUTS)
-    tracker, rest = (rest[-count:], rest[:-count]) if len(rest) > 2 else ((), rest)
+    rest, tracked = rest[: -len(fresh.INPUTS)], dict(zip(fresh.INPUTS, rest[-len(fresh.INPUTS):]))
     y, deep = rest if len(rest) == 2 else (None, rest[0])
-    run = lambda sample, t: speed.shallow_forward(unet, sample, t, context, y, deep)
-    if not tracker:
-        return run(x, timesteps)
-    inputs = fresh.group(fresh.SHALLOW_INPUTS, tracker)
-    return fresh.shallow(
-        run, x, timesteps, inputs["x"], inputs["sigma"], inputs["log_sigmas"], inputs["pred"], fresh.unpack(inputs), inputs["power"], inputs["broken"],
-        inputs["measure"], inputs["out"],
-    )
+    return fresh.shallow(lambda sample, t: speed.shallow_forward(unet, sample, t, context, y, deep), x, timesteps, tracked)
 
 
 @common.inference_mode
@@ -202,10 +194,10 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
     ]
     if arch.adm_channels:
         inputs.append(torch.randn(2, arch.adm_channels, dtype=dtype, device=device))
-    paths = {name: os.path.join(folder, f"{name}.onnx") for name in ("unet", "shallow")}
+    paths = {"unet": os.path.join(folder, "unet.onnx"), "shallow": os.path.join(folder, "shallow.onnx")}
     axes = {k: v for k, v in DYNAMIC_AXES.items() if k in names or k == "latent"}
     logger.debug(f"Exporting the {arch.name} UNet to ONNX.")
-    shallow = tracked = True
+    shallow = True
     with _traceable_attention(), quiet_warnings():
         try:
             deep = speed.full_forward(unet, *inputs)[1]
@@ -221,45 +213,31 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
                 del unet.forward
             axes.pop("deep", None)
             torch.onnx.export(unet, tuple(inputs), paths["unet"], input_names=names, output_names=["latent"], dynamic_axes=axes, **ONNX_KWARGS)
-        if shallow:
-            unet.forward = types.MethodType(_as_shallow, unet)
-            try:
-                tracker = fresh.example_inputs(inputs[0])
+        try:
+            if shallow:
+                unet.forward = types.MethodType(_as_shallow, unet)
                 torch.onnx.export(
-                    unet, (*inputs, deep, *tracker), paths["shallow"], input_names=names + ["deep", *fresh.SHALLOW_INPUTS],
-                    output_names=fresh.SHALLOW_OUTPUTS, dynamic_axes={**axes, **fresh.dynamic_axes()}, **ONNX_KWARGS,
+                    unet, (*inputs, deep, *fresh.example_inputs(inputs[0])), paths["shallow"], input_names=names + ["deep", *fresh.INPUTS],
+                    output_names=fresh.OUTPUTS, dynamic_axes={**axes, **fresh.dynamic_axes()}, **ONNX_KWARGS,
                 )
-            except Exception as e:
-                logger.warning(
-                    f"Couldn't export Speed Hacks' handling of fresh sampler noise, so these engines are built without it: {e}",
-                    exc_info=logger.isEnabledFor(logging.DEBUG),
-                )
-                tracked = False
-            try:
-                if not tracked:
-                    torch.onnx.export(
-                        unet, (*inputs, deep), paths["shallow"], input_names=names + ["deep"], output_names=["latent"], dynamic_axes=axes, **ONNX_KWARGS
-                    )
-            except Exception as e:
-                logger.warning(f"Couldn't export the UNet's Speed Hacks part, so these engines are built without it: {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
-                shallow = False
-            finally:
-                with contextlib.suppress(AttributeError):
-                    del unet.forward
+        except Exception as e:
+            logger.warning(f"Couldn't export the UNet's Speed Hacks part, so these engines are built without it: {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
+            shallow = False
+        finally:
+            with contextlib.suppress(AttributeError):
+                del unet.forward
     exported = {k: list(v.shape) for k, v in unet.state_dict(keep_vars=True).items()}
     del unet, inputs, deep
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     loaded = {k: list(v.shape) for k, v in patcher.model.diffusion_model.state_dict(keep_vars=True).items()}
-    result = {"unet": _weightless_graph(paths["unet"], names, (exported, loaded)), "shallow": None, "deep": info, "tracked": False}
+    result = {"unet": _weightless_graph(paths["unet"], names, (exported, loaded)), "shallow": None, "deep": info}
     if shallow:
         try:
-            result["shallow"] = _weightless_graph(paths["shallow"], names + ["deep"] + (fresh.SHALLOW_INPUTS if tracked else []), (exported, loaded))
-            result["tracked"] = tracked
+            result["shallow"] = _weightless_graph(paths["shallow"], names + ["deep", *fresh.INPUTS], (exported, loaded))
         except Exception as e:
             logger.warning(f"Couldn't prepare the UNet's Speed Hacks part, so these engines are built without it: {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
-            result["shallow"] = None
     return result
 
 
@@ -461,14 +439,13 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 break
             hacks = shallow_plan = hack_error = None
             if graphs["shallow"] is not None:
-                tracked = graphs["tracked"]
                 shallow_job = {
                     **job,
                     "onnx": os.path.join(folder, "shallow.onnx"),
                     "plan": os.path.join(folder, "shallow.plan"),
                     "weights": sorted(graphs["shallow"]),
-                    "profiles": [{**speed.shallow_shapes(s, graphs["deep"]), **(fresh.input_shapes(s) if tracked else {})} for s in unet_shapes],
-                    "exact_fp32": tracked,
+                    "profiles": [{**speed.shallow_shapes(s, graphs["deep"]), **fresh.input_shapes(s)} for s in unet_shapes],
+                    "exact_fp32": True,
                 }
                 logger.debug(f"Building the {what}'s Speed Hacks part.")
                 shallow = _build_plan(shallow_job, folder, shallow_step)
@@ -484,9 +461,8 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                         "weights": shallow_job["weights"],
                         "weight_bytes": sum(math.prod(graphs["shallow"][w]) * 2 for w in shallow_job["weights"]),
                         "stripped": shallow["stripped"],
+                        "fresh": fresh.SIGNATURE,
                     }
-                    if tracked:
-                        hacks["fresh"] = fresh.SIGNATURE
                 else:
                     hack_error = str(shallow.get("error"))
                     logger.warning(f"Couldn't build the {what}'s Speed Hacks part, so it runs without Speed Hacks: {hack_error}")

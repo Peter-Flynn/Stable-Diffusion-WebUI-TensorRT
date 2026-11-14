@@ -1,21 +1,18 @@
-# Speed Hacks: DeepCache with its refresh interval stretched while a measured error allows.
+# Speed Hacks: DeepCache, with due full calls waiting while a measured error allows.
 #
 # DeepCache (Ma et al., 2023): the UNet's deep features change little between steps. Every engine is built twice: the
 # full UNet, which also outputs the input of output block deep_block() (the "deep" feature), and a shallow engine of
-# only the outermost blocks, which takes that feature as an input. Most evaluations run only the shallow engine, on the
-# deep feature from the last full evaluation: INTERVAL - 1 in a row, more while checks allow.
+# only the outermost blocks, which takes that feature as an input. After a full call, the next INTERVAL - 1 calls run
+# only the shallow engine, on its deep feature. The noise ancestral and SDE samplers add: fresh.py, in the shallow
+# engine.
 #
-# Checks: a full call from CHECKS calls before the first shallow call until the full steps at the end also runs the
-# shallow engine as the shallow call at its index would have run, on the deep feature it replaces, and compares
-# (fresh.py). That is the error a shallow call of that age actually makes, for any sampler, noise included; it costs a
-# shallow call, a few percent of a full one on SDXL. A due full call waits while the latest check's error, scaled
-# linearly to the age the deep feature would reach, stays within budget(quality) times the error of the first check
-# after warmup (the error DeepCache's own interval made there). Only checks at a sampler step's first call count: DPM++
-# SDE and Heun call the UNet twice per step (reForge's total_steps / steps), at two kinds of point whose errors differed
-# ~50x in simulation. This replaces AdaptiveDiffusion's test (Ye et al., 2024), which judged staleness from how smoothly
-# x moves: noise the sampler adds and the kink at each refresh both read as roughness.
-#
-# Samplers that add noise between calls (ancestral, SDE): fresh.py, built into the shallow engine.
+# Waiting (in place of AdaptiveDiffusion, Ye et al., 2024, whose test of how smoothly x moves reads that noise as
+# roughness, so it never passed with those samplers): a due full call also runs the shallow engine as the shallow call
+# at its index would have, on the deep feature it replaces (a "check", the cost of a shallow call), which gives the
+# error that shallow call would have made, for any sampler. Due full calls wait while the latest check's error, scaled
+# linearly to the age the deep feature would reach, stays within budget(quality) times the pass's first check's. Only
+# a sampler step's first call is checked: DPM++ SDE and Heun call the UNet twice per step (reForge's total_steps /
+# steps), at points whose errors aren't comparable.
 import math
 
 import torch
@@ -25,23 +22,20 @@ INTERVAL = 3
 WARMUP = 0.4
 TAIL = 0.05
 QUALITY = 0.9
-# Checked warmup calls before the first shallow call: fresh.py's noise share is measured at checks and averaged (EMA
-# 0.5). Simulated: the last 3 of 18 warmup calls gave 0.0065 distance to the all-full image, all 18 0.0059, the last 1
-# 0.0133.
-CHECKS = 3
 MIN_STEPS = 12
 
 
 def budget(quality: float) -> float:
-    # The error a stretched call may reach, as a multiple of the reference: 0 at quality 1 (DeepCache alone), infinite at
-    # 0 (every call between the full shares shallow). Simulated (13 samplers, Karras and DDIM schedules, 20 to 44 steps,
-    # a shallow call costing 5% of a full one), the speed over DeepCache alone came to about x1.03 at 0.9, x1.16 at 0.5,
-    # x1.26 at 0.1 and x1.34 at 0.
+    # The error a call past DeepCache's interval may reach, in units of the pass's first check (the error of a call at
+    # DeepCache's interval there). At 1 nothing waits. Down to 0.9 the budget rises to 1, where a waiting call is no
+    # worse than that first check. Below 0.9 it's 0.9 / quality: at a steady error rate a call waits until age
+    # INTERVAL * budget, so the share of full calls falls in proportion to quality, from DeepCache's 1 in INTERVAL at
+    # 0.9 to none at 0.
     if quality >= 1:
         return 0.0
     if quality <= 0:
         return math.inf
-    return 2 * ((1 - quality) / quality) ** 0.75
+    return 10 * (1 - quality) if quality >= 0.9 else 0.9 / quality
 
 
 def deep_block(unet, branch: int = BRANCH) -> int:
@@ -109,14 +103,13 @@ class Schedule:
         self.check = False
         self.last_full = None
         self.slot = 0
-        self.start = 0
-        self.per = 1  # UNet calls per sampler step
         # (slot, sample shape) -> (deep feature, evaluation index). Keyed by shape too: with "Negative Guidance minimum
         # sigma", every other evaluation drops the unconds, so one slot alternates between two batch shapes.
         self.deep = {}
         self.shallow_calls = self.full_calls = 0
-        self.rate = self.reference = None  # error per call of age: the latest check's and the first after warmup's
-        self._pending = []  # (error in pinned memory, CUDA event, age) of checks not read yet
+        self.rate = self.reference = None  # a check's error per call of age: the latest read, and the pass's first
+        self.checks = []  # (index, age, error) of the checks read
+        self._pending = []  # (index, age, error in pinned memory, CUDA event) of checks not read yet
 
     def begin(self, index: int, total, steps):
         self.index, self.slot = index, 0
@@ -129,40 +122,39 @@ class Schedule:
         # (decision, whether a full call is checked)
         if not total or not steps or steps < MIN_STEPS:
             return "full", False
-        self.per = max(1, total // steps)
-        self.start, end = round(self.warmup * total), total - max(1, round(self.tail * total))
-        if index < self.start or index >= end or self.last_full is None:
-            return "full", self.start - CHECKS <= index < end
+        start, end = round(self.warmup * total), total - max(1, round(self.tail * total))
+        if index < start or index >= end or self.last_full is None:
+            return "full", False
         age = index - self.last_full
         if age < INTERVAL or self.budget == math.inf:
             return "shallow", False
-        if self.budget > 0 and self.rate is not None and self.rate * age <= self.budget * self.reference * INTERVAL:
+        if self.budget == 0:
+            return "full", False
+        if self.rate is not None and self.rate * age <= self.budget * self.reference * INTERVAL:
             return "shallow", False
-        return "full", True
+        return "full", index % max(1, total // steps) == 0
 
-    def checked(self, error, origin: int):
-        # origin: the call index of the deep feature checked. The error is copied to pinned memory asynchronously and
-        # read once its event has completed, a few calls later at the earliest, so the CPU never waits for the GPU here.
-        # Warmup's checks are for fresh.py's noise share only.
-        if self.index < self.start or self.index % self.per:
-            return
-        age = self.index - origin
+    def checked(self, error, age: int):
+        # The error is copied to pinned memory asynchronously and read once its event has completed, a call or more
+        # later, so the CPU never waits for the GPU here.
         host = torch.empty((), dtype=torch.float32, pin_memory=True)
         host.copy_(error.reshape(()), non_blocking=True)
         event = torch.cuda.Event()
         event.record()
-        self._pending.append((host, event, age))
+        self._pending.append((self.index, age, host, event))
 
     def _collect(self):
-        while self._pending and self._pending[0][1].query():
-            host, _, age = self._pending.pop(0)
-            self.rate = float(host) / age
+        while self._pending and self._pending[0][3].query():
+            index, age, host, _ = self._pending.pop(0)
+            error = float(host)
+            self.checks.append((index, age, error))
+            self.rate = error / age
             if self.reference is None:
                 self.reference = self.rate
 
     def call(self, shape) -> tuple:
-        # (slot, deep feature or None, index of the full call that computed it, (deep feature, index) this checked full
-        # call replaces or None)
+        # (slot, deep feature or None, index of the call that computed it, (deep feature, index) this checked full call
+        # replaces or None)
         if self.index is None:
             self.full_calls += 1
             return None, None, None, None

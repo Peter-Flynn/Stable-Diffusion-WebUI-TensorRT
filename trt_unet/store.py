@@ -12,7 +12,7 @@ import os
 import shutil
 from dataclasses import dataclass, field
 
-from . import common
+from . import common, fresh
 from .arch import Arch
 from .profiles import Profile
 
@@ -123,11 +123,16 @@ class Record:
 
     @property
     def speed_hacks(self):
-        return self.meta.get("speed_hacks")
+        hacks = self.meta.get("speed_hacks")
+        return hacks if hacks and hacks.get("fresh") == fresh.SIGNATURE else None
+
+    @property
+    def stale_speed_hacks(self) -> bool:  # built with another fresh.SIGNATURE, so it takes other inputs
+        return self.speed_hacks is None and "speed_hacks" in self.meta
 
     @property
     def retry_speed_hacks(self) -> bool:
-        return self.speed_hacks is None and not self.meta.get("speed_hacks_retried")
+        return self.speed_hacks is None and (self.stale_speed_hacks or not self.meta.get("speed_hacks_retried"))
 
     @property
     def label(self) -> str:

@@ -150,11 +150,10 @@ def build(job, logger, progress, strip=True):
         raise RuntimeError(f"{len(unmarked)} of the model's weights aren't in the TensorRT network (e.g. {unmarked[0]})")
 
     config = builder.create_builder_config()
-    if job["weights"]:
-        config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)
-        if strip:
-            config.set_flag(trt.BuilderFlag.STRIP_PLAN)
-    if job.get("exact_fp32") and hasattr(trt.BuilderFlag, "TF32"):
+    config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)
+    if strip:
+        config.set_flag(trt.BuilderFlag.STRIP_PLAN)
+    if job.get("exact_fp32"):
         # fresh.py's FP32 layers: TF32's 10-bit mantissa breaks its Gram-Schmidt fit. FP16 layers aren't affected.
         config.clear_flag(trt.BuilderFlag.TF32)
     if job.get("optimization_level") is not None:

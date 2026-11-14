@@ -47,8 +47,7 @@ class DoesNotFit(RuntimeError):
 
 class TrtModel:
     # Implements the parts of ModelPatcher that reForge's LoadedModel calls, so the model manager can hold an engine
-    # (and its Speed Hacks partner) like any model. Its size is what gpu.py measured once loaded, an estimate
-    # before.
+    # (and its Speed Hacks partner) like any model. Its size is what gpu.py measured once loaded, an estimate before.
     parent = None
     evicted_last = True
 
@@ -58,9 +57,6 @@ class TrtModel:
         self.owner = f"{record.arch.label} {record.label}"  # key into gpu.py's per-owner accounting: must be unique
         self.name = f"{record.arch.name} {record.label}"
         self.hacks = record.speed_hacks
-        if self.hacks and self.hacks.get("fresh") not in (None, fresh.SIGNATURE):
-            notify(f"The {self.name} was built by an older version of Speed Hacks, so it runs without them until it's rebuilt in the TensorRT tab.")
-            self.hacks = None
         self.model = TensorRTUNet()
         self.load_device = mm.get_torch_device()
         self.offload_device = torch.device("cpu")
@@ -94,14 +90,6 @@ class TrtModel:
     @property
     def shallow_loaded(self) -> bool:
         return self.shallow is not None and self.shallow.loaded
-
-    @property
-    def tracks(self) -> bool:
-        return self.shallow_loaded and self.shallow_takes_tracker
-
-    @property
-    def shallow_takes_tracker(self) -> bool:  # False for shallow engines built before fresh.py
-        return bool(self.hacks and self.hacks.get("fresh"))
 
     def full(self, shallow: bool, kept=None) -> int:
         total = 0
@@ -255,10 +243,7 @@ class TrtModel:
         logger.debug(f"Kept the {label} in RAM ({common.gib(kept.nbytes)}, {time.time() - start:.1f}s); {count} kept in all, {common.gib(total)}.")
 
     def _serialized_size(self, role: str) -> int:
-        plan, weights = {
-            "unet": (self.record.plan, self.record.weight_bytes),
-            "shallow": (self.record.shallow_plan, (self.hacks or {}).get("weight_bytes", 0)),
-        }[role]
+        plan, weights = (self.record.plan, self.record.weight_bytes) if role == "unet" else (self.record.shallow_plan, self.hacks["weight_bytes"])
         if role not in self._plan_bytes:
             try:
                 self._plan_bytes[role] = os.path.getsize(plan)
@@ -406,13 +391,13 @@ FULL_START, FULL_END, QUALITY = "trt_speed_hacks_full_start", "trt_speed_hacks_f
 def speed_settings() -> tuple:
     from modules import shared
 
-    def setting(key, default, scale=1.0):
+    def fraction(key, default, scale=1.0):
         try:
             return min(max(float(getattr(shared.opts, key)) / scale, 0.0), 1.0)
         except Exception:
             return default
 
-    return setting(FULL_START, speed.WARMUP, 100), setting(FULL_END, speed.TAIL, 100), setting(QUALITY, speed.QUALITY)
+    return fraction(FULL_START, speed.WARMUP, 100), fraction(FULL_END, speed.TAIL, 100), fraction(QUALITY, speed.QUALITY)
 
 
 class SpeedHacksOption(sd_unet.SdUnetOption):
@@ -568,7 +553,7 @@ class Pass:
     def __init__(self, records: list, patcher, x, hacks: bool = False):
         self.patcher = patcher
         self.schedule = speed.Schedule(*speed_settings()) if hacks else None
-        self.tracker = _tracker(patcher) if hacks else None
+        self.tracker = fresh.Tracker(patcher.model.model_sampling, common.mm().get_torch_device()) if hacks else None
         self.slots = store.slots(records)
         self.model = None
         self.weights = EffectiveWeights(patcher)
@@ -651,6 +636,8 @@ class Pass:
         hacks = self.schedule
         if hacks is not None and hacks.shallow_calls:
             logger.debug(f"Speed Hacks ran {hacks.shallow_calls} of {hacks.shallow_calls + hacks.full_calls} UNet calls on the shallow engine.")
+            if hacks.checks:
+                logger.debug("Speed Hacks checks (call, age, error): " + ", ".join(f"{i} {a} {e:.4f}" for i, a, e in hacks.checks))
             _note_speed_hacks()
         for model in _models.values():
             if model.weights is self.weights:
@@ -697,14 +684,11 @@ class Pass:
                     _unload(failed, keep=False)
                 self.fall_back(f"Couldn't load the {record.arch.name} {record.label} ({e})", _unexpected(e))
         stream = torch.cuda.current_stream().cuda_stream
-        slot = deep = origin = stale = tracking = None
+        hack = deep = None
         if self.schedule is not None and self.model.shallow_loaded:
             slot, deep, origin, stale = self.schedule.call(feed["sample"].shape)
-            if self.model.tracks:
-                tracking = self.tracker.call(feed["sample"], chunks, padded > b, slot, self.schedule.index)
-        if self.tracker is not None:
-            self.tracker.stash = None
-        out = self._infer_with_room(feed, profile, stream, slot, deep, origin, tracking, stale)
+            hack = (slot, deep, origin, stale, self.tracker.call(feed["sample"], chunks, padded > b, slot, self.schedule.index))
+        out = self._infer_with_room(feed, profile, stream, hack)
         if deep is None and not self.checked:
             self.checked = True
             if not torch.isfinite(out).all():
@@ -717,25 +701,25 @@ class Pass:
                 out = self._infer_with_room(feed, profile, stream)
         return out[:b].to(x.dtype)
 
-    def _infer_with_room(self, feed, profile, stream, slot=None, deep=None, origin=None, tracking=None, stale=None):
+    def _infer_with_room(self, feed, profile, stream, hack=None):
         try:
-            return self._infer(feed, profile, stream, slot, deep, origin, tracking, stale)
+            return self._infer(feed, profile, stream, hack)
         except torch.cuda.OutOfMemoryError:
             self.model.engine.release_activations()
             common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
             common.mm().soft_empty_cache(force=True)
             try:
-                return self._infer(feed, profile, stream, slot, deep, origin, tracking, stale)
+                return self._infer(feed, profile, stream, hack)
             except torch.cuda.OutOfMemoryError:
                 self.fall_back("The engine ran out of VRAM")
 
-    def _infer(self, feed, profile, stream, slot=None, deep=None, origin=None, tracking=None, stale=None):
+    def _infer(self, feed, profile, stream, hack=None):
+        # hack: (slot, deep feature or None, index of the call that computed it, (deep feature, index) this checked full
+        # call replaces or None, fresh.Call or None)
+        slot, deep, origin, stale, tracking = hack or (None,) * 5
         try:
             if deep is not None:
-                extra = {}
-                if self.model.shallow_takes_tracker:
-                    extra = self.tracker.shallow_inputs(tracking, origin) if tracking is not None else self.tracker.dummy_inputs(feed["sample"])
-                outputs = self.model.shallow.infer({**feed, "deep": deep, **extra}, profile, stream)
+                outputs = self.model.shallow.infer({**feed, "deep": deep, **self.tracker.inputs(tracking, origin, feed["sample"])}, profile, stream)
                 if tracking is not None:
                     self.tracker.after_shallow(tracking, outputs, origin)
                 return outputs["latent"]
@@ -743,9 +727,10 @@ class Pass:
             out = outputs["latent"]
             if slot is not None and "deep" in outputs:
                 self.schedule.keep(slot, feed["sample"].shape, outputs["deep"])
-                if self.schedule.check and slot == 0 and self.model.shallow_takes_tracker and (stale is not None or tracking is not None):
-                    self._check(feed, profile, stream, tracking, out, outputs["deep"], stale)
-                    return out
+                if stale is not None and tracking is not None:
+                    inputs = {**feed, "deep": stale[0], **self.tracker.inputs(tracking, stale[1], feed["sample"])}
+                    checked = self.model.shallow.infer(inputs, profile, stream)["latent"]
+                    self.schedule.checked(self.tracker.error(tracking, checked, out), self.schedule.index - stale[1])
             if tracking is not None:
                 self.tracker.after_full(tracking, out)
             return out
@@ -753,27 +738,6 @@ class Pass:
             raise
         except Exception as e:
             self.fall_back(f"The engine failed ({e})", _unexpected(e))
-
-    def _check(self, feed, profile, stream, tracking, out, deep, stale):
-        # stale: (deep feature, index) this full call replaces, on which the shallow engine runs as the shallow call at
-        # this index would have. Without one (no full call before it), on this call's own deep feature, for the noise
-        # share alone.
-        origin = stale[1] if stale is not None else None
-        extra = self.tracker.shallow_inputs(tracking, origin, out) if tracking is not None else self.tracker.dummy_inputs(feed["sample"], out)
-        outputs = self.model.shallow.infer({**feed, "deep": stale[0] if stale is not None else deep, **extra}, profile, stream)
-        if tracking is not None:
-            self.tracker.after_full(tracking, out, outputs)
-        if origin is not None:
-            self.schedule.checked(outputs["error"], origin)
-
-
-def _tracker(patcher):
-    sampling = getattr(patcher.model, "model_sampling", None)
-    try:
-        pred = fresh.supported(sampling)
-    except Exception:
-        pred = None
-    return fresh.Tracker(sampling.log_sigmas if pred is not None else None, pred, common.mm().get_torch_device())
 
 
 def _engine_records(patcher, x):
@@ -797,7 +761,10 @@ def _engine_records(patcher, x):
         notify(f"No {arch.name} profile covers {w * 8}x{h * 8} at batch size {b}, so this pass runs on PyTorch. Add one in the TensorRT tab.")
         return None, False
     hacks = chosen == SPEED_HACKS and any(r.speed_hacks for r in records)
-    failed = sum(not r.speed_hacks for r in records) if chosen == SPEED_HACKS else 0
+    stale = sum(r.stale_speed_hacks for r in records) if chosen == SPEED_HACKS else 0
+    failed = sum(not r.speed_hacks for r in records) - stale if chosen == SPEED_HACKS else 0
+    if stale:
+        notify(f"{stale} of the {arch.name} engines have a Speed Hacks part from another version of this extension, so they run without Speed Hacks until they're built again in the TensorRT tab.")
     if failed:
         retry = " Building them again in the TensorRT tab retries once." if any(r.retry_speed_hacks for r in records) else ""
         notify(f"Speed Hacks couldn't be built for {failed} of the {arch.name} engines, so they run without them.{retry}")
@@ -961,36 +928,24 @@ def _wrap_close(original):
 
 
 def _wrap_denoiser(original):
-    def forward(self, x, *args, **kwargs):
+    def forward(self, x, sigma, *args, **kwargs):
         p = _pass
         if p is not None and p.schedule is not None and p.fallback is None:
             try:
                 from modules import shared
 
                 p.schedule.begin(int(self.step), self.total_steps, shared.state.sampling_steps)
-                # Inpainting blends x with the image outside the mask, which isn't in fresh.py's linear chain.
-                if p.tracker is not None and getattr(self, "mask", None) is not None:
+                p.tracker.stash = (x, sigma)
+                # Inpainting blends x with the original image outside the mask, which isn't in fresh.py's linear fit.
+                if self.mask is not None:
                     p.tracker.active = False
             except Exception as e:
                 notify(f"Speed Hacks failed ({e}), so the rest of this pass runs without them.", e)
                 p.schedule = None
-        return original(self, x, *args, **kwargs)
+        return original(self, x, sigma, *args, **kwargs)
 
     forward._trt_original = original
     return forward
-
-
-def _wrap_apply_model(original):
-    # Stashes the FP32 x and sigma of the UNet call apply_model is about to make, for fresh.py's fit. The UNet's own
-    # input is FP16, whose rounding (up to 2^-11 of x) is far above fresh.FLOOR and would count as fresh noise.
-    def apply_model(self, x, t, *args, **kwargs):
-        p = _pass
-        if p is not None and p.tracker is not None and self is p.patcher.model:
-            p.tracker.stash = (x, t)
-        return original(self, x, t, *args, **kwargs)
-
-    apply_model._trt_original = original
-    return apply_model
 
 
 def _wrap_vae_decode(original):
@@ -1077,13 +1032,6 @@ def install_hooks():
             denoiser.forward = _wrap_denoiser(denoiser.forward)
     except Exception as e:
         _hook_failed(f"Couldn't hook reForge's CFG denoiser, so Speed Hacks never skip a step: {e}")
-    try:
-        from ldm_patched.modules import model_base
-
-        if not hasattr(model_base.BaseModel.apply_model, "_trt_original"):
-            model_base.BaseModel.apply_model = _wrap_apply_model(model_base.BaseModel.apply_model)
-    except Exception as e:
-        _hook_failed(f"Couldn't hook reForge's apply_model, so Speed Hacks don't correct the noise ancestral and SDE samplers add: {e}")
 
 
 def new_batch():  # each batch starts on the engine that fits it best, not the one the last batch ended on
