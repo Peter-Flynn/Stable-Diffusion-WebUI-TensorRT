@@ -16,7 +16,8 @@ import torch
 BRANCH = 0  # shallow engine = input blocks 0..BRANCH and the output blocks from deep_block(BRANCH) on
 INTERVAL = 3
 MAX_STRETCH = 2
-SMOOTHNESS = 0.01  # AdaptiveDiffusion's threshold for SD 1.5 and SDXL
+SMOOTHNESS = 0.01  # AdaptiveDiffusion's threshold for SD 1.5 and SDXL, tuned at 50 steps
+SMOOTHNESS_STEPS = 50
 WARMUP = 0.4
 TAIL = 0.05
 STRETCH_FROM = 0.5
@@ -96,13 +97,14 @@ class Schedule:
         self._smooth_host = self._smooth_ready = None
         self._smooth_pending = False
 
-    def begin(self, index: int, total, steps, x):
+    def begin(self, index: int, total, steps, length, x):
+        # length: steps in the schedule this pass's sigmas come from; an img2img pass runs only its tail
         self.index, self.slot = index, 0
         self.latents = (self.latents + [x.detach().clone()])[-4:]
         self.decision = self._decide(index, total, steps, self._collect())
         if self.decision == "full":
             self.last_full, self.stretched = index, 0
-        self._test()
+        self._test(length)
 
     def _decide(self, index, total, steps, smooth: bool) -> str:
         if not total or not steps or steps < MIN_STEPS:
@@ -117,16 +119,22 @@ class Schedule:
             return "shallow"
         return "full"
 
-    def _test(self):
+    def _test(self, length):
         # The smoothness test runs on the GPU and its answer is copied to pinned memory asynchronously; the next call
         # reads it (_collect), one call late, so the CPU never waits for the GPU here. If the copy hasn't landed by
         # then, the latents count as not smooth.
-        if len(self.latents) < 4:
+        if len(self.latents) < 4 or not length:
             return
         x3, x2, x1, x0 = self.latents  # oldest first: the paper's x_{i+2}, x_{i+1}, x_i, x_{i-1}
         previous = x1 - x2  # Eq. 4's threshold is relative to this difference, not the newest one
         third = (x0 - x1) - 2 * previous + (x2 - x3)
-        smooth = third.float().norm() <= SMOOTHNESS * previous.float().norm()
+        # A third difference shrinks with the step size cubed and a first difference with the step size, so the ratio
+        # goes with the step size squared; the paper only advises a higher threshold for fewer steps. Scaling it by
+        # (50 / length)^2 passes the same trajectories at any step count: on a toy model (an exact Wiener denoiser,
+        # SDXL's sigmas, reForge's DDIM scheduler), plain Euler's median ratio in a pass's second half stayed at
+        # 0.72-0.80 of the scaled threshold from 12 to 100 steps.
+        threshold = SMOOTHNESS * (SMOOTHNESS_STEPS / length) ** 2
+        smooth = third.float().norm() <= threshold * previous.float().norm()
         if self._smooth_host is None:
             self._smooth_host = torch.zeros((), dtype=torch.bool, pin_memory=True)
             self._smooth_ready = torch.cuda.Event()

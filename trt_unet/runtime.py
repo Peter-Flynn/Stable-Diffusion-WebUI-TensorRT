@@ -985,7 +985,13 @@ def _wrap_denoiser(original):
             try:
                 from modules import shared
 
-                p.schedule.begin(int(self.step), self.total_steps, shared.state.sampling_steps, x)
+                steps = length = shared.state.sampling_steps
+                # img2img and hires fix run the last steps of a schedule about steps / strength long
+                # (sd_samplers_common.setup_img2img_steps); init_latent is set only for those passes.
+                strength = getattr(self.p, "denoising_strength", None) if getattr(self, "init_latent", None) is not None else None
+                if strength and 0 < strength < 1:
+                    length = steps / strength
+                p.schedule.begin(int(self.step), self.total_steps, steps, length, x)
                 # Inpainting blends x with the image outside the mask, which isn't in fresh.py's linear chain.
                 if p.tracker is not None and getattr(self, "mask", None) is not None:
                     p.tracker.active = False
