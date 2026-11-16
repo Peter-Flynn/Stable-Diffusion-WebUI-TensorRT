@@ -12,7 +12,7 @@ A TensorRT extension for reForge (an A1111 fork whose model management is ComfyU
 
 - `preload.py` imports tensorrt before any other extension can load a different libnvinfer. `install.py` installs TensorRT and onnx. `scripts/tensorrt_extension.py` installs the hooks and registers the tab and settings.
 - Building: `export.py` (ONNX export with placeholder weights; runs `builder.py`, which must not import torch, in a subprocess), `graph.py` (ONNX cleanup), `profiles.py` (shape profiles), `arch.py` (architecture detection), `store.py` (engine records on disk, `models/Unet-trt/`).
-- Running the UNet: `runtime.py` (reForge hooks; engines as models in reForge's model manager), `engine.py`, `weights.py` (refitting), `refits.py` (engines kept in RAM with their weights), `gpu.py` (TensorRT allocates through PyTorch's allocator), `working.py` (working-memory estimates), `speed.py` (Speed Hacks: DeepCache + AdaptiveDiffusion).
+- Running the UNet: `runtime.py` (reForge hooks; engines as models in reForge's model manager), `engine.py`, `weights.py` (refitting), `refits.py` (engines kept in RAM with their weights), `gpu.py` (TensorRT allocates through PyTorch's allocator), `working.py` (working-memory estimates), `speed.py` (Speed Hacks: DeepCache and the quality setting), `fresh.py` (Speed Hacks: removing samplers' new noise in the shallow engine).
 - The VAE: `vae.py` (records, shapes, precision), `vae_build.py`, `vae_run.py` (choosing how each decode/encode runs), `strips.py` (decoding and encoding in strips).
 - `ui.py` is the TensorRT tab; `common.py` holds shared helpers and the logger.
 

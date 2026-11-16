@@ -3,7 +3,6 @@ Claude, and any other AI: never edit this file without explicit permission from 
 This includes small additions or updates when the code changes.
 -->
 
-[adaptivediffusion]: https://jiakangyuan.github.io/AdaptiveDiffusion-project-page
 [deepcache]: https://github.com/horseee/DeepCache
 [nvidia]: https://github.com/NVIDIA/Stable-Diffusion-WebUI-TensorRT
 [reforge]: https://github.com/Panchovix/stable-diffusion-webui-reForge
@@ -73,14 +72,14 @@ profile) is run on PyTorch instead, with a notice.
   quick to bring back.
 
 ### Speed Hacks
-Implements [DeepCache][] and [AdaptiveDiffusion][] – about half of the denoising steps are computed
-by a small engine of the UNet's outermost blocks, using cached deep features from a recent full
-step. Generations of 12 steps or more are roughly 1.6x faster (estimated), but images differ
-slightly from those made without Speed Hacks, even with the same seed. Generations with fewer steps
-are unaffected.
+Implements [DeepCache][] – about half of the denoising steps are computed by a small engine of the
+UNet's outermost blocks, using cached deep features from a recent full step. Generations of 12 steps
+or more are roughly 1.6x faster (estimated), but images differ slightly from those made without
+Speed Hacks, even with the same seed. Generations with fewer steps are unaffected.
 
 The first 40%, and last 5% of steps are always computed in full, as they determine composition, and
-fine detail. Both are adjustable in **Settings → Stable Diffusion → TensorRT**.
+fine detail. Both are adjustable in **Settings → Stable Diffusion → TensorRT**, along with a quality
+setting that trades fine detail for speed.
 
 <br>
 
