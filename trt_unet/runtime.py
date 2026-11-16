@@ -727,16 +727,18 @@ class Pass:
         stream = torch.cuda.current_stream().cuda_stream
         hack = deep = None
         if self.schedule is not None and self.model.shallow_loaded:
-            key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()))
-            slot, deep, origin, stale = self.schedule.call(key)
+            prompt = feed["encoder_hidden_states"]
+            key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()), tuple(prompt.shape), tuple(_prompts))
+            slot, deep, origin, stale, kind = self.schedule.call(key)
             entry = self.tracker.call(feed["sample"], b)
-            kind = self.schedule.check if stale is not None else None
             if deep is not None and not self.tracker.safe(entry, origin):
                 # Noise the fit can't remove for this call, or for a call the fit can't follow, noise not yet ruled out.
                 # It runs in full, and a tracked one also runs the shallow engine as a probe: a status without that
                 # noise lets later calls run shallow again.
                 stale, kind, deep, origin = (deep, origin), "probe", None, None
-                self.schedule.ran_full(slot)
+                self.schedule.ran_full()
+            if deep is not None:
+                self.schedule.compare(slot, key, prompt)
             hack = (slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b)
         out = self._infer_with_room(feed, profile, stream, hack)
         if deep is None and not self.checked:
@@ -778,11 +780,11 @@ class Pass:
             outputs = self.model.engine.infer(feed, profile, stream)
             out = outputs["latent"]
             if slot is not None and "deep" in outputs:
-                self.schedule.keep(slot, key, outputs["deep"])
+                self.schedule.keep(slot, key, outputs["deep"], feed["encoder_hidden_states"])
                 if kind is not None and entry is not None:
                     inputs = {**feed, "deep": stale[0], **self.tracker.inputs(entry, stale[1], feed["sample"])}
                     shallow = self.model.shallow.infer(inputs, profile, stream)
-                    self.tracker.status(shallow, stale[1])
+                    self.tracker.status(shallow)
                     if kind == "check":
                         self.tracker.add_check(entry, out[:b], shallow["latent"][:b], self.schedule.index - stale[1])
             if entry is not None:
@@ -991,6 +993,7 @@ def _wrap_denoiser(original):
 
                 p.schedule.begin(int(self.step), self.total_steps, shared.state.sampling_steps)
                 p.tracker.begin(int(self.step), x)
+                _prompts.clear()
                 tracked = True
             except Exception as e:
                 notify(f"Speed Hacks failed ({e}), so the rest of this pass runs without them.", e)
@@ -1058,6 +1061,40 @@ def _rebind(owner, name, wrap):  # also replaces references other modules took w
 _hook_failures = set()  # install_hooks runs every generation: log each failure once
 
 
+# Per CFG denoiser call of a Speed Hacks pass, which scheduled prompt each prompt in the batch uses: ids of the conds
+# reForge's prompt_parser picked (they live as long as the generation), or None where the schedules weren't readable.
+_prompts = []
+
+
+def _note_prompts(schedules_of, step):
+    # schedules_of() -> one list of ScheduledPromptConditioning per prompt
+    if _pass is None or _pass.schedule is None:
+        return
+    try:
+        # prompt_parser's choice: the first schedule entry whose end_at_step the step hasn't passed
+        _prompts.append(tuple(id(next((e.cond for e in s if step <= e.end_at_step), s[0].cond)) for s in schedules_of()))
+    except Exception:
+        _prompts.append(None)
+
+
+def _wrap_reconstruct_cond_batch(original):
+    def reconstruct_cond_batch(c, current_step):
+        _note_prompts(lambda: c, current_step)
+        return original(c, current_step)
+
+    reconstruct_cond_batch._trt_original = original
+    return reconstruct_cond_batch
+
+
+def _wrap_reconstruct_multicond_batch(original):
+    def reconstruct_multicond_batch(c, current_step):
+        _note_prompts(lambda: [prompt.schedules for prompts in c.batch for prompt in prompts], current_step)
+        return original(c, current_step)
+
+    reconstruct_multicond_batch._trt_original = original
+    return reconstruct_multicond_batch
+
+
 def _hook_failed(message: str):
     if message not in _hook_failures:
         _hook_failures.add(message)
@@ -1095,6 +1132,13 @@ def install_hooks():
             denoiser.forward = _wrap_denoiser(denoiser.forward)
     except Exception as e:
         _hook_failed(f"Couldn't hook reForge's CFG denoiser, so Speed Hacks never skip a step: {e}")
+    try:
+        from modules import prompt_parser
+
+        _rebind(prompt_parser, "reconstruct_cond_batch", _wrap_reconstruct_cond_batch)
+        _rebind(prompt_parser, "reconstruct_multicond_batch", _wrap_reconstruct_multicond_batch)
+    except Exception as e:
+        _hook_failed(f"Couldn't hook reForge's prompt schedules, so Speed Hacks see prompt edits a call late: {e}")
 
 
 def new_batch():  # each batch starts on the engine that fits it best, not the one the last batch ended on
