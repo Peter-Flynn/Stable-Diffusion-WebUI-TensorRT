@@ -568,6 +568,9 @@ class Pass:
         self.checked = self.shallow_checked = False
         self._keep = None
         self._hint_batching()
+        self._watching = False
+        if hacks:
+            self._watch_apply_model(model)
 
     def use(self, record):
         model = model_for(record)
@@ -605,8 +608,39 @@ class Pass:
             keep.__enter__()
             self._keep = keep
 
+    def _watch_apply_model(self, model):
+        # fresh.Tracker takes x and sigma from apply_model: in FP32, and as the UNet gets them. A wrapper left by a pass
+        # that didn't end is removed first, so wrappers don't pile up.
+        stale = model.__dict__.get("apply_model")
+        if hasattr(stale, "_trt_before"):
+            self._put_apply_model(model, stale._trt_before)
+        before = model.__dict__.get("apply_model")
+        original = model.apply_model
+
+        def apply_model(x, t, *args, **kwargs):
+            tracker = self.tracker
+            if tracker is not None:
+                tracker.see(x, t)
+            return original(x, t, *args, **kwargs)
+
+        apply_model._trt_before = before
+        model.apply_model = apply_model
+        self._watching = True
+
+    @staticmethod
+    def _put_apply_model(model, value):
+        if value is None:
+            model.__dict__.pop("apply_model", None)
+        else:
+            model.apply_model = value
+
     def _restore(self):
         self.patcher.model.__dict__.pop("memory_required", None)
+        if self._watching:
+            self._watching = False
+            current = self.patcher.model.__dict__.get("apply_model")
+            if hasattr(current, "_trt_before"):
+                self._put_apply_model(self.patcher.model, current._trt_before)
         self._hold(None)
         if self.model is not None and self.model.loaded:
             self.model.engine.release_activations()
@@ -741,7 +775,7 @@ class Pass:
                     shallow = self.model.shallow.infer(inputs, profile, stream)
                     self.tracker.status(shallow, stale[1])
                     if kind == "check":
-                        self.tracker.check = (entry, out, shallow["latent"], self.schedule.index - stale[1])
+                        self.tracker.add_check(entry, out, shallow["latent"], self.schedule.index - stale[1])
             if entry is not None:
                 self.tracker.after_call(entry, out, cond_or_uncond)
             return out
@@ -945,21 +979,18 @@ def _wrap_denoiser(original):
         if p is not None and p.schedule is not None and p.fallback is None:
             try:
                 from modules import shared
-                from modules.sd_samplers_timesteps import CFGDenoiserTimesteps
 
                 p.schedule.begin(int(self.step), self.total_steps, shared.state.sampling_steps)
-                # Timestep-based samplers (DDIM, PLMS, UniPC) pass x scaled by alphas and a timestep for sigma, which
-                # fresh.py's fit and the checks don't take: they run Speed Hacks without either.
-                if not isinstance(self, CFGDenoiserTimesteps):
-                    p.tracker.begin(int(self.step), x, sigma)
-                    tracked = True
+                p.tracker.begin(int(self.step), x)
+                tracked = True
             except Exception as e:
                 notify(f"Speed Hacks failed ({e}), so the rest of this pass runs without them.", e)
                 p.schedule = None
         denoised = original(self, x, sigma, *args, **kwargs)
         if tracked and p.schedule is not None and p.tracker is not None:
             try:
-                checked = p.tracker.finish(denoised)
+                # Timestep samplers (DDIM, PLMS, UniPC) get eps back
+                checked = p.tracker.finish(denoised, eps=bool(getattr(self, "classic_ddim_eps_estimation", False)))
                 if checked is not None:
                     p.schedule.checked(*checked)
             except Exception as e:

@@ -127,7 +127,7 @@ class Record:
         return hacks if hacks and hacks.get("fresh") == fresh.SIGNATURE else None
 
     @property
-    def stale_speed_hacks(self) -> bool:  # built with another fresh.SIGNATURE, so it takes other inputs
+    def stale_speed_hacks(self) -> bool:  # built with another fresh.SIGNATURE: a different shallow graph
         return self.speed_hacks is None and "speed_hacks" in self.meta
 
     @property

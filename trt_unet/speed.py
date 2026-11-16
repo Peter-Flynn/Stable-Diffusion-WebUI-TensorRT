@@ -12,10 +12,10 @@
 # error that shallow call would have made, for any sampler. Due full calls wait while drift(), the error the shallow
 # calls since the last full call are predicted to have made in total, stays within tolerance(quality). The tolerance is
 # a fixed amount of error (relative to the denoised value's norm), not one relative to other checks, so the start and
-# end shares don't change what a quality means. Only a sampler step's first call is checked: DPM++ SDE and Heun call the
-# UNet twice per step (reForge's total_steps / steps), at points whose errors aren't comparable. The last full call
-# before the first shallow one also runs the shallow engine (a "probe"), so fresh.Tracker knows whether the sampler adds
-# noise before any shallow call runs.
+# end shares don't change what a quality means. Only a sampler step's first denoiser call is checked, in all of its UNet
+# calls: DPM++ SDE and Heun call the denoiser twice per step (reForge's total_steps / steps), at points whose errors
+# aren't comparable. The last full call before the first shallow one also runs the shallow engine (a "probe"), whose
+# status tells fresh.Tracker whether the sampler adds noise before any shallow call runs.
 #
 # Measurements behind the constants: SDXL (novaOrangeXL v1.4, 1024x1024, CFG 3), Euler, Euler a, DPM++ 2M, 2M SDE,
 # 3M SDE, SDE and Heun, Karras/Simple/Exponential/SGM Uniform, 20 to 100 steps, 3 prompts; every call's shallow error
@@ -185,7 +185,7 @@ class Schedule:
             self.shallow_calls += 1
             return slot, kept[0], kept[1], None
         self.full_calls += 1
-        return slot, None, None, kept if self.check and slot == 0 else None
+        return slot, None, None, kept if self.check else None
 
     def ran_full(self, slot: int):
         # A call the schedule gave a deep feature that the runtime ran in full instead
