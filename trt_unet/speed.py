@@ -9,10 +9,16 @@
 # Waiting (in place of AdaptiveDiffusion, Ye et al., 2024, whose test of how smoothly x moves reads that noise as
 # roughness, so it never passed with those samplers): a due full call also runs the shallow engine as the shallow call
 # at its index would have, on the deep feature it replaces (a "check", the cost of a shallow call), which gives the
-# error that shallow call would have made, for any sampler. Due full calls wait while the latest check's error, scaled
-# linearly to the age the deep feature would reach, stays within budget(quality) times the pass's first check's. Only
-# a sampler step's first call is checked: DPM++ SDE and Heun call the UNet twice per step (reForge's total_steps /
+# error that shallow call would have made, for any sampler. Due full calls wait while drift(), the error the shallow
+# calls since the last full call are predicted to have made in total, stays within tolerance(quality). Errors are
+# absolute (relative to the denoised value), so the start and end shares don't change what a quality means. Only a
+# sampler step's first call is checked: DPM++ SDE and Heun call the UNet twice per step (reForge's total_steps /
 # steps), at points whose errors aren't comparable.
+#
+# Measurements behind the constants: SDXL (novaOrangeXL v1.4, 1024x1024, CFG 3), Euler, Euler a, DPM++ 2M, 2M SDE,
+# 3M SDE, SDE and Heun, Karras/Simple/Exponential/SGM Uniform, 20 to 100 steps, 3 prompts; every call's shallow error
+# against the full UNet's output at the same x, on runs with DeepCache every 3rd and 6th call and with every call
+# shallow between the start and end shares.
 import math
 
 import torch
@@ -25,17 +31,26 @@ QUALITY = 0.9
 MIN_STEPS = 12
 
 
-def budget(quality: float) -> float:
-    # The error a call past DeepCache's interval may reach, in units of the pass's first check (the error of a call at
-    # DeepCache's interval there). At 1 nothing waits. Down to 0.9 the budget rises to 1, where a waiting call is no
-    # worse than that first check. Below 0.9 it's 0.9 / quality: at a steady error rate a call waits until age
-    # INTERVAL * budget, so the share of full calls falls in proportion to quality, from DeepCache's 1 in INTERVAL at
-    # 0.9 to none at 0.
+# A shallow call's error grew as age ** 0.42 (deterministic samplers) and age ** 0.25 (ancestral and SDE) from age 3 to
+# 12 in the measurements: 0.5 slightly over-predicts both.
+AGE_EXPONENT = 0.5
+
+
+def tolerance(quality: float) -> float:
+    # The drift() a stretch may reach before a full call. 1.9 * (1 - q) / q, fitted to the measurements: at 30 steps it
+    # keeps the share of full calls between the start and end shares near quality times DeepCache's (1 in INTERVAL),
+    # and at more steps, where calls change less, it runs fewer. Of c * ((1 - q) / q) ** p, p = 1 fitted best.
     if quality >= 1:
         return 0.0
     if quality <= 0:
         return math.inf
-    return 10 * (1 - quality) if quality >= 0.9 else 0.9 / quality
+    return 1.9 * (1 - quality) / quality
+
+
+def drift(check: tuple, age: int) -> float:
+    # check: (error, age) of the latest check
+    error, checked = check
+    return sum(error * (a / checked) ** AGE_EXPONENT for a in range(1, age + 1))
 
 
 def deep_block(unet, branch: int = BRANCH) -> int:
@@ -97,7 +112,7 @@ def shallow_shapes(shapes: dict, deep: dict) -> dict:
 class Schedule:
     def __init__(self, warmup: float = WARMUP, tail: float = TAIL, quality: float = QUALITY):
         self.warmup, self.tail = warmup, tail
-        self.budget = budget(quality)
+        self.tolerance = tolerance(quality)
         self.index = None
         self.decision = "full"
         self.check = False
@@ -107,7 +122,7 @@ class Schedule:
         # sigma", every other evaluation drops the unconds, so one slot alternates between two batch shapes.
         self.deep = {}
         self.shallow_calls = self.full_calls = 0
-        self.rate = self.reference = None  # a check's error per call of age: the latest read, and the pass's first
+        self.latest = None  # (error, age) of the latest check read
         self.checks = []  # (index, age, error) of the checks read
         self._pending = []  # (index, age, error in pinned memory, CUDA event) of checks not read yet
 
@@ -129,11 +144,11 @@ class Schedule:
         if index < start or index >= end or self.last_full is None:
             return "full", False
         age = index - self.last_full
-        if age < INTERVAL or self.budget == math.inf:
+        if age < INTERVAL or self.tolerance == math.inf:
             return "shallow", False
-        if self.budget == 0:
+        if self.tolerance == 0:
             return "full", False
-        if self.rate is not None and self.rate * age <= self.budget * self.reference * INTERVAL:
+        if self.latest is not None and drift(self.latest, age) <= self.tolerance:
             return "shallow", False
         return "full", index % per == 0
 
@@ -151,9 +166,7 @@ class Schedule:
             index, age, host, _ = self._pending.pop(0)
             error = float(host)
             self.checks.append((index, age, error))
-            self.rate = error / age
-            if self.reference is None:
-                self.reference = self.rate
+            self.latest = (error, age)
 
     def call(self, shape) -> tuple:
         # (slot, deep feature or None, index of the call that computed it, (deep feature, index) this checked full call
