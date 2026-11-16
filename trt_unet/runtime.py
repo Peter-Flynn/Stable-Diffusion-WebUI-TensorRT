@@ -576,6 +576,7 @@ class Pass:
         self.checked = self.shallow_checked = False
         self._keep = None
         self._hint_batching()
+        self.started = self.schedule  # for end()'s report once Speed Hacks turn off mid-pass
         self._watching = False
         if hacks:
             self._watch_apply_model(model)
@@ -626,14 +627,30 @@ class Pass:
         original = model.apply_model
 
         def apply_model(x, t, *args, **kwargs):
-            tracker = self.tracker
-            if tracker is not None:
-                tracker.see(x, t)
+            if self.schedule is not None:
+                with self._speed_hacks():
+                    self.tracker.see(x, t)
             return original(x, t, *args, **kwargs)
 
         apply_model._trt_before = before
         model.apply_model = apply_model
         self._watching = True
+
+    @contextlib.contextmanager
+    def _speed_hacks(self):
+        # Speed Hacks' own work: an error in it turns them off for the rest of the pass, and the engine keeps running
+        try:
+            yield
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except Exception as e:
+            self.drop_speed_hacks(f"Speed Hacks failed ({e})", _unexpected(e))
+
+    def drop_speed_hacks(self, reason: str, error: Exception = None):
+        notify(f"{reason}, so the rest of this pass runs without them.", error)
+        if self.schedule is not None:
+            self.schedule.release()
+        self.schedule = self.tracker = None
 
     @staticmethod
     def _put_apply_model(model, value):
@@ -676,7 +693,7 @@ class Pass:
         from .engine import profile_report
 
         profile_report("sampling pass")
-        hacks = self.schedule
+        hacks = self.started
         if hacks is not None and hacks.shallow_calls:
             logger.debug(f"Speed Hacks ran {hacks.shallow_calls} of {hacks.shallow_calls + hacks.full_calls} UNet calls on the shallow engine.")
             if hacks.checks:
@@ -727,21 +744,23 @@ class Pass:
                     _unload(failed, keep=False)
                 self.fall_back(f"Couldn't load the {record.arch.name} {record.label} ({e})", _unexpected(e))
         stream = torch.cuda.current_stream().cuda_stream
-        hack = deep = None
+        hack = None
         if self.schedule is not None and self.model.shallow_loaded:
-            prompt = (feed["encoder_hidden_states"], feed.get("y"))
-            key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()), tuple(prompt[0].shape), tuple(_prompts))
-            slot, deep, origin, stale, kind = self.schedule.call(key)
-            entry = self.tracker.call(feed["sample"], b)
-            if deep is not None and not self.tracker.safe(entry, origin):
-                # Noise the fit can't remove for this call, or for a call the fit can't follow, noise not yet ruled out.
-                # It runs in full, and a tracked one also runs the shallow engine as a probe: a status without that
-                # noise lets later calls run shallow again.
-                stale, kind, deep, origin = (deep, origin), "probe", None, None
-                self.schedule.ran_full()
-            if deep is not None:
-                self.schedule.compare(slot, key, prompt)
-            hack = (slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b)
+            with self._speed_hacks():
+                prompt = (feed["encoder_hidden_states"], feed.get("y"))
+                key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()), tuple(prompt[0].shape), tuple(_prompts))
+                slot, deep, origin, stale, kind = self.schedule.call(key)
+                entry = self.tracker.call(feed["sample"], b)
+                if deep is not None and not self.tracker.safe(entry, origin):
+                    # Noise the fit can't remove for this call, or for a call the fit can't follow, noise not yet ruled
+                    # out. It runs in full, and a tracked one also runs the shallow engine as a probe: a status without
+                    # that noise lets later calls run shallow again.
+                    stale, kind, deep, origin = (deep, origin), "probe", None, None
+                    self.schedule.ran_full()
+                if deep is not None:
+                    self.schedule.compare(slot, key, prompt)
+                hack = (slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b)
+        deep = hack[2] if hack is not None else None
         out = self._infer_with_room(feed, profile, stream, hack)
         if deep is None and not self.checked:
             self.checked = True
@@ -750,8 +769,7 @@ class Pass:
         if deep is not None and not self.shallow_checked:
             self.shallow_checked = True
             if not torch.isfinite(out).all():
-                notify("Speed Hacks produced NaN/Inf values, so the rest of this pass runs without them.")
-                self.schedule = None
+                self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
                 out = self._infer_with_room(feed, profile, stream)
         return out[:b].to(x.dtype)
 
@@ -774,23 +792,26 @@ class Pass:
         slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b = hack or (None,) * 9
         try:
             if deep is not None:
-                outputs = self.model.shallow.infer({**feed, "deep": deep, **self.tracker.inputs(entry, origin, feed["sample"])}, profile, stream)
-                if entry is not None:
-                    self.tracker.after_shallow(entry, outputs, origin)
-                    self.tracker.after_call(entry, outputs["latent"][:b], cond_or_uncond)
-                return outputs["latent"]
+                # A shallow call that fails runs in full below
+                with self._speed_hacks():
+                    outputs = self.model.shallow.infer({**feed, "deep": deep, **self.tracker.inputs(entry, origin, feed["sample"])}, profile, stream)
+                    if entry is not None:
+                        self.tracker.after_shallow(entry, outputs, origin)
+                        self.tracker.after_call(entry, outputs["latent"][:b], cond_or_uncond)
+                    return outputs["latent"]
             outputs = self.model.engine.infer(feed, profile, stream)
             out = outputs["latent"]
-            if slot is not None and "deep" in outputs:
-                self.schedule.keep(slot, key, outputs["deep"], (feed["encoder_hidden_states"], feed.get("y")))
-                if kind is not None and entry is not None:
-                    inputs = {**feed, "deep": stale[0], **self.tracker.inputs(entry, stale[1], feed["sample"])}
-                    shallow = self.model.shallow.infer(inputs, profile, stream)
-                    self.tracker.status(shallow)
-                    if kind == "check":
-                        self.tracker.add_check(entry, out[:b], shallow["latent"][:b], self.schedule.index - stale[1])
-            if entry is not None:
-                self.tracker.after_call(entry, out[:b], cond_or_uncond)
+            if slot is not None and "deep" in outputs and self.schedule is not None:
+                with self._speed_hacks():
+                    self.schedule.keep(slot, key, outputs["deep"], (feed["encoder_hidden_states"], feed.get("y")))
+                    if kind is not None and entry is not None:
+                        inputs = {**feed, "deep": stale[0], **self.tracker.inputs(entry, stale[1], feed["sample"])}
+                        shallow = self.model.shallow.infer(inputs, profile, stream)
+                        self.tracker.status(shallow)
+                        if kind == "check":
+                            self.tracker.add_check(entry, out[:b], shallow["latent"][:b], self.schedule.index - stale[1])
+                    if entry is not None:
+                        self.tracker.after_call(entry, out[:b], cond_or_uncond)
             return out
         except torch.cuda.OutOfMemoryError:
             raise
@@ -998,8 +1019,7 @@ def _wrap_denoiser(original):
                 _prompts.clear()
                 tracked = True
             except Exception as e:
-                notify(f"Speed Hacks failed ({e}), so the rest of this pass runs without them.", e)
-                p.schedule = None
+                p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
         denoised = original(self, x, sigma, *args, **kwargs)
         if tracked and p.schedule is not None and p.tracker is not None:
             try:
@@ -1008,8 +1028,7 @@ def _wrap_denoiser(original):
                 if checked is not None:
                     p.schedule.checked(*checked)
             except Exception as e:
-                notify(f"Speed Hacks failed ({e}), so the rest of this pass runs without them.", e)
-                p.schedule = None
+                p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
         return denoised
 
     forward._trt_original = original
