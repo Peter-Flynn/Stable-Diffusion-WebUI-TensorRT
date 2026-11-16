@@ -121,8 +121,9 @@ class Schedule:
         self.check = None  # "check", "probe" or None, for this call
         self.last_full = None
         self.slot = 0
-        # (slot, sample shape) -> (deep feature, evaluation index). Keyed by shape too: with "Negative Guidance minimum
-        # sigma", every other evaluation drops the unconds, so one slot alternates between two batch shapes.
+        # (slot, (sample shape, reForge's cond_or_uncond)) -> (deep feature, evaluation index). Keyed by shape too: with
+        # "Negative Guidance minimum sigma", every other evaluation drops the unconds, so one slot alternates between two
+        # batch shapes. Keyed by cond_or_uncond so that a cond row never reuses an uncond row's deep feature.
         self.deep = {}
         self.shallow_calls = self.full_calls = 0
         self.latest = None  # (error, age) of the latest check read
@@ -173,14 +174,14 @@ class Schedule:
             self.checks.append((index, age, error))
             self.latest = (error, age)
 
-    def call(self, shape) -> tuple:
-        # (slot, deep feature or None, index of the call that computed it, (deep feature, index) that this checked or
-        # probed full call replaces, or None)
+    def call(self, key: tuple) -> tuple:
+        # key: (sample shape, cond_or_uncond). Returns (slot, deep feature or None, index of the call that computed it,
+        # (deep feature, index) that this checked or probed full call replaces, or None).
         if self.index is None:
             self.full_calls += 1
             return None, None, None, None
         slot, self.slot = self.slot, self.slot + 1
-        kept = self.deep.get((slot, tuple(shape)))
+        kept = self.deep.get((slot, key))
         if self.decision == "shallow" and kept is not None:
             self.shallow_calls += 1
             return slot, kept[0], kept[1], None
@@ -194,8 +195,8 @@ class Schedule:
         if slot == 0:
             self.last_full = self.index
 
-    def keep(self, slot: int, shape, deep):
-        self.deep[(slot, tuple(shape))] = (deep, self.index)
+    def keep(self, slot: int, key: tuple, deep):
+        self.deep[(slot, key)] = (deep, self.index)
 
     def release(self):
         self.deep.clear()

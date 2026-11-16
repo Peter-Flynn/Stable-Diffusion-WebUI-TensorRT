@@ -221,15 +221,11 @@ class Tracker:
         self.sampling = model_sampling
         self.device = device
         self.channels = channels
-        try:
-            self.tables = tables(model_sampling, device)
-            self.active = True
-        except Exception:
-            self.tables = torch.zeros(5, GRID, device=device)
-            self.active = False
+        self.tables = tables(model_sampling, device)
         self.history = deque(maxlen=WINDOW)  # complete Entries, newest last
         self.current = None  # the Entry of the denoiser call in progress
         self.noisy = False  # a fit in this pass left a residual above NOISY
+        self.read = False  # a status has been read
         self.blocked = False  # the latest status read had noise left in by reason 2 to 4 on some image
         self.dead = set()  # indices of deep features whose chain broke
         self.check = None  # (Entry, age, [full output rows], [checked rows]) until the denoiser's output is in
@@ -247,7 +243,7 @@ class Tracker:
         newest = self.history[-1] if self.history else None
         if newest is not None and (newest.index != index - 1 or newest.shape != tuple(x.shape)):
             self.history.clear()
-        self.current = Entry(index, x.shape) if self.active else None
+        self.current = Entry(index, x.shape)
 
     def see(self, x, sigma):
         # apply_model's arguments, for every UNet call. The step's first full-size call's are copied: a sampler may write
@@ -260,24 +256,29 @@ class Tracker:
         sigma = sigma.reshape(-1).to(torch.float32)
         entry.sigma = (sigma[:n] if sigma.shape[0] >= n else sigma.expand(n)).clone(memory_format=torch.contiguous_format)
 
-    def call(self, sample, padded: bool):
-        # The Entry a UNet call belongs to, if its rows are blocks of the denoiser's images (not crops, as sliding window
-        # guidance and area conds send, nor a padded batch)
+    def call(self, sample, rows: int):
+        # The Entry a UNet call belongs to, if its rows are blocks of the denoiser's images: not crops, as sliding window
+        # guidance and area conds send. rows: the real ones; a batch padded to a profile's minimum repeats them, which
+        # keeps the padded rows in blocks too.
         entry = self.current
-        if entry is None or entry.x is None or padded:
+        if entry is None or entry.x is None:
             return None
-        rows, channels, h, w = sample.shape
+        padded, channels, h, w = sample.shape
         n, c = entry.shape[:2]
-        if rows % n or channels < c or (h, w) != entry.shape[2:]:
+        if rows % n or padded % n or channels < c or (h, w) != entry.shape[2:]:
             return None
         return entry
 
     def safe(self, entry, origin) -> bool:
-        # Whether a shallow call may run: always on a pass without noise, and with noise only where the fit can remove it
+        # Whether a shallow call may run. One the fit can't follow (entry None) only once a status showed the pass adds no
+        # noise. A tracked one always on a pass without noise (before the first status, its graph removes what noise it
+        # finds), and with noise only where the fit can remove it.
         self._collect()
+        if entry is None:
+            return self.read and not self.noisy
         if not self.noisy:
             return True
-        return entry is not None and not self.blocked and origin not in self.dead and self._prior(entry, origin) is not None
+        return not self.blocked and origin not in self.dead and self._prior(entry, origin) is not None
 
     def _prior(self, entry, origin):
         newest = self.history[-1] if self.history else None
@@ -336,6 +337,7 @@ class Tracker:
         while self._statuses and self._statuses[0][1].query():
             host, _, origin = self._statuses.pop(0)
             reasons, shares = host.tolist()
+            self.read = True
             self.noisy = self.noisy or any(s > NOISY for s in shares)
             self.blocked = any(r >= 2 and s > NOISY for r, s in zip(reasons, shares))
             if any(r == 1 for r in reasons):
@@ -347,16 +349,23 @@ class Tracker:
         self.check[2].append(full)
         self.check[3].append(checked)
 
-    def finish(self, output, eps: bool = False):
-        # After the denoiser returned its output (eps for a timestep sampler): completes the step's Entry, and returns a
-        # pending check's (error, age) or None
+    def finish(self, output, x=None, sigma=None, eps: bool = False):
+        # After the denoiser returned its output (eps for a timestep sampler) for x and sigma, its arguments: completes the
+        # step's Entry, and returns a pending check's (error, age) or None
         entry, self.current = self.current, None
         check, self.check = self.check, None
         if entry is None:
             return None
-        if entry.x is None or tuple(output.shape) != entry.shape:
+        if tuple(output.shape) != entry.shape or (entry.x is None and (eps or x is None)):
             self.history.clear()
             return None
+        if entry.x is None:
+            # No UNet call of the step was on the whole image (tiled diffusion sends tiles): the denoiser's own x and
+            # sigma, and the fit in PyTorch until a status says whether the pass adds noise
+            entry.x = x.to(torch.float32, memory_format=torch.contiguous_format, copy=True)
+            entry.sigma = sigma.reshape(-1).to(torch.float32).expand(entry.shape[0]).clone(memory_format=torch.contiguous_format)
+            if not self.read and not self._statuses:
+                self._measure(entry)
         if eps:
             entry.denoised = entry.x - entry.sigma.reshape(-1, 1, 1, 1) * output.float()
         else:
@@ -366,6 +375,17 @@ class Tracker:
         if check is None or check[0] is not entry:
             return None
         return self._error(entry, torch.cat(check[2]), torch.cat(check[3])), check[1]
+
+    def _measure(self, entry):
+        columns = []
+        for p in self.history:
+            columns += [p.x, p.denoised] + ([p.uncond] if p.uncond is not None else [])
+        if not columns:
+            return
+        noise = _residual(entry.x, columns)
+        share = (noise * noise).mean((1, 2, 3)) / entry.sigma ** 2
+        reason = torch.where(_white(noise), 0.0, 3.0)
+        self.status({"reason": reason, "share": share}, None)
 
     def _error(self, entry, full, checked):
         # A check's error in the denoiser's output, relative to it. How the output depends on each block of UNet rows

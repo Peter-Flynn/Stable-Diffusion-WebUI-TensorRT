@@ -552,9 +552,15 @@ def _load_torch_unet(patcher, shape):
 class Pass:
     def __init__(self, records: list, patcher, x, hacks: bool = False):
         self.patcher = patcher
-        self.schedule = speed.Schedule(*speed_settings()) if hacks else None
         model = patcher.model
-        self.tracker = fresh.Tracker(model.model_sampling, common.mm().get_torch_device(), model.diffusion_model.out_channels) if hacks else None
+        self.schedule = self.tracker = None
+        if hacks:
+            try:
+                self.tracker = fresh.Tracker(model.model_sampling, common.mm().get_torch_device(), model.diffusion_model.out_channels)
+                self.schedule = speed.Schedule(*speed_settings())
+            except Exception as e:
+                notify(f"Speed Hacks failed ({e}), so this pass runs without them.", e)
+                self.tracker, hacks = None, False
         self.slots = store.slots(records)
         self.model = None
         self.weights = EffectiveWeights(patcher)
@@ -721,15 +727,17 @@ class Pass:
         stream = torch.cuda.current_stream().cuda_stream
         hack = deep = None
         if self.schedule is not None and self.model.shallow_loaded:
-            slot, deep, origin, stale = self.schedule.call(feed["sample"].shape)
-            entry = self.tracker.call(feed["sample"], padded > b)
+            key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()))
+            slot, deep, origin, stale = self.schedule.call(key)
+            entry = self.tracker.call(feed["sample"], b)
             kind = self.schedule.check if stale is not None else None
             if deep is not None and not self.tracker.safe(entry, origin):
-                # The sampler adds noise that the fit can't remove for this call. It runs in full and also runs the
-                # shallow engine as a probe: a status without that noise lets later calls run shallow again.
+                # Noise the fit can't remove for this call, or for a call the fit can't follow, noise not yet ruled out.
+                # It runs in full, and a tracked one also runs the shallow engine as a probe: a status without that
+                # noise lets later calls run shallow again.
                 stale, kind, deep, origin = (deep, origin), "probe", None, None
                 self.schedule.ran_full(slot)
-            hack = (slot, deep, origin, stale, kind, entry, cond_or_uncond)
+            hack = (slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b)
         out = self._infer_with_room(feed, profile, stream, hack)
         if deep is None and not self.checked:
             self.checked = True
@@ -756,28 +764,29 @@ class Pass:
                 self.fall_back("The engine ran out of VRAM")
 
     def _infer(self, feed, profile, stream, hack=None):
-        # hack: (slot, deep feature or None, index of the call that computed it, (deep feature, index) to check or probe
-        # this full call against or None, "check"/"probe"/None, fresh.Entry or None, reForge's cond_or_uncond)
-        slot, deep, origin, stale, kind, entry, cond_or_uncond = hack or (None,) * 7
+        # hack: (slot, Schedule key, deep feature or None, index of the call that computed it, (deep feature, index) to
+        # check or probe this full call against or None, "check"/"probe"/None, fresh.Entry or None, reForge's
+        # cond_or_uncond, rows before padding)
+        slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b = hack or (None,) * 9
         try:
             if deep is not None:
                 outputs = self.model.shallow.infer({**feed, "deep": deep, **self.tracker.inputs(entry, origin, feed["sample"])}, profile, stream)
                 if entry is not None:
                     self.tracker.after_shallow(entry, outputs, origin)
-                    self.tracker.after_call(entry, outputs["latent"], cond_or_uncond)
+                    self.tracker.after_call(entry, outputs["latent"][:b], cond_or_uncond)
                 return outputs["latent"]
             outputs = self.model.engine.infer(feed, profile, stream)
             out = outputs["latent"]
             if slot is not None and "deep" in outputs:
-                self.schedule.keep(slot, feed["sample"].shape, outputs["deep"])
+                self.schedule.keep(slot, key, outputs["deep"])
                 if kind is not None and entry is not None:
                     inputs = {**feed, "deep": stale[0], **self.tracker.inputs(entry, stale[1], feed["sample"])}
                     shallow = self.model.shallow.infer(inputs, profile, stream)
                     self.tracker.status(shallow, stale[1])
                     if kind == "check":
-                        self.tracker.add_check(entry, out, shallow["latent"], self.schedule.index - stale[1])
+                        self.tracker.add_check(entry, out[:b], shallow["latent"][:b], self.schedule.index - stale[1])
             if entry is not None:
-                self.tracker.after_call(entry, out, cond_or_uncond)
+                self.tracker.after_call(entry, out[:b], cond_or_uncond)
             return out
         except torch.cuda.OutOfMemoryError:
             raise
@@ -990,7 +999,7 @@ def _wrap_denoiser(original):
         if tracked and p.schedule is not None and p.tracker is not None:
             try:
                 # Timestep samplers (DDIM, PLMS, UniPC) get eps back
-                checked = p.tracker.finish(denoised, eps=bool(getattr(self, "classic_ddim_eps_estimation", False)))
+                checked = p.tracker.finish(denoised, x, sigma, eps=bool(getattr(self, "classic_ddim_eps_estimation", False)))
                 if checked is not None:
                     p.schedule.checked(*checked)
             except Exception as e:
