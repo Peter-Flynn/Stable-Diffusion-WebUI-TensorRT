@@ -13,7 +13,9 @@
 # calls since the last full call are predicted to have made in total, stays within tolerance(quality). The tolerance is
 # a fixed amount of error (relative to the denoised value's norm), not one relative to other checks, so the start and
 # end shares don't change what a quality means. Only a sampler step's first call is checked: DPM++ SDE and Heun call the
-# UNet twice per step (reForge's total_steps / steps), at points whose errors aren't comparable.
+# UNet twice per step (reForge's total_steps / steps), at points whose errors aren't comparable. The last full call
+# before the first shallow one also runs the shallow engine (a "probe"), so fresh.Tracker knows whether the sampler adds
+# noise before any shallow call runs.
 #
 # Measurements behind the constants: SDXL (novaOrangeXL v1.4, 1024x1024, CFG 3), Euler, Euler a, DPM++ 2M, 2M SDE,
 # 3M SDE, SDE and Heun, Karras/Simple/Exponential/SGM Uniform, 20 to 100 steps, 3 prompts; every call's shallow error
@@ -116,7 +118,7 @@ class Schedule:
         self.tolerance = tolerance(quality)
         self.index = None
         self.decision = "full"
-        self.check = False
+        self.check = None  # "check", "probe" or None, for this call
         self.last_full = None
         self.slot = 0
         # (slot, sample shape) -> (deep feature, evaluation index). Keyed by shape too: with "Negative Guidance minimum
@@ -135,23 +137,25 @@ class Schedule:
             self.last_full = index
 
     def _decide(self, index, total, steps) -> tuple:
-        # (decision, whether a full call is checked)
+        # (decision, the full call's check)
         if not total or not steps or steps < MIN_STEPS:
-            return "full", False
+            return "full", None
         per = max(1, total // steps)
         # Samplers that call the UNet twice per step (Heun, DPM++ SDE, DPM++ 2S a) call it once at their last step, so
         # their final call is at total - 2.
         start, end = round(self.warmup * total), total - max(per, round(self.tail * total))
+        if index == start - 1 and index >= 1:
+            return "full", "probe"
         if index < start or index >= end or self.last_full is None:
-            return "full", False
+            return "full", None
         age = index - self.last_full
         if age < INTERVAL or self.tolerance == math.inf:
-            return "shallow", False
+            return "shallow", None
         if self.tolerance == 0:
-            return "full", False
+            return "full", None
         if self.latest is not None and drift(self.latest, age) <= self.tolerance:
-            return "shallow", False
-        return "full", index % per == 0
+            return "shallow", None
+        return "full", "check" if index % per == 0 else None
 
     def checked(self, error, age: int):
         # The error is copied to pinned memory asynchronously and read once its event has completed, a call or more
@@ -170,8 +174,8 @@ class Schedule:
             self.latest = (error, age)
 
     def call(self, shape) -> tuple:
-        # (slot, deep feature or None, index of the call that computed it, (deep feature, index) this checked full call
-        # replaces or None)
+        # (slot, deep feature or None, index of the call that computed it, (deep feature, index) that this checked or
+        # probed full call replaces, or None)
         if self.index is None:
             self.full_calls += 1
             return None, None, None, None
@@ -182,6 +186,13 @@ class Schedule:
             return slot, kept[0], kept[1], None
         self.full_calls += 1
         return slot, None, None, kept if self.check and slot == 0 else None
+
+    def ran_full(self, slot: int):
+        # A call the schedule gave a deep feature that the runtime ran in full instead
+        self.shallow_calls -= 1
+        self.full_calls += 1
+        if slot == 0:
+            self.last_full = self.index
 
     def keep(self, slot: int, shape, deep):
         self.deep[(slot, tuple(shape))] = (deep, self.index)

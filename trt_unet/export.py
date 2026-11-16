@@ -203,7 +203,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
             deep = speed.full_forward(unet, *inputs)[1]
             scale = inputs[0].shape[2] // deep.shape[2]
             axes["deep"] = {0: "batch", 2: "height", 3: "width"} if scale == 1 else {0: "batch", 2: "deep_height", 3: "deep_width"}
-            info = {"channels": int(deep.shape[1]), "scale": int(scale), "branch": speed.BRANCH}
+            info = {"channels": int(deep.shape[1]), "scale": int(scale), "branch": speed.BRANCH, "latent_channels": int(unet.out_channels)}
             unet.forward = types.MethodType(_as_full, unet)  # on the UNet itself so the weights keep their names
             torch.onnx.export(unet, tuple(inputs), paths["unet"], input_names=names, output_names=["latent", "deep"], dynamic_axes=axes, **ONNX_KWARGS)
         except Exception as e:
@@ -217,7 +217,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
             if shallow:
                 unet.forward = types.MethodType(_as_shallow, unet)
                 torch.onnx.export(
-                    unet, (*inputs, deep, *fresh.example_inputs(inputs[0])), paths["shallow"], input_names=names + ["deep", *fresh.INPUTS],
+                    unet, (*inputs, deep, *fresh.example_inputs(inputs[0], info["latent_channels"])), paths["shallow"], input_names=names + ["deep", *fresh.INPUTS],
                     output_names=fresh.OUTPUTS, dynamic_axes={**axes, **fresh.dynamic_axes()}, **ONNX_KWARGS,
                 )
         except Exception as e:
@@ -444,7 +444,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                     "onnx": os.path.join(folder, "shallow.onnx"),
                     "plan": os.path.join(folder, "shallow.plan"),
                     "weights": sorted(graphs["shallow"]),
-                    "profiles": [{**speed.shallow_shapes(s, graphs["deep"]), **fresh.input_shapes(s)} for s in unet_shapes],
+                    "profiles": [{**speed.shallow_shapes(s, graphs["deep"]), **fresh.input_shapes(s, graphs["deep"]["latent_channels"])} for s in unet_shapes],
                     "exact_fp32": True,
                 }
                 logger.debug(f"Building the {what}'s Speed Hacks part.")
