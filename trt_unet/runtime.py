@@ -386,6 +386,8 @@ def setting() -> str:
 
 
 FULL_START, FULL_END, QUALITY = "trt_speed_hacks_full_start", "trt_speed_hacks_full_end", "trt_speed_hacks_quality"
+# Their names in infotext: written for a generation that ran Speed Hacks, and read back by reForge's paste as overrides
+INFOTEXT = {FULL_START: "Speed Hacks full start", FULL_END: "Speed Hacks full end", QUALITY: "Speed Hacks quality"}
 
 
 def speed_settings() -> tuple:
@@ -679,7 +681,7 @@ class Pass:
             logger.debug(f"Speed Hacks ran {hacks.shallow_calls} of {hacks.shallow_calls + hacks.full_calls} UNet calls on the shallow engine.")
             if hacks.checks:
                 logger.debug("Speed Hacks checks (call, age, error): " + ", ".join(f"{i} {a} {e:.4f}" for i, a, e in hacks.checks))
-            _note_speed_hacks()
+            _note_speed_hacks(hacks)
         for model in _models.values():
             if model.weights is self.weights:
                 model.weights = None  # don't keep this checkpoint alive
@@ -1149,10 +1151,13 @@ _generation = None
 _generation_thread = None
 
 
-def _note_speed_hacks():
+def _note_speed_hacks(schedule):
     p = _generation() if _generation is not None else None
     if p is not None:
         p.extra_generation_params["TensorRT"] = SPEED_HACKS
+        p.extra_generation_params[INFOTEXT[FULL_START]] = round(schedule.warmup * 100)
+        p.extra_generation_params[INFOTEXT[FULL_END]] = round(schedule.tail * 100)
+        p.extra_generation_params[INFOTEXT[QUALITY]] = round(schedule.quality, 4)
 
 
 def new_generation(p=None):

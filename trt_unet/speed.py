@@ -119,17 +119,18 @@ def shallow_shapes(shapes: dict, deep: dict) -> dict:
 
 class Schedule:
     def __init__(self, warmup: float = WARMUP, tail: float = TAIL, quality: float = QUALITY):
-        self.warmup, self.tail = warmup, tail
+        self.warmup, self.tail, self.quality = warmup, tail, quality
         self.tolerance = tolerance(quality)
         self.index = None
         self.region = False  # this evaluation is between the start and end shares
         self.kind = None  # "check", "probe" or None: what this evaluation's full calls also run the shallow engine for
         self.slot = 0
-        # (slot, key) -> [deep feature, evaluation index, the prompt it saw, last evaluation index that used it]. key:
-        # (sample shape, reForge's cond_or_uncond, prompt shape, which scheduled prompts the evaluation used). With
-        # "Negative Guidance minimum sigma", every other evaluation drops the unconds, so one slot alternates between two
-        # batch shapes; cond_or_uncond keeps a cond row from reusing an uncond row's deep feature; and the prompts give
-        # a prompt edit ([a:b:0.5]) a full call, and each prompt of an alternation ([a|b]) its own deep feature.
+        # (slot, key) -> [deep feature, evaluation index, the prompt it saw ((tensor, its norm) per prompt tensor), last
+        # evaluation index that used it]. key: (sample shape, reForge's cond_or_uncond, prompt shape, which scheduled
+        # prompts the evaluation used). With "Negative Guidance minimum sigma", every other evaluation drops the
+        # unconds, so one slot alternates between two batch shapes; cond_or_uncond keeps a cond row from reusing an
+        # uncond row's deep feature; and the prompts give a prompt edit ([a:b:0.5]) a full call, and each prompt of an
+        # alternation ([a|b]) its own deep feature.
         self.deep = {}
         self.shallow_calls = self.full_calls = 0
         self.latest = None  # (error, age) of the latest check read
@@ -218,10 +219,13 @@ class Schedule:
         kept = self.deep.get((slot, key))
         if kept is None:
             return
-        moves = [(t.float() - r.float()).norm() / r.float().norm().clamp_min(1e-30) for t, r in zip(prompt, kept[2]) if t is not None and r is not None]
-        if not moves:
+        moved = None
+        for t, (r, norm) in zip(prompt, kept[2]):
+            if t is not None and r is not None:
+                m = torch.dist(t, r) / norm
+                moved = m if moved is None else torch.maximum(moved, m)
+        if moved is None:
             return
-        moved = torch.stack(moves).amax()
         host = torch.empty((), dtype=torch.float32, pin_memory=True)
         host.copy_(moved, non_blocking=True)
         event = torch.cuda.Event()
@@ -235,6 +239,7 @@ class Schedule:
 
     def keep(self, slot: int, key: tuple, deep, prompt: tuple):
         if (slot, key) not in self.volatile:
+            prompt = [(t, t.float().norm().clamp_min(1e-30) if t is not None else None) for t in prompt]
             self.deep[(slot, key)] = [deep, self.index, prompt, self.index]
 
     def release(self):

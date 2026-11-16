@@ -547,12 +547,15 @@ def on_ui_settings():
     section, slider = ("tensorrt", "TensorRT"), {"minimum": 0, "maximum": 100, "step": 1}
     shared.opts.add_option(runtime.FULL_START, shared.OptionInfo(
         round(speed.WARMUP * 100), "Speed Hacks: share of steps at the start that run in full (%)", gr.Slider, slider, section=section, category_id="sd",
+        infotext=runtime.INFOTEXT[runtime.FULL_START],
     ).info("where composition and colors settle; more keeps images closer to running without Speed Hacks, less runs faster"))
     shared.opts.add_option(runtime.FULL_END, shared.OptionInfo(
         round(speed.TAIL * 100), "Speed Hacks: share of steps at the end that run in full (%)", gr.Slider, slider, section=section, category_id="sd",
+        infotext=runtime.INFOTEXT[runtime.FULL_END],
     ).info("where fine detail settles; the last step always runs in full"))
     shared.opts.add_option(runtime.QUALITY, shared.OptionInfo(
         speed.QUALITY, "Speed Hacks: quality", gr.Slider, {"minimum": 0, "maximum": 1, "step": 0.01}, section=section, category_id="sd",
+        infotext=runtime.INFOTEXT[runtime.QUALITY],
     ).info("1 runs a full step every third step; 0.9 lets them wait where the image changes very slowly; lower runs faster and softer, down to no full steps between the shares above at 0"))
 
 

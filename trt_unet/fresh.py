@@ -29,11 +29,12 @@
 # plain shallow UNet, and on a pass where noise was found Tracker.safe() has the runtime run such calls in full instead.
 #
 # Engine inputs: x and sigma per image (see above); tables (see tables()); hx/hr/hv/hd/hu<m>: the m-th previous call's
-# x, N (zeros up to the deep feature's call), 1 per image where its N isn't known (not removed and not negligible),
-# denoised value and uncond denoised value (zeros if none). Outputs: latent (the UNet output rows), removed
-# (this call's N), reason (per image, why N wasn't removed: 0 it was, 1 the UNet input rows aren't
-# calculate_input(sigma, x), 2 the residual isn't white noise of even variance, 3 the residual exceeds sigma^2), share
-# (the residual's variance / sigma^2, white or not: a residual the fit can't explain may hold noise).
+# x, N (zeros up to the deep feature's call), that call's reason per image (0 where its N is known; see below),
+# denoised value and uncond denoised value (zeros if none). Outputs: latent (the UNet output rows), removed (this call's
+# N), reason (per image: 0 where N was removed or is negligible, as with deterministic samplers, whose residual is FP32
+# rounding and may fail the evenness test; else why not: 1 the UNet input rows aren't calculate_input(sigma, x), 2 the
+# residual isn't white noise of even variance, 3 the residual exceeds sigma^2), share (the residual's variance /
+# sigma^2, white or not: a residual the fit can't explain may hold noise).
 import math
 from collections import deque
 
@@ -63,7 +64,7 @@ NOISY = 1e-4
 # (sigma_max 4096), where linear interpolation of the smooth columns is exact to ~1e-5.
 GRID = 2048
 # Engines record this; one built with another has a different shallow graph. Raise the version when shallow() changes.
-SIGNATURE = {"version": 7, "window": WINDOW, "grid": GRID}
+SIGNATURE = {"version": 8, "window": WINDOW, "grid": GRID}
 
 IMAGES = [f"{name}{m}" for m in range(1, WINDOW + 1) for name in ("hx", "hr", "hd", "hu")]
 VECTORS = [f"hv{m}" for m in range(1, WINDOW + 1)]
@@ -170,7 +171,8 @@ def shallow(run, sample, timesteps, inputs: dict):
     removed = torch.where(_view(apply), noise, torch.zeros_like(noise))
     share = variance / s2
     one = torch.ones_like(variance)
-    reason = torch.where(apply, 0 * one, torch.where(~consistent, one, torch.where(~white, 2 * one, 3 * one)))
+    known = apply | (variance <= NOISY * s2)
+    reason = torch.where(known, 0 * one, torch.where(~consistent, one, torch.where(~white, 2 * one, 3 * one)))
     return latent, removed, reason, share
 
 
@@ -209,13 +211,12 @@ def input_shapes(unet_shapes: dict, channels: int) -> dict:
 
 class Entry:
     # One CFG denoiser call: the shape of its images, x and sigma (see the header), the denoised value, the uncond rows'
-    # denoised value, and for a step that ran shallow its N, where N isn't known (hv in the header) and the index of the
-    # deep feature's call.
-    __slots__ = ("index", "shape", "x", "sigma", "denoised", "uncond", "removed", "unknown", "origin")
+    # denoised value, and for a step that ran shallow its N, reasons and the index of the deep feature's call.
+    __slots__ = ("index", "shape", "x", "sigma", "denoised", "uncond", "removed", "reason", "origin")
 
     def __init__(self, index, shape):
         self.index, self.shape = index, tuple(shape)
-        self.x = self.sigma = self.denoised = self.uncond = self.removed = self.unknown = self.origin = None
+        self.x = self.sigma = self.denoised = self.uncond = self.removed = self.reason = self.origin = None
 
 
 class Tracker:
@@ -302,7 +303,7 @@ class Tracker:
             if p.index <= origin:
                 removed, valid = zeros, known
             elif p.origin == origin and p.removed is not None:
-                removed, valid = p.removed, p.unknown
+                removed, valid = p.removed, p.reason
             else:
                 removed, valid = zeros, unknown
             values.update({f"hx{m}": p.x, f"hr{m}": removed, f"hv{m}": valid, f"hd{m}": p.denoised, f"hu{m}": p.uncond if p.uncond is not None else zeros})
@@ -326,9 +327,7 @@ class Tracker:
 
     def after_shallow(self, entry, outputs: dict, origin):
         if entry.removed is None:
-            # A residual of FP32 rounding (deterministic samplers) may fail the evenness test; its N is known all the same
-            entry.unknown = ((outputs["reason"] > 0) & (outputs["share"] > NOISY)).float()
-            entry.removed, entry.origin = outputs["removed"], origin
+            entry.removed, entry.reason, entry.origin = outputs["removed"], outputs["reason"], origin
         self.status(outputs)
 
     def status(self, outputs: dict):
@@ -345,7 +344,7 @@ class Tracker:
             reasons, shares = host.tolist()
             self.read = True
             self.noisy = self.noisy or any(s > NOISY for s in shares)
-            self.blocked = any(r > 0 and s > NOISY for r, s in zip(reasons, shares))
+            self.blocked = any(r > 0 for r in reasons)
 
     def add_check(self, entry, full, checked, age: int):
         if self.check is None or self.check[0] is not entry:
@@ -388,7 +387,7 @@ class Tracker:
             return
         noise = _residual(entry.x, columns)
         share = (noise * noise).mean((1, 2, 3)) / entry.sigma ** 2
-        reason = torch.where(_white(noise), 0.0, 2.0)
+        reason = torch.where(_white(noise) | (share <= NOISY), 0.0, 2.0)
         self.status({"reason": reason, "share": share})
 
     def _error(self, entry, full, checked):
