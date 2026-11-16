@@ -727,8 +727,8 @@ class Pass:
         stream = torch.cuda.current_stream().cuda_stream
         hack = deep = None
         if self.schedule is not None and self.model.shallow_loaded:
-            prompt = feed["encoder_hidden_states"]
-            key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()), tuple(prompt.shape), tuple(_prompts))
+            prompt = (feed["encoder_hidden_states"], feed.get("y"))
+            key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()), tuple(prompt[0].shape), tuple(_prompts))
             slot, deep, origin, stale, kind = self.schedule.call(key)
             entry = self.tracker.call(feed["sample"], b)
             if deep is not None and not self.tracker.safe(entry, origin):
@@ -780,7 +780,7 @@ class Pass:
             outputs = self.model.engine.infer(feed, profile, stream)
             out = outputs["latent"]
             if slot is not None and "deep" in outputs:
-                self.schedule.keep(slot, key, outputs["deep"], feed["encoder_hidden_states"])
+                self.schedule.keep(slot, key, outputs["deep"], (feed["encoder_hidden_states"], feed.get("y")))
                 if kind is not None and entry is not None:
                     inputs = {**feed, "deep": stale[0], **self.tracker.inputs(entry, stale[1], feed["sample"])}
                     shallow = self.model.shallow.infer(inputs, profile, stream)
@@ -1068,7 +1068,7 @@ _prompts = []
 
 def _note_prompts(schedules_of, step):
     # schedules_of() -> one list of ScheduledPromptConditioning per prompt
-    if _pass is None or _pass.schedule is None:
+    if _pass is None or _pass.schedule is None or _pass.fallback is not None:
         return
     try:
         # prompt_parser's choice: the first schedule entry whose end_at_step the step hasn't passed

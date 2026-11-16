@@ -211,14 +211,17 @@ class Schedule:
         self.full_calls += 1
         return slot, None, None, (kept[0], kept[1]) if self.kind else None, self.kind
 
-    def compare(self, slot: int, key: tuple, prompt):
-        # For a shallow call: how far the prompt moved from the one its deep feature saw, which callbacks can change
-        # without the scheduled prompts changing. Read like checks; a move past MOVED drops the deep feature.
+    def compare(self, slot: int, key: tuple, prompt: tuple):
+        # For a shallow call: how far the prompt (its tensors: context and SDXL's y) moved from the one its deep feature
+        # saw, which callbacks can change without the scheduled prompts changing. Read like checks; a move past MOVED
+        # drops the deep feature.
         kept = self.deep.get((slot, key))
-        if kept is None or kept[2] is None:
+        if kept is None:
             return
-        reference = kept[2].float()
-        moved = (prompt.float() - reference).norm() / reference.norm().clamp_min(1e-30)
+        moves = [(t.float() - r.float()).norm() / r.float().norm().clamp_min(1e-30) for t, r in zip(prompt, kept[2]) if t is not None and r is not None]
+        if not moves:
+            return
+        moved = torch.stack(moves).amax()
         host = torch.empty((), dtype=torch.float32, pin_memory=True)
         host.copy_(moved, non_blocking=True)
         event = torch.cuda.Event()
@@ -230,8 +233,9 @@ class Schedule:
         self.shallow_calls -= 1
         self.full_calls += 1
 
-    def keep(self, slot: int, key: tuple, deep, prompt):
-        self.deep[(slot, key)] = [deep, self.index, prompt, self.index]
+    def keep(self, slot: int, key: tuple, deep, prompt: tuple):
+        if (slot, key) not in self.volatile:
+            self.deep[(slot, key)] = [deep, self.index, prompt, self.index]
 
     def release(self):
         self.deep.clear()
