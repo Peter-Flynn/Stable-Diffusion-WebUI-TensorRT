@@ -10,10 +10,10 @@
 # roughness, so it never passed with those samplers): a due full call also runs the shallow engine as the shallow call
 # at its index would have, on the deep feature it replaces (a "check", the cost of a shallow call), which gives the
 # error that shallow call would have made, for any sampler. Due full calls wait while drift(), the error the shallow
-# calls since the last full call are predicted to have made in total, stays within tolerance(quality). Errors are
-# absolute (relative to the denoised value), so the start and end shares don't change what a quality means. Only a
-# sampler step's first call is checked: DPM++ SDE and Heun call the UNet twice per step (reForge's total_steps /
-# steps), at points whose errors aren't comparable.
+# calls since the last full call are predicted to have made in total, stays within tolerance(quality). The tolerance is
+# a fixed amount of error (relative to the denoised value's norm), not one relative to other checks, so the start and
+# end shares don't change what a quality means. Only a sampler step's first call is checked: DPM++ SDE and Heun call the
+# UNet twice per step (reForge's total_steps / steps), at points whose errors aren't comparable.
 #
 # Measurements behind the constants: SDXL (novaOrangeXL v1.4, 1024x1024, CFG 3), Euler, Euler a, DPM++ 2M, 2M SDE,
 # 3M SDE, SDE and Heun, Karras/Simple/Exponential/SGM Uniform, 20 to 100 steps, 3 prompts; every call's shallow error
@@ -37,9 +37,10 @@ AGE_EXPONENT = 0.5
 
 
 def tolerance(quality: float) -> float:
-    # The drift() a stretch may reach before a full call. 1.9 * (1 - q) / q, fitted to the measurements: at 30 steps it
-    # keeps the share of full calls between the start and end shares near quality times DeepCache's (1 in INTERVAL),
-    # and at more steps, where calls change less, it runs fewer. Of c * ((1 - q) / q) ** p, p = 1 fitted best.
+    # The drift() a stretch may reach before a full call. 1.9 * (1 - q) / q, fitted to the measurements: at 30 steps
+    # with 10% of steps full at the start, it keeps the share of full calls between the start and end shares near
+    # quality times DeepCache's (1 in INTERVAL); at more steps, where calls change less, it runs fewer (0.9 runs 5% fewer
+    # full calls than 1 at 30 steps, 19% at 100). Of c * ((1 - q) / q) ** p, p = 1 fitted best.
     if quality >= 1:
         return 0.0
     if quality <= 0:
