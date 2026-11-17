@@ -76,7 +76,7 @@ GRID = 2048
 # A latent scale alpha(sigma) below which a call's noise isn't removed: a flow model's first steps, near sigma = 1
 LATENT = 0.01
 # Engines record this; one built with another has a different shallow graph. Raise the version when shallow() changes.
-SIGNATURE = {"version": 9, "window": WINDOW, "grid": GRID}
+SIGNATURE = {"version": 10, "window": WINDOW, "grid": GRID}
 
 IMAGES = [f"{name}{m}" for m in range(1, WINDOW + 1) for name in ("hx", "hr", "hd", "hu")]
 VECTORS = [f"hv{m}" for m in range(1, WINDOW + 1)]
@@ -97,7 +97,7 @@ def tables(model_sampling, device) -> torch.Tensor:
         model_sampling.calculate_input(sigma, ones),
         model_sampling.calculate_denoised(sigma, zeros, ones),
         model_sampling.calculate_denoised(sigma, ones, zeros),
-        model_sampling.noise_scaling(sigma, zeros.clone(), ones),
+        model_sampling.noise_scaling(sigma, zeros.clone(), ones) if hasattr(model_sampling, "noise_scaling") else ones,
     ]
     columns = [c.reshape(-1).double().cpu() for c in columns]
     alpha = columns[-1]
@@ -173,7 +173,10 @@ def shallow(run, sample, timesteps, inputs: dict):
     s2 = sigma * sigma
     white = _white(noise)
     below = (variance < CEILING * s2) & (alpha >= LATENT)
-    apply = consistent & white & below
+    share = excess / s2
+    # A negligible residual (deterministic samplers) runs the plain shallow UNet, at the sampler's own timestep
+    negligible = share <= NOISY
+    apply = consistent & white & below & ~negligible
     # When N is nearly all of x's noise (a long wait with an ancestral sampler), x - N is close to the previous
     # denoised value at almost no noise, which the shallow UNet returns nearly as is.
     left = (s2 - variance).clamp_min(1e-6 * s2).sqrt()
@@ -192,9 +195,8 @@ def shallow(run, sample, timesteps, inputs: dict):
     fixed = (_view(a_eff) * x_eff - _view(a) * x + _view(b_eff) * rows.float()) / _view(b)
     latent = torch.where(lanes, fixed.to(out.dtype), rows).reshape(out.shape)
     removed = torch.where(_view(apply), noise, torch.zeros_like(noise))
-    share = excess / s2
     one = torch.ones_like(variance)
-    known = apply | (share <= NOISY)
+    known = apply | negligible
     reason = torch.where(known, 0 * one, torch.where(~consistent, one, torch.where(~white, 2 * one, 3 * one)))
     return latent, removed, reason, share
 
