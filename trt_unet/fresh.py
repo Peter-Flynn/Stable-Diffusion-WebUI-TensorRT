@@ -3,41 +3,46 @@
 # alone attributes little of the new noise to its noise prediction: the denoised value keeps it as image content, a
 # burst of latent noise at the first shallow call. The shallow engine's graph (shallow() below) removes it.
 #
-# For every k-diffusion sampler, the x it passes to the model is a linear combination (per-image scalar coefficients)
-# of earlier calls' x and denoised values, plus the noise it draws. Here x and sigma are what reForge's apply_model got
-# in the step's first UNet call, after any edits by the CFG denoiser, its callbacks and conditioning modifiers. For a
+# For every k-diffusion sampler, the x it passes to the model is a linear combination (per-image scalar coefficients) of
+# earlier calls' x and denoised values, plus the noise it draws. Here x and sigma are what reForge's apply_model got in
+# the step's first UNet call, after any edits by the CFG denoiser, its callbacks and conditioning modifiers. For a
 # timestep sampler such as DDIM, that is its x rescaled to k-diffusion's and the sigma of its timestep, which keeps the
-# combination linear. The denoised value is what the CFG denoiser returned, after any guidance (computed from the eps
-# a timestep sampler gets back), and the uncond rows' denoised value is a column of its own for CFG++ samplers: the fit
+# combination linear. The denoised value is what the CFG denoiser returned, after any guidance (computed from the eps a
+# timestep sampler gets back), and the uncond rows' denoised value is a column of its own for CFG++ samplers: the fit
 # doesn't depend on how they were computed. For the calls after the deep feature's call j, write x_i = shadow_i + N_i,
 # N_i being the noise drawn since j as it stands in x_i (N_i = 0 for i <= j). A shallow call's denoised value is
 # computed on its shadow and holds none of N, so x = (a combination of the last WINDOW calls' shadows and denoised
-# values) + N, with N independent of all of those: least squares of x on them leaves N as the residual. A call whose
-# N isn't known (it ran on another deep feature, or its fit failed) leaves its x out: x_i is itself a combination of
+# values) + N, with N independent of all of those: least squares of x on them leaves N as the residual. A call whose N
+# isn't known (it ran on another deep feature, or its fit failed) leaves its x out: x_i is itself a combination of
 # earlier x and denoised values plus noise, so the fit still holds while an earlier call's x or shadow is in the window.
-# The shallow UNet runs on x - N at sigma_eff = sqrt(sigma^2 - var(N)), the noise level that leaves, and its output is
-# converted to the one that gives the same denoised value at the call's real x and sigma. The sampler's x keeps N,
-# which the next full call sees whole.
+# Every kind of model sampling reForge has scales x as noise_scaling does, alpha(sigma) * latent + sigma * noise, with
+# alpha = 1 but for flow models' CONST (1 - sigma): x - N holds noise sqrt(sigma^2 - var(N)) at the same alpha, which is
+# the point sigma_eff of the schedule with that ratio of noise to alpha, after scaling x - N by alpha(sigma_eff) /
+# alpha(sigma). The shallow UNet runs there, and its output is converted to the one that gives the same denoised value
+# at the call's real x and sigma. The sampler's x keeps N, which the next full call sees whole.
 #
-# The model sampling's own timestep, calculate_input and calculate_denoised (linear in their tensor arguments for every
-# kind reForge has) come in as tables over log sigma, so the graph serves any of them. The fit is classical Gram-Schmidt
-# applied twice (CGS2) in FP32: TensorRT has no FP64 or QR, and consecutive calls' values are nearly parallel, which
-# rules out normal equations in FP32. The correction applies per image only where the graph finds its assumptions hold:
-# the UNet's input rows are calculate_input(sigma, x) (not in a later UNet call of the step on another x), and the
-# residual is white noise of the same variance across the image (a sampler the window doesn't cover leaves structure;
-# inpainting's "mask before denoising" adds fresh noise outside the inpainted area only). Elsewhere the call runs the
-# plain shallow UNet, and on a pass where noise was found Tracker.safe() has the runtime run such calls in full instead.
+# The model sampling's own timestep, calculate_input, calculate_denoised and noise_scaling (linear in their tensor
+# arguments for every kind reForge has) come in as tables (see tables()), so the graph serves any of them. The fit is
+# classical Gram-Schmidt applied twice (CGS2) in FP32: TensorRT has no FP64 or QR, and consecutive calls' values are
+# nearly parallel, which rules out normal equations in FP32. The correction applies per image only where the graph finds
+# its assumptions hold: the UNet's input rows are calculate_input(sigma, x) (not in a later UNet call of the step on
+# another x), and the residual is white noise of the same variance across the image (a sampler the window doesn't cover
+# leaves structure; inpainting's "mask before denoising" adds fresh noise outside the inpainted area only). Elsewhere
+# the call runs the plain shallow UNet, and on a pass where noise was found Tracker.safe() has the runtime run such
+# calls in full instead.
 #
 # Engine inputs: x and sigma per image (see above); tables (see tables()); hx/hr/hv/hd/hu<m>: the m-th previous call's
-# x, N (zeros up to the deep feature's call), that call's reason per image (0 where its N is known; see below),
-# denoised value and uncond denoised value (zeros if none). Outputs: latent (the UNet output rows), removed (this call's
-# N), reason (per image: 0 where N was removed or is negligible, as with deterministic samplers, whose residual is FP32
+# x, N (zeros up to the deep feature's call), that call's reason per image (0 where its N is known; see below), denoised
+# value and uncond denoised value (zeros if none). Outputs: latent (the UNet output rows), removed (this call's N),
+# reason (per image: 0 where N was removed or is negligible, as with deterministic samplers, whose residual is FP32
 # rounding and may fail the evenness test; else why not: 1 the UNet input rows aren't calculate_input(sigma, x), 2 the
-# residual isn't white noise of even variance, 3 the residual exceeds sigma^2), share (the residual's variance /
-# sigma^2, white or not: a residual the fit can't explain may hold noise).
+# residual isn't white noise of even variance, 3 the residual exceeds sigma^2, or alpha is below LATENT), share (the
+# residual's variance less FLOOR times x's mean square, / sigma^2, white or not: a residual the fit can't explain may
+# hold noise).
 import math
 from collections import deque
 
+import numpy
 import torch
 
 # SA-Solver's corrector uses the last 4 calls' denoised values and DPM++ 3M SDE's update the last 3; DPM++ SDE, DPM++
@@ -60,11 +65,18 @@ GATE = 0.01
 # A residual share of sigma^2 above which a call's x holds noise or structure the deep feature's call didn't see:
 # deterministic samplers leave FP32 rounding (~1e-12), ancestral and SDE samplers 0.01 to 0.5 (SDXL measurements).
 NOISY = 1e-4
+# The fit's own FP32 error, as a variance relative to x's mean square, subtracted before comparing with NOISY. Measured
+# up to (3.5e-5)^2 on deterministic samplers down to sigma 0.0015 (flow schedules), where consecutive calls' values are
+# nearly parallel; under (2.5e-7)^2 above sigma 0.03. Ancestral noise at a share of 0.01 exceeds it above sigma 0.003
+# for latents of unit mean square.
+FLOOR = 1e-7
 # Table points over log sigma, from sigma_min / 2 to sigma_max * 2: 0.0065 apart for a zero-terminal-SNR model
 # (sigma_max 4096), where linear interpolation of the smooth columns is exact to ~1e-5.
 GRID = 2048
+# A latent scale alpha(sigma) below which a call's noise isn't removed: a flow model's first steps, near sigma = 1
+LATENT = 0.01
 # Engines record this; one built with another has a different shallow graph. Raise the version when shallow() changes.
-SIGNATURE = {"version": 8, "window": WINDOW, "grid": GRID}
+SIGNATURE = {"version": 9, "window": WINDOW, "grid": GRID}
 
 IMAGES = [f"{name}{m}" for m in range(1, WINDOW + 1) for name in ("hx", "hr", "hd", "hu")]
 VECTORS = [f"hv{m}" for m in range(1, WINDOW + 1)]
@@ -73,29 +85,38 @@ OUTPUTS = ["latent", "removed", "reason", "share"]
 
 
 def tables(model_sampling, device) -> torch.Tensor:
-    # (5, GRID): log sigma (evenly spaced), timestep, and the coefficients of calculate_input (input = c_in * x) and
-    # calculate_denoised (denoised = a * x + b * output)
+    # (8, GRID). Rows 0-5, at log sigma evenly spaced: log sigma, timestep, the coefficients of calculate_input
+    # (input = c_in * x) and calculate_denoised (denoised = a * x + b * output), and alpha (see the header). Rows 6-7, at
+    # log(sigma / alpha) evenly spaced over the sigmas where alpha >= LATENT: log(sigma / alpha), and sigma.
     lo, hi = float(model_sampling.sigma_min), float(model_sampling.sigma_max)
-    grid = torch.linspace(math.log(lo / 2), math.log(hi * 2), GRID, dtype=torch.float64, device=device)
-    sigma = grid.exp().float()
+    grid = torch.linspace(math.log(lo / 2), math.log(hi * 2), GRID, dtype=torch.float64)
+    sigma = grid.exp().float().to(device)
     ones, zeros = torch.ones(GRID, 1, device=device), torch.zeros(GRID, 1, device=device)
     columns = [
         model_sampling.timestep(sigma),
         model_sampling.calculate_input(sigma, ones),
         model_sampling.calculate_denoised(sigma, zeros, ones),
         model_sampling.calculate_denoised(sigma, ones, zeros),
+        model_sampling.noise_scaling(sigma, zeros.clone(), ones),
     ]
-    return torch.stack([grid.float()] + [c.float().reshape(-1).to(device) for c in columns])
+    columns = [c.reshape(-1).double().cpu() for c in columns]
+    alpha = columns[-1]
+    valid = alpha >= LATENT
+    ratio = grid[valid] - alpha[valid].log()
+    if not bool((ratio[1:] > ratio[:-1]).all()):
+        raise RuntimeError(f"{type(model_sampling).__name__}'s noise to latent ratio doesn't rise with sigma")
+    inverse = torch.linspace(float(ratio[0]), float(ratio[-1]), GRID, dtype=torch.float64)
+    at = torch.from_numpy(numpy.interp(inverse.numpy(), ratio.numpy(), grid[valid].exp().numpy()))
+    return torch.stack([grid, *columns, inverse, at]).float().to(device)
 
 
-def _lookup(tables, sigma):
-    # (4, n): timestep, c_in, a, b at each sigma, linear in log sigma between table points
-    grid = tables[0]
-    position = ((sigma.log() - grid[0]) / (grid[1] - grid[0])).clamp(0, GRID - 1.001)
+def _lookup(grid, rows, value):
+    # rows at each value, linear in log value between the points of grid (log values, evenly spaced)
+    position = ((value.log() - grid[0]) / (grid[1] - grid[0])).clamp(0, GRID - 1.001)
     index = position.floor()
     weight = position - index
     index = index.long()
-    lo, hi = tables[1:].index_select(1, index), tables[1:].index_select(1, index + 1)
+    lo, hi = rows.index_select(1, index), rows.index_select(1, index + 1)
     return lo + (hi - lo) * weight
 
 
@@ -137,7 +158,7 @@ def _white(r):
 def shallow(run, sample, timesteps, inputs: dict):
     x, sigma, tables = inputs["x"], inputs["sigma"], inputs["tables"]
     n, c = x.shape[0], x.shape[1]
-    _, c_in, a, b = _lookup(tables, sigma)
+    _, c_in, a, b, alpha = _lookup(tables[0], tables[1:6], sigma)
     blocks = sample.reshape(-1, n, *sample.shape[1:])
     scaled = _view(c_in) * x
     gap = (blocks[:, :, :c].float() - scaled.unsqueeze(0)).abs().amax((0, 2, 3, 4))
@@ -148,15 +169,17 @@ def shallow(run, sample, timesteps, inputs: dict):
         columns += [torch.where(_view(inputs[f"hv{m}"] < 0.5), shadow, torch.zeros_like(shadow)), inputs[f"hd{m}"], inputs[f"hu{m}"]]
     noise = _residual(x, columns)
     variance = (noise * noise).mean((1, 2, 3))
+    excess = (variance - FLOOR * (x * x).mean((1, 2, 3))).clamp_min(0)
     s2 = sigma * sigma
     white = _white(noise)
-    below = variance < CEILING * s2
+    below = (variance < CEILING * s2) & (alpha >= LATENT)
     apply = consistent & white & below
     # When N is nearly all of x's noise (a long wait with an ancestral sampler), x - N is close to the previous
     # denoised value at almost no noise, which the shallow UNet returns nearly as is.
-    sigma_eff = (s2 - variance).clamp_min(1e-6 * s2).sqrt()
-    t_eff, c_eff, a_eff, b_eff = _lookup(tables, sigma_eff)
-    x_eff = x - noise
+    left = (s2 - variance).clamp_min(1e-6 * s2).sqrt()
+    sigma_eff = _lookup(tables[6], tables[7:8], left / alpha.clamp_min(LATENT))[0]
+    t_eff, c_eff, a_eff, b_eff, alpha_eff = _lookup(tables[0], tables[1:6], sigma_eff)
+    x_eff = (x - noise) * _view(alpha_eff / alpha.clamp_min(LATENT))
     lanes = apply.reshape(1, -1, 1, 1, 1)
     latent = torch.where(lanes, (_view(c_eff) * x_eff).to(sample.dtype).unsqueeze(0), blocks[:, :, :c])
     if sample.shape[1] > c:
@@ -169,9 +192,9 @@ def shallow(run, sample, timesteps, inputs: dict):
     fixed = (_view(a_eff) * x_eff - _view(a) * x + _view(b_eff) * rows.float()) / _view(b)
     latent = torch.where(lanes, fixed.to(out.dtype), rows).reshape(out.shape)
     removed = torch.where(_view(apply), noise, torch.zeros_like(noise))
-    share = variance / s2
+    share = excess / s2
     one = torch.ones_like(variance)
-    known = apply | (variance <= NOISY * s2)
+    known = apply | (share <= NOISY)
     reason = torch.where(known, 0 * one, torch.where(~consistent, one, torch.where(~white, 2 * one, 3 * one)))
     return latent, removed, reason, share
 
@@ -190,7 +213,7 @@ def example_inputs(sample, channels: int) -> list:
     kw = {"device": sample.device}
     grid = torch.linspace(-4, 9, GRID, **kw)
     values = {"x": torch.randn(n, channels, h, w, **kw), "sigma": torch.rand(n, **kw) * 10 + 0.1}
-    values["tables"] = torch.stack([grid, grid * 100, torch.rsqrt(grid.exp() ** 2 + 1), torch.ones_like(grid), -grid.exp()])
+    values["tables"] = torch.stack([grid, grid * 100, torch.rsqrt(grid.exp() ** 2 + 1), torch.ones_like(grid), -grid.exp(), torch.ones_like(grid), grid, grid.exp()])
     values.update({name: torch.randn(n, channels, h, w, **kw) for name in IMAGES})
     values.update({name: torch.zeros(n, **kw) for name in VECTORS})
     return [values[name] for name in INPUTS]
@@ -203,7 +226,7 @@ def input_shapes(unet_shapes: dict, channels: int) -> dict:
     i_opt = max(1, r_opt // 2)
     image = [[1, channels, h_lo, w_lo], [i_opt, channels, h_opt, w_opt], [r_hi, channels, h_hi, w_hi]]
     vector = [[1], [i_opt], [r_hi]]
-    shapes = {"x": image, "sigma": vector, "tables": [[5, GRID]] * 3}
+    shapes = {"x": image, "sigma": vector, "tables": [[8, GRID]] * 3}
     shapes.update({name: image for name in IMAGES})
     shapes.update({name: vector for name in VECTORS})
     return shapes
@@ -386,7 +409,8 @@ class Tracker:
         if not columns:
             return
         noise = _residual(entry.x, columns)
-        share = (noise * noise).mean((1, 2, 3)) / entry.sigma ** 2
+        excess = ((noise * noise).mean((1, 2, 3)) - FLOOR * (entry.x * entry.x).mean((1, 2, 3))).clamp_min(0)
+        share = excess / entry.sigma ** 2
         reason = torch.where(_white(noise) | (share <= NOISY), 0.0, 2.0)
         self.status({"reason": reason, "share": share})
 
