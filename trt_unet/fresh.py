@@ -245,11 +245,19 @@ def input_shapes(unet_shapes: dict, channels: int) -> dict:
 class Entry:
     # One CFG denoiser call: the shape of its images, x and sigma (see the header), the denoised value, the uncond rows'
     # denoised value, and for a step that ran shallow its N, reasons and the index of the deep feature's call.
-    __slots__ = ("index", "shape", "x", "sigma", "denoised", "uncond", "removed", "reason", "origin")
+    __slots__ = ("index", "shape", "x", "sigma", "denoised", "uncond", "uncond_rows", "removed", "reason", "origin")
 
     def __init__(self, index, shape):
         self.index, self.shape = index, tuple(shape)
-        self.x = self.sigma = self.denoised = self.uncond = self.removed = self.reason = self.origin = None
+        self.x = self.sigma = self.denoised = self.uncond = self.uncond_rows = self.removed = self.reason = self.origin = None
+
+    def uncond_value(self, sampling):
+        # The uncond rows' denoised value, from the UNet output rows kept for it when first needed: most steps' is never
+        # a column of the fit (only the newest UNCOND calls' are, and only before a shallow call or check)
+        if self.uncond is None and self.uncond_rows is not None:
+            self.uncond = sampling.calculate_denoised(self.sigma, self.uncond_rows.float(), self.x)
+            self.uncond_rows = None
+        return self.uncond
 
 
 class Tracker:
@@ -349,7 +357,8 @@ class Tracker:
             else:
                 values.update({f"hx{m}": p.x, f"hr{m}": zeros, f"hv{m}": unknown, f"hd{m}": p.denoised})
             if m <= UNCOND:
-                values[f"hu{m}"] = p.uncond if p is not None and p.uncond is not None else zeros
+                uncond = p.uncond_value(self.sampling) if p is not None else None
+                values[f"hu{m}"] = uncond if uncond is not None else zeros
         return values
 
     def _untracked(self, sample) -> dict:
@@ -363,11 +372,12 @@ class Tracker:
         return values
 
     def after_call(self, entry, out, cond_or_uncond):
-        # Every tracked UNet call: the uncond rows' denoised value, which CFG++ samplers step with
+        # Every tracked UNet call: the uncond rows, whose denoised value CFG++ samplers step with. A view of the engine's
+        # output, which nothing writes to after the call (reForge's apply_model takes a float copy).
         n = entry.shape[0]
-        if entry.uncond is None and cond_or_uncond and 1 in cond_or_uncond and len(cond_or_uncond) * n == out.shape[0]:
+        if entry.uncond is None and entry.uncond_rows is None and cond_or_uncond and 1 in cond_or_uncond and len(cond_or_uncond) * n == out.shape[0]:
             i = cond_or_uncond.index(1)
-            entry.uncond = self.sampling.calculate_denoised(entry.sigma, out[i * n:(i + 1) * n].float(), entry.x)
+            entry.uncond_rows = out[i * n:(i + 1) * n]
 
     def after_shallow(self, entry, outputs: dict, origin):
         if entry.removed is None:
@@ -421,7 +431,8 @@ class Tracker:
     def _measure(self, entry):
         columns = []
         for m, p in enumerate(reversed(self.history), 1):
-            columns += [p.x, p.denoised] + ([p.uncond] if p.uncond is not None and m <= UNCOND else [])
+            uncond = p.uncond_value(self.sampling) if m <= UNCOND else None
+            columns += [p.x, p.denoised] + ([uncond] if uncond is not None else [])
         if not columns:
             return
         noise = _residual(entry.x, columns)
