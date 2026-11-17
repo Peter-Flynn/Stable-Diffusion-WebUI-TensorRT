@@ -760,13 +760,14 @@ class Pass:
                 if deep is not None:
                     self.schedule.compare(slot, key, prompt)
                 hack = (slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b)
-        deep = hack[2] if hack is not None else None
         out = self._infer_with_room(feed, profile, stream, hack)
-        if deep is None and not self.checked:
+        # A shallow call whose Speed Hacks failed ran on the full engine instead
+        shallow = hack is not None and hack[2] is not None and self.schedule is not None
+        if not shallow and not self.checked:
             self.checked = True
             if not torch.isfinite(out).all():
                 self.fall_back("The engine produced NaN/Inf values")
-        if deep is not None and not self.shallow_checked:
+        if shallow and not self.shallow_checked:
             self.shallow_checked = True
             if not torch.isfinite(out).all():
                 self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
