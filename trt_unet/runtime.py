@@ -1019,9 +1019,10 @@ def _wrap_denoiser(original):
                 from modules import shared
 
                 p.schedule.begin(int(self.step), self.total_steps, shared.state.sampling_steps)
-                p.tracker.begin(int(self.step), x)
                 _prompts.clear()
-                tracked = True
+                if not p.schedule.idle:
+                    p.tracker.begin(int(self.step), x)
+                    tracked = True
             except Exception as e:
                 p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
         denoised = original(self, x, sigma, *args, **kwargs)

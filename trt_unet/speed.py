@@ -133,11 +133,12 @@ class Schedule:
         self.tolerance = tolerance(quality)
         self.index = None
         self.region = False  # this evaluation is between the start and end shares
+        self.idle = False  # the pass is too short for any shallow call
         self.kind = None  # "check", "probe" or None: what this evaluation's full calls also run the shallow engine for
         self._checked_at = -math.inf  # evaluation index of the latest check
         self.slot = 0
-        # (slot, key) -> [deep feature, evaluation index, the prompt it saw ((tensor, its norm) per prompt tensor), last
-        # evaluation index that used it]. key: (sample shape, reForge's cond_or_uncond, prompt shape, which scheduled
+        # (slot, key) -> [deep feature, evaluation index, the prompt it saw ([tensor, its norm once compare() needs it]
+        # per prompt tensor), last evaluation index that used it]. key: (sample shape, reForge's cond_or_uncond, prompt shape, which scheduled
         # prompts the evaluation used). With "Negative Guidance minimum sigma", every other evaluation drops the
         # unconds, so one slot alternates between two batch shapes; cond_or_uncond keeps a cond row from reusing an
         # uncond row's deep feature; and the prompts give a prompt edit ([a:b:0.5]) a full call, and each prompt of an
@@ -162,7 +163,8 @@ class Schedule:
             del self.deep[k]
 
     def _decide(self, index, total, steps) -> tuple:
-        if not total or not steps or steps < MIN_STEPS:
+        self.idle = not total or not steps or steps < MIN_STEPS
+        if self.idle:
             return False, None
         per = max(1, total // steps)
         # Samplers that call the UNet twice per step (Heun, DPM++ SDE, DPM++ 2S a) call it once at their last step, so
@@ -233,9 +235,12 @@ class Schedule:
         if kept is None:
             return
         moved = None
-        for t, (r, norm) in zip(prompt, kept[2]):
+        for t, reference in zip(prompt, kept[2]):
+            r = reference[0]
             if t is not None and r is not None:
-                m = torch.dist(t, r) / norm
+                if reference[1] is None:
+                    reference[1] = r.float().norm().clamp_min(1e-30)
+                m = torch.dist(t, r) / reference[1]
                 moved = m if moved is None else torch.maximum(moved, m)
         if moved is not None:
             self._readback.send(("move", (slot, key), kept[1]), moved)
@@ -247,8 +252,7 @@ class Schedule:
 
     def keep(self, slot: int, key: tuple, deep, prompt: tuple):
         if (slot, key) not in self.volatile:
-            prompt = [(t, t.float().norm().clamp_min(1e-30) if t is not None else None) for t in prompt]
-            self.deep[(slot, key)] = [deep, self.index, prompt, self.index]
+            self.deep[(slot, key)] = [deep, self.index, [[t, None] for t in prompt], self.index]
 
     def release(self):
         self.deep.clear()
