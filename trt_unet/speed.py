@@ -26,6 +26,8 @@ import math
 
 import torch
 
+from .common import Readback
+
 BRANCH = 0  # shallow engine = input blocks 0..BRANCH and the output blocks from deep_block(BRANCH) on
 INTERVAL = 3
 WARMUP = 0.4
@@ -135,8 +137,9 @@ class Schedule:
         self.shallow_calls = self.full_calls = 0
         self.latest = None  # (error, age) of the latest check read
         self.checks = []  # (index, age, error) of the checks read
-        self._pending = []  # (index, age, error in pinned memory, CUDA event) of checks not read yet
-        self._moves = []  # ((slot, key), deep feature's index, prompt movement in pinned memory, CUDA event)
+        # Checks' errors, tagged ("check", evaluation index, age), and prompt movements, tagged ("move", (slot, key), deep
+        # feature's index)
+        self._readback = Readback()
         # A prompt that moves again within STALE evaluations (an extension blending or alternating prompts every step)
         # is seen a call late each time, so its calls run in full for the rest of the pass.
         self._moved = {}  # (slot, key) -> evaluation index of the latest move read
@@ -169,23 +172,16 @@ class Schedule:
         return self.tolerance > 0 and self.latest is not None and drift(self.latest, age) <= self.tolerance
 
     def checked(self, error, age: int):
-        # The error is copied to pinned memory asynchronously and read once its event has completed, a call or more
-        # later, so the CPU never waits for the GPU here.
-        host = torch.empty((), dtype=torch.float32, pin_memory=True)
-        host.copy_(error.reshape(()), non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        self._pending.append((self.index, age, host, event))
+        self._readback.send(("check", self.index, age), error)
 
     def _collect(self):
-        while self._pending and self._pending[0][3].query():
-            index, age, host, _ = self._pending.pop(0)
-            error = float(host)
-            self.checks.append((index, age, error))
-            self.latest = (error, age)
-        while self._moves and self._moves[0][3].query():
-            where, origin, host, _ = self._moves.pop(0)
-            if float(host) <= MOVED:
+        for (kind, a, b), ((value,),) in self._readback.ready():
+            if kind == "check":
+                self.checks.append((a, b, value))
+                self.latest = (value, b)
+                continue
+            where, origin = a, b
+            if value <= MOVED:
                 continue
             if self.index - self._moved.get(where, -math.inf) <= STALE:
                 self.volatile.add(where)
@@ -224,13 +220,8 @@ class Schedule:
             if t is not None and r is not None:
                 m = torch.dist(t, r) / norm
                 moved = m if moved is None else torch.maximum(moved, m)
-        if moved is None:
-            return
-        host = torch.empty((), dtype=torch.float32, pin_memory=True)
-        host.copy_(moved, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        self._moves.append(((slot, key), kept[1], host, event))
+        if moved is not None:
+            self._readback.send(("move", (slot, key), kept[1]), moved)
 
     def ran_full(self):
         # A call the schedule gave a deep feature that the runtime ran in full instead
@@ -244,5 +235,4 @@ class Schedule:
 
     def release(self):
         self.deep.clear()
-        self._pending = []
-        self._moves = []
+        self._readback.clear()

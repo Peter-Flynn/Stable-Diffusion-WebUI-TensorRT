@@ -45,9 +45,14 @@ from collections import deque
 import numpy
 import torch
 
+from .common import Readback
+
 # SA-Solver's corrector uses the last 4 calls' denoised values and DPM++ 3M SDE's update the last 3; DPM++ SDE, DPM++
 # 2S a and Heun step from the x of 2 calls back.
 WINDOW = 4
+# CFG++ samplers step with the uncond denoised value of the current call and, for DPM++ 2M CFG++ and res_multistep
+# CFG++, the previous one: only the newest UNCOND calls' are columns of the fit.
+UNCOND = 2
 # Lag-1 autocorrelation / energy of the residual: ~1 / sqrt(pixels) for noise (under 0.01 at 512x512), near 1 for
 # image structure.
 WHITE = 0.1
@@ -73,12 +78,14 @@ FLOOR = 1e-7
 # Table points over log sigma, from sigma_min / 2 to sigma_max * 2: 0.0065 apart for a zero-terminal-SNR model
 # (sigma_max 4096), where linear interpolation of the smooth columns is exact to ~1e-5.
 GRID = 2048
+# The most evaluations between probes while they keep finding the fit failing (Tracker.probe)
+PROBES = 8
 # A latent scale alpha(sigma) below which a call's noise isn't removed: a flow model's first steps, near sigma = 1
 LATENT = 0.01
 # Engines record this; one built with another has a different shallow graph. Raise the version when shallow() changes.
-SIGNATURE = {"version": 10, "window": WINDOW, "grid": GRID}
+SIGNATURE = {"version": 11, "window": WINDOW, "uncond": UNCOND, "grid": GRID}
 
-IMAGES = [f"{name}{m}" for m in range(1, WINDOW + 1) for name in ("hx", "hr", "hd", "hu")]
+IMAGES = [f"{name}{m}" for m in range(1, WINDOW + 1) for name in ("hx", "hr", "hd", "hu")[: 4 if m <= UNCOND else 3]]
 VECTORS = [f"hv{m}" for m in range(1, WINDOW + 1)]
 INPUTS = ["x", "sigma", "tables", *IMAGES, *VECTORS]
 OUTPUTS = ["latent", "removed", "reason", "share"]
@@ -166,7 +173,9 @@ def shallow(run, sample, timesteps, inputs: dict):
     columns = []
     for m in range(1, WINDOW + 1):
         shadow = inputs[f"hx{m}"] - inputs[f"hr{m}"]
-        columns += [torch.where(_view(inputs[f"hv{m}"] < 0.5), shadow, torch.zeros_like(shadow)), inputs[f"hd{m}"], inputs[f"hu{m}"]]
+        columns += [torch.where(_view(inputs[f"hv{m}"] < 0.5), shadow, torch.zeros_like(shadow)), inputs[f"hd{m}"]]
+        if m <= UNCOND:
+            columns.append(inputs[f"hu{m}"])
     noise = _residual(x, columns)
     variance = (noise * noise).mean((1, 2, 3))
     excess = (variance - FLOOR * (x * x).mean((1, 2, 3))).clamp_min(0)
@@ -259,7 +268,8 @@ class Tracker:
         self.read = False  # a status has been read
         self.blocked = False  # the latest status read had noise left in on some image
         self.check = None  # (Entry, age, [full output rows], [checked rows]) until the denoiser's output is in
-        self._statuses = []  # (reasons and shares in pinned memory, CUDA event)
+        self._statuses = Readback()  # (reasons, shares) of shallow-graph runs
+        self._probe_at, self._probe_gap = 0, 1
         self._constants = {}
 
     def _constant(self, shape, value=0.0, dtype=torch.float32):
@@ -313,6 +323,15 @@ class Tracker:
             return False
         return any(p.index <= origin or p.origin == origin for p in self.history)
 
+    def probe(self, index: int) -> bool:
+        # Whether a call that runs in full because safe() refused also runs the shallow engine, whose status can show the
+        # fit working again. While statuses keep showing it failing, each probe waits twice as long as the last (up to
+        # PROBES evaluations), so a pass the fit can't follow costs little more than one without Speed Hacks.
+        if index < self._probe_at:
+            return False
+        self._probe_at, self._probe_gap = index + self._probe_gap, min(2 * self._probe_gap, PROBES)
+        return True
+
     def inputs(self, entry, origin, sample) -> dict:
         if entry is None:
             return self._untracked(sample)
@@ -321,17 +340,17 @@ class Tracker:
         zeros, known, unknown = self._constant((n, c, h, w)), self._constant((n,)), self._constant((n,), 1.0)
         past = list(self.history)[::-1]
         for m in range(1, WINDOW + 1):
-            if m > len(past):
-                values.update({f"hx{m}": zeros, f"hr{m}": zeros, f"hv{m}": unknown, f"hd{m}": zeros, f"hu{m}": zeros})
-                continue
-            p = past[m - 1]
-            if p.index <= origin:
-                removed, valid = zeros, known
+            p = past[m - 1] if m <= len(past) else None
+            if p is None:
+                values.update({f"hx{m}": zeros, f"hr{m}": zeros, f"hv{m}": unknown, f"hd{m}": zeros})
+            elif p.index <= origin:
+                values.update({f"hx{m}": p.x, f"hr{m}": zeros, f"hv{m}": known, f"hd{m}": p.denoised})
             elif p.origin == origin and p.removed is not None:
-                removed, valid = p.removed, p.reason
+                values.update({f"hx{m}": p.x, f"hr{m}": p.removed, f"hv{m}": p.reason, f"hd{m}": p.denoised})
             else:
-                removed, valid = zeros, unknown
-            values.update({f"hx{m}": p.x, f"hr{m}": removed, f"hv{m}": valid, f"hd{m}": p.denoised, f"hu{m}": p.uncond if p.uncond is not None else zeros})
+                values.update({f"hx{m}": p.x, f"hr{m}": zeros, f"hv{m}": unknown, f"hd{m}": p.denoised})
+            if m <= UNCOND:
+                values[f"hu{m}"] = p.uncond if p is not None and p.uncond is not None else zeros
         return values
 
     def _untracked(self, sample) -> dict:
@@ -356,20 +375,15 @@ class Tracker:
         self.status(outputs)
 
     def status(self, outputs: dict):
-        host = torch.empty((2, outputs["share"].shape[0]), dtype=torch.float32, pin_memory=True)
-        host[0].copy_(outputs["reason"], non_blocking=True)
-        host[1].copy_(outputs["share"], non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        self._statuses.append((host, event))
+        self._statuses.send(None, outputs["reason"], outputs["share"])
 
     def _collect(self):
-        while self._statuses and self._statuses[0][1].query():
-            host, _ = self._statuses.pop(0)
-            reasons, shares = host.tolist()
+        for _, (reasons, shares) in self._statuses.ready():
             self.read = True
             self.noisy = self.noisy or any(s > NOISY for s in shares)
             self.blocked = any(r > 0 for r in reasons)
+            if not self.blocked:
+                self._probe_at, self._probe_gap = 0, 1
 
     def add_check(self, entry, full, checked, age: int):
         if self.check is None or self.check[0] is not entry:
@@ -392,7 +406,7 @@ class Tracker:
             # sigma, and the fit in PyTorch until a status says whether the pass adds noise
             entry.x = x.to(torch.float32, memory_format=torch.contiguous_format, copy=True)
             entry.sigma = sigma.reshape(-1).to(torch.float32).expand(entry.shape[0]).clone(memory_format=torch.contiguous_format)
-            if not self.read and not self._statuses:
+            if not self.read and not self._statuses.pending:
                 self._measure(entry)
         if eps:
             entry.denoised = entry.x - entry.sigma.reshape(-1, 1, 1, 1) * output.float()
@@ -406,8 +420,8 @@ class Tracker:
 
     def _measure(self, entry):
         columns = []
-        for p in self.history:
-            columns += [p.x, p.denoised] + ([p.uncond] if p.uncond is not None else [])
+        for m, p in enumerate(reversed(self.history), 1):
+            columns += [p.x, p.denoised] + ([p.uncond] if p.uncond is not None and m <= UNCOND else [])
         if not columns:
             return
         noise = _residual(entry.x, columns)

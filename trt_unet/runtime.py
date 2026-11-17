@@ -755,9 +755,10 @@ class Pass:
                 entry = self.tracker.call(feed["sample"], b)
                 if deep is not None and not self.tracker.safe(entry, origin):
                     # Noise the fit can't remove for this call, or for a call the fit can't follow, noise not yet ruled
-                    # out. It runs in full, and a tracked one also runs the shallow engine as a probe: a status without
-                    # that noise lets later calls run shallow again.
-                    stale, kind, deep, origin = (deep, origin), "probe", None, None
+                    # out. It runs in full, and a tracked one may also probe (fresh.Tracker.probe).
+                    probe = entry is not None and self.tracker.probe(self.schedule.index)
+                    stale, kind = ((deep, origin), "probe") if probe else (None, None)
+                    deep = origin = None
                     self.schedule.ran_full()
                 if deep is not None:
                     self.schedule.compare(slot, key, prompt)

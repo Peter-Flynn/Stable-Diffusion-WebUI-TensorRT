@@ -1,3 +1,4 @@
+import collections
 import functools
 import json
 import logging
@@ -25,6 +26,37 @@ def notify(message: str, error: BaseException = None):
         gr.Warning(f"TensorRT: {message}")
     except Exception:
         pass
+
+
+class Readback:
+    # GPU values read on the CPU without a sync: send() copies them to pinned memory and records an event, and ready()
+    # yields (tag, rows) for each send whose event has completed, in the order sent. Read buffers and events are reused.
+    def __init__(self):
+        self._pending = collections.deque()  # (tag, pinned rows, event)
+        self._spare = {}  # rows' shape -> [(pinned rows, event)]
+
+    def send(self, tag, *values):
+        shape = (len(values), values[0].numel())
+        spare = self._spare.get(shape)
+        host, event = spare.pop() if spare else (torch.empty(shape, dtype=torch.float32, pin_memory=True), torch.cuda.Event())
+        for row, value in zip(host, values):
+            row.copy_(value.reshape(-1), non_blocking=True)
+        event.record()
+        self._pending.append((tag, host, event))
+
+    def ready(self):
+        while self._pending and self._pending[0][2].query():
+            tag, host, event = self._pending.popleft()
+            rows = host.tolist()
+            self._spare.setdefault(tuple(host.shape), []).append((host, event))
+            yield tag, rows
+
+    @property
+    def pending(self) -> bool:
+        return bool(self._pending)
+
+    def clear(self):
+        self._pending.clear()
 
 
 generation = 0
