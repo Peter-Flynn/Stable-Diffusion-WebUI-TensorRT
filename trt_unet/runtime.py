@@ -626,11 +626,13 @@ class Pass:
         before = model.__dict__.get("apply_model")
         original = model.apply_model
 
-        def apply_model(x, t, *args, **kwargs):
+        def apply_model(*args, **kwargs):
             if self.schedule is not None:
                 with self._speed_hacks():
+                    x = args[0] if args else kwargs.get("x")
+                    t = args[1] if len(args) > 1 else kwargs.get("t")
                     self.tracker.see(x, t)
-            return original(x, t, *args, **kwargs)
+            return original(*args, **kwargs)
 
         apply_model._trt_before = before
         model.apply_model = apply_model
