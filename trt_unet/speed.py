@@ -13,10 +13,13 @@
 # error that shallow call would have made, for any sampler. Due full calls wait while drift(), the error the shallow
 # calls since the deep feature's call are predicted to have made in total, stays within tolerance(quality). The
 # tolerance is a fixed amount of error (relative to the denoised value's norm), not one relative to other checks, so the
-# start and end shares don't change what a quality means. Only a sampler step's first denoiser call is checked, in all
-# of its UNet calls: DPM++ SDE and Heun call the denoiser twice per step (reForge's total_steps / steps), at points
-# whose errors aren't comparable. The last full call before the first shallow one also runs the shallow engine (a
-# "probe"), whose status tells fresh.Tracker whether the sampler adds noise before any shallow call runs.
+# start and end shares don't change what a quality means. Checks cost a shallow call each and errors change slowly along
+# a pass, so a due full call checks only once the latest check is CHECKS steps old, or 3 times that while the latest put
+# waiting far out of reach (drift at age INTERVAL above FAR times the tolerance). Only a sampler step's first denoiser
+# call is checked, in all of its UNet calls: DPM++ SDE and Heun call the denoiser twice per step (reForge's total_steps
+# / steps), at points whose errors aren't comparable. The last full call before the first shallow one also runs the
+# shallow engine (a "probe"), whose status tells fresh.Tracker whether the sampler adds noise before any shallow call
+# runs.
 #
 # Measurements behind the constants: SDXL (novaOrangeXL v1.4, 1024x1024, CFG 3), Euler, Euler a, DPM++ 2M, 2M SDE,
 # 3M SDE, SDE and Heun, Karras/Simple/Exponential/SGM Uniform, 20 to 100 steps, 3 prompts; every call's shallow error
@@ -34,6 +37,11 @@ WARMUP = 0.4
 TAIL = 0.05
 QUALITY = 0.9
 MIN_STEPS = 12
+# Check spacing (see the header). Backtested on the measurements below with every check's error read at once: at any
+# accumulated error, as cheap or cheaper than a check at every due full call (1.5-4.3% less at quality 0.9-0.95 for a
+# shallow call costing 3-10% of a full one), with 3.3 checks per pass at quality 0.9 instead of 8.6.
+CHECKS = 4
+FAR = 2
 # A kept deep feature no call has used for this many evaluations is dropped (the old prompt's, after a prompt edit).
 STALE = 8
 # A prompt that moved by more than this share of its norm since the deep feature's call makes the next call full.
@@ -126,6 +134,7 @@ class Schedule:
         self.index = None
         self.region = False  # this evaluation is between the start and end shares
         self.kind = None  # "check", "probe" or None: what this evaluation's full calls also run the shallow engine for
+        self._checked_at = -math.inf  # evaluation index of the latest check
         self.slot = 0
         # (slot, key) -> [deep feature, evaluation index, the prompt it saw ((tensor, its norm) per prompt tensor), last
         # evaluation index that used it]. key: (sample shape, reForge's cond_or_uncond, prompt shape, which scheduled
@@ -163,7 +172,14 @@ class Schedule:
             return False, "probe"
         if index < start or index >= end:
             return False, None
-        return True, "check" if 0 < self.tolerance < math.inf and index % per == 0 else None
+        return True, "check" if 0 < self.tolerance < math.inf and index % per == 0 and self._check_due(index, per) else None
+
+    def _check_due(self, index, per) -> bool:
+        gap = index - self._checked_at
+        if gap < CHECKS * per:
+            return False
+        far = self.latest is not None and drift(self.latest, INTERVAL) > FAR * self.tolerance
+        return not far or gap >= 3 * CHECKS * per
 
     def _wait(self, age: int) -> bool:
         # Whether a call may reuse a deep feature computed age evaluations ago
@@ -172,6 +188,7 @@ class Schedule:
         return self.tolerance > 0 and self.latest is not None and drift(self.latest, age) <= self.tolerance
 
     def checked(self, error, age: int):
+        self._checked_at = self.index
         self._readback.send(("check", self.index, age), error)
 
     def _collect(self):
