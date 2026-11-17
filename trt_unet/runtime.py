@@ -747,7 +747,7 @@ class Pass:
                 self.fall_back(f"Couldn't load the {record.arch.name} {record.label} ({e})", _unexpected(e))
         stream = torch.cuda.current_stream().cuda_stream
         hack = None
-        if self.schedule is not None and self.model.shallow_loaded:
+        if self.schedule is not None and not self.schedule.idle and self.model.shallow_loaded:
             with self._speed_hacks():
                 prompt = (feed["encoder_hidden_states"], feed.get("y"))
                 key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()), tuple(prompt[0].shape), tuple(_prompts))
