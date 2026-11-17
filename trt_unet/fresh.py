@@ -231,8 +231,7 @@ def example_inputs(sample, channels: int) -> list:
 
 
 def input_shapes(unet_shapes: dict, channels: int) -> dict:
-    # Images range from 1 to the profile's most UNet rows: a sampler without uncond sends one row per image, and
-    # Tracker.inputs sends one image per row for a call it doesn't track.
+    # Images range from 1 to the profile's most UNet rows: a sampler without uncond sends one row per image.
     (r_lo, _, h_lo, w_lo), (r_opt, _, h_opt, w_opt), (r_hi, _, h_hi, w_hi) = unet_shapes["sample"]
     i_opt = max(1, r_opt // 2)
     image = [[1, channels, h_lo, w_lo], [i_opt, channels, h_opt, w_opt], [r_hi, channels, h_hi, w_hi]]
@@ -354,12 +353,13 @@ class Tracker:
         return values
 
     def _untracked(self, sample) -> dict:
-        # One image per UNet row, all zeros, for which shallow() returns the plain shallow UNet's output (reason 1)
-        rows, _, h, w = sample.shape
-        image = self._constant((rows, self.channels, h, w))
-        values = {"x": image, "sigma": self._constant((rows,), 1.0), "tables": self.tables}
+        # One image of zeros, which every UNet row is a block of: the rows fail the gate, so shallow() returns the plain
+        # shallow UNet's output, after fitting that one image rather than one per row
+        _, _, h, w = sample.shape
+        image = self._constant((1, self.channels, h, w))
+        values = {"x": image, "sigma": self._constant((1,), 1.0), "tables": self.tables}
         values.update({name: image for name in IMAGES})
-        values.update({name: self._constant((rows,), 1.0) for name in VECTORS})
+        values.update({name: self._constant((1,), 1.0) for name in VECTORS})
         return values
 
     def after_call(self, entry, out, cond_or_uncond):
