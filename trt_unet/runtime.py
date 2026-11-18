@@ -95,7 +95,7 @@ class TrtModel:
         total = 0
         for role in ("unet", "shallow") if shallow else ("unet",):
             blob = kept.blobs.get(role) if kept is not None else None
-            total += memoryview(blob).nbytes if blob is not None else self._serialized_size(role)
+            total += blob.nbytes if blob is not None else self._serialized_size(role)
         return total
 
     def model_size(self):
@@ -194,14 +194,19 @@ class TrtModel:
         blob = kept.blobs.get(role) if kept is not None else None
         self.applied.pop(role, None)
         if blob is not None:
-            try:
-                seconds = engine.load(blob)
-                self.applied[role] = dict(kept.signatures[role])
-                return seconds
-            except Exception as e:
-                logger.debug(f"Couldn't load the {self.name} from RAM ({e}); loading its plan and refitting it instead.")
-                refits.drop(self.record.key, role)
-                engine.unload()
+            with blob.open() as serialized:
+                if serialized is None:
+                    logger.debug(f"The system took back RAM the {self.name} was kept in; loading its plan and refitting it instead.")
+                    refits.drop(self.record.key, role)
+                else:
+                    try:
+                        seconds = engine.load(serialized)
+                        self.applied[role] = dict(kept.signatures[role])
+                        return seconds
+                    except Exception as e:
+                        logger.debug(f"Couldn't load the {self.name} from RAM ({e}); loading its plan and refitting it instead.")
+                        refits.drop(self.record.key, role)
+                        engine.unload()
         return engine.load()
 
     def _kept(self):
@@ -222,9 +227,12 @@ class TrtModel:
             return
         key, label = self.record.key, self.name
         entry = refits.get(key)
-        if entry is not None and entry.signatures.get("unet") != self.applied["unet"]:
-            refits.drop(key)
-            entry = None
+        if entry is not None:
+            if entry.signatures.get("unet") != self.applied["unet"]:
+                refits.drop(key)
+            for role in [role for role, blob in entry.blobs.items() if not blob.intact()]:
+                refits.drop(key, role)
+            entry = refits.get(key)
         todo = [role for role in loaded if entry is None or entry.signatures.get(role) != self.applied[role]]
         if not todo:
             return
@@ -235,8 +243,15 @@ class TrtModel:
         torch.cuda.current_stream().synchronize()
         blobs = dict(entry.blobs) if entry is not None else {}
         signatures = dict(entry.signatures) if entry is not None else {}
-        for role in todo:
-            blobs[role], signatures[role] = loaded[role].serialize(), dict(self.applied[role])
+        made = []
+        try:
+            for role in todo:
+                made.append(refits.store(loaded[role].serialize))
+                blobs[role], signatures[role] = made[-1], dict(self.applied[role])
+        except BaseException:
+            for blob in made:
+                blob.free()
+            raise
         kept = refits.Kept(signatures, blobs, label, self._source())
         refits.put(key, kept)
         count, total = refits.held()

@@ -31,7 +31,7 @@ HELP = """
 - *Per-profile engines* – one engine per profile, loaded as needed. Only one is loaded at a time, using about as much VRAM as the checkpoint's UNet. Each batch starts on the engine that fits it best, and stays on it for any later pass (ex. Hires. fix) it covers.
 - *Merged engine* – every profile in one engine, which never needs swapping, but holds every profile's share of TensorRT's memory at once.
 
-Swapped-out engines are kept in RAM (with their weights) when there's room to spare, making them quick to bring back.
+Swapped-out engines are kept in RAM (with their weights) when there's room to spare, making them quick to bring back. The system takes that RAM back whenever it needs it.
 
 **Build engines** builds an engine for each profile without one, and deletes those of removed profiles. A merged engine is rebuilt whenever the profiles change.
 
