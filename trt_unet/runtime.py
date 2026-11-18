@@ -230,8 +230,9 @@ class TrtModel:
         if entry is not None:
             if entry.signatures.get("unet") != self.applied["unet"]:
                 refits.drop(key)
-            for role in [role for role, blob in entry.blobs.items() if not blob.intact()]:
-                refits.drop(key, role)
+            else:
+                for role in [role for role, blob in entry.blobs.items() if not blob.intact()]:
+                    refits.drop(key, role)
             entry = refits.get(key)
         todo = [role for role in loaded if entry is None or entry.signatures.get(role) != self.applied[role]]
         if not todo:

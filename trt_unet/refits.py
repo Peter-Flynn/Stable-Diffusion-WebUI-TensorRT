@@ -103,6 +103,8 @@ class _Memory:
 
 
 class _LinuxMemory(_Memory):
+    pagemap = True  # whether /proc/self/pagemap shows which pages are in RAM; _probe() checks
+
     def __init__(self, nbytes: int):
         super().__init__(nbytes)
         self._map = mmap.mmap(-1, self.size, flags=mmap.MAP_PRIVATE, prot=mmap.PROT_READ | mmap.PROT_WRITE)
@@ -169,13 +171,14 @@ class _LinuxMemory(_Memory):
         if self._freed:
             return
         self._freed = True
+        self._saved = None
         try:
             self._map.close()
         except BufferError:  # a view of it is still referenced somewhere: return its pages, unmapped once that's gone
             self._map.madvise(_MADV_DONTNEED)
 
     def resident(self) -> int:
-        if self.freed or self._open:
+        if self.freed or self._open or not self.pagemap:
             return super().resident()
         want, raw = self.size // PAGE * 8, b""
         try:
@@ -270,6 +273,7 @@ def _probe() -> tuple:
             memory = _LinuxMemory(len(sample))
             try:
                 memory.fill(sample)
+                _LinuxMemory.pagemap = memory.resident() == memory.size
                 with memory.open() as data:
                     whole = data is not None and data.tobytes() == sample
             finally:
@@ -562,23 +566,11 @@ def _trim_commit() -> int:
 
 
 def trim() -> int:
-    gone = []  # (what, its memory, why)
     with _lock:
-        for key, entry in list(_kept.items()):
-            if entry.orphaned:
-                gone.append((f"the {entry.label}", list(_kept.pop(key).blobs.values()), "its checkpoint isn't loaded anymore"))
-                continue
-            lost = [role for role, memory in entry.blobs.items() if not memory.intact()]
-            if "unet" in lost:
-                gone.append((f"the {entry.label}", list(_kept.pop(key).blobs.values()), "the system took back part of it"))
-                continue
-            for role in lost:
-                entry.signatures.pop(role, None)
-                gone.append((f"the Speed Hacks part of the {entry.label}", [entry.blobs.pop(role)], "the system took back part of it"))
-    for what, memories, why in gone:
-        logger.debug(f"Dropped {what} from RAM ({gib(sum(memory.nbytes for memory in memories))}): {why}.")
-        for memory in memories:
-            memory.free()
+        gone = [_kept.pop(key) for key, entry in list(_kept.items()) if entry.orphaned]
+    for entry in gone:
+        logger.debug(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}): its checkpoint isn't loaded anymore.")
+        entry.free()
     dropped = len(gone)
     if _supported()[0] is _WindowsMemory:
         try:

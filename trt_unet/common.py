@@ -262,7 +262,7 @@ def _ram() -> str:
     if count:
         left = refits.resident()
         still = f", {gib(left)} of it still there" if left < nbytes else ""
-        parts.append(f"{count} engine{'s' if count > 1 else ''} kept in RAM the system can take back ({gib(nbytes)}{still})")
+        parts.append(f"{count} engine{'s' if count > 1 else ''} kept ({gib(nbytes)}{still}), counted as free")
     _, pinned, _ = strips.host_memory()
     if pinned:
         parts.append(f"{gib(pinned)} for VAE strips")
