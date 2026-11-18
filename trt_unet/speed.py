@@ -7,8 +7,9 @@
 # prompt edit gets a full call, and each prompt of an alternation its own deep feature. The noise ancestral and SDE
 # samplers add: fresh.py, in the shallow engine.
 #
-# Waiting (in place of AdaptiveDiffusion, Ye et al., 2024, whose test of how smoothly x moves reads that noise as
-# roughness, so it never passed with those samplers): a due full call also runs the shallow engine as the shallow call
+# Waiting (in place of AdaptiveDiffusion, Ye et al., 2024, whose test of how smoothly x moves reads DeepCache's own
+# call-to-call unevenness, and the noise of ancestral and SDE samplers, as roughness: in the measurements below it never
+# passed where it would have let a full call wait): a due full call also runs the shallow engine as the shallow call
 # at its index would have, on the deep feature it replaces (a "check", the cost of a shallow call), which gives the
 # error that shallow call would have made, for any sampler. Due full calls wait while drift(), the error the shallow
 # calls since the deep feature's call are predicted to have made in total, stays within tolerance(quality). The
@@ -21,10 +22,11 @@
 # shallow engine (a "probe"), whose status tells fresh.Tracker whether the sampler adds noise before any shallow call
 # runs.
 #
-# Measurements behind the constants: SDXL (novaOrangeXL v1.4, 1024x1024, CFG 3), Euler, Euler a, DPM++ 2M, 2M SDE,
-# 3M SDE, SDE and Heun, Karras/Simple/Exponential/SGM Uniform, 20 to 100 steps, 3 prompts; every call's shallow error
-# against the full UNet's output at the same x, on runs with DeepCache every 3rd and 6th call and with every call
-# shallow between the start and end shares.
+# Measurements behind the constants: SDXL (novaOrangeXL v1.4, 1024x1024, CFG 1, 3 and 7), Euler, Euler a, DPM++ 2M,
+# 2M SDE, 3M SDE, SDE and Heun, Karras/Simple/Exponential/SGM Uniform, 20/30/40/50/70/100 steps, 3 prompts; every
+# call's shallow error against the full UNet's output at the same x, on runs with DeepCache every 3rd and 6th call and
+# with every call shallow between the start and end shares. The backtests replay those errors through this schedule
+# with a start share of 0.4.
 import math
 
 import torch
@@ -37,9 +39,9 @@ WARMUP = 0.4
 TAIL = 0.05
 QUALITY = 0.9
 MIN_STEPS = 12
-# Check spacing (see the header). Backtested on the measurements below with every check's error read at once: at any
-# accumulated error, as cheap or cheaper than a check at every due full call (1.5-4.3% less at quality 0.9-0.95 for a
-# shallow call costing 3-10% of a full one), with 3.3 checks per pass at quality 0.9 instead of 8.6.
+# Check spacing (see the header). Backtested: at any accumulated error, within 0.03% of or cheaper than a check at
+# every due full call (up to 1% less near quality 0.9 for a shallow call costing 3-10% of a full one), with 4.5 checks
+# per pass at quality 0.9 instead of 7.8.
 CHECKS = 4
 FAR = 2
 # A kept deep feature no call has used for this many evaluations is dropped (the old prompt's, after a prompt edit).
@@ -48,21 +50,21 @@ STALE = 8
 MOVED = 0.01
 
 
-# A shallow call's error grew as age ** 0.42 (deterministic samplers) and age ** 0.25 (ancestral and SDE) from age 3 to
-# 12 in the measurements: 0.5 slightly over-predicts both.
+# A shallow call's error grew as age ** 0.5-0.8 (deterministic samplers, more at more steps) and age ** 0.25-0.4
+# (ancestral and SDE) from age 3 to 6 in the measurements. Backtested, any exponent from 0.35 to 0.8 changed the cost
+# at a given accumulated error by under 0.3%.
 AGE_EXPONENT = 0.5
 
 
 def tolerance(quality: float) -> float:
-    # The drift() a stretch may reach before a full call. 1.9 * (1 - q) / q, fitted to the measurements: at 30 steps
-    # with 10% of steps full at the start, it keeps the share of full calls between the start and end shares near
-    # quality times DeepCache's (1 in INTERVAL); at more steps, where calls change less, it runs fewer (0.9 runs 5% fewer
-    # full calls than 1 at 30 steps, 19% at 100). Of c * ((1 - q) / q) ** p, p = 1 fitted best.
+    # The drift() a stretch may reach before a full call. Fitted on the backtests: at 30 steps, quality q skips about
+    # 1 - q of the full calls between the start and end shares that quality 0 skips; at more steps, where calls change
+    # less, more of them (0.9: 8% at 30 steps, 17% at 50, 27% at 100).
     if quality >= 1:
         return 0.0
     if quality <= 0:
         return math.inf
-    return 1.9 * (1 - quality) / quality
+    return 1.5 * ((1 - quality) / quality) ** (2 / 3)
 
 
 def drift(check: tuple, age: int) -> float:
