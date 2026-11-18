@@ -23,19 +23,25 @@ SETTLED = threading.Event()
 MODE_LABELS = {store.PER_PROFILE: "Per-profile engines", store.MERGED: "Merged engine"}
 MERGED_VRAM, MERGED_RAM = 24, 64
 HELP = """
-**Engines** are compiled for a UNet architecture, not a checkpoint: every checkpoint with that architecture (fine-tunes, merges, v-prediction ones) runs on the same engines with its own weights, LoRAs included. Engine files hold no weights.
+**Engines** are built per architecture, rather than per checkpoint. They hold no weights – those of the loaded checkpoint, and LoRAs are loaded into them, so every checkpoint of the same architecture (fine-tunes, merges, v-prediction models) uses the same engines.
 
-**Profiles** are the image sizes, batch sizes and prompt lengths the engines run. TensorRT tunes each profile for its optimal values and accepts anything from min to max; narrower ranges build faster and can run a little faster. Anything no profile covers, and ControlNet or other UNet patches, runs on PyTorch.
+**Profiles** set the resolutions, batch sizes, and prompt lengths the engines are built for. Each is tuned for its optimal values, and accepts anything from min to max – narrower ranges build faster, and can run slightly faster. Anything unsupported by the engines (ControlNet, UNet patches like FreeU, sizes outside every profile) is run on PyTorch instead, with a notice.
 
-**Per-profile engines** (the engine mode, above) are one engine per profile. Only one is loaded at a time, taking about as much VRAM as the checkpoint's UNet. Each batch starts on the engine whose profile fits it best, and its later passes (e.g. Hires. fix) stay on that engine while it covers their sizes; a pass it doesn't cover loads the engine of a profile that does. An engine that makes way for another is kept in RAM with its weights while RAM allows, so it comes back for the same checkpoint and LoRAs without refitting them. **A merged engine** holds every profile, so passes in any of their sizes run without loading another engine, but it takes every profile's share of TensorRT's memory at once.
+**Engine modes** are chosen on first build, and can only be changed while no engines exist:
+- *Per-profile engines* – one engine per profile, loaded as needed. Only one is loaded at a time, using about as much VRAM as the checkpoint's UNet. Each batch starts on the engine that fits it best, and stays on it for any later pass (ex. Hires. fix) it covers.
+- *Merged engine* – every profile in one engine, which never needs swapping, but holds every profile's share of TensorRT's memory at once.
 
-**Building** makes the engines match the profiles: per-profile, it builds the profiles that have no engine yet, one at a time, and deletes the engines of profiles that are gone; merged, it builds the engine again whenever the profiles change.
+Swapped-out engines are kept in RAM (with their weights) when there's room to spare, making them quick to bring back.
 
-**SD Unet** (Settings, Stable Diffusion) decides when engines run: `Automatic` uses the engines of the loaded checkpoint's architecture, `Speed Hacks` uses them with Speed Hacks, `None` always uses PyTorch.
+**Build engines** builds an engine for each profile without one, and deletes those of removed profiles. A merged engine is rebuilt whenever the profiles change.
 
-**The VAE** gets engines too, for its decoder and its encoder, built with the UNet's for the sizes its profiles cover. Those that take a whole image run in the precision reForge runs the VAE in (BF16 where the GPU has it, else FP32). Larger decodes (a Hires. fix's) run in strips on engines of their own, in FP16 on GPUs without BF16: half the VRAM, the VAE scaled down by a power of two between its normalizations so none overflows there. A decode takes the first way there can be room for: whole beside the UNet engine, in strips beside it, then either with the UNet engine evicted. It's the same image either way. Encodes (img2img's and inpainting's images, a Hires. fix's upscaled one) run on the encoder's engines the same way. PyTorch does the rest.
+**SD Unet** (in **Settings → Stable Diffusion**) chooses what runs the UNet: `Automatic` (the default) uses the engines, `Speed Hacks` uses them with Speed Hacks, and `None` returns to PyTorch. It's also an axis of the X/Y/Z plot script.
 
-**Speed Hacks** run about half of the denoising steps on a small part of the UNet, reusing what the rest of it computed a step or two before (DeepCache). With samplers that add noise every step (ancestral ones like Euler a, and SDE ones), that part finds the new noise and treats it as noise, so it doesn't become image content. The first 15% and last 5% of steps run in full, so composition and detail stay close. **Quality** sets how long full steps may wait beyond that: some full steps also measure how far off the shortcut would have been there, and later ones wait while the error built up since the last full step stays within what the quality allows, so they wait longer where the image changes slowly and at higher step counts. At 1 none wait; at 0.9 they wait only where the image changes very slowly, more so in passes of many steps, as with AdaptiveDiffusion; lower, like the default 0.8, trades fine detail for speed, down to no full steps between those shares at 0, which looks noticeably soft. All three are in Settings, Stable Diffusion, TensorRT, and in the X/Y/Z plot script. Passes of 12 steps or more should run roughly 1.8x faster than on the engines alone (an estimate), with slightly less precise images: a seed gives a somewhat different image than without them. Every engine is built ready for them, which should add about 10-20% to a build.
+**The VAE**'s encoder, and decoder get engines too, built alongside the UNet's for the sizes its profiles cover. Whole images run in the precision reForge uses for the VAE (BF16, or FP32 on GPUs without it). Large decodes (ex. Hires. fix) are split into strips on engines of their own to save VRAM, with identical results – in FP16 on GPUs without BF16, with the VAE scaled down between its normalizations so nothing overflows. Each decode, and encode takes the first of these with room: whole, in strips, then either with the UNet's engine unloaded – otherwise, it runs on PyTorch.
+
+**Speed Hacks** implement [DeepCache](https://github.com/horseee/DeepCache) – about half of the denoising steps are computed by a small engine of the UNet's outermost blocks, using cached deep features from a recent full step. With samplers that add noise every step (ex. Euler a, and SDE samplers), that noise is separated out first, so the small engine doesn't turn it into image content. Generations of 12 steps or more are roughly 1.8x faster (estimated), but images differ slightly from those made without Speed Hacks, even with the same seed. Generations with fewer steps are unaffected. Every engine is built ready for them, adding about 10–20% to a build.
+
+The first 15%, and last 5% of steps are always computed in full, as they determine composition, and fine detail. In between, **quality** sets how long a full step may wait: some full steps also measure the small engine's error, and later ones wait while the error built up since the last full step stays within what the quality allows – longer where the image changes slowly, and at higher step counts. At `1`, none wait; at `0.9`, they wait only where the image changes very slowly; lower values (the default is `0.8`) trade fine detail for speed, down to no full steps in between at `0`, which looks noticeably soft. All three are adjustable in **Settings → Stable Diffusion → TensorRT**, and in the X/Y/Z plot script.
 """
 
 
@@ -561,8 +567,10 @@ def on_ui_settings():
 
 def add_xyz_axes():
     # reForge's X/Y/Z plot script lists its axes in its module's axis_options. apply_override puts a value in
-    # p.override_settings, which processing.process_images applies for that generation and restores after.
-    from modules import scripts
+    # p.override_settings, which processing.process_images applies for that generation and restores after. runtime reads
+    # SD Unet from shared.opts at each pass, and process_images_inner calls sd_unet.apply_unet() every generation for
+    # other extensions' SD Unet options, so an overridden SD Unet takes effect.
+    from modules import scripts, shared_items
 
     from . import runtime
 
@@ -577,6 +585,18 @@ def add_xyz_axes():
     ):
         if label not in labels:
             xyz.axis_options.append(xyz.AxisOption(label, kind, xyz.apply_override(key)))
+    if "SD Unet" not in labels:
+        def confirm(p, xs):
+            known = shared_items.sd_unet_items()
+            for x in xs:
+                if x not in known:
+                    raise RuntimeError(f"Unknown SD Unet: {x}")
+
+        # cost 0.5 (UniPC Order's) makes it an outer loop around free axes like Steps: switching to or from None loads a
+        # different UNet
+        xyz.axis_options.append(xyz.AxisOption(
+            "SD Unet", str, xyz.apply_override("sd_unet"), confirm=confirm, cost=0.5, choices=shared_items.sd_unet_items,
+        ))
 
 
 def on_ui_tabs():
