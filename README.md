@@ -74,10 +74,10 @@ profile) is run on PyTorch instead, with a notice.
 ### Speed Hacks
 Implements [DeepCache][] – about half of the denoising steps are computed by a small engine of the
 UNet's outermost blocks, using cached deep features from a recent full step. Generations of 12 steps
-or more are roughly 1.6x faster (estimated), but images differ slightly from those made without
+or more are roughly 1.8x faster (estimated), but images differ slightly from those made without
 Speed Hacks, even with the same seed. Generations with fewer steps are unaffected.
 
-The first 40%, and last 5% of steps are always computed in full, as they determine composition, and
+The first 15%, and last 5% of steps are always computed in full, as they determine composition, and
 fine detail. Both are adjustable in **Settings → Stable Diffusion → TensorRT**, along with a quality
 setting that trades fine detail for speed.
 

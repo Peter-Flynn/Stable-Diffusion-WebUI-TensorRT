@@ -35,9 +35,9 @@ from .common import Readback
 
 BRANCH = 0  # shallow engine = input blocks 0..BRANCH and the output blocks from deep_block(BRANCH) on
 INTERVAL = 3
-WARMUP = 0.4
+WARMUP = 0.15
 TAIL = 0.05
-QUALITY = 0.9
+QUALITY = 0.8
 MIN_STEPS = 12
 # Check spacing (see the header). Backtested: at any accumulated error, within 0.03% of or cheaper than a check at
 # every due full call (up to 1% less near quality 0.9 for a shallow call costing 3-10% of a full one), with 4.5 checks
