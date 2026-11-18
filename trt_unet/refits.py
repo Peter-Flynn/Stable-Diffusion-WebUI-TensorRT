@@ -2,30 +2,33 @@
 # every one. So an engine is serialized with its weights before it unloads, and a later load for the same weights
 # (same checkpoint, same LoRAs) deserializes that instead. A kept engine is about the size of its weights (GBs).
 #
-# The OS decides how long a kept engine stays. Each is held in memory the OS may take back whenever it needs RAM, without
-# writing it anywhere, and is checked to be whole before each use: an engine missing any page is dropped, and the load
-# refits instead. Nothing here reads memory pressure: the OS takes back what it needs.
-#   Linux: a private anonymous mapping released with MADV_FREE (Linux 4.5 on). The kernel reclaims such pages like
-#     file pages, without swapping them, and only as many as it needs: on Linux 6.18 (without MGLRU) under a memory
-#     cgroup's limit, it took them from the oldest mapping first. Linux before 4.12 without swap frees them at once,
-#     which _probe() detects. A page the kernel took back reads as zeros, so each page's first two 8-byte words are
-#     replaced by markers, the originals kept in _saved. Before use, the first words are checked and restored: writing a
-#     page takes it back from the kernel. The second words are then checked and restored, which catches a page taken
-#     between the first check and that write (the write lands on a fresh zero page). After use, the markers go back and
-#     the mapping is released again.
+# The OS decides how long a kept engine stays. Each is held in memory the OS may take back whenever it needs RAM,
+# without writing it anywhere, and is checked to be whole before each use: an engine missing any page is dropped, and
+# the load refits instead. Nothing here reads memory pressure: the OS takes back what it needs.
+#   Linux 4.12 on: a private anonymous mapping released with MADV_FREE. The kernel reclaims such pages like file pages,
+#     without swapping them, and only as many as it needs: on Linux 6.18 (without MGLRU) under a memory cgroup's limit,
+#     it took them from the oldest mapping first. (Before 4.12, without swap, it frees them at once.) The serialized
+#     copy TensorRT returns goes back to the kernel as it's copied, so keeping an engine takes about its size in RAM at
+#     any moment. A page the kernel took back reads as zeros, so each page's first two 8-byte words are replaced by
+#     markers, the originals kept in _saved. Before use, the first words are checked and restored: writing a page takes
+#     it back from the kernel. The second words are then checked and restored, which catches a page taken between the
+#     first check and that write (the write lands on a fresh zero page). After use, the markers go back and the mapping
+#     is released again.
 #   Windows: VirtualAlloc'd memory released with OfferVirtualMemory and taken back with ReclaimVirtualMemory, which
-#     reports whether Windows discarded any of it (Windows 8.1 Update on). Offered memory still counts against the
-#     commit limit, and Windows doesn't discard it to make commit available, so a watcher thread drops the least
-#     recently used engine whenever available commit is under FLOOR of the limit.
+#     reports whether Windows discarded any of it (Windows 8.1 Update on).
 #   Elsewhere nothing is kept (TensorRT doesn't run on macOS).
+# Where allocations count against a commit limit (Windows, and Linux with vm.overcommit_memory = 2), kept engines still
+# do, and the OS doesn't take them back to make commit available. So there a watcher thread drops the least recently
+# used engine whenever available commit is under FLOOR of the limit.
 #
-# Keeping one also needs RAM for the serialized copy TensorRT returns while it's copied over, with FLOOR of RAM left
-# free. Engines kept earlier make way, least recently used first, except any loaded since this engine's previous load
-# (_may_go).
+# Keeping one needs RAM for it while it's copied (on Windows, twice its size: TensorRT's copy and ours), with FLOOR of
+# RAM left free. Engines kept earlier make way, least recently used first, except any loaded since this engine's
+# previous load (_may_go).
 import contextlib
 import ctypes
 import mmap
 import os
+import re
 import sys
 import threading
 import time
@@ -37,7 +40,7 @@ from .common import gib, logger
 
 FLOOR = 0.05
 READS = 5  # tries at reading memory counts before keeping an engine anyway: empty counts mean the reading failed
-INTERVAL = 2.0  # Windows: seconds between checks of the commit limit while engines are kept
+INTERVAL = 2.0  # seconds between checks of the commit limit while engines are kept (where there is one)
 PAGE = mmap.PAGESIZE
 # Linux: the copy releases each CHUNK as soon as it's written, so at most this much of it is held that the kernel can't
 # take back: small next to an engine (GBs).
@@ -124,10 +127,14 @@ class _LinuxMemory(_Memory):
     def _words(self):
         return np.frombuffer(self._map, dtype=np.uint64).reshape(-1, PAGE // 8)
 
-    def fill(self, source):
+    def fill(self, source, consume: bool = False):
+        # consume: return source's whole pages to the kernel as they're copied (MADV_DONTNEED; they read as zeros
+        # after). For a buffer about to be freed that nothing else reads: malloc'd memory, with glibc or tcmalloc.
         data = np.frombuffer(source, dtype=np.uint8)
         target = np.frombuffer(self._map, dtype=np.uint8)
         words = self._words()
+        address = data.ctypes.data
+        returned = -(-address // PAGE) * PAGE  # the source's first whole page
         try:
             for start in range(0, self.size, CHUNK):
                 end = min(start + CHUNK, self.size)
@@ -137,6 +144,10 @@ class _LinuxMemory(_Memory):
                 self._saved[pages] = words[pages, :2]
                 words[pages, 0], words[pages, 1] = _MARKS
                 self._map.madvise(_MADV_FREE, start, end - start)
+                copied = (address + min(end, self.nbytes)) // PAGE * PAGE
+                if consume and copied > returned:
+                    _libc().madvise(returned, copied - returned, _MADV_DONTNEED)
+                    returned = copied
         finally:
             del words, target, data
 
@@ -221,13 +232,22 @@ def _kernel32():
     return _k32
 
 
-def _commit() -> tuple:
-    # (commit available, commit limit) in bytes
-    status = _MemoryStatus()
-    status.length = ctypes.sizeof(status)
-    if not _kernel32().GlobalMemoryStatusEx(ctypes.byref(status)):
-        raise OSError(f"GlobalMemoryStatusEx failed (error {ctypes.get_last_error()})")
-    return int(status.commit_free), int(status.commit_limit)
+def _commit():
+    # (commit available, commit limit) in bytes, or None where allocations don't count against a limit
+    if os.name == "nt":
+        status = _MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        if not _kernel32().GlobalMemoryStatusEx(ctypes.byref(status)):
+            raise OSError(f"GlobalMemoryStatusEx failed (error {ctypes.get_last_error()})")
+        return int(status.commit_free), int(status.commit_limit)
+    try:
+        with open("/proc/sys/vm/overcommit_memory") as f:
+            if f.read().strip() != "2":
+                return None
+    except OSError:
+        return None
+    m = _meminfo()
+    return m["CommitLimit"] - m["Committed_AS"], m["CommitLimit"]
 
 
 class _WindowsMemory(_Memory):
@@ -240,7 +260,7 @@ class _WindowsMemory(_Memory):
     def _view(self):
         return memoryview((ctypes.c_ubyte * self.size).from_address(self._address))
 
-    def fill(self, source):
+    def fill(self, source, consume: bool = False):
         data = np.frombuffer(source, dtype=np.uint8)
         target = np.frombuffer((ctypes.c_ubyte * self.size).from_address(self._address), dtype=np.uint8)
         try:
@@ -262,26 +282,37 @@ class _WindowsMemory(_Memory):
             _kernel32().VirtualFree(self._address, 0, 0x8000)  # MEM_RELEASE
 
 
+_libc_handle = None
+
+
+def _libc():
+    global _libc_handle
+    if _libc_handle is None:
+        libc = ctypes.CDLL(None)
+        libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+        _libc_handle = libc
+    return _libc_handle
+
+
 _support = None
 
 
 def _probe() -> tuple:
     # (memory class or None, why nothing can be kept)
     if sys.platform.startswith("linux"):
-        sample = bytes(range(256)) * (2 * PAGE // 256)
+        release = os.uname().release
+        version = re.match(r"(\d+)\.(\d+)", release)
+        if not version or tuple(map(int, version.groups())) < (4, 12):
+            return None, f"Linux {release} can't take memory back only when it needs it (Linux 4.12 on can)"
         try:
-            memory = _LinuxMemory(len(sample))
+            memory = _LinuxMemory(2 * PAGE)
             try:
-                memory.fill(sample)
+                memory.fill(np.ones(2 * PAGE, dtype=np.uint8))
                 _LinuxMemory.pagemap = memory.resident() == memory.size
-                with memory.open() as data:
-                    whole = data is not None and data.tobytes() == sample
             finally:
                 memory.free()
         except (OSError, ValueError) as e:
-            return None, f"this kernel can't take memory back when it needs it (MADV_FREE: {e})"
-        if not whole:
-            return None, "this kernel frees such memory at once (Linux before 4.12, without swap)"
+            return None, f"this system won't let memory be taken back when it's needed (MADV_FREE: {e})"
         return _LinuxMemory, ""
     if os.name == "nt":
         try:
@@ -405,7 +436,7 @@ def _give_back():
     if os.name == "nt":
         return
     try:
-        libc = ctypes.CDLL(None)
+        libc = _libc()
         if hasattr(libc, "MallocExtension_ReleaseFreeMemory"):
             libc.MallocExtension_ReleaseFreeMemory()
         elif hasattr(libc, "malloc_trim"):
@@ -415,8 +446,8 @@ def _give_back():
 
 
 def store(serialize):
-    # Runs serialize() (returning a buffer) and copies the result into memory the OS can take back; the serialized copy
-    # is freed before this returns.
+    # Runs serialize() (returning a buffer nothing else uses) and copies the result into memory the OS can take back;
+    # the serialized copy is freed by the time this returns.
     kind, why = _supported()
     if kind is None:
         raise RuntimeError(why)
@@ -424,7 +455,7 @@ def store(serialize):
     try:
         memory = kind(memoryview(source).nbytes)
         try:
-            memory.fill(source)
+            memory.fill(source, consume=True)
         except BaseException:
             memory.free()
             raise
@@ -499,16 +530,17 @@ def room(nbytes: int, key: str = None) -> bool:
         return False
     try:
         supply, _, total = _measure(READS)
-        commit = _commit() if kind is _WindowsMemory else None
+        commit = _commit()
     except Exception as e:
         _last["error"] = f"{type(e).__name__}: {e}"
         return True
     floor = int(FLOOR * total)
-    # TensorRT's serialized copy plus the part of ours not yet released (Linux), or plus all of ours (Windows)
+    # Linux: TensorRT's serialized copy shrinks in RAM as ours grows, which holds CHUNK the kernel can't take back yet.
+    # Commit: both count until TensorRT's is freed.
     need = nbytes + (CHUNK if kind is _LinuxMemory else nbytes)
 
     def fits(ram: int, commit) -> bool:
-        return ram - need >= floor and (commit is None or commit[0] - need >= FLOOR * commit[1])
+        return ram - need >= floor and (commit is None or commit[0] - 2 * nbytes >= FLOOR * commit[1])
 
     dropped = []
     with _lock:
@@ -541,7 +573,7 @@ def put(key: str, entry: Kept):
     with _lock:
         old = _kept.pop(key, None)
         _kept[key] = entry
-        if _watcher is None and _supported()[0] is _WindowsMemory:
+        if _watcher is None and _commit_limited():
             _watcher = threading.Thread(target=_watch, name="trt-refits", daemon=True)
             _watcher.start()
     if old is not None:
@@ -550,8 +582,18 @@ def put(key: str, entry: Kept):
                 memory.free()
 
 
+def _commit_limited() -> bool:
+    try:
+        return _commit() is not None
+    except Exception:
+        return False
+
+
 def _trim_commit() -> int:
-    available, limit = _commit()
+    commit = _commit()
+    if commit is None:
+        return 0
+    available, limit = commit
     dropped = 0
     while available < FLOOR * limit:
         with _lock:
@@ -572,11 +614,10 @@ def trim() -> int:
         logger.debug(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}): its checkpoint isn't loaded anymore.")
         entry.free()
     dropped = len(gone)
-    if _supported()[0] is _WindowsMemory:
-        try:
-            dropped += _trim_commit()
-        except OSError:
-            pass
+    try:
+        dropped += _trim_commit()
+    except Exception:
+        pass
     return dropped
 
 
@@ -594,4 +635,4 @@ def _watch():
         except Exception as e:
             if not failed:
                 failed = True
-                logger.warning(f"Couldn't check whether Windows needs the commit that engines kept in RAM hold: {e}")
+                logger.warning(f"Couldn't check whether the system needs the commit that engines kept in RAM hold: {e}")

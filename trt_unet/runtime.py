@@ -199,14 +199,19 @@ class TrtModel:
                     logger.debug(f"The system took back RAM the {self.name} was kept in; loading its plan and refitting it instead.")
                     refits.drop(self.record.key, role)
                 else:
+                    from .engine import LOGGER
+
+                    failures = gpu.failures()
                     try:
                         seconds = engine.load(serialized)
                         self.applied[role] = dict(kept.signatures[role])
                         return seconds
                     except Exception as e:
+                        engine.unload()
+                        if gpu.failures() != failures or LOGGER.out_of_memory:
+                            raise  # out of VRAM, not a bad copy: partially_load makes more room and loads it again
                         logger.debug(f"Couldn't load the {self.name} from RAM ({e}); loading its plan and refitting it instead.")
                         refits.drop(self.record.key, role)
-                        engine.unload()
         return engine.load()
 
     def _kept(self):

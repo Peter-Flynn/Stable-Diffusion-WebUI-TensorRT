@@ -58,6 +58,10 @@ class Logger(trt.ILogger):
             self.errors.append(msg)
         logger.debug(f"Runtime {severity.name.lower()}: {msg}")
 
+    @property
+    def out_of_memory(self) -> bool:
+        return any("OutOfMemory" in m for m in self.messages)
+
 
 LOGGER = Logger()
 _runtime = None
@@ -226,7 +230,7 @@ class Engine:
         self.engine = _deserialize(plan, self.owner)
         if self.engine is None:
             said = LOGGER.errors[-1] if LOGGER.errors else "no reason given"
-            other = "" if any("OutOfMemory" in m for m in LOGGER.messages) else other_tensorrt()
+            other = "" if LOGGER.out_of_memory else other_tensorrt()
             what = os.path.basename(self.plan_path) + ("" if serialized is None else " as kept in RAM")
             raise RuntimeError(f"TensorRT {trt.__version__} couldn't load {what}: {said}" + (f" {other}" if other else ""))
         self.io = []
