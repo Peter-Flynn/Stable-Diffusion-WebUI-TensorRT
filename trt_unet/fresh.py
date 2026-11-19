@@ -75,6 +75,11 @@ NOISY = 1e-4
 # nearly parallel; under (2.5e-7)^2 above sigma 0.03. Ancestral noise at a share of 0.01 exceeds it above sigma 0.003
 # for latents of unit mean square.
 FLOOR = 1e-7
+# Cosine similarity of a denoiser call's x with the previous call's below which the sampler evaluates the model off its
+# path, where no earlier call's deep feature applies: Kohaku_LoNyu_Yog evaluates at -x (-1). Consecutive x of one path
+# share their latent and most of their noise; LCM, which redraws all its noise every call, leaves them uncorrelated at
+# worst.
+JUMP = -0.5
 # Table points over log sigma, from sigma_min / 2 to sigma_max * 2: 0.0065 apart for a zero-terminal-SNR model
 # (sigma_max 4096), where linear interpolation of the smooth columns is exact to ~1e-5.
 GRID = 2048
@@ -275,7 +280,11 @@ class Tracker:
         self.read = False  # a status has been read
         self.blocked = False  # the latest status read had noise left in on some image
         self.check = None  # (Entry, age, [full output rows], [checked rows]) until the denoiser's output is in
+        self.compared = False  # a JUMP comparison of consecutive calls' x has been read
+        self.jumped = False  # one fell below JUMP
+        self._last = None  # (index, x in FP32) of the latest denoiser call
         self._statuses = Readback()  # (reasons, shares) of shallow-graph runs
+        self._jumps = Readback()  # JUMP comparisons
         self._probe_at, self._probe_gap = 0, 1
         self._constants = {}
 
@@ -291,6 +300,10 @@ class Tracker:
         if newest is not None and (newest.index != index - 1 or newest.shape != tuple(x.shape)):
             self.history.clear()
         self.current = Entry(index, x.shape)
+        last, self._last = self._last, (index, x.to(torch.float32, memory_format=torch.contiguous_format, copy=True))
+        if last is not None and last[0] == index - 1 and last[1].shape == x.shape:
+            a, b = self._last[1].flatten(1), last[1].flatten(1)
+            self._jumps.send(None, ((a * b).sum(1) / (a.norm(dim=1) * b.norm(dim=1)).clamp_min(1e-30)).min())
 
     def see(self, x, sigma):
         # apply_model's arguments, for every UNet call. The step's first full-size call's are copied: a sampler may write
@@ -317,10 +330,13 @@ class Tracker:
         return entry
 
     def safe(self, entry, origin) -> bool:
-        # Whether a shallow call may run. One the fit can't follow (entry None) only once a status showed the pass adds no
-        # noise. A tracked one always on a pass without noise (before the first status, its graph removes what noise it
-        # finds), and with noise while the window holds the calls the fit needs and no status says it fails.
+        # Whether a shallow call may run: not before a JUMP comparison has been read, nor once one failed. One the fit
+        # can't follow (entry None) only once a status showed the pass adds no noise. A tracked one always on a pass
+        # without noise (before the first status, its graph removes what noise it finds), and with noise while the
+        # window holds the calls the fit needs and no status says it fails.
         self._collect()
+        if self.jumped or not self.compared:
+            return False
         if entry is None:
             return self.read and not self.noisy
         if not self.noisy:
@@ -388,6 +404,8 @@ class Tracker:
         self._statuses.send(None, outputs["reason"], outputs["share"])
 
     def _collect(self):
+        for _, ((cosine,),) in self._jumps.ready():
+            self.compared, self.jumped = True, self.jumped or cosine < JUMP
         for _, (reasons, shares) in self._statuses.ready():
             self.read = True
             self.noisy = self.noisy or any(s > NOISY for s in shares)

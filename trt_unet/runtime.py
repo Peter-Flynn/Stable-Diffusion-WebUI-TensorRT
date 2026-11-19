@@ -1044,6 +1044,9 @@ def _wrap_denoiser(original):
                 if not p.schedule.idle:
                     p.tracker.begin(int(self.step), x)
                     tracked = True
+                    if p.tracker.jumped:
+                        tracked = False
+                        p.drop_speed_hacks("This sampler runs the UNet on inputs off its path (Kohaku_LoNyu_Yog at -x), where Speed Hacks' cached features don't apply")
             except Exception as e:
                 p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
         denoised = original(self, x, sigma, *args, **kwargs)
