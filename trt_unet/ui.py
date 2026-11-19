@@ -222,7 +222,7 @@ def _vae_status(arch) -> str:
             text += f"; encodes up to {record.encode_reach()}"
         return text + "."
     except Exception as e:
-        common.logger.debug(f"Couldn't describe the VAE engines: {e}")
+        common.notify(f"Couldn't describe the VAE engines: {e}")
         return ""
 
 
@@ -230,7 +230,7 @@ def _vae_part(draft) -> str:
     try:
         return vae_mod.needs_build(arch_mod.detect(), [Profile.from_dict(d) for d in draft])
     except Exception as e:
-        common.logger.debug(f"Couldn't check which VAE engines are built: {e}")
+        common.notify(f"Couldn't check which VAE engines are built: {e}")
         return ""
 
 

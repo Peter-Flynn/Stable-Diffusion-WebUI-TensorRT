@@ -196,7 +196,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
         inputs.append(torch.randn(2, arch.adm_channels, dtype=dtype, device=device))
     paths = {"unet": os.path.join(folder, "unet.onnx"), "shallow": os.path.join(folder, "shallow.onnx")}
     axes = {k: v for k, v in DYNAMIC_AXES.items() if k in names or k == "latent"}
-    logger.debug(f"Exporting the {arch.name} UNet to ONNX.")
+    logger.info(f"Exporting the {arch.name} UNet to ONNX.")
     shallow = True
     with _traceable_attention(), quiet_warnings():
         try:
@@ -447,7 +447,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                     "profiles": [{**speed.shallow_shapes(s, graphs["deep"]), **fresh.input_shapes(s, graphs["deep"]["latent_channels"])} for s in unet_shapes],
                     "exact_fp32": True,
                 }
-                logger.debug(f"Building the {what}'s Speed Hacks part.")
+                logger.info(f"Building the {what}'s Speed Hacks part.")
                 shallow = _build_plan(shallow_job, folder, shallow_step)
                 memory_warnings += shallow.get("memory_warnings") or 0
                 if shallow.get("error") == "cancelled" or CANCEL.is_set():

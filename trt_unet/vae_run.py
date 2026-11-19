@@ -135,7 +135,7 @@ class _Side:
                 if gpu.attached() and not load.get("failures"):  # didn't run out: more room won't help
                     raise
                 room = model.obtainable()
-                logger.debug(f"Loading {os.path.basename(plan)} ran out of VRAM ({error}); freeing all there is and trying again.")
+                logger.info(f"Loading {os.path.basename(plan)} ran out of VRAM ({error}); freeing all there is and trying again.")
         self.sizes[which] = load["grew"]
         self.engines[which] = e
         self.loads, self.load_seconds = self.loads + 1, self.load_seconds + time.time() - start
@@ -557,7 +557,7 @@ def decode(vae, samples_in):
             except torch.cuda.OutOfMemoryError as e:
                 said = _ran_out(model, e)
                 del e
-                logger.debug(f"The VAE engines ran out of VRAM decoding ({said}).")
+                logger.info(f"The VAE engines ran out of VRAM decoding ({said}).")
                 if not again:
                     logger.warning("The VAE engines ran out of VRAM, so this decode runs on PyTorch.")
                     _make_way(model)
@@ -630,7 +630,7 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
                 else:
                     if pixels is not None:
                         at_once = f", {n} at a time" if n < b else ""
-                        logger.debug(
+                        logger.info(
                             f"Decoded {images} on the VAE engines in {time.time() - start:.2f}s: whole{at_once}, in {label(record.meta['dtype'])}, "
                             f"{_beside(engines)}. {_counted(peak.held + act, need)}{_did(side)}."
                         )
@@ -645,7 +645,7 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
             if result is not _NO_ROOM:
                 pixels, report = result
                 if pixels is not None:
-                    logger.debug(
+                    logger.info(
                         f"Decoded {images} on the VAE engines in {time.time() - start:.2f}s: in strips, in {_in_strips(record, side)}, "
                         f"{_beside(engines)}{passed}. {report}{_did(side)}."
                     )
@@ -800,7 +800,7 @@ def encode(vae, pixel_samples):
             except torch.cuda.OutOfMemoryError as e:
                 said = _ran_out(model, e)
                 del e
-                logger.debug(f"The VAE engines ran out of VRAM encoding ({said}).")
+                logger.info(f"The VAE engines ran out of VRAM encoding ({said}).")
                 if not again:
                     logger.warning("The VAE engines ran out of VRAM, so this encode runs on PyTorch.")
                     _make_way(model)
@@ -844,7 +844,7 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
                     whole, passed = False, _whole_failed(model, True, h // 8, w // 8, f"encode {w}x{h}", e, found is not None)
                 else:
                     at_once = f", {n} at a time" if n < b else ""
-                    logger.debug(
+                    logger.info(
                         f"Encoded {images} on the VAE engines in {time.time() - start:.2f}s: whole{at_once}, in {label(record.meta['dtype'])}, "
                         f"{_beside(engines)}. {_counted(peak.held + act, need)}{_did(side)}."
                     )
@@ -859,7 +859,7 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
             if result is not _NO_ROOM:
                 samples, report = result
                 if samples is not None:
-                    logger.debug(
+                    logger.info(
                         f"Encoded {images} on the VAE engines in {time.time() - start:.2f}s: in strips, in {_in_strips(record, side)}, "
                         f"{_beside(engines)}{passed}. {report}{_did(side)}."
                     )

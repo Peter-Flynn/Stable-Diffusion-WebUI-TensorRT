@@ -182,7 +182,7 @@ def _read(meta_path: str):
             record.arch
             return record
     except Exception as e:
-        common.logger.debug(f"Ignoring {meta_path}, which couldn't be read: {e}")
+        common.notify(f"Ignoring {meta_path}, which couldn't be read: {e}")
     return None
 
 

@@ -26,7 +26,6 @@ from dataclasses import dataclass, field
 import torch
 
 from . import common, store, strips
-from .common import logger
 
 PRE, POST = "pre", "post"
 ENCODE_PRE, ENCODE_POST = "encode-pre", "encode-post"
@@ -478,7 +477,7 @@ def records(arch_id: str) -> list:
                     meta = {**meta, "encoder": {**r.encoder, "strips": {}}}
                 found.append(Record(base, meta))
         except Exception as e:
-            logger.debug(f"Ignoring {path}, which couldn't be read: {e}")
+            common.notify(f"Ignoring {path}, which couldn't be read: {e}")
     return found
 
 
@@ -487,7 +486,7 @@ def record_for(arch_id: str, vae):
         wanted = digest(vae)
         matching = [r for r in records(arch_id) if r.meta.get("digest") == wanted]
     except Exception as e:
-        logger.debug(f"Couldn't look up the VAE engines: {e}")
+        common.notify(f"Couldn't look up the VAE engines: {e}")
         return None
     wanted = (engine_dtype(vae), strip_dtype(vae))
     return next((r for r in matching if (r.dtype, r.strips_dtype) == wanted), matching[0] if matching else None)
@@ -525,7 +524,7 @@ def needs_build(arch, profiles: list, vae=None) -> str:
         if any(not parts for parts in lacking):
             return ""
     except Exception as e:
-        logger.debug(f"Couldn't check which VAE engines are built: {e}")
+        common.notify(f"Couldn't check which VAE engines are built: {e}")
         return ""
     only_encoder = any(all(part in ENCODER or part.startswith(ENCODE_STRIP) for part in parts) for parts in lacking)
     what = "VAE encoder" if only_encoder else "VAE decoder and encoder" if enc_wanted else "VAE decoder"

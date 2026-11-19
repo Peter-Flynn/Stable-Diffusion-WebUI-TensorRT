@@ -253,7 +253,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                     f"{wanted_w}x{wanted_h}: {why_smaller(cause, dtype, vram, 'encode')}. Larger encodes run {further}."
                 )
         if old is not None and sorted(todo) != sorted(everything):
-            logger.debug(f"{len(everything) - len(todo)} of the {len(everything)} VAE engines already cover these sizes; building the rest.")
+            logger.info(f"{len(everything) - len(todo)} of the {len(everything)} VAE engines already cover these sizes; building the rest.")
         if progress:
             progress(0.0, "exporting the graphs")
         graphs = {}

@@ -161,11 +161,11 @@ class TrtModel:
                     continue
                 if gpu.attached() and not load.get("failures") and gpu.failures() == failures:  # didn't run out: more room won't help
                     raise
-                logger.debug(f"Loading the {self.name} ran out of VRAM with {common.gib(need)} freed ({e}); freeing all there is and trying again.")
+                logger.info(f"Loading the {self.name} ran out of VRAM with {common.gib(need)} freed ({e}); freeing all there is and trying again.")
         refits.used(self.record.key)
         hacks = " with Speed Hacks" if self.shallow_loaded else ""
         how = ["from RAM" if kept else f"plan {plan_seconds:.1f}s"] + ([_refit_times(refit)] if refit else [])
-        logger.debug(f"Loaded the {self.name}{hacks} in {time.time() - start:.1f}s ({', '.join(how)}); it holds {common.gib(gpu.held(self.owner))} of VRAM.")
+        logger.info(f"Loaded the {self.name}{hacks} in {time.time() - start:.1f}s ({', '.join(how)}); it holds {common.gib(gpu.held(self.owner))} of VRAM.")
         common.memory(f"after loading the {self.name}")
         return self.model_size()
 
@@ -196,7 +196,7 @@ class TrtModel:
         if blob is not None:
             with blob.open() as serialized:
                 if serialized is None:
-                    logger.debug(f"The system took back RAM the {self.name} was kept in; loading its plan and refitting it instead.")
+                    logger.info(f"The system took back RAM the {self.name} was kept in; loading its plan and refitting it instead.")
                     refits.drop(self.record.key, role)
                 else:
                     from .engine import LOGGER
@@ -210,7 +210,7 @@ class TrtModel:
                         engine.unload()
                         if gpu.failures() != failures or LOGGER.out_of_memory:
                             raise  # out of VRAM, not a bad copy: partially_load makes more room and loads it again
-                        logger.debug(f"Couldn't load the {self.name} from RAM ({e}); loading its plan and refitting it instead.")
+                        logger.info(f"Couldn't load the {self.name} from RAM ({e}); loading its plan and refitting it instead.")
                         refits.drop(self.record.key, role)
         return engine.load()
 
@@ -228,7 +228,7 @@ class TrtModel:
         loaded = {role: e for role, e in (("unet", self.engine), ("shallow", self.shallow)) if e is not None and e.loaded and self.applied.get(role)}
         if "unet" not in loaded or not self._current():
             why = "it holds no weights" if "unet" not in loaded else "its weights aren't the loaded checkpoint's"
-            logger.debug(f"Not keeping the {self.name} in RAM: {why}.")
+            logger.info(f"Not keeping the {self.name} in RAM: {why}.")
             return
         key, label = self.record.key, self.name
         entry = refits.get(key)
@@ -243,7 +243,7 @@ class TrtModel:
         if not todo:
             return
         if not refits.room(sum(self._serialized_size(role) for role in todo), key):
-            logger.debug(f"Not keeping the {label} in RAM: {refits.explain()}.")
+            logger.info(f"Not keeping the {label} in RAM: {refits.explain()}.")
             return
         start = time.time()
         torch.cuda.current_stream().synchronize()
@@ -261,7 +261,7 @@ class TrtModel:
         kept = refits.Kept(signatures, blobs, label, self._source())
         refits.put(key, kept)
         count, total = refits.held()
-        logger.debug(f"Kept the {label} in RAM ({common.gib(kept.nbytes)}, {time.time() - start:.1f}s); {count} kept in all, {common.gib(total)}.")
+        logger.info(f"Kept the {label} in RAM ({common.gib(kept.nbytes)}, {time.time() - start:.1f}s); {count} kept in all, {common.gib(total)}.")
 
     def _serialized_size(self, role: str) -> int:
         plan, weights = (self.record.plan, self.record.weight_bytes) if role == "unet" else (self.record.shallow_plan, self.hacks["weight_bytes"])
@@ -297,7 +297,7 @@ class TrtModel:
                 self.shallow.unload()
                 self.want_shallow, self.shallow_failed = False, True
                 raise
-        logger.debug(f"Loaded the Speed Hacks part of the {self.name} in {time.time() - start:.1f}s; the engine holds {common.gib(gpu.held(self.owner))} of VRAM with it.")
+        logger.info(f"Loaded the Speed Hacks part of the {self.name} in {time.time() - start:.1f}s; the engine holds {common.gib(gpu.held(self.owner))} of VRAM with it.")
 
     def partially_unload(self, device, memory_to_free=0):
         return 0
@@ -317,7 +317,7 @@ class TrtModel:
             if left:
                 logger.debug(f"TensorRT still holds {common.gib(left)} of the {self.name}'s VRAM after unloading it.")
             gpu.forget(self.owner)
-            logger.debug(f"Unloaded the {self.name}.")
+            logger.info(f"Unloaded the {self.name}.")
         return self.model
 
     def sync(self, quiet=False):
@@ -340,7 +340,7 @@ class TrtModel:
             refit = {"seconds": seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
             total = refit if total is None else {k: total[k] + refit[k] for k in refit}
         if total is not None and not quiet:
-            logger.debug(f"The {self.name} {_refit_times(total)}.")
+            logger.info(f"The {self.name} {_refit_times(total)}.")
         return total
 
 
@@ -718,7 +718,7 @@ class Pass:
         profile_report("sampling pass")
         hacks = self.started
         if hacks is not None and hacks.shallow_calls:
-            logger.debug(f"Speed Hacks ran {hacks.shallow_calls} of {hacks.shallow_calls + hacks.full_calls} UNet calls on the shallow engine.")
+            logger.info(f"Speed Hacks ran {hacks.shallow_calls} of {hacks.shallow_calls + hacks.full_calls} UNet calls on the shallow engine.")
             if hacks.checks:
                 logger.debug("Speed Hacks checks (call, age, error): " + ", ".join(f"{i} {a} {e:.4f}" for i, a, e in hacks.checks))
             _note_speed_hacks(hacks)
@@ -924,7 +924,7 @@ def _fits(model: TrtModel, p: Pass, x):
         engine = model.full(shallow, model._kept())
     room = common.obtainable(model.load_device, keep=[model]) - common.reserve() + held
     need = held + common.padded(engine - held + calls)  # margin only on what isn't in VRAM yet
-    logger.debug(
+    logger.info(
         f"The {model.name} at {_sizes(x)} needs {common.gib(need)} of VRAM ({common.gib(engine)} for the engine, {common.gib(calls)} "
         f"to run it, {common.gib(need - engine - calls)} margin); {common.gib(room)} can be freed."
     )

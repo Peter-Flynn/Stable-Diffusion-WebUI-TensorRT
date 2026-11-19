@@ -66,7 +66,7 @@ class _Memory:
             try:
                 whole = not self._freed and not self._doomed and self._take()
             except Exception as e:
-                logger.debug(f"Couldn't check a kept engine's memory: {e}")
+                logger.warning(f"Couldn't check a kept engine's memory: {e}")
                 whole = False
             if not whole:
                 self._release()
@@ -563,7 +563,7 @@ def room(nbytes: int, key: str = None) -> bool:
                 commit = (commit[0] + committed, commit[1])
             dropped.append(_kept.pop(k))
     for entry in dropped:
-        logger.debug(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}) to make room for another.")
+        logger.info(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}) to make room for another.")
         entry.free()
     return fits(supply, commit)
 
@@ -600,7 +600,7 @@ def _trim_commit() -> int:
             if not _kept:
                 break
             entry = _kept.pop(next(iter(_kept)))
-        logger.debug(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}): {gib(available)} of the commit limit ({gib(limit)}) was left.")
+        logger.info(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}): {gib(available)} of the commit limit ({gib(limit)}) was left.")
         entry.free()
         available += entry.nbytes
         dropped += 1
@@ -611,7 +611,7 @@ def trim() -> int:
     with _lock:
         gone = [_kept.pop(key) for key, entry in list(_kept.items()) if entry.orphaned]
     for entry in gone:
-        logger.debug(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}): its checkpoint isn't loaded anymore.")
+        logger.info(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}): its checkpoint isn't loaded anymore.")
         entry.free()
     dropped = len(gone)
     try:
