@@ -17,16 +17,22 @@
 # start and end shares don't change what a quality means. Checks cost a shallow call each and errors change slowly along
 # a pass, so a due full call checks only once the latest check is CHECKS steps old, or 3 times that while the latest put
 # waiting far out of reach (drift at age INTERVAL above FAR times the tolerance). Only a sampler step's first denoiser
-# call is checked, in all of its UNet calls: DPM++ SDE and Heun call the denoiser twice per step (reForge's total_steps
-# / steps), at points whose errors aren't comparable. The last full call before the first shallow one also runs the
-# shallow engine (a "probe"), whose status tells fresh.Tracker whether the sampler adds noise before any shallow call
-# runs.
+# call is checked, in all of its UNet calls: Heun, DPM++ SDE, SEEDS, HeunPP2 and others call the denoiser 2-3 times per
+# step, at points whose errors aren't comparable. The last full call before the first shallow one also runs the shallow
+# engine (a "probe"), whose status tells fresh.Tracker whether the sampler adds noise before any shallow call runs.
+#
+# The start and end shares are of the steps of the sampler's schedule, and each call is placed on a step (_place) by its
+# sigma and the sampler's callbacks. Counting calls instead misplaces them for the samplers reForge doesn't flag
+# second_order (its total_steps counts 1 call per step for all of reForge's "alter" samplers, which make 2-3) and for
+# the adaptive ones (DPM adaptive, the ODE samplers), whose error control sets the number of calls. Timestep samplers
+# (DDIM, PLMS, UniPC), which make 1 call per step, are placed by call index against total_steps.
 #
 # Measurements behind the constants: SDXL (novaOrangeXL v1.4, 1024x1024, CFG 1, 3 and 7), Euler, Euler a, DPM++ 2M,
 # 2M SDE, 3M SDE, SDE and Heun, Karras/Simple/Exponential/SGM Uniform, 20/30/40/50/70/100 steps, 3 prompts; every
 # call's shallow error against the full UNet's output at the same x, on runs with DeepCache every 3rd and 6th call and
 # with every call shallow between the start and end shares. The backtests replay those errors through this schedule
 # with a start share of 0.4.
+import bisect
 import math
 
 import torch
@@ -137,7 +143,17 @@ class Schedule:
         self.region = False  # this evaluation is between the start and end shares
         self.idle = False  # the pass is too short for any shallow call
         self.kind = None  # "check", "probe" or None: what this evaluation's full calls also run the shallow engine for
+        self._undecided = None  # (total, steps, step, sigma) until the evaluation's first call() decides region and kind
+        # The sigmas KDiffusionSampler.get_sigmas returned for this pass (runtime.py), or None (timestep samplers)
+        self.sigmas = None
+        self._levels = None  # the sigmas of the steps this pass samples, negated (ascending), once known
+        self._probed = False
         self._checked_at = -math.inf  # evaluation index of the latest check
+        # The sampler's steps, from its callback (reForge's state.sampling_step): the evaluation before each callback is
+        # taken as a step's first, and the evaluations between two callbacks as the evaluations per step.
+        self._step = None
+        self._anchor = None  # index of the latest evaluation followed by a callback
+        self.per = None
         self.slot = 0
         # (slot, key) -> [deep feature, evaluation index, the prompt it saw ([tensor, its norm once compare() needs it]
         # per prompt tensor), last evaluation index that used it]. key: (sample shape, reForge's cond_or_uncond, prompt shape, which scheduled
@@ -157,33 +173,73 @@ class Schedule:
         self._moved = {}  # (slot, key) -> evaluation index of the latest move read
         self.volatile = set()  # (slot, key)
 
-    def begin(self, index: int, total, steps):
+    def begin(self, index: int, total, steps, step, sigma):
+        # step: reForge's state.sampling_step; sigma: the denoiser's, a GPU tensor read in the first call()
         self.index, self.slot = index, 0
         self._collect()
-        self.region, self.kind = self._decide(index, total, steps)
+        self._follow(index, step)
+        self.idle = not total or not steps or steps < MIN_STEPS
+        self.region, self.kind = False, None
+        self._undecided = None if self.idle else (total, steps, step, sigma)
         for k in [k for k, kept in self.deep.items() if index - kept[3] > STALE]:
             del self.deep[k]
 
-    def _decide(self, index, total, steps) -> tuple:
-        self.idle = not total or not steps or steps < MIN_STEPS
-        if self.idle:
-            return False, None
-        per = max(1, total // steps)
-        # Samplers that call the UNet twice per step (Heun, DPM++ SDE, DPM++ 2S a) call it once at their last step, so
-        # their final call is at total - 2.
-        start, end = round(self.warmup * total), total - max(per, round(self.tail * total))
-        if index == start - 1 and index >= 1:
-            return False, "probe"
-        if index < start or index >= end:
-            return False, None
-        return True, "check" if 0 < self.tolerance < math.inf and index % per == 0 and self._check_due(index, per) else None
+    def _follow(self, index, step):
+        if self._step is None:
+            self._step = step
+        elif step != self._step:
+            self._step = step
+            if self._anchor is not None and index - 1 > self._anchor:
+                self.per = index - 1 - self._anchor
+            self._anchor = index - 1
 
-    def _check_due(self, index, per) -> bool:
+    def _first(self, index) -> bool:
+        return self.per is not None and (index - self._anchor) % self.per == 0
+
+    def _decide(self, index, total, steps, step, sigma) -> tuple:
+        if self._levels is None and self.sigmas is not None and len(self.sigmas) > steps:
+            self._levels = [-v for v in self.sigmas[-(steps + 1):]]  # img2img samples the schedule's last steps
+        if self._levels is not None:
+            # A sync, in the evaluation's first UNet call right before the engine runs (as fresh.Tracker.valid's)
+            region, probe = self._place(index, float(torch.as_tensor(sigma).max()), step)
+        else:
+            # Calls against reForge's total_steps, which counts 2 per step only for samplers it flags second_order:
+            # their final call is at total - 2.
+            per = max(1, total // steps)
+            start, end = round(self.warmup * total), total - max(per, round(self.tail * total))
+            region, probe = start <= index < end, index == start - 1 and index >= 1
+        if probe:
+            return False, "probe"
+        if not region:
+            return False, None
+        return True, "check" if 0 < self.tolerance < math.inf and self._first(index) and self._check_due(index) else None
+
+    def _place(self, index, sigma: float, step) -> tuple:
+        # (region, probe) by the call's step: the later of the last step whose sigma the call's hasn't gone below and the
+        # steps the sampler's callbacks have reported. Callback i sets state.sampling_step to i after step i's first
+        # call, and a later call is taken as step i + 1's, which places the rest of step i's calls (Heun's, DPM++ SDE's)
+        # up to a step late. Callbacks alone miss DPM fast's calls (1 callback per 3) and the adaptive samplers'; sigma
+        # alone places the calls of samplers that raise sigma before calling the model (s_churn; the Dy samplers by
+        # sqrt(2)) steps early, which would leave the last steps in the region.
+        n = len(self._levels) - 1
+        start, end = round(self.warmup * n), n - max(1, round(self.tail * n))
+        # Sigmas a sampler recomputes from log sigma (DPM++ SDE, the RES samplers) differ from the schedule's by FP32
+        # rounding.
+        position = max(bisect.bisect_right(self._levels, -sigma * (1 - 1e-4)) - 1, step + 1 if index else 0)
+        region = start <= position < end
+        # The probe is the call before the first shallow one, or the first call placed past start if none was
+        # placed just before it
+        if 2 <= start and not self._probed and (region or position == start - 1):
+            self._probed = True
+            return False, True
+        return region, False
+
+    def _check_due(self, index) -> bool:
         gap = index - self._checked_at
-        if gap < CHECKS * per:
+        if gap < CHECKS * self.per:
             return False
         far = self.latest is not None and drift(self.latest, INTERVAL) > FAR * self.tolerance
-        return not far or gap >= 3 * CHECKS * per
+        return not far or gap >= 3 * CHECKS * self.per
 
     def _wait(self, age: int) -> bool:
         # Whether a call may reuse a deep feature computed age evaluations ago
@@ -217,6 +273,9 @@ class Schedule:
         if self.index is None:
             self.full_calls += 1
             return None, None, None, None, None
+        if self._undecided is not None:
+            self.region, self.kind = self._decide(self.index, *self._undecided)
+            self._undecided = None
         slot, self.slot = self.slot, self.slot + 1
         kept = self.deep.get((slot, key))
         if kept is None or (slot, key) in self.volatile:

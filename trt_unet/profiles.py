@@ -109,27 +109,29 @@ def _p(w, h, batch=(1, 1, 1), tokens=(75, 300, 750)):  # a wide prompt-length ra
 
 PRESETS = {
     "xl": {
-        "640-1536 (every SDXL resolution)": _p((640, 1024, 1536), (640, 1024, 1536)),
+        "320-1536 (every SDXL resolution, and half sizes)": _p((320, 1024, 1536), (320, 1024, 1536)),
         "1024x1024": _p(1024, 1024),
         "832x1216": _p(832, 1216),
         "1216x832": _p(1216, 832),
-        "640-3072 (Hires. fix up to 2x of every SDXL resolution)": _p((640, 1536, 3072), (640, 1536, 3072)),
-        "640-1536, batch 1-4": _p((640, 1024, 1536), (640, 1024, 1536), (1, 1, 4)),
+        "320-3072 (Hires. fix up to 2x of every SDXL resolution)": _p((320, 1536, 3072), (320, 1536, 3072)),
+        "320-1536, batch 1-4": _p((320, 1024, 1536), (320, 1024, 1536), (1, 1, 4)),
     },
     "sd": {
-        "512-768 (every SD 1.5 resolution)": _p((512, 512, 768), (512, 512, 768)),
+        "256-768 (every SD 1.5 resolution, and half sizes)": _p((256, 512, 768), (256, 512, 768)),
         "512x512": _p(512, 512),
         "512x768": _p(512, 768),
         "768x512": _p(768, 512),
-        "512-1536 (Hires. fix up to 2x of every SD 1.5 resolution)": _p((512, 1024, 1536), (512, 1024, 1536)),
-        "512-768, batch 1-4": _p((512, 512, 768), (512, 512, 768), (1, 1, 4)),
+        "256-1536 (Hires. fix up to 2x of every SD 1.5 resolution)": _p((256, 1024, 1536), (256, 1024, 1536)),
+        "256-768, batch 1-4": _p((256, 512, 768), (256, 512, 768), (1, 1, 4)),
     },
 }
-# The Hires. fix profiles start at the smallest base size, not the largest: an upscaled portrait or landscape
-# (640x1536 at 1.5x is 960x2304) only exceeds the base profile on one side.
+# The size ranges start at half the smallest base size: Euler Dy, Euler SMEA Dy, Euler Negative Dy and their CFG++
+# versions call the UNet at half size in steps 0-3, and DPM++ 2S Ancestral CFG++ Intern in every step, and a call no
+# profile takes sends the rest of the pass to PyTorch. That also covers the Hires. fix profile's own reason to start
+# low: an upscaled portrait or landscape (640x1536 at 1.5x is 960x2304) only exceeds the base profile on one side.
 DEFAULTS = {
-    "xl": ("640-1536 (every SDXL resolution)", "640-3072 (Hires. fix up to 2x of every SDXL resolution)"),
-    "sd": ("512-768 (every SD 1.5 resolution)", "512-1536 (Hires. fix up to 2x of every SD 1.5 resolution)"),
+    "xl": ("320-1536 (every SDXL resolution, and half sizes)", "320-3072 (Hires. fix up to 2x of every SDXL resolution)"),
+    "sd": ("256-768 (every SD 1.5 resolution, and half sizes)", "256-1536 (Hires. fix up to 2x of every SD 1.5 resolution)"),
 }
 
 

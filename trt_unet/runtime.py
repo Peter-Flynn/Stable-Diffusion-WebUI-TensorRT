@@ -774,6 +774,8 @@ class Pass:
                 key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()), tuple(prompt[0].shape), tuple(_prompts))
                 slot, deep, origin, stale, kind = self.schedule.call(key)
                 entry = self.tracker.call(feed["sample"], b)
+                if kind == "check" and not self.tracker.valid(stale[1]):
+                    stale = kind = None
                 if deep is not None and not self.tracker.safe(entry, origin):
                     # Noise the fit can't remove for this call, or for a call the fit can't follow, noise not yet ruled
                     # out. It runs in full, and a tracked one may also probe (fresh.Tracker.probe).
@@ -1039,14 +1041,12 @@ def _wrap_denoiser(original):
             try:
                 from modules import shared
 
-                p.schedule.begin(int(self.step), self.total_steps, shared.state.sampling_steps)
+                state = shared.state
+                p.schedule.begin(int(self.step), self.total_steps, state.sampling_steps, state.sampling_step, sigma)
                 _prompts.clear()
                 if not p.schedule.idle:
                     p.tracker.begin(int(self.step), x)
                     tracked = True
-                    if p.tracker.jumped:
-                        tracked = False
-                        p.drop_speed_hacks("This sampler runs the UNet on inputs off its path (Kohaku_LoNyu_Yog at -x), where Speed Hacks' cached features don't apply")
             except Exception as e:
                 p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
         denoised = original(self, x, sigma, *args, **kwargs)
@@ -1062,6 +1062,21 @@ def _wrap_denoiser(original):
 
     forward._trt_original = original
     return forward
+
+
+def _wrap_get_sigmas(original):
+    # The schedule speed.Schedule places its start and end shares on. KDiffusionSampler.sample and sample_img2img call
+    # get_sigmas after sampling_prepare, before the first denoiser call; a subclass's override that calls the base
+    # class's returns last, and its sigmas are the ones sampled.
+    def get_sigmas(self, p, steps, *args, **kwargs):
+        sigmas = original(self, p, steps, *args, **kwargs)
+        if _pass is not None and _pass.schedule is not None and _pass.schedule.index is None:
+            with _pass._speed_hacks():
+                _pass.schedule.sigmas = [float(s) for s in sigmas.reshape(-1).tolist()]
+        return sigmas
+
+    get_sigmas._trt_original = original
+    return get_sigmas
 
 
 def _wrap_vae_decode(original):
@@ -1182,6 +1197,19 @@ def install_hooks():
             denoiser.forward = _wrap_denoiser(denoiser.forward)
     except Exception as e:
         _hook_failed(f"Couldn't hook reForge's CFG denoiser, so Speed Hacks never skip a step: {e}")
+    try:
+        from modules import sd_samplers_kdiffusion
+
+        # AlterSampler (reForge's "alter" samplers) and LCMSampler subclass KDiffusionSampler; AlterSampler overrides
+        # get_sigmas without calling the base class's.
+        classes = [sd_samplers_kdiffusion.KDiffusionSampler]
+        for cls in classes:
+            classes.extend(c for c in cls.__subclasses__() if c not in classes)
+            original = cls.__dict__.get("get_sigmas")
+            if original is not None and not hasattr(original, "_trt_original"):
+                cls.get_sigmas = _wrap_get_sigmas(original)
+    except Exception as e:
+        _hook_failed(f"Couldn't hook reForge's sampler schedules, so Speed Hacks place their start and end shares by call count: {e}")
     try:
         from modules import prompt_parser
 

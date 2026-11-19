@@ -55,6 +55,10 @@ class Readback:
     def pending(self) -> bool:
         return bool(self._pending)
 
+    def wait(self):  # until every send so far is ready()
+        if self._pending:
+            self._pending[-1][2].synchronize()
+
     def clear(self):
         self._pending.clear()
 
