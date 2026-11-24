@@ -254,6 +254,8 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                 )
         if old is not None and sorted(todo) != sorted(everything):
             logger.info(f"{len(everything) - len(todo)} of the {len(everything)} VAE engines already cover these sizes; building the rest.")
+        if export.CANCEL.is_set():
+            raise _Cancelled()
         if progress:
             progress(0.0, "exporting the graphs")
         graphs = {}
@@ -268,7 +270,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()  # the trace's VRAM, back to the driver for the builder process
-        built, done, tries = {}, 0, 0
+        built, done = {}, 0
         total = len(todo)
 
         def job(part, plan_shapes):
@@ -306,50 +308,56 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                 done += 1
             return metas, None
 
-        parts = [p for p in (POST, PRE) if p in todo]  # post first: it may need a retry at a smaller size
-        while parts:
-            part = parts[0]
-            result = export._build_plan(job(part, shapes[part]), work, step(f"{part} engine"))
-            warned = result.get("memory_warnings") or 0
-            skipped += warned
-            if not result["ok"]:
-                smaller = shapes_for(profiles, cfg, dtype, vram, RETRY_SHARE) if dtype is not None and vram else asked
-                if part != POST or tries or not warned or smaller[POST] == shapes[POST]:
-                    logger.warning(f"Couldn't build the VAE engines, so the VAE runs on PyTorch: {result.get('error')}")
-                    return None, str(result.get("error")), skipped
-                tries, shapes[POST] = 1, smaller[POST]
-                b, _, h, w = shapes[POST]["x"][2]
-                logger.info(f"TensorRT found no kernels for the VAE decoder that fit in the VRAM free; trying again up to {w * 8}x{h * 8} ({b} at a time).")
-                continue
-            built[part] = result
-            parts.pop(0)
-            done += 1
-        enc_meta = old.encoder if old is not None and enc_wanted and ENCODE_PRE not in todo else None
-        enc_error = None
-        if ENCODE_PRE in todo:
-            enc_shapes, tries = enc_wanted["shapes"], 0
-            parts = list(ENCODER)
-            while parts and not enc_error:
+        def build_parts(todo_parts: list, plan_shapes: dict, retry_part: str, retry_fn, what: str):
+            nonlocal done, skipped
+            remaining, tries = list(todo_parts), 0
+            while remaining:
                 if export.CANCEL.is_set():
-                    return None, "cancelled", skipped
-                part = parts[0]
-                result = export._build_plan(job(part, enc_shapes[part]), work, step(f"{part} engine"))
+                    raise _Cancelled()
+                part = remaining[0]
+                result = export._build_plan(job(part, plan_shapes[part]), work, step(f"{part} engine"))
                 warned = result.get("memory_warnings") or 0
                 skipped += warned
                 if result["ok"]:
                     built[part] = result
-                    parts.pop(0)
+                    remaining.pop(0)
                     done += 1
                     continue
-                smaller = encoder_shapes(profiles, enc_wanted["config"], dtype, vram, RETRY_SHARE) if dtype is not None and vram else enc_shapes
                 if export.CANCEL.is_set() or str(result.get("error")) == "cancelled":
-                    return None, "cancelled", skipped
-                if part != ENCODE_PRE or tries or not warned or smaller == enc_shapes:
-                    enc_error = str(result.get("error"))
-                    break
-                tries, enc_shapes = 1, smaller
-                b, _, h, w = enc_shapes[ENCODE_PRE]["image"][2]
-                logger.info(f"TensorRT found no kernels for the VAE encoder that fit in the VRAM free; trying again up to {w}x{h} ({b} at a time).")
+                    raise _Cancelled()
+                smaller = retry_fn() if part == retry_part and not tries and warned and dtype is not None and vram else None
+                if smaller is None or smaller == plan_shapes:
+                    return plan_shapes, str(result.get("error"))
+                tries, plan_shapes = 1, smaller
+                if retry_part == POST:
+                    b, _, h, w = plan_shapes[POST]["x"][2]
+                    size = f"{w * 8}x{h * 8}"
+                else:
+                    b, _, h, w = plan_shapes[ENCODE_PRE]["image"][2]
+                    size = f"{w}x{h}"
+                logger.info(f"TensorRT found no kernels for the VAE {what} that fit in the VRAM free; trying again up to {size} ({b} at a time).")
+            return plan_shapes, None
+
+        shapes, dec_error = build_parts(
+            [p for p in (POST, PRE) if p in todo],  # post first: it may need a retry at a smaller size
+            shapes,
+            POST,
+            lambda: {**shapes, POST: shapes_for(profiles, cfg, dtype, vram, RETRY_SHARE)[POST]},
+            "decoder",
+        )
+        if dec_error:
+            logger.warning(f"Couldn't build the VAE engines, so the VAE runs on PyTorch: {dec_error}")
+            return None, dec_error, skipped
+        enc_meta = old.encoder if old is not None and enc_wanted and ENCODE_PRE not in todo else None
+        enc_error = None
+        if ENCODE_PRE in todo:
+            enc_shapes, enc_error = build_parts(
+                list(ENCODER),
+                enc_wanted["shapes"],
+                ENCODE_PRE,
+                lambda: encoder_shapes(profiles, enc_wanted["config"], dtype, vram, RETRY_SHARE),
+                "encoder",
+            )
             if enc_error:
                 done = len([p for p in todo if p in (PRE, POST) + ENCODER])
                 total -= len(enc_kinds_todo)

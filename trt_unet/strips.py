@@ -19,6 +19,7 @@
 # In FP16, tensors between GroupNorms are multiplied by `scale` (a power of two; vae.py explains why that's exact): conv
 # inputs are multiplied through the `keep` row masks, the attention output is scaled on the way in, and each
 # GroupNorm's epsilon is scaled with the variance it's added to (Stats.affine).
+import atexit
 import contextlib
 import math
 import time
@@ -605,29 +606,35 @@ def _layout(events: list, sizes: dict) -> tuple:
     return offsets, size, at
 
 
-_pinned = {"tensor": None, "kind": None, "seconds": 0.0}
+_pinned = {"tensor": None, "kind": None, "seconds": 0.0, "used": False}
 
 
 def _host_slab(nbytes: int):
-    # Pinned by cudaHostRegister, not PyTorch's pinned allocator, which rounds up to a power of two. Kept for the next
-    # decode until release_pinned().
+    # Pinned by cudaHostRegister, not PyTorch's pinned allocator, which rounds up to a power of two. Kept warm for the
+    # next generation, then released by trim_pinned() if a generation passes without using it.
     t = _pinned["tensor"]
     if t is not None and t.numel() >= nbytes:
+        _pinned["used"] = True
         return t
     release_pinned()
     start = time.perf_counter()
-    t, kind = torch.empty(max(nbytes, 1), dtype=torch.uint8), "pageable"
+    size = max(nbytes, 1)
+    t, kind = torch.empty(size, dtype=torch.uint8), "pageable"
     try:
-        if int(torch.cuda.cudart().cudaHostRegister(t.data_ptr(), t.numel(), 0)) == 0:
+        cudart = torch.cuda.cudart()
+        if int(cudart.cudaHostRegister(t.data_ptr(), t.numel(), 0)) == 0:
             kind = "registered"
+        else:
+            cudart.cudaGetLastError()
     except Exception:
         pass
     if kind == "pageable":
+        del t
         try:
-            t, kind = torch.empty(max(nbytes, 1), dtype=torch.uint8, pin_memory=True), "pinned"
+            t, kind = torch.empty(size, dtype=torch.uint8, pin_memory=True), "pinned"
         except RuntimeError:
-            pass
-    _pinned.update(tensor=t, kind=kind, seconds=time.perf_counter() - start)
+            t = torch.empty(size, dtype=torch.uint8)
+    _pinned.update(tensor=t, kind=kind, seconds=time.perf_counter() - start, used=True)
     return t
 
 
@@ -639,7 +646,18 @@ def release_pinned():
             torch.cuda.cudart().cudaHostUnregister(t.data_ptr())
         except Exception:
             pass
-    _pinned.update(tensor=None, kind=None, seconds=0.0)
+    _pinned.update(tensor=None, kind=None, seconds=0.0, used=False)
+
+
+def trim_pinned():
+    if _pinned["tensor"] is not None:
+        if _pinned["used"]:
+            _pinned["used"] = False
+        else:
+            release_pinned()
+
+
+atexit.register(release_pinned)
 
 
 def host_memory() -> tuple:
@@ -866,12 +884,16 @@ class Decode:
                 return list(live)
         return list(live)
 
-    def run(self, x, attention, plan: Plan):
+    def run(self, inputs: list, plan: Plan):
+        # Caller passes [x, attention] and drops its own refs so fill() frees them before io and arena allocate.
+        h, w = inputs[0].shape[2], inputs[0].shape[3]
+
         def fill(held):
+            x, attention = inputs.pop(0), inputs.pop(0)
             held[-2].t.copy_(x[0].permute(1, 0, 2))
             held[-1].t.copy_(attention[0].permute(1, 0, 2))
 
-        held, _ = self._run(plan, x.shape[2], x.shape[3], fill)
+        held, _ = self._run(plan, h, w, fill)
         return self._out(held[len(plan.stages) - 1].t)
 
     def _out(self, t):
@@ -884,15 +906,15 @@ class Decode:
         shapes = self._shapes(found, h, w)
         slab = torch.empty(max(plan.device_bytes, 1), dtype=torch.uint8, device=self.device)
         ram = _host_slab(plan.host_bytes) if plan.host else None
-        io = torch.empty(max(max(plan.io), 1), dtype=torch.uint8, device=self.device)
-        if self.arena is not None:
-            self.arena.get(plan.act)  # once, at the largest any stage needs, so no engine rebinds it
         held = {}
         for key, shape in shapes.items():
             base = ram if key in plan.host else slab
             offset, nbytes = plan.offsets[key], math.prod(shape) * self.size
             held[key] = Held(base[offset:offset + nbytes].view(self.dtype).view(shape), key in plan.host)
         fill(held)
+        io = torch.empty(max(max(plan.io), 1), dtype=torch.uint8, device=self.device)
+        if self.arena is not None:
+            self.arena.get(plan.act)  # once, at the largest any stage needs, so no engine rebinds it
         stats_last = {}
         for n, st in enumerate(found):
             for _, key in st.norms:
@@ -1080,11 +1102,12 @@ class Encode(Decode):
     def _list(fsm, padding: dict, modes: dict = None) -> list:
         return encoder_stages(fsm, padding, modes)
 
-    def run(self, image, plan: Plan) -> tuple:
+    def run(self, inputs: list, plan: Plan) -> tuple:
         first = plan.stages[0]
-        h, w = image.shape[2] // first.in_scale, image.shape[3] // first.in_scale
+        h, w = inputs[0].shape[2] // first.in_scale, inputs[0].shape[3] // first.in_scale
 
         def fill(held):
+            image = inputs.pop(0)
             held[-1].t.copy_(image[0].permute(1, 0, 2))
             if self.scale != 1.0:
                 held[-1].t.mul_(self.scale)

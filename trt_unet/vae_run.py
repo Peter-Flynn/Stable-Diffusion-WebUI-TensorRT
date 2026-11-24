@@ -134,7 +134,7 @@ class _Side:
                     continue
                 if gpu.attached() and not load.get("failures"):  # didn't run out: more room won't help
                     raise
-                room = model.obtainable()
+                room = model.obtainable(not model.beside)
                 logger.info(f"Loading {os.path.basename(plan)} ran out of VRAM ({error}); freeing all there is and trying again.")
         self.sizes[which] = load["grew"]
         self.engines[which] = e
@@ -262,9 +262,9 @@ class VaeModel:
         for part in parts if load else ():
             side.engine(part)
 
-    def obtainable(self, engines: bool = True) -> int:
+    def obtainable(self, engines: bool = True, trim: bool = True) -> int:
         spare = self.decoder.spare(self.using) + self.encoder.spare(self.using)
-        return common.obtainable(self.load_device, keep=[self], engines=engines) - common.reserve() + spare
+        return common.obtainable(self.load_device, keep=[self], engines=engines, trim=trim) - common.reserve() + spare
 
     def make_room(self, nbytes: int) -> int:
         if common.free(self.load_device) < nbytes:
@@ -392,7 +392,7 @@ def _fit(model: VaeModel, top: int, need_for, engines: bool, load) -> tuple:
 
     for loaded in (False, True):
         can = model.obtainable(engines)
-        beside = model.obtainable(engines=False)
+        beside = can if not engines else model.obtainable(engines=False, trim=False)
         n = next((n for n in range(top, 0, -1) if room_for(n) <= beside), 0) or (1 if room_for(1) <= can else 0)
         if not n:
             return 0, *need_for(1), can
@@ -543,32 +543,38 @@ def decode(vae, samples_in):
     if not whole and found is None:
         return None
     side = model.decoder
-    model.vae, side.key = vae, _key(vae)
+    return _run_with_retries(model, side, vae, _key(vae), whole, found, lambda w_, f_: _decode(model, vae, samples_in, w_, f_))
+
+
+def _run_with_retries(model: VaeModel, side: _Side, vae, key: str, whole: bool, found, fn):
+    decoding = side is model.decoder
+    noun, role, verb = ("decode", "decoder", "decoding") if decoding else ("encode", "encoder", "encoding")
+    model.vae, side.key = vae, key
     again = True
     try:
         while True:
-            if found is not None and record.scaled and _exponents.get(side.key, EXPONENT) is None:
+            if found is not None and model.record.scaled and _exponents.get(side.key, EXPONENT) is None:
                 found = None
             if not whole and found is None:
                 return None
             try:
                 with torch.inference_mode():
-                    return _decode(model, vae, samples_in, whole, found)
+                    return fn(whole, found)
             except _Overflow:
-                _outgrew(side, "decoder")
+                _outgrew(side, role)
             except torch.cuda.OutOfMemoryError as e:
                 said = _ran_out(model, e)
                 del e
-                logger.info(f"The VAE engines ran out of VRAM decoding ({said}).")
+                logger.info(f"The VAE engines ran out of VRAM {verb} ({said}).")
                 if not again:
-                    logger.warning("The VAE engines ran out of VRAM, so this decode runs on PyTorch.")
+                    logger.warning(f"The VAE engines ran out of VRAM, so this {noun} runs on PyTorch.")
                     _make_way(model)
                     return None
                 again = False
     finally:
         model.release()
         model.vae, model.using, model.beside = None, set(), False  # don't keep the VAE alive
-        _profiled("VAE decode")
+        _profiled(f"VAE {noun}")
 
 
 def _ran_out(model: VaeModel, error) -> str:
@@ -640,7 +646,8 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
             else:
                 passed = _passed(need, can)
         if found is not None:
-            model.use(side, (PRE,), strips=True)
+            model.beside = not engines
+            model.use(side, (PRE,), strips=True, load=False)
             model.release()
             start = time.time()
             result = _run_strips(model, vae, samples_in, found, out_gpu, engines)
@@ -691,7 +698,7 @@ def _run(model: VaeModel, vae, samples_in, n: int):
         h = _attention(model, vae, mid.pop("q"), mid.pop("k"), mid.pop("v"))
         image = post.infer({"x": mid.pop("x"), "attention": h}, 0, stream)["image"]
         del h
-        if pixels is None and not torch.isfinite(image).all():
+        if not torch.isfinite(image).all():
             notify(f"The VAE decoder engines produced NaN/Inf values in {label(record.meta['dtype'])}, so this decode runs on PyTorch.")
             return None
         if pixels is None:
@@ -713,7 +720,7 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
     # Not allocated yet at planning time: the image the strips output, plus (on GPU) its FP32 copy and the images so far
     beside = image * sdtype.itemsize + (image * 4 * (b + 1) if out_gpu else 0)
     before = model.need(1, h, w, whole=False)[0]
-    held = 2 * cfg["mid_channels"] * h * w * dtype.itemsize  # held through the strips: mid-block input, attention output
+    held = 2 * cfg["mid_channels"] * h * w * dtype.itemsize  # alive while slab allocates, freed once copied in
     before = common.padded(before)
     if before > model.obtainable(engines) or _settled(decoder, h, w, lambda: common.usable(model.obtainable(engines)) - beside - held, engines) is None:
         return _NO_ROOM
@@ -740,15 +747,15 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
                 return _NO_ROOM
         if side.scale != 1.0:  # scaled in FP32, before the strips convert to FP16
             x, attended = x.float().mul_(side.scale), attended.float().mul_(side.scale)
-        with _Peak() as peak:
-            image_out = decoder.run(x, attended, plan)
+        inputs = [x, attended]
         del x, attended
+        with _Peak() as peak:
+            image_out = decoder.run(inputs, plan)
         if not torch.isfinite(image_out).all():
             if record.scaled:
                 raise _Overflow()
-            if pixels is None:
-                notify(f"The VAE decoder's strip engines produced NaN/Inf values in {label(dtype_name(sdtype))}, so this decode runs on PyTorch.")
-                return None, ""
+            notify(f"The VAE decoder's strip engines produced NaN/Inf values in {label(dtype_name(sdtype))}, so this decode runs on PyTorch.")
+            return None, ""
         if pixels is None:
             report = _strips_report(plan, peak.held, plan.vram + beside)
             pixels = torch.empty((b,) + tuple(image_out.shape[1:]), device=vae.output_device)
@@ -786,32 +793,7 @@ def encode(vae, pixel_samples):
     if not whole and found is None:
         return None
     side = model.encoder
-    model.vae, side.key = vae, _key(vae, encoder=True)
-    again = True
-    try:
-        while True:
-            if found is not None and record.scaled and _exponents.get(side.key, EXPONENT) is None:
-                found = None
-            if not whole and found is None:
-                return None
-            try:
-                with torch.inference_mode():
-                    return _encode(model, vae, pixels, whole, found)
-            except _Overflow:
-                _outgrew(side, "encoder")
-            except torch.cuda.OutOfMemoryError as e:
-                said = _ran_out(model, e)
-                del e
-                logger.info(f"The VAE engines ran out of VRAM encoding ({said}).")
-                if not again:
-                    logger.warning("The VAE engines ran out of VRAM, so this encode runs on PyTorch.")
-                    _make_way(model)
-                    return None
-                again = False
-    finally:
-        model.release()
-        model.vae, model.using, model.beside = None, set(), False
-        _profiled("VAE encode")
+    return _run_with_retries(model, side, vae, _key(vae, encoder=True), whole, found, lambda w_, f_: _encode(model, vae, pixels, w_, f_))
 
 
 def _encode(model: VaeModel, vae, pixels, whole: bool, found):
@@ -854,7 +836,8 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
             else:
                 passed = _passed(need, can)
         if found is not None:
-            model.use(side, (ENCODE_POST,), strips=True)
+            model.beside = not engines
+            model.use(side, (ENCODE_POST,), strips=True, load=False)
             model.release()
             start = time.time()
             result = _encode_strips(model, vae, pixels, found, engines)
@@ -904,9 +887,10 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
             plan = _plan_strips(model, encoder, mh, mw, beside, engines)
             if plan is None:
                 return _NO_ROOM
-        with _Peak() as peak:
-            x, stats = encoder.run(image, plan)
+        inputs = [image]
         del image
+        with _Peak() as peak:
+            x, stats = encoder.run(inputs, plan)
         model.release()
         if record.scaled and not torch.isfinite(x).all():
             raise _Overflow()

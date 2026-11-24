@@ -188,12 +188,13 @@ def reserve() -> int:
         return 0
 
 
-def _free_now(device) -> int:
+def _free_now(device, trim_cache: bool = True) -> int:
     try:
         if torch.device(device).type == "cuda":
             cached = 0
             if pooled():
-                trim()
+                if trim_cache:
+                    trim()
             else:
                 stats = torch.cuda.memory_stats(device)
                 cached = stats.get("reserved_bytes.all.current", 0) - stats.get("active_bytes.all.current", 0)
@@ -207,7 +208,7 @@ def free(device) -> int:
     return _free_now(device) - reserve()
 
 
-def obtainable(device, keep=(), engines: bool = True) -> int:
+def obtainable(device, keep=(), engines: bool = True, trim: bool = True) -> int:
     m = mm()
     held = sum(
         lm.model_loaded_memory()
@@ -215,7 +216,7 @@ def obtainable(device, keep=(), engines: bool = True) -> int:
         if lm.device == device and lm.model is not None and not any(lm.model is k for k in keep)
         and (engines or not getattr(lm.model, "evicted_last", False))
     )
-    return _free_now(device) + held
+    return _free_now(device, trim) + held
 
 
 def register(model):

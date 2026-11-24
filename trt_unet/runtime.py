@@ -17,7 +17,7 @@ import torch
 from modules import sd_unet
 
 from . import arch as arch_mod
-from . import common, fresh, gpu, profiles, refits, speed, store, working
+from . import common, fresh, gpu, profiles, refits, speed, store, strips, working
 from . import vae_run
 from .common import inference_mode, logger, notify
 from .weights import EffectiveWeights
@@ -1323,6 +1323,7 @@ def new_generation(p=None):
         refits.clear()
     else:
         refits.trim()
+        strips.trim_pinned()
     try:
         install_hooks()
     except Exception as e:
