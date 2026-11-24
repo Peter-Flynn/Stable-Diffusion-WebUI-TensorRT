@@ -126,13 +126,16 @@ class _Side:
                 gpu.unloaded(model.owner, load.get("grew", 0))
                 self.names.pop(which, None)
                 self.applied.pop(which, None)
+                ran_out = isinstance(error, torch.cuda.OutOfMemoryError) or bool(load.get("failures")) or engine_mod.LOGGER.out_of_memory
                 if attempt:
+                    if model.beside and ran_out:
+                        raise _BesideNoRoom() from None
                     raise
                 # gpu.suspect ignores memory held by model.owner, which this VAE's other engines share; gpu.retire() would free it.
                 alone = not model.decoder.engines and not model.encoder.engines
                 if past and alone and engine_mod.own_allocator(failures, model.owner, error):
                     continue
-                if gpu.attached() and not load.get("failures"):  # didn't run out: more room won't help
+                if gpu.attached() and not ran_out:  # didn't run out: more room won't help
                     raise
                 room = model.obtainable(not model.beside)
                 logger.info(f"Loading {os.path.basename(plan)} ran out of VRAM ({error}); freeing all there is and trying again.")
@@ -331,6 +334,10 @@ _exponents = {}  # weights key -> exponent, for VAEs that overflowed EXPONENT; N
 
 
 class _Overflow(Exception):
+    pass
+
+
+class _BesideNoRoom(Exception):
     pass
 
 
@@ -625,7 +632,13 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
     for engines in (False, True):
         if whole:
             model.use(side, (PRE, POST), load=False)
-            n, need, act, can = _fit(model, min(b, record.max_batch), need_for, engines, lambda: model.use(side, (PRE, POST)))
+            try:
+                n, need, act, can = _fit(model, min(b, record.max_batch), need_for, engines, lambda: model.use(side, (PRE, POST)))
+            except _BesideNoRoom:
+                n, passed = 0, " (the VAE engines didn't fit beside the UNet engine)"
+            else:
+                if not n:
+                    passed = _passed(need, can)
             if n:
                 start = time.time()
                 try:
@@ -643,14 +656,15 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
                             f"{_beside(engines)}. {_counted(peak.held + act, need)}{_did(side)}."
                         )
                     return pixels
-            else:
-                passed = _passed(need, can)
         if found is not None:
             model.beside = not engines
             model.use(side, (PRE,), strips=True, load=False)
             model.release()
             start = time.time()
-            result = _run_strips(model, vae, samples_in, found, out_gpu, engines)
+            try:
+                result = _run_strips(model, vae, samples_in, found, out_gpu, engines)
+            except _BesideNoRoom:
+                result = _NO_ROOM
             if result is not _NO_ROOM:
                 pixels, report = result
                 if pixels is not None:
@@ -806,7 +820,13 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
     for engines in (False, True):
         if whole:
             model.use(side, ENCODER, load=False)
-            n, need, act, can = _fit(model, min(b, record.encode_batch), lambda n: model.need_encode(n, h, w, pixels_gpu), engines, lambda: model.use(side, ENCODER))
+            try:
+                n, need, act, can = _fit(model, min(b, record.encode_batch), lambda n: model.need_encode(n, h, w, pixels_gpu), engines, lambda: model.use(side, ENCODER))
+            except _BesideNoRoom:
+                n, passed = 0, " (the VAE engines didn't fit beside the UNet engine)"
+            else:
+                if not n:
+                    passed = _passed(need, can)
             if n:
                 start = time.time()
                 samples = None
@@ -833,14 +853,15 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
                         f"{_beside(engines)}. {_counted(peak.held + act, need)}{_did(side)}."
                     )
                     return samples
-            else:
-                passed = _passed(need, can)
         if found is not None:
             model.beside = not engines
             model.use(side, (ENCODE_POST,), strips=True, load=False)
             model.release()
             start = time.time()
-            result = _encode_strips(model, vae, pixels, found, engines)
+            try:
+                result = _encode_strips(model, vae, pixels, found, engines)
+            except _BesideNoRoom:
+                result = _NO_ROOM
             if result is not _NO_ROOM:
                 samples, report = result
                 if samples is not None:

@@ -162,7 +162,7 @@ class TrtModel:
                         raise
                     if past and engine_mod.own_allocator(failures, self.owner, e):
                         continue
-                    if gpu.attached() and not load.get("failures") and gpu.failures() == failures:  # didn't run out: more room won't help
+                    if gpu.attached() and not isinstance(e, torch.cuda.OutOfMemoryError) and not load.get("failures") and gpu.failures() == failures:  # didn't run out: more room won't help
                         raise
                     logger.info(f"Loading the {self.name} ran out of VRAM with {common.gib(need)} freed ({e}); freeing all there is and trying again.")
             refits.used(self.record.key)
@@ -186,6 +186,7 @@ class TrtModel:
             except Exception as e:
                 notify(f"Couldn't load the Speed Hacks part of the {self.name}, so it runs without Speed Hacks: {e}")
                 self.shallow.unload()
+                self.applied.pop("shallow", None)
                 self.want_shallow, self.shallow_failed = False, True
         refit = self.sync(quiet=True)
         return refit, plan_seconds, kept
@@ -304,6 +305,7 @@ class TrtModel:
                 self.sync(quiet=True)
             except Exception:
                 self.shallow.unload()
+                self.applied.pop("shallow", None)
                 self.want_shallow, self.shallow_failed = False, True
                 raise
         logger.info(f"Loaded the Speed Hacks part of the {self.name} in {time.time() - start:.1f}s; the engine holds {common.gib(gpu.held(self.owner))} of VRAM with it.")

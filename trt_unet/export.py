@@ -321,7 +321,9 @@ def run_builder(job_path: str, progress=None) -> dict:
             if CANCEL.wait(0.5):
                 return stop("cancelled")
             if _exited(proc):
-                return stop()
+                if os.name != "nt":
+                    stop()
+                return
             short = _memory_short()
             if short:
                 return stop(short)

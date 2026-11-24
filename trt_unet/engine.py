@@ -329,11 +329,9 @@ class Engine:
 
             def flush():
                 nonlocal gpu_bytes
-                if not gpu_batch:
-                    return
-                for name, proto, t in gpu_batch:
+                while gpu_batch:
+                    name, proto, t = gpu_batch.pop(0)
                     bind(name, proto, t.to("cpu"))
-                gpu_batch.clear()
                 gpu_bytes = 0
 
             def put(name):
