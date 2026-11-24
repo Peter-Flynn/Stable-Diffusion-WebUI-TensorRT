@@ -104,7 +104,7 @@ def _deserialize(plan, owner):
     before = gpu.failures()
     with gpu.owner(owner):
         engine = runtime().deserialize_cuda_engine(plan)
-    if engine is not None or not gpu.suspect(before, owner):
+    if engine is not None or LOGGER.out_of_memory or not gpu.suspect(before, owner):
         return engine
     own = trt.Runtime(LOGGER)
     engine = own.deserialize_cuda_engine(plan)

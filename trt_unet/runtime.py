@@ -160,9 +160,10 @@ class TrtModel:
                     self._discard()
                     if attempt:
                         raise
-                    if past and engine_mod.own_allocator(failures, self.owner, e):
+                    ran_out = isinstance(e, torch.cuda.OutOfMemoryError) or bool(load.get("failures")) or gpu.failures() != failures or engine_mod.LOGGER.out_of_memory
+                    if past and not ran_out and engine_mod.own_allocator(failures, self.owner, e):
                         continue
-                    if gpu.attached() and not isinstance(e, torch.cuda.OutOfMemoryError) and not load.get("failures") and gpu.failures() == failures:  # didn't run out: more room won't help
+                    if gpu.attached() and not ran_out:  # didn't run out: more room won't help
                         raise
                     logger.info(f"Loading the {self.name} ran out of VRAM with {common.gib(need)} freed ({e}); freeing all there is and trying again.")
             refits.used(self.record.key)
@@ -299,15 +300,17 @@ class TrtModel:
         need = self.full(True, kept) - self.full(False, kept)
         common.make_room(common.padded(need), self.load_device, _loaded_entries(self))
         start = time.time()
-        with gpu.loading(self.owner):
-            try:
+        load = {}
+        try:
+            with gpu.loading(self.owner) as load:
                 self._load("shallow", self.shallow, kept)
                 self.sync(quiet=True)
-            except Exception:
-                self.shallow.unload()
-                self.applied.pop("shallow", None)
-                self.want_shallow, self.shallow_failed = False, True
-                raise
+        except Exception:
+            self.shallow.unload()
+            gpu.unloaded(self.owner, load.get("grew", 0))
+            self.applied.pop("shallow", None)
+            self.want_shallow, self.shallow_failed = False, True
+            raise
         logger.info(f"Loaded the Speed Hacks part of the {self.name} in {time.time() - start:.1f}s; the engine holds {common.gib(gpu.held(self.owner))} of VRAM with it.")
 
     def partially_unload(self, device, memory_to_free=0):
@@ -633,6 +636,7 @@ class Pass:
             self.model = model
             self._hold(model, self.patcher)
         _last_used[self.arch_id] = record.key
+        model.sync()
         if self.schedule is not None and model.hacks and not model.shallow_loaded and not model.shallow_failed:
             model.want_shallow = True
             try:
@@ -640,7 +644,6 @@ class Pass:
                     model.load_shallow()
             except Exception as e:
                 notify(f"Couldn't load the Speed Hacks part of the {model.name}, so it runs without Speed Hacks: {e}")
-        model.sync()
         return model
 
     def preferred(self) -> set:
@@ -790,10 +793,12 @@ class Pass:
             if self.schedule.done:
                 self.schedule.full_calls += 1
             else:
+                planned_shallow = False
                 with self._speed_hacks():
                     prompt = (feed["encoder_hidden_states"], feed.get("y"))
                     key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()), tuple(prompt[0].shape), tuple(_prompts))
                     slot, deep, origin, stale, kind = self.schedule.call(key)
+                    planned_shallow = deep is not None
                     entry = self.tracker.call(feed["sample"], b)
                     if kind is not None and not self.tracker.valid(stale[1]):
                         stale = kind = None
@@ -803,10 +808,13 @@ class Pass:
                         probe = entry is not None and self.tracker.valid(origin) and self.tracker.probe(self.schedule.index)
                         stale, kind = ((deep, origin), "probe") if probe else (None, None)
                         deep = origin = None
+                        planned_shallow = False
                         self.schedule.ran_full()
                     if deep is not None:
                         self.schedule.compare(slot, key, prompt)
                     hack = (slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b)
+                if hack is None and planned_shallow and self.started is not None:
+                    self.started.ran_full()
         out = self._infer_with_room(feed, profile, stream, hack)
         # A shallow call whose Speed Hacks failed ran on the full engine instead
         shallow = hack is not None and hack[2] is not None and self.schedule is not None
@@ -841,7 +849,7 @@ class Pass:
         # cond_or_uncond, rows before padding)
         slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b = hack or (None,) * 9
         try:
-            if deep is not None:
+            if deep is not None and self.schedule is not None:
                 # A shallow call that fails runs in full below
                 with self._speed_hacks():
                     outputs = self.model.shallow.infer({**feed, "deep": deep, **self.tracker.inputs(entry, origin, feed["sample"])}, profile, stream)

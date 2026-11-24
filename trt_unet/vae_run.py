@@ -126,14 +126,14 @@ class _Side:
                 gpu.unloaded(model.owner, load.get("grew", 0))
                 self.names.pop(which, None)
                 self.applied.pop(which, None)
-                ran_out = isinstance(error, torch.cuda.OutOfMemoryError) or bool(load.get("failures")) or engine_mod.LOGGER.out_of_memory
+                ran_out = isinstance(error, torch.cuda.OutOfMemoryError) or bool(load.get("failures")) or gpu.failures() != failures or engine_mod.LOGGER.out_of_memory
                 if attempt:
                     if model.beside and ran_out:
                         raise _BesideNoRoom() from None
                     raise
                 # gpu.suspect ignores memory held by model.owner, which this VAE's other engines share; gpu.retire() would free it.
                 alone = not model.decoder.engines and not model.encoder.engines
-                if past and alone and engine_mod.own_allocator(failures, model.owner, error):
+                if past and alone and not ran_out and engine_mod.own_allocator(failures, model.owner, error):
                     continue
                 if gpu.attached() and not ran_out:  # didn't run out: more room won't help
                     raise
