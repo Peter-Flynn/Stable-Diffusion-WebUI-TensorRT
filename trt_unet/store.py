@@ -187,7 +187,7 @@ def _read(meta_path: str):
 
 
 def records() -> list:
-    found = [r for r in (_read(p) for p in glob.glob(os.path.join(root(), "*", "*.json"))) if r is not None]
+    found = [r for r in (_read(p) for p in glob.glob(os.path.join(glob.escape(root()), "*", "*.json"))) if r is not None]
     return sorted(found, key=lambda r: (r.group, r.index))
 
 
@@ -259,5 +259,5 @@ def delete(group: list):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(path)
     for folder in {os.path.dirname(r.plan) for r in group}:
-        if not glob.glob(os.path.join(folder, "*.plan")):
+        if not glob.glob(os.path.join(glob.escape(folder), "*.plan")):
             shutil.rmtree(folder, ignore_errors=True)

@@ -46,8 +46,8 @@ def checksum(t: torch.Tensor) -> int:
     flat = t.detach().reshape(-1)
     size = flat.element_size()
     per = 8 // size
-    if flat.storage_offset() % per:
-        flat = flat.clone()  # .view(torch.int64) needs a word-aligned storage offset
+    if not flat.is_contiguous() or flat.storage_offset() % per:
+        flat = flat.clone(memory_format=torch.contiguous_format)  # .view(torch.int64) needs contiguous, word-aligned storage
     whole = flat.numel() // per * per
     total = flat[:whole].view(torch.int64).sum()
     if whole < flat.numel():

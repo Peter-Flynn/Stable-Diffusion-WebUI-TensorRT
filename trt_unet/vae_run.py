@@ -550,16 +550,18 @@ def decode(vae, samples_in):
     if not whole and found is None:
         return None
     side = model.decoder
-    return _run_with_retries(model, side, vae, _key(vae), whole, found, lambda w_, f_: _decode(model, vae, samples_in, w_, f_))
+    return _run_with_retries(model, side, vae, _key(vae), (h, w), whole, found, lambda w_, f_: _decode(model, vae, samples_in, w_, f_))
 
 
-def _run_with_retries(model: VaeModel, side: _Side, vae, key: str, whole: bool, found, fn):
+def _run_with_retries(model: VaeModel, side: _Side, vae, key: str, size: tuple, whole: bool, found, fn):
     decoding = side is model.decoder
     noun, role, verb = ("decode", "decoder", "decoding") if decoding else ("encode", "encoder", "encoding")
     model.vae, side.key = vae, key
     again = True
     try:
         while True:
+            if whole and (not decoding, *size) in model.failed:
+                whole = False
             if found is not None and model.record.scaled and _exponents.get(side.key, EXPONENT) is None:
                 found = None
             if not whole and found is None:
@@ -807,7 +809,7 @@ def encode(vae, pixel_samples):
     if not whole and found is None:
         return None
     side = model.encoder
-    return _run_with_retries(model, side, vae, _key(vae, encoder=True), whole, found, lambda w_, f_: _encode(model, vae, pixels, w_, f_))
+    return _run_with_retries(model, side, vae, _key(vae, encoder=True), (h // 8, w // 8), whole, found, lambda w_, f_: _encode(model, vae, pixels, w_, f_))
 
 
 def _encode(model: VaeModel, vae, pixels, whole: bool, found):

@@ -30,9 +30,10 @@ class Profile:
             lo, opt, hi = (max(lowest, v * step) for v in (math.floor(lo / step), round(opt / step), math.ceil(hi / step)))
             return min(lo, opt), opt, max(hi, opt)
 
+        lowest = max(multiple, 64)  # fresh.TILE is 8 latent pixels (64 image pixels)
         return Profile(
-            fix(self.width, multiple, multiple),
-            fix(self.height, multiple, multiple),
+            fix(self.width, multiple, lowest),
+            fix(self.height, multiple, lowest),
             fix(self.batch, 1, 1),
             fix(self.tokens, TOKENS_PER_CHUNK, TOKENS_PER_CHUNK),
         )

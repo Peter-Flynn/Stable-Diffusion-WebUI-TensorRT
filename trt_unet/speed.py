@@ -323,7 +323,7 @@ class Schedule:
             if t is not None and r is not None:
                 if reference[1] is None:
                     reference[1] = r.float().norm().clamp_min(1e-30)
-                m = torch.dist(t, r) / reference[1]
+                m = torch.dist(t.float(), r.float()) / reference[1]
                 moved = m if moved is None else torch.maximum(moved, m)
         if moved is not None:
             self._readback.send(("move", (slot, key), kept[1]), moved)

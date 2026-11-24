@@ -554,7 +554,8 @@ def _wrap_get_free_memory(original):
     # pool, whose in-use count has been seen 1.3 GiB above what it holds, and reForge then loaded its UNet partially
     # and gave its VAE 128 MiB.
     def get_free_memory(dev=None, torch_free_too=False):
-        result = original(dev, torch_free_too)
+        with common.on_device() if dev is None else contextlib.nullcontext():
+            result = original(dev, torch_free_too)
         try:
             device = torch.device(dev if dev is not None else common.device())
             if device.type != "cuda":
@@ -573,7 +574,7 @@ def _wrap_get_free_memory(original):
 
 def _wrap_unload_all(original):
     def unload_all_models(*args, **kwargs):
-        with _evictable():
+        with _evictable(), common.on_device():
             return original(*args, **kwargs)
 
     unload_all_models._trt_original = original
@@ -1045,8 +1046,9 @@ def _begin_step(p: Pass, index: int, total, steps, step, x, sigma):
 
 def _wrap_prepare(original):
     def sampling_prepare(unet, x, *args, **kwargs):
-        global _pass, _latest_sigmas
+        global _pass, _latest_sigmas, _generation_thread
         end_pass()
+        _generation_thread = threading.get_ident()
         if _denoiser_state is None:
             _latest_sigmas = None
         records, hacks = _engine_records(unet, x)
