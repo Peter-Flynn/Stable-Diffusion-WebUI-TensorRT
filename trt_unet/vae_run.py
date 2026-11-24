@@ -213,7 +213,9 @@ class VaeModel:
         state = self.vae.first_stage_model.state_dict(keep_vars=True)
 
         def get(name, device):
-            t = state[name].data.to(device)
+            t = state[name].data
+            if device is not None:
+                t = t.to(device)
             return t.float() * scale if scale != 1.0 and scaled_bias(name) else t
 
         return get

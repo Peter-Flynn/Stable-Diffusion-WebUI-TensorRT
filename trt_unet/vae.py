@@ -191,7 +191,7 @@ def scaled_bias(name: str) -> bool:
 
 def weight_bytes(vae, names, dtype) -> int:
     state = vae.first_stage_model.state_dict(keep_vars=True)
-    return sum(state[n].numel() for n in names if n in state) * torch.tensor([], dtype=dtype).element_size()
+    return sum(state[n].numel() for n in names if n in state) * dtype.itemsize
 
 
 def label(name: str) -> str:
@@ -214,7 +214,7 @@ def gpu_vram():
 def vram_budget(dtype=None, vram=None, share: float = 1.0):
     if dtype is None or not vram:
         return None
-    return max(0, int((vram - RESERVE) * share / torch.tensor([], dtype=dtype).element_size()))
+    return max(0, int((vram - RESERVE) * share / dtype.itemsize))
 
 
 def _levels(cfg: dict, h: int, w: int):
@@ -332,8 +332,7 @@ def strip_shapes(profiles: list, found: list, dtype=torch.float32) -> dict:
     lo_w = min(p.width[0] for p in profiles) // 8
     hi = (max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8)
     opt = (profiles[0].height[1] // 8, profiles[0].width[1] // 8)
-    itemsize = torch.tensor([], dtype=dtype).element_size()
-    return {name: strips.kind_shapes(kind, scales, lo_w, opt, hi, itemsize) for name, (kind, scales) in strips.kinds(found).items()}
+    return {name: strips.kind_shapes(kind, scales, lo_w, opt, hi, dtype.itemsize) for name, (kind, scales) in strips.kinds(found).items()}
 
 
 def _covers(outer: dict, inner: dict) -> bool:

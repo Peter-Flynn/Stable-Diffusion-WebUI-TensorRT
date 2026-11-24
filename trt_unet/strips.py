@@ -693,7 +693,7 @@ class Decode:
         self.fsm, self.padding, self.runner_for = fsm, padding, runner_for
         self.dtype, self.device, self.copy_stream, self.arena = dtype, torch.device(device), copy_stream, arena
         self.scale = scale
-        self.size = torch.tensor([], dtype=dtype).element_size()
+        self.size = dtype.itemsize
         self.cache = cache if cache is not None else {}
         self.ways = self._choices(fsm, padding)
         if available is not None:

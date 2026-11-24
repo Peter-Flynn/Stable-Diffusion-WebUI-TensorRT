@@ -312,29 +312,52 @@ class Engine:
                 if setting not in _unsettable:
                     _unsettable.add(setting)
                     logger.debug(f"Couldn't set the refitter's {setting}: {e}")
-        keep, start = [], time.perf_counter()
+        keep, gpu_batch, gpu_bytes, start = [], [], 0, time.perf_counter()
+        batch_limit = 32 * 2**20  # bounds extra VRAM while letting LoRA/FP8 kernels queue without per-weight syncs
 
-        def put(name):
-            proto = refitter.get_weights_prototype(name)
-            t = tensor_for(name, "cpu").to(dtype=torch_dtype(proto.dtype)).contiguous()
+        def bind(name, proto, t):
             if t.numel() != proto.size:
                 raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
             keep.append(t)
             if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), trt.TensorLocation.HOST):
                 raise RuntimeError(f"TensorRT rejected weight {name}")
 
+        def flush():
+            nonlocal gpu_bytes
+            if not gpu_batch:
+                return
+            for name, proto, t in gpu_batch:
+                bind(name, proto, t.to("cpu"))
+            gpu_batch.clear()
+            gpu_bytes = 0
+
+        def put(name):
+            nonlocal gpu_bytes
+            proto = refitter.get_weights_prototype(name)
+            t = tensor_for(name, None).to(dtype=torch_dtype(proto.dtype)).contiguous()
+            if t.is_cuda:
+                gpu_batch.append((name, proto, t))
+                gpu_bytes += t.numel() * t.element_size()
+                if gpu_bytes >= batch_limit:
+                    flush()
+            else:
+                bind(name, proto, t)
+
         LOGGER.clear()
         try:
             for name in names:
                 put(name)
+            flush()
             for name in refitter.get_missing_weights():
                 put(name)
+            flush()
             with self._taking():
                 try:
                     ok = refitter.refit_cuda_engine()
                 finally:
                     refitter.release_refit_resources()  # otherwise the refit's scratch VRAM stays allocated for the engine's lifetime
         finally:
+            gpu_batch.clear()
             keep.clear()  # an exception's traceback holds this frame, and with it GBs of weights
         if not ok:
             raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
@@ -374,7 +397,7 @@ class Engine:
         return self.activation_bytes()
 
     def io_bytes(self) -> dict:
-        return {name: math.prod(self.context.get_tensor_shape(name)) * torch.tensor([], dtype=dtype).element_size() for name, _, dtype in self.io}
+        return {name: math.prod(self.context.get_tensor_shape(name)) * dtype.itemsize for name, _, dtype in self.io}
 
     def infer(self, feed: dict, profile: int, stream: int, into: dict = None) -> dict:
         self._prepare(profile, {name: tuple(feed[name].shape) for name, is_input, _ in self.io if is_input}, stream)

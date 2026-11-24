@@ -102,7 +102,7 @@ class EffectiveWeights:
         patches = self.patches.get(PREFIX + name)
         convert = self.converters.get(name)
         if not patches and convert is None:
-            return base.to(device)
+            return base if device is None else base.to(device)
         # Two steps: one .to(device, float32) would convert on the CPU first. copy=True because convert and patch work in place.
         weight = base.to(common.device()).to(torch.float32, copy=True)
         if convert is not None:
@@ -111,4 +111,5 @@ class EffectiveWeights:
             from ldm_patched.modules.lora import calculate_weight
 
             weight = calculate_weight(patches, weight, PREFIX + name)
-        return weight.to(torch.float16).to(device)
+        weight = weight.to(torch.float16)
+        return weight if device is None else weight.to(device)
