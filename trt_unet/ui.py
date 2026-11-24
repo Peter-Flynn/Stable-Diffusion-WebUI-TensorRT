@@ -507,12 +507,15 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
                 profile_list = [Profile.from_dict(d) for d in draft]
                 todo, _ = _plan(draft, records, mode)
                 vae_part = _vae_part(draft)
-                _release_engines()
-                result = {"ok": True, "records": []}
-                if todo or vae_part:
-                    result = export.build(
-                        arch, patcher, [(i, profile_list[i]) for i in todo], int(optimization_level), lambda f, t: progress(f, desc=t), mode, profiles=profile_list,
-                    )
+                if export.CANCEL.is_set():
+                    result = {"ok": False, "error": "cancelled", "records": []}
+                else:
+                    _release_engines()
+                    result = {"ok": True, "records": []}
+                    if todo or vae_part:
+                        result = export.build(
+                            arch, patcher, [(i, profile_list[i]) for i in todo], int(optimization_level), lambda f, t: progress(f, desc=t), mode, profiles=profile_list,
+                        )
                 deleted = store.keep_only(arch.id, profile_list, mode) if result["ok"] else 0
                 message = _outcome(arch, len(todo), deleted, result, mode)
     except Exception as e:
@@ -537,13 +540,14 @@ def cancel_build():
 def delete_engine(choice, draft, draft_arch):
     from modules.call_queue import queue_lock
 
-    group = _groups().get(choice) if choice else None
-    if group:
+    if choice:
         with queue_lock:
-            _release_engines()
-            store.delete(group)
-            vae_mod.delete_for(group[0].meta["arch"]["id"], group[0].meta["gpu"], group[0].meta["trt"])
-        common.logger.info(f"Deleted {_n(len(group), 'engine')}: {choice}.")
+            group = _groups().get(choice)
+            if group:
+                _release_engines()
+                store.delete(group)
+                vae_mod.delete_for(group[0].meta["arch"]["id"], group[0].meta["gpu"], group[0].meta["trt"])
+                common.logger.info(f"Deleted {_n(len(group), 'engine')}: {choice}.")
     return refresh(draft, draft_arch)
 
 
@@ -650,7 +654,7 @@ def on_ui_tabs():
         outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, cancel_button, *mode_outputs]
         # Outputs null to the preset menu last, emptying it, so picking the same preset again still fires .change.
         preset.change(
-            None, [preset], [*numbers, preset],
+            None, [preset, *numbers], [*numbers, preset],
             **{JS: f"(name, ...current) => [...(({json.dumps(presets)})[name] || current.slice(0, {len(numbers)})), null]"},
         )
         quiet = {"show_progress": "hidden"}

@@ -15,8 +15,9 @@ def installed_tensorrt():
         name = (dist.metadata.get("Name") or "").lower().replace("_", "-")
         match = re.fullmatch(r"(tensorrt(?:-cu\d+)?)(-bindings)?", name)
         if match:
-            found.append((match.group(2) is not None, match.group(1), dist.version))  # False first: min() prefers a package over its -bindings
-    return min(found)[1:] if found else (None, None)
+            version = tuple(map(int, re.findall(r"\d+", dist.version)))
+            found.append((match.group(2) is None, version, match.group(1), dist.version))  # True first: max() prefers full package over -bindings, then highest version
+    return max(found)[2:] if found else (None, None)
 
 
 def install():

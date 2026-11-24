@@ -350,7 +350,8 @@ def run_builder(job_path: str, progress=None) -> dict:
             stop()
         _exited(proc, block=True)
         with lock:
-            _kill_tree(proc)
+            if os.name != "nt":
+                _kill_tree(proc)
             state["code"] = proc.wait()
         for stream in (proc.stdin, proc.stdout):
             with contextlib.suppress(Exception):
@@ -386,6 +387,8 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
     from . import vae as vae_mod
     from . import vae_build
 
+    if CANCEL.is_set():
+        return {"ok": False, "error": "cancelled", "records": [], "memory_warnings": 0, "hack_errors": [], "vae": None, "vae_error": None}
     common.trt_version()
     runtime.release_all()
     common.inference_mode(common.mm().unload_all_models)()

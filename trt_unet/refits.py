@@ -188,20 +188,27 @@ class _LinuxMemory(_Memory):
         except BufferError:  # a view of it is still referenced somewhere: return its pages, unmapped once that's gone
             self._map.madvise(_MADV_DONTNEED)
 
-    def resident(self) -> int:
-        if self.freed or self._open or not self.pagemap:
-            return super().resident()
+    def _pagemap_present(self):
         want, raw = self.size // PAGE * 8, b""
         try:
             with open("/proc/self/pagemap", "rb") as f:
                 while len(raw) < want:
                     more = os.pread(f.fileno(), want - len(raw), self._address // PAGE * 8 + len(raw))
                     if not more:
-                        return self.size
+                        return None
                     raw += more
         except OSError:
-            return self.size
+            return None
         return int(np.count_nonzero(np.frombuffer(raw, dtype=np.uint64) >> np.uint64(63))) * PAGE  # bit 63: present
+
+    def resident(self) -> int:
+        if self.freed or self._open or not self.pagemap:
+            return super().resident()
+        present = self._pagemap_present()
+        if present is None:
+            _LinuxMemory.pagemap = False
+            return self.size
+        return present
 
     def intact(self) -> bool:
         return self.resident() == self.size
@@ -279,7 +286,12 @@ class _WindowsMemory(_Memory):
     def _release(self):
         if not self._freed:
             self._freed = True
-            _kernel32().VirtualFree(self._address, 0, 0x8000)  # MEM_RELEASE
+            if getattr(self, "_address", None):
+                _kernel32().VirtualFree(self._address, 0, 0x8000)  # MEM_RELEASE
+
+    def __del__(self):
+        with contextlib.suppress(Exception):
+            self._release()
 
 
 _libc_handle = None
@@ -308,7 +320,7 @@ def _probe() -> tuple:
             memory = _LinuxMemory(2 * PAGE)
             try:
                 memory.fill(np.ones(2 * PAGE, dtype=np.uint8))
-                _LinuxMemory.pagemap = memory.resident() == memory.size
+                _LinuxMemory.pagemap = memory._pagemap_present() == memory.size
             finally:
                 memory.free()
         except (OSError, ValueError) as e:
@@ -417,8 +429,6 @@ def memory(reads: int = 1) -> tuple:
 def explain() -> str:
     if "unsupported" in _last:
         return _last["unsupported"]
-    if "error" in _last:
-        return f"RAM couldn't be read ({_last['error']})"
     if not _last:
         return "nothing weighed"
     floor = f", and {gib(_last['floor'])} must stay free" if _last["floor"] else ""
@@ -531,8 +541,7 @@ def room(nbytes: int, key: str = None) -> bool:
     try:
         supply, _, total = _measure(READS)
         commit = _commit()
-    except Exception as e:
-        _last["error"] = f"{type(e).__name__}: {e}"
+    except Exception:
         return True
     floor = int(FLOOR * total)
     # Linux: TensorRT's serialized copy shrinks in RAM as ours grows, which holds CHUNK the kernel can't take back yet.
