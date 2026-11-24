@@ -663,7 +663,7 @@ class Pass:
         original = model.apply_model
 
         def apply_model(*args, **kwargs):
-            if self.schedule is not None:
+            if self.schedule is not None and not self.schedule.idle and not self.schedule.done:
                 with self._speed_hacks():
                     x = args[0] if args else kwargs.get("x")
                     t = args[1] if len(args) > 1 else kwargs.get("t")
@@ -784,23 +784,26 @@ class Pass:
         stream = torch.cuda.current_stream(self.model.load_device).cuda_stream
         hack = None
         if self.schedule is not None and not self.schedule.idle and self.model.shallow_loaded:
-            with self._speed_hacks():
-                prompt = (feed["encoder_hidden_states"], feed.get("y"))
-                key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()), tuple(prompt[0].shape), tuple(_prompts))
-                slot, deep, origin, stale, kind = self.schedule.call(key)
-                entry = self.tracker.call(feed["sample"], b)
-                if kind == "check" and not self.tracker.valid(stale[1]):
-                    stale = kind = None
-                if deep is not None and not self.tracker.safe(entry, origin):
-                    # Noise the fit can't remove for this call, or for a call the fit can't follow, noise not yet ruled
-                    # out. It runs in full, and a tracked one may also probe (fresh.Tracker.probe).
-                    probe = entry is not None and self.tracker.probe(self.schedule.index)
-                    stale, kind = ((deep, origin), "probe") if probe else (None, None)
-                    deep = origin = None
-                    self.schedule.ran_full()
-                if deep is not None:
-                    self.schedule.compare(slot, key, prompt)
-                hack = (slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b)
+            if self.schedule.done:
+                self.schedule.full_calls += 1
+            else:
+                with self._speed_hacks():
+                    prompt = (feed["encoder_hidden_states"], feed.get("y"))
+                    key = (tuple(feed["sample"].shape), tuple(cond_or_uncond or ()), tuple(prompt[0].shape), tuple(_prompts))
+                    slot, deep, origin, stale, kind = self.schedule.call(key)
+                    entry = self.tracker.call(feed["sample"], b)
+                    if kind is not None and not self.tracker.valid(stale[1]):
+                        stale = kind = None
+                    if deep is not None and not self.tracker.safe(entry, origin):
+                        # Noise the fit can't remove for this call, or for a call the fit can't follow, noise not yet ruled
+                        # out. It runs in full, and a tracked one may also probe (fresh.Tracker.probe) when on the same path.
+                        probe = entry is not None and self.tracker.valid(origin) and self.tracker.probe(self.schedule.index)
+                        stale, kind = ((deep, origin), "probe") if probe else (None, None)
+                        deep = origin = None
+                        self.schedule.ran_full()
+                    if deep is not None:
+                        self.schedule.compare(slot, key, prompt)
+                    hack = (slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b)
         out = self._infer_with_room(feed, profile, stream, hack)
         # A shallow call whose Speed Hacks failed ran on the full engine instead
         shallow = hack is not None and hack[2] is not None and self.schedule is not None
@@ -811,6 +814,8 @@ class Pass:
         if shallow and not self.shallow_checked:
             self.shallow_checked = True
             if not torch.isfinite(out).all():
+                if self.started is not None:
+                    self.started.ran_full()
                 self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
                 out = self._infer_with_room(feed, profile, stream)
         return out[:b].to(x.dtype)
@@ -841,6 +846,8 @@ class Pass:
                         self.tracker.after_shallow(entry, outputs, origin)
                         self.tracker.after_call(entry, outputs["latent"][:b], cond_or_uncond)
                     return outputs["latent"]
+                if self.started is not None:
+                    self.started.ran_full()
             outputs = self.model.engine.infer(feed, profile, stream)
             out = outputs["latent"]
             if slot is not None and "deep" in outputs and self.schedule is not None:
@@ -1018,15 +1025,38 @@ def _wrap_forward(original):
     return forward
 
 
+_latest_sigmas = None
+_denoiser_state = None  # active CFGDenoiser.forward call, so a refiner switch inside it can start the new pass on that step
+
+
+def _begin_step(p: Pass, index: int, total, steps, step, x, sigma):
+    try:
+        p.schedule.begin(index, total, steps, step, sigma)
+        _prompts.clear()
+        if p.schedule.done:
+            p.tracker.release()
+        elif not p.schedule.idle:
+            p.tracker.begin(index, x)
+    except Exception as e:
+        p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
+
+
 def _wrap_prepare(original):
     def sampling_prepare(unet, x, *args, **kwargs):
-        global _pass
+        global _pass, _latest_sigmas
         end_pass()
+        if _denoiser_state is None:
+            _latest_sigmas = None
         records, hacks = _engine_records(unet, x)
         if records is None:
             with _evictable():
                 return original(unet, x, *args, **kwargs)
         _pass = _begin(records, hacks, unet, x, lambda u, v: original(u, v, *args, **kwargs))
+        if _pass is not None and _pass.schedule is not None and _denoiser_state is not None:
+            # Refiner switch mid-denoiser: get_sigmas doesn't run again, and the switch step is already in flight.
+            if _latest_sigmas is not None:
+                _pass.schedule.sigmas = list(_latest_sigmas)
+            _begin_step(_pass, *_denoiser_state)
 
     sampling_prepare._trt_original = original
     return sampling_prepare
@@ -1054,29 +1084,35 @@ def _wrap_close(original):
 
 def _wrap_denoiser(original):
     def forward(self, x, sigma, *args, **kwargs):
+        global _denoiser_state
         p = _pass
-        tracked = False
-        if p is not None and p.schedule is not None and p.fallback is None:
+        current_state = None
+        if setting() in (AUTOMATIC, SPEED_HACKS):
             try:
                 from modules import shared
 
                 state = shared.state
-                p.schedule.begin(int(self.step), self.total_steps, state.sampling_steps, state.sampling_step, sigma)
-                _prompts.clear()
-                if not p.schedule.idle:
-                    p.tracker.begin(int(self.step), x)
-                    tracked = True
+                current_state = (int(self.step), self.total_steps, state.sampling_steps, state.sampling_step, x, sigma)
             except Exception as e:
-                p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
-        denoised = original(self, x, sigma, *args, **kwargs)
-        if tracked and p.schedule is not None and p.tracker is not None:
+                if p is not None and p.schedule is not None and p.fallback is None:
+                    p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
+            else:
+                if p is not None and p.schedule is not None and p.fallback is None:
+                    _begin_step(p, *current_state)
+        prev_state, _denoiser_state = _denoiser_state, current_state
+        try:
+            denoised = original(self, x, sigma, *args, **kwargs)
+        finally:
+            _denoiser_state = prev_state
+        active = _pass
+        if active is not None and active.schedule is not None and active.tracker is not None and active.tracker.current is not None:
             try:
                 # Timestep samplers (DDIM, PLMS, UniPC) get eps back
-                checked = p.tracker.finish(denoised, x, sigma, eps=bool(getattr(self, "classic_ddim_eps_estimation", False)))
+                checked = active.tracker.finish(denoised, x, sigma, eps=bool(getattr(self, "classic_ddim_eps_estimation", False)))
                 if checked is not None:
-                    p.schedule.checked(*checked)
+                    active.schedule.checked(*checked)
             except Exception as e:
-                p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
+                active.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
         return denoised
 
     forward._trt_original = original
@@ -1088,10 +1124,18 @@ def _wrap_get_sigmas(original):
     # get_sigmas after sampling_prepare, before the first denoiser call; a subclass's override that calls the base
     # class's returns last, and its sigmas are the ones sampled.
     def get_sigmas(self, p, steps, *args, **kwargs):
+        global _latest_sigmas
         sigmas = original(self, p, steps, *args, **kwargs)
+        try:
+            values = [float(s) for s in sigmas.reshape(-1).tolist()]
+        except Exception as e:
+            _latest_sigmas = None
+            if _pass is not None and _pass.schedule is not None and _pass.schedule.index is None:
+                _pass.drop_speed_hacks(f"Speed Hacks failed ({e})", _unexpected(e))
+            return sigmas
+        _latest_sigmas = values
         if _pass is not None and _pass.schedule is not None and _pass.schedule.index is None:
-            with _pass._speed_hacks():
-                _pass.schedule.sigmas = [float(s) for s in sigmas.reshape(-1).tolist()]
+            _pass.schedule.sigmas = values
         return sigmas
 
     get_sigmas._trt_original = original
@@ -1168,7 +1212,7 @@ _prompts = []
 
 def _note_prompts(schedules_of, step):
     # schedules_of() -> one list of ScheduledPromptConditioning per prompt
-    if _pass is None or _pass.schedule is None or _pass.fallback is not None:
+    if _pass is None or _pass.schedule is None or _pass.schedule.idle or _pass.schedule.done or _pass.fallback is not None:
         return
     try:
         # prompt_parser's choice: the first schedule entry whose end_at_step the step hasn't passed
@@ -1265,9 +1309,10 @@ def _note_speed_hacks(schedule):
 
 
 def new_generation(p=None):
-    global _generation, _generation_thread
+    global _generation, _generation_thread, _latest_sigmas
     end_pass()
     common.new_generation()
+    _latest_sigmas = None
     _generation = weakref.ref(p) if p is not None else None
     _generation_thread = threading.get_ident()
     if setting() not in (AUTOMATIC, SPEED_HACKS):

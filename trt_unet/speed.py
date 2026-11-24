@@ -141,7 +141,8 @@ class Schedule:
         self.tolerance = tolerance(quality)
         self.index = None
         self.region = False  # this evaluation is between the start and end shares
-        self.idle = False  # the pass is too short for any shallow call
+        self.idle = False  # the pass has no shallow region (too short, or start >= end)
+        self.done = False  # past the shallow region (in the tail)
         self.kind = None  # "check", "probe" or None: what this evaluation's full calls also run the shallow engine for
         self._undecided = None  # (total, steps, step, sigma) until the evaluation's first call() decides region and kind
         # The sigmas KDiffusionSampler.get_sigmas returned for this pass (runtime.py), or None (timestep samplers)
@@ -178,11 +179,31 @@ class Schedule:
         self.index, self.slot = index, 0
         self._collect()
         self._follow(index, step)
+        if self._levels is None and self.sigmas is not None and steps and len(self.sigmas) > steps:
+            self._levels = [-v for v in self.sigmas[-(steps + 1):]]  # img2img samples the schedule's last steps
         self.idle = not total or not steps or steps < MIN_STEPS
+        if not self.idle:
+            if self._levels is not None:
+                n = len(self._levels) - 1
+                start, end = round(self.warmup * n), n - max(1, round(self.tail * n))
+                if start >= end:
+                    self.idle = True
+                elif (step + 1 if index else 0) >= end:
+                    self.done = True
+            else:
+                per = max(1, total // steps)
+                start, end = round(self.warmup * total), total - max(per, round(self.tail * total))
+                if start >= end:
+                    self.idle = True
+                elif index >= end:
+                    self.done = True
         self.region, self.kind = False, None
-        self._undecided = None if self.idle else (total, steps, step, sigma)
-        for k in [k for k, kept in self.deep.items() if index - kept[3] > STALE]:
-            del self.deep[k]
+        self._undecided = None if self.idle or self.done else (total, steps, step, sigma)
+        if self.done:
+            self.deep.clear()
+        else:
+            for k in [k for k, kept in self.deep.items() if index - kept[3] > STALE]:
+                del self.deep[k]
 
     def _follow(self, index, step):
         if self._step is None:
@@ -201,7 +222,8 @@ class Schedule:
             self._levels = [-v for v in self.sigmas[-(steps + 1):]]  # img2img samples the schedule's last steps
         if self._levels is not None:
             # A sync, in the evaluation's first UNet call right before the engine runs (as fresh.Tracker.valid's)
-            region, probe = self._place(index, float(torch.as_tensor(sigma).max()), step)
+            t = torch.as_tensor(sigma)
+            region, probe = self._place(index, float(t) if t.numel() == 1 else float(t.max()), step)
         else:
             # Calls against reForge's total_steps, which counts 2 per step only for samplers it flags second_order:
             # their final call is at total - 2.

@@ -470,6 +470,14 @@ class Tracker:
         reason = torch.where(_white(noise) | (share <= NOISY), 0.0, 2.0)
         self.status({"reason": reason, "share": share})
 
+    def release(self):
+        self.history.clear()
+        self.current = self.check = None
+        self._last.clear()
+        self._constants.clear()
+        self._statuses.clear()
+        self._jumps.clear()
+
     def _error(self, entry, full, checked):
         # A check's error in the denoiser's output, relative to it. How the output depends on each block of UNet rows
         # comes from a least-squares fit of the output on the blocks' denoised values, per image: CFG's 1 - s and s, and
@@ -482,7 +490,7 @@ class Tracker:
         changed = self.sampling.calculate_denoised(sigma, checked.float(), x).reshape(k, n, -1).permute(1, 2, 0).double()
         output = entry.denoised.reshape(n, -1, 1).double()
         gram = blocks.transpose(1, 2) @ blocks
-        ridge = 1e-12 * gram.diagonal(dim1=1, dim2=2).sum(1).reshape(n, 1, 1) * torch.eye(k, dtype=gram.dtype, device=gram.device)
+        ridge = 1e-12 * gram.diagonal(dim1=1, dim2=2).sum(1).clamp_min(1e-30).reshape(n, 1, 1) * torch.eye(k, dtype=gram.dtype, device=gram.device)
         weights = torch.linalg.solve_ex(gram + ridge, blocks.transpose(1, 2) @ output)[0]
         error = (changed - blocks) @ weights
         return (error.norm() / output.norm().clamp_min(1e-30)).float()
