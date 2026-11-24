@@ -1,4 +1,5 @@
 import collections
+import contextlib
 import functools
 import json
 import logging
@@ -37,11 +38,16 @@ class Readback:
 
     def send(self, tag, *values):
         shape = (len(values), values[0].numel())
+        dev = values[0].device if values[0].is_cuda else device()
         spare = self._spare.get(shape)
-        host, event = spare.pop() if spare else (torch.empty(shape, dtype=torch.float32, pin_memory=True), torch.cuda.Event())
+        if spare:
+            host, event = spare.pop()
+        else:
+            with on_device(dev):
+                host, event = torch.empty(shape, dtype=torch.float32, pin_memory=True), torch.cuda.Event()
         for row, value in zip(host, values):
             row.copy_(value.reshape(-1), non_blocking=True)
-        event.record()
+        event.record(torch.cuda.current_stream(dev))
         self._pending.append((tag, host, event))
 
     def ready(self):
@@ -92,6 +98,12 @@ def device() -> torch.device:
         return dev
     except Exception:
         return torch.device("cuda", torch.cuda.current_device())
+
+
+def on_device(dev=None):
+    # Binds the calling thread's CUDA context for libraries (TensorRT, cudart) that read the active thread device.
+    dev = torch.device(dev) if dev is not None else device()
+    return torch.cuda.device(dev) if dev.type == "cuda" else contextlib.nullcontext()
 
 
 def inference_mode(fn):

@@ -621,17 +621,19 @@ def _host_slab(nbytes: int):
     size = max(nbytes, 1)
     t, kind = torch.empty(size, dtype=torch.uint8), "pageable"
     try:
-        cudart = torch.cuda.cudart()
-        if int(cudart.cudaHostRegister(t.data_ptr(), t.numel(), 0)) == 0:
-            kind = "registered"
-        else:
-            cudart.cudaGetLastError()
+        with common.on_device():
+            cudart = torch.cuda.cudart()
+            if int(cudart.cudaHostRegister(t.data_ptr(), t.numel(), 0)) == 0:
+                kind = "registered"
+            else:
+                cudart.cudaGetLastError()
     except Exception:
         pass
     if kind == "pageable":
         del t
         try:
-            t, kind = torch.empty(size, dtype=torch.uint8, pin_memory=True), "pinned"
+            with common.on_device():
+                t, kind = torch.empty(size, dtype=torch.uint8, pin_memory=True), "pinned"
         except RuntimeError:
             t = torch.empty(size, dtype=torch.uint8)
     _pinned.update(tensor=t, kind=kind, seconds=time.perf_counter() - start, used=True)
@@ -642,8 +644,10 @@ def release_pinned():
     t = _pinned["tensor"]
     if t is not None and _pinned["kind"] == "registered":
         try:
-            torch.cuda.synchronize(common.device())
-            torch.cuda.cudart().cudaHostUnregister(t.data_ptr())
+            dev = common.device()
+            with common.on_device(dev):
+                torch.cuda.synchronize(dev)
+                torch.cuda.cudart().cudaHostUnregister(t.data_ptr())
         except Exception:
             pass
     _pinned.update(tensor=None, kind=None, seconds=0.0, used=False)

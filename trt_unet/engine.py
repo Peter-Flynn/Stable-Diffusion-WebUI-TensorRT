@@ -121,7 +121,8 @@ def own_allocator(failures_before: int, owner, error) -> bool:
     if not gpu.suspect(failures_before, owner):
         return False
     _set_aside.append(_runtime)
-    _runtime = trt.Runtime(LOGGER)
+    with common.on_device():
+        _runtime = trt.Runtime(LOGGER)
     gpu.retire()
     logger.warning(f"Loading the {owner} failed with PyTorch's allocator ({error}), so TensorRT manages its own VRAM from now on. Trying again.")
     return True
@@ -225,19 +226,20 @@ class Engine:
         if plan is None:
             with open(self.plan_path, "rb") as f:
                 plan = f.read()
-        self.engine = _deserialize(plan, self.owner)
-        if self.engine is None:
-            said = LOGGER.errors[-1] if LOGGER.errors else "no reason given"
-            other = "" if LOGGER.out_of_memory else other_tensorrt()
-            what = os.path.basename(self.plan_path) + ("" if serialized is None else " as kept in RAM")
-            raise RuntimeError(f"TensorRT {trt.__version__} couldn't load {what}: {said}" + (f" {other}" if other else ""))
-        self.io = []
-        for i in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(i)
-            is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
-            self.io.append((name, is_input, torch_dtype(self.engine.get_tensor_dtype(name))))
-        with gpu.owner(self.owner):
-            self.weight_names = list(trt.Refitter(self.engine, LOGGER).get_all_weights())
+        with common.on_device():
+            self.engine = _deserialize(plan, self.owner)
+            if self.engine is None:
+                said = LOGGER.errors[-1] if LOGGER.errors else "no reason given"
+                other = "" if LOGGER.out_of_memory else other_tensorrt()
+                what = os.path.basename(self.plan_path) + ("" if serialized is None else " as kept in RAM")
+                raise RuntimeError(f"TensorRT {trt.__version__} couldn't load {what}: {said}" + (f" {other}" if other else ""))
+            self.io = []
+            for i in range(self.engine.num_io_tensors):
+                name = self.engine.get_tensor_name(i)
+                is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+                self.io.append((name, is_input, torch_dtype(self.engine.get_tensor_dtype(name))))
+            with gpu.owner(self.owner):
+                self.weight_names = list(trt.Refitter(self.engine, LOGGER).get_all_weights())
         self.context = None  # created on first use, after the weights are refitted in
         self._reset_context_state()
         return time.perf_counter() - start
@@ -265,7 +267,7 @@ class Engine:
         if self.context is None:
             LOGGER.clear()
             try:
-                with self._taking():
+                with common.on_device(), self._taking():
                     self.context = self.engine.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
             except Exception:
                 self.context = None
@@ -283,9 +285,10 @@ class Engine:
         return self.context
 
     def unload(self):
-        with gpu.owner(self.owner):
-            self.context = None  # before the engine it belongs to
-            self.engine = None
+        if self.context is not None or self.engine is not None:
+            with common.on_device(), gpu.owner(self.owner):
+                self.context = None  # before the engine it belongs to
+                self.engine = None
         self._reset_context_state()
         self.arena.release()
         if self.extra:
@@ -293,72 +296,74 @@ class Engine:
             self.extra = 0
 
     def serialize(self):
-        config = self.engine.create_serialization_config()
-        config.clear_flag(trt.SerializationFlag.EXCLUDE_WEIGHTS)  # inherited from the weight-stripped plan
-        config.set_flag(trt.SerializationFlag.INCLUDE_REFIT)  # without it, the reloaded engine can never be refitted again
-        LOGGER.clear()
-        with gpu.owner(self.owner):
-            serialized = self.engine.serialize_with_config(config)
+        with common.on_device():
+            config = self.engine.create_serialization_config()
+            config.clear_flag(trt.SerializationFlag.EXCLUDE_WEIGHTS)  # inherited from the weight-stripped plan
+            config.set_flag(trt.SerializationFlag.INCLUDE_REFIT)  # without it, the reloaded engine can never be refitted again
+            LOGGER.clear()
+            with gpu.owner(self.owner):
+                serialized = self.engine.serialize_with_config(config)
         if serialized is None:
             raise RuntimeError("TensorRT could not serialize the engine" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
         return serialized
 
     def refit(self, names, tensor_for) -> float:
-        refitter = trt.Refitter(self.engine, LOGGER)
-        for setting, value in REFITTER_SETTINGS.items():
-            try:
-                setattr(refitter, setting, value)
-            except (AttributeError, TypeError) as e:
-                if setting not in _unsettable:
-                    _unsettable.add(setting)
-                    logger.debug(f"Couldn't set the refitter's {setting}: {e}")
-        keep, gpu_batch, gpu_bytes, start = [], [], 0, time.perf_counter()
-        batch_limit = 32 * 2**20  # bounds extra VRAM while letting LoRA/FP8 kernels queue without per-weight syncs
-
-        def bind(name, proto, t):
-            if t.numel() != proto.size:
-                raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
-            keep.append(t)
-            if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), trt.TensorLocation.HOST):
-                raise RuntimeError(f"TensorRT rejected weight {name}")
-
-        def flush():
-            nonlocal gpu_bytes
-            if not gpu_batch:
-                return
-            for name, proto, t in gpu_batch:
-                bind(name, proto, t.to("cpu"))
-            gpu_batch.clear()
-            gpu_bytes = 0
-
-        def put(name):
-            nonlocal gpu_bytes
-            proto = refitter.get_weights_prototype(name)
-            t = tensor_for(name, None).to(dtype=torch_dtype(proto.dtype)).contiguous()
-            if t.is_cuda:
-                gpu_batch.append((name, proto, t))
-                gpu_bytes += t.numel() * t.element_size()
-                if gpu_bytes >= batch_limit:
-                    flush()
-            else:
-                bind(name, proto, t)
-
-        LOGGER.clear()
-        try:
-            for name in names:
-                put(name)
-            flush()
-            for name in refitter.get_missing_weights():
-                put(name)
-            flush()
-            with self._taking():
+        with common.on_device():
+            refitter = trt.Refitter(self.engine, LOGGER)
+            for setting, value in REFITTER_SETTINGS.items():
                 try:
-                    ok = refitter.refit_cuda_engine()
-                finally:
-                    refitter.release_refit_resources()  # otherwise the refit's scratch VRAM stays allocated for the engine's lifetime
-        finally:
-            gpu_batch.clear()
-            keep.clear()  # an exception's traceback holds this frame, and with it GBs of weights
+                    setattr(refitter, setting, value)
+                except (AttributeError, TypeError) as e:
+                    if setting not in _unsettable:
+                        _unsettable.add(setting)
+                        logger.debug(f"Couldn't set the refitter's {setting}: {e}")
+            keep, gpu_batch, gpu_bytes, start = [], [], 0, time.perf_counter()
+            batch_limit = 32 * 2**20  # bounds extra VRAM while letting LoRA/FP8 kernels queue without per-weight syncs
+
+            def bind(name, proto, t):
+                if t.numel() != proto.size:
+                    raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
+                keep.append(t)
+                if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), trt.TensorLocation.HOST):
+                    raise RuntimeError(f"TensorRT rejected weight {name}")
+
+            def flush():
+                nonlocal gpu_bytes
+                if not gpu_batch:
+                    return
+                for name, proto, t in gpu_batch:
+                    bind(name, proto, t.to("cpu"))
+                gpu_batch.clear()
+                gpu_bytes = 0
+
+            def put(name):
+                nonlocal gpu_bytes
+                proto = refitter.get_weights_prototype(name)
+                t = tensor_for(name, None).to(dtype=torch_dtype(proto.dtype)).contiguous()
+                if t.is_cuda:
+                    gpu_batch.append((name, proto, t))
+                    gpu_bytes += t.numel() * t.element_size()
+                    if gpu_bytes >= batch_limit:
+                        flush()
+                else:
+                    bind(name, proto, t)
+
+            LOGGER.clear()
+            try:
+                for name in names:
+                    put(name)
+                flush()
+                for name in refitter.get_missing_weights():
+                    put(name)
+                flush()
+                with self._taking():
+                    try:
+                        ok = refitter.refit_cuda_engine()
+                    finally:
+                        refitter.release_refit_resources()  # otherwise the refit's scratch VRAM stays allocated for the engine's lifetime
+            finally:
+                gpu_batch.clear()
+                keep.clear()  # an exception's traceback holds this frame, and with it GBs of weights
         if not ok:
             raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
         return time.perf_counter() - start
@@ -393,47 +398,49 @@ class Engine:
         return self.size
 
     def estimate_activation_bytes(self, profile: int, shapes: dict, stream: int) -> int:
-        self._set_shapes(profile, shapes, stream)
-        return self.activation_bytes()
+        with common.on_device():
+            self._set_shapes(profile, shapes, stream)
+            return self.activation_bytes()
 
     def io_bytes(self) -> dict:
         return {name: math.prod(self.context.get_tensor_shape(name)) * dtype.itemsize for name, _, dtype in self.io}
 
     def infer(self, feed: dict, profile: int, stream: int, into: dict = None) -> dict:
-        self._prepare(profile, {name: tuple(feed[name].shape) for name, is_input, _ in self.io if is_input}, stream)
         dev = common.device()
-        outputs = {}
-        for name, is_input, dtype in self.io:
-            if is_input:
-                t = feed[name]
-                if t.dtype != dtype or t.device != dev or not t.is_contiguous():
-                    t = feed[name] = t.to(device=dev, dtype=dtype).contiguous()
-            else:
-                shape = tuple(self.context.get_tensor_shape(name))
-                given = (into or {}).get(name)
-                if given is not None and tuple(given.shape) == shape and given.dtype == dtype and given.device == dev and given.is_contiguous():
-                    t = outputs[name] = given
+        with common.on_device(dev):
+            self._prepare(profile, {name: tuple(feed[name].shape) for name, is_input, _ in self.io if is_input}, stream)
+            outputs = {}
+            for name, is_input, dtype in self.io:
+                if is_input:
+                    t = feed[name]
+                    if t.dtype != dtype or t.device != dev or not t.is_contiguous():
+                        t = feed[name] = t.to(device=dev, dtype=dtype).contiguous()
                 else:
-                    t = outputs[name] = torch.empty(shape, dtype=dtype, device=dev)
-            self.context.set_tensor_address(name, t.data_ptr())
-        LOGGER.clear()
-        if self.ran:
-            ran = self.context.execute_async_v3(stream)
-        else:
-            with self._taking("as it first ran"):  # a context allocates more on its first run
+                    shape = tuple(self.context.get_tensor_shape(name))
+                    given = (into or {}).get(name)
+                    if given is not None and tuple(given.shape) == shape and given.dtype == dtype and given.device == dev and given.is_contiguous():
+                        t = outputs[name] = given
+                    else:
+                        t = outputs[name] = torch.empty(shape, dtype=dtype, device=dev)
+                self.context.set_tensor_address(name, t.data_ptr())
+            LOGGER.clear()
+            if self.ran:
                 ran = self.context.execute_async_v3(stream)
-        if not ran:
-            raise RuntimeError("TensorRT inference failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
-        if not self.ran:
-            self.ran = True
-            gpu.proven()
-        if PROFILE:
-            torch.cuda.current_stream(dev).synchronize()
-            try:
-                self.context.report_to_profiler()
-            except Exception:
-                pass
-        return outputs
+            else:
+                with self._taking("as it first ran"):  # a context allocates more on its first run
+                    ran = self.context.execute_async_v3(stream)
+            if not ran:
+                raise RuntimeError("TensorRT inference failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
+            if not self.ran:
+                self.ran = True
+                gpu.proven()
+            if PROFILE:
+                torch.cuda.current_stream(dev).synchronize()
+                try:
+                    self.context.report_to_profiler()
+                except Exception:
+                    pass
+            return outputs
 
     def release_activations(self):
         self.arena.release()
