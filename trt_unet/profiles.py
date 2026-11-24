@@ -78,7 +78,7 @@ def fit(shapes: dict, batch: int, height: int, width: int, context: int):
         return None
     padded = max(batch, b_lo)
     spread = math.log(h_hi * w_hi / (h_lo * w_lo)) + math.log(b_hi / b_lo) + math.log(c_hi / c_lo)
-    score = (padded / batch, repeats, abs(math.log(height * width / (h_opt * w_opt))), abs(math.log(padded / b_opt)), spread)
+    score = (padded / batch, repeats, abs(math.log(height / h_opt)) + abs(math.log(width / w_opt)), abs(math.log(padded / b_opt)), spread)
     return score, padded, repeats
 
 

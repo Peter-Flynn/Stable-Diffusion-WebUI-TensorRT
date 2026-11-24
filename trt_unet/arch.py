@@ -51,10 +51,20 @@ def unet_config(patcher) -> dict:
     return {k: v for k, v in patcher.model.model_config.unet_config.items() if k not in _IGNORED_CONFIG}
 
 
-def _supported(module) -> bool:
+def _supported(module, patcher):
     from ldm_patched.ldm.modules.diffusionmodules.openaimodel import UNetModel
 
-    return isinstance(module, UNetModel)
+    if type(module) is not UNetModel or getattr(module, "predict_codebook_ids", False):
+        return None
+    config = unet_config(patcher)
+    if (
+        config.get("dims", 2) != 2
+        or config.get("num_classes") not in (None, "sequential")
+        or config.get("use_temporal_attention")
+        or config.get("use_temporal_resblock")
+    ):
+        return None
+    return config
 
 
 def detect(patcher=None):
@@ -66,8 +76,8 @@ def detect(patcher=None):
     if cached is not None and cached[0]() is module:
         return cached[1]
     arch = None
-    if _supported(module):
-        config = unet_config(patcher)
+    config = _supported(module, patcher)
+    if config is not None:
         shapes = sorted((k, list(v.shape)) for k, v in module.state_dict(keep_vars=True).items() if not k.endswith(_IGNORED_WEIGHTS))
         family = type(patcher.model.model_config).__name__
         digest = hashlib.sha256(json.dumps([sorted((k, repr(v)) for k, v in config.items()), shapes]).encode()).hexdigest()

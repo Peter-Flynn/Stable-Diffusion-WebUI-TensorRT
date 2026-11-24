@@ -125,48 +125,57 @@ class TrtModel:
 
         if self.loaded:
             return 0
-        if self.weights is None:  # loaded by reForge outside a sampling pass: use the loaded checkpoint's weights
+        temp_weights = self.weights is None
+        if temp_weights:  # loaded by reForge outside a sampling pass: use the loaded checkpoint's weights
             patcher = arch_mod.unet_patcher()
             if patcher is None:
                 raise RuntimeError("no checkpoint to take the engine's weights from")
             self.weights = EffectiveWeights(patcher)
-        shallow = bool(self.hacks and self.want_shallow)
-        start, need = time.time(), 0
-        if self.opened:  # in VRAM without weights, after a failed refit
-            self._discard()
-        for attempt in (0, 1):
-            load, failures = {}, gpu.failures()
-            try:
-                kept = self._kept()
-                need = self.full(shallow, kept)
-                common.make_room(common.padded(need) if not attempt else common.obtainable(self.load_device) - common.reserve(), self.load_device)
-                with gpu.loading(self.owner) as load:
-                    engine = self._engines()
-                    self.applied = {}
-                    plan_seconds = self._load("unet", engine, kept)
-                with gpu.loading(self.owner) as rest:
-                    refit, more, kept = self._load_engines(kept)
-                load["failures"] = load.get("failures", 0) + rest.get("failures", 0)
-                plan_seconds += more
-                break
-            except Exception as e:
-                past = self.opened
-                if not attempt:
-                    e.__traceback__ = None  # its frames reference what TensorRT allocated for the failed load
+        weights, want_shallow = self.weights, self.want_shallow
+        try:
+            shallow = bool(self.hacks and want_shallow)
+            start, need = time.time(), 0
+            if self.opened:  # in VRAM without weights, after a failed refit
                 self._discard()
-                if attempt:
-                    raise
-                if past and engine_mod.own_allocator(failures, self.owner, e):
-                    continue
-                if gpu.attached() and not load.get("failures") and gpu.failures() == failures:  # didn't run out: more room won't help
-                    raise
-                logger.info(f"Loading the {self.name} ran out of VRAM with {common.gib(need)} freed ({e}); freeing all there is and trying again.")
-        refits.used(self.record.key)
-        hacks = " with Speed Hacks" if self.shallow_loaded else ""
-        how = ["from RAM" if kept else f"plan {plan_seconds:.1f}s"] + ([_refit_times(refit)] if refit else [])
-        logger.info(f"Loaded the {self.name}{hacks} in {time.time() - start:.1f}s ({', '.join(how)}); it holds {common.gib(gpu.held(self.owner))} of VRAM.")
-        common.memory(f"after loading the {self.name}")
-        return self.model_size()
+            for attempt in (0, 1):
+                self.weights, self.want_shallow = weights, want_shallow
+                load, failures = {}, gpu.failures()
+                try:
+                    kept = self._kept()
+                    need = self.full(shallow, kept)
+                    common.make_room(common.padded(need) if not attempt else common.obtainable(self.load_device) - common.reserve(), self.load_device)
+                    with gpu.loading(self.owner) as load:
+                        engine = self._engines()
+                        self.applied = {}
+                        plan_seconds = self._load("unet", engine, kept)
+                    with gpu.loading(self.owner) as rest:
+                        refit, more, kept = self._load_engines(kept)
+                    load["failures"] = load.get("failures", 0) + rest.get("failures", 0)
+                    plan_seconds += more
+                    break
+                except Exception as e:
+                    past = self.opened
+                    if not attempt:
+                        e.__traceback__ = None  # its frames reference what TensorRT allocated for the failed load
+                    self._discard()
+                    if attempt:
+                        raise
+                    if past and engine_mod.own_allocator(failures, self.owner, e):
+                        continue
+                    if gpu.attached() and not load.get("failures") and gpu.failures() == failures:  # didn't run out: more room won't help
+                        raise
+                    logger.info(f"Loading the {self.name} ran out of VRAM with {common.gib(need)} freed ({e}); freeing all there is and trying again.")
+            refits.used(self.record.key)
+            hacks = " with Speed Hacks" if self.shallow_loaded else ""
+            how = ["from RAM" if kept else f"plan {plan_seconds:.1f}s"] + ([_refit_times(refit)] if refit else [])
+            logger.info(f"Loaded the {self.name}{hacks} in {time.time() - start:.1f}s ({', '.join(how)}); it holds {common.gib(gpu.held(self.owner))} of VRAM.")
+            common.memory(f"after loading the {self.name}")
+            return self.model_size()
+        finally:
+            if temp_weights or not self.loaded:
+                self.weights = None
+            if not self.loaded:
+                self.want_shallow = False
 
     def _load_engines(self, kept) -> tuple:
         plan_seconds = 0.0
@@ -213,11 +222,12 @@ class TrtModel:
                         refits.drop(self.record.key, role)
         return engine.load()
 
-    def _kept(self):
+    def _kept(self, weights=None):
+        weights = weights if weights is not None else self.weights
         entry = refits.get(self.record.key)
-        if entry is None:
+        if entry is None or weights is None:
             return None
-        wanted = self.weights.signature
+        wanted = weights.signature
         if "unet" in entry.blobs and all(wanted(name) == sig for sigs in entry.signatures.values() for name, sig in sigs.items()):
             return entry
         refits.drop(self.record.key)
@@ -311,7 +321,7 @@ class TrtModel:
             if self.shallow is not None:
                 self.shallow.unload()
             self.engine.unload()
-            self.applied, self.shallow_failed = {}, False
+            self.applied, self.shallow_failed, self.want_shallow, self.weights = {}, False, False, None
             left = gpu.ledger(self.owner)
             if left:
                 logger.debug(f"TensorRT still holds {common.gib(left)} of the {self.name}'s VRAM after unloading it.")
@@ -451,6 +461,11 @@ def _unsupported(patcher) -> str:
         return "ControlNet"
     if getattr(patcher, "extra_concat_condition", None) is not None:
         return "extra input channels (inpainting add-ons)"
+    module = getattr(getattr(patcher, "model", None), "diffusion_model", None)
+    if module is not None:
+        paddings = {m.padding_mode for m in module.modules() if isinstance(m, torch.nn.Conv2d) and m.padding_mode != "zeros"}
+        if paddings:
+            return "tiling (circular padding)" if paddings == {"circular"} else f"non-zero conv padding ({', '.join(sorted(paddings))})"
     options = patcher.model_options.get("transformer_options", {})
     kinds = sorted({k for group in ("patches", "patches_replace") for k, v in options.get(group, {}).items() if v})
     if options.get("wrappers", {}).get("diffusion_model"):
@@ -477,28 +492,22 @@ def _unload_torch_unet(patcher):
         mm.soft_empty_cache(force=True)
 
 
-def _no_free_memory(memory_required, device, keep_loaded=[]):
-    return []
+_evicting = 0  # > 0 inside _evictable(): loads for PyTorch's UNet and unload_all_models evict engines normally
+_no_free = 0  # > 0 inside _begin()'s sampling_prepare: keeps engines from being evicted while patches apply
+_kept = []  # model tuples appended to keep_loaded by _wrap_free_memory
 
 
 @contextlib.contextmanager
 def _keeping(*models):
     # Loads inside this block can't evict these models. During a pass the UNet must stay loaded (unloading it undoes its
     # patches, e.g. model sampling, which the pass still uses) and so must the engine (it would reload on the next step).
-    mm = common.mm()
-    original = mm.free_memory
-
-    def free_memory(memory_required, device, keep_loaded=[]):
-        return original(memory_required, device, keep_loaded=list(keep_loaded) + _loaded_entries(*models))
-
-    mm.free_memory = free_memory
+    entry = tuple(models)
+    _kept.append(entry)
     try:
         yield
     finally:
-        mm.free_memory = original
-
-
-_evicting = 0  # > 0 inside _evictable(): loads for PyTorch's UNet and unload_all_models evict engines normally
+        with contextlib.suppress(ValueError):
+            _kept.remove(entry)
 
 
 @contextlib.contextmanager
@@ -516,16 +525,22 @@ def _wrap_free_memory(original):
     # go last, and only if evicting them makes the estimate fit: a worst-case estimate nothing could meet (e.g. a large
     # VAE decode in FP32) no longer takes the engine along; the load makes do with what's free, as it does anyway.
     def free_memory(memory_required, device, keep_loaded=[]):
+        if _no_free:
+            return []
+        keep = list(keep_loaded)
+        if _kept:
+            extra = _loaded_entries(*(m for group in list(_kept) for m in group))
+            keep.extend(lm for lm in extra if lm not in keep)
         mm = common.mm()
         engines = []
         if not _evicting and not getattr(mm, "DISABLE_SMART_MEMORY", False):
-            engines = [lm for lm in mm.current_loaded_models if getattr(lm.model, "evicted_last", False) and lm.device == device and lm not in keep_loaded]
+            engines = [lm for lm in mm.current_loaded_models if getattr(lm.model, "evicted_last", False) and lm.device == device and lm not in keep]
         if not engines:
-            return original(memory_required, device, keep_loaded)
-        unloaded = original(memory_required, device, list(keep_loaded) + engines)
+            return original(memory_required, device, keep)
+        unloaded = original(memory_required, device, keep + engines)
         short = memory_required - mm.get_free_memory(device)
         if 0 < short <= sum(lm.model_loaded_memory() for lm in engines):
-            unloaded += original(memory_required, device, keep_loaded)
+            unloaded += original(memory_required, device, keep)
         return unloaded
 
     free_memory._trt_original = original
@@ -607,13 +622,13 @@ class Pass:
             for other in list(_models.values()):
                 if other is not model and other.opened:
                     _unload(other)
-            self._hold(None)
+            self._hold()
             model.weights = self.weights
-            model.want_shallow = model.want_shallow or (self.schedule is not None and model.hacks is not None and not model.shallow_failed)
+            model.want_shallow = bool(self.schedule is not None and model.hacks is not None and not model.shallow_failed)
             with torch.inference_mode(), _keeping(self.patcher):
                 common.register(model)
             self.model = model
-            self._hold(_keeping(model, self.patcher))
+            self._hold(model, self.patcher)
         _last_used[self.arch_id] = record.key
         if self.schedule is not None and model.hacks and not model.shallow_loaded and not model.shallow_failed:
             model.want_shallow = True
@@ -629,13 +644,14 @@ class Pass:
         key = _last_used.get(self.arch_id)
         return {i for i, (r, _) in enumerate(self.slots) if r.key == key}
 
-    def _hold(self, keep):
+    def _hold(self, *models):
         if self._keep is not None:
-            self._keep, old = None, self._keep
-            old.__exit__(None, None, None)
-        if keep is not None:
-            keep.__enter__()
-            self._keep = keep
+            with contextlib.suppress(ValueError):
+                _kept.remove(self._keep)
+            self._keep = None
+        if models:
+            self._keep = tuple(models)
+            _kept.append(self._keep)
 
     def _watch_apply_model(self, model):
         # fresh.Tracker takes x and sigma from apply_model: in FP32, and as the UNet gets them. A wrapper left by a pass
@@ -688,7 +704,7 @@ class Pass:
             current = self.patcher.model.__dict__.get("apply_model")
             if hasattr(current, "_trt_before"):
                 self._put_apply_model(self.patcher.model, current._trt_before)
-        self._hold(None)
+        self._hold()
         if self.model is not None and self.model.loaded:
             self.model.engine.release_activations()
         if self.schedule is not None:
@@ -877,16 +893,19 @@ def _engine_records(patcher, x):
 
 
 def _begin(records, hacks, patcher, x, prepare):
+    global _no_free
     mm = common.mm()
     with torch.inference_mode():
         _unload_torch_unet(patcher)
-        state = mm.vram_state, mm.free_memory
+        prev_state = mm.vram_state
         # reForge's sampling_prepare applies the UNet's patches; NO_VRAM keeps its weights in RAM while it does
-        mm.vram_state, mm.free_memory = mm.VRAMState.NO_VRAM, _no_free_memory
+        mm.vram_state = mm.VRAMState.NO_VRAM
+        _no_free += 1
         try:
             prepare(patcher, x)
         finally:
-            mm.vram_state, mm.free_memory = state
+            _no_free -= 1
+            mm.vram_state = prev_state
         p = Pass(records, patcher, x, hacks)
         try:
             b, _, h, w = x.shape
@@ -915,14 +934,13 @@ def _unexpected(error):  # the error, for its traceback, unless a RuntimeError: 
 
 
 def _fits(model: TrtModel, p: Pass, x):
-    shallow = bool(model.hacks and (model.want_shallow or (p.schedule is not None and not model.shallow_failed)))
+    shallow = bool(model.hacks and p.schedule is not None and not model.shallow_failed)
     calls = max(call_bytes(model, p.patcher, x), model.took.get(tuple(x.shape[i] for i in (0, 2, 3)), 0))
     held = gpu.held(model.owner)
     if model.loaded:
         engine = held + (model._serialized_size("shallow") if shallow and not model.shallow_loaded else 0)
     else:
-        model.weights = p.weights
-        engine = model.full(shallow, model._kept())
+        engine = model.full(shallow, model._kept(p.weights))
     room = common.obtainable(model.load_device, keep=[model]) - common.reserve() + held
     need = held + common.padded(engine - held + calls)  # margin only on what isn't in VRAM yet
     logger.info(
@@ -989,6 +1007,8 @@ def _wrap_forward(original):
                     p.fall_back("TensorRT engines can't apply ControlNet")
                 if any(v for g in ("patches", "patches_replace") for v in transformer_options.get(g, {}).values()):
                     p.fall_back("TensorRT engines can't apply UNet patches")
+                if (transformer_options.get("wrappers") or {}).get("diffusion_model"):
+                    p.fall_back("TensorRT engines can't apply UNet wrappers")
                 return p.run(x, timesteps, context, y, transformer_options.get("cond_or_uncond"))
             except Fallback:
                 pass
@@ -1110,16 +1130,32 @@ def _wrap_vae_encode(original):
     return encode
 
 
-def _rebind(owner, name, wrap):  # also replaces references other modules took with `from ... import name`
-    current = getattr(owner, name)
-    if hasattr(current, "_trt_original"):
+_installed = set()  # (owner, name) hooks already installed, so another extension wrapping on top doesn't cause double-wrapping
+
+
+def _hook(owner, name, wrap):
+    key = (owner, name)
+    if key in _installed:
         return
-    replacement = wrap(current)
-    setattr(owner, name, replacement)
-    for module in list(sys.modules.values()):
-        namespace = getattr(module, "__dict__", None)
-        if isinstance(namespace, dict) and namespace.get(name) is current:
-            setattr(module, name, replacement)
+    current = getattr(owner, name)
+    if not hasattr(current, "_trt_original"):
+        setattr(owner, name, wrap(current))
+    _installed.add(key)
+
+
+def _rebind(owner, name, wrap):  # also replaces references other modules took with `from ... import name`
+    key = (owner, name)
+    if key in _installed:
+        return
+    current = getattr(owner, name)
+    if not hasattr(current, "_trt_original"):
+        replacement = wrap(current)
+        setattr(owner, name, replacement)
+        for module in list(sys.modules.values()):
+            namespace = getattr(module, "__dict__", None)
+            if isinstance(namespace, dict) and namespace.get(name) is current:
+                setattr(module, name, replacement)
+    _installed.add(key)
 
 
 _hook_failures = set()  # install_hooks runs every generation: log each failure once
@@ -1170,10 +1206,8 @@ def install_hooks():
     from modules import processing
     from modules_forge import forge_sampler
 
-    if not hasattr(openaimodel.UNetModel.forward, "_trt_original"):
-        openaimodel.UNetModel.forward = _wrap_forward(openaimodel.UNetModel.forward)
-    if not hasattr(processing.StableDiffusionProcessing.close, "_trt_original"):
-        processing.StableDiffusionProcessing.close = _wrap_close(processing.StableDiffusionProcessing.close)
+    _hook(openaimodel.UNetModel, "forward", _wrap_forward)
+    _hook(processing.StableDiffusionProcessing, "close", _wrap_close)
     _rebind(forge_sampler, "sampling_prepare", _wrap_prepare)
     _rebind(forge_sampler, "sampling_cleanup", _wrap_cleanup)
     _rebind(common.mm(), "free_memory", _wrap_free_memory)
@@ -1182,18 +1216,14 @@ def install_hooks():
     try:
         from ldm_patched.modules import sd as ldm_sd
 
-        if not hasattr(ldm_sd.VAE.decode, "_trt_original"):
-            ldm_sd.VAE.decode = _wrap_vae_decode(ldm_sd.VAE.decode)
-        if not hasattr(ldm_sd.VAE.encode, "_trt_original"):
-            ldm_sd.VAE.encode = _wrap_vae_encode(ldm_sd.VAE.encode)
+        _hook(ldm_sd.VAE, "decode", _wrap_vae_decode)
+        _hook(ldm_sd.VAE, "encode", _wrap_vae_encode)
     except Exception as e:
         _hook_failed(f"Couldn't hook reForge's VAE, so it always runs on PyTorch: {e}")
     try:
         from modules import sd_samplers_cfg_denoiser
 
-        denoiser = sd_samplers_cfg_denoiser.CFGDenoiser
-        if not hasattr(denoiser.forward, "_trt_original"):
-            denoiser.forward = _wrap_denoiser(denoiser.forward)
+        _hook(sd_samplers_cfg_denoiser.CFGDenoiser, "forward", _wrap_denoiser)
     except Exception as e:
         _hook_failed(f"Couldn't hook reForge's CFG denoiser, so Speed Hacks never skip a step: {e}")
     try:
@@ -1204,9 +1234,8 @@ def install_hooks():
         classes = [sd_samplers_kdiffusion.KDiffusionSampler]
         for cls in classes:
             classes.extend(c for c in cls.__subclasses__() if c not in classes)
-            original = cls.__dict__.get("get_sigmas")
-            if original is not None and not hasattr(original, "_trt_original"):
-                cls.get_sigmas = _wrap_get_sigmas(original)
+            if "get_sigmas" in cls.__dict__:
+                _hook(cls, "get_sigmas", _wrap_get_sigmas)
     except Exception as e:
         _hook_failed(f"Couldn't hook reForge's sampler schedules, so Speed Hacks place their start and end shares by call count: {e}")
     try:
@@ -1243,7 +1272,7 @@ def new_generation(p=None):
     _generation_thread = threading.get_ident()
     if setting() not in (AUTOMATIC, SPEED_HACKS):
         for model in list(_models.values()):
-            if model.loaded:
+            if model.opened:
                 _unload(model, keep=False)
         vae_run.release_all()
         refits.clear()
