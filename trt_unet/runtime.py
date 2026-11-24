@@ -52,13 +52,12 @@ class TrtModel:
     evicted_last = True
 
     def __init__(self, record: store.Record):
-        mm = common.mm()
         self.record = record
         self.owner = f"{record.arch.label} {record.label}"  # key into gpu.py's per-owner accounting: must be unique
         self.name = f"{record.arch.name} {record.label}"
         self.hacks = record.speed_hacks
         self.model = TensorRTUNet()
-        self.load_device = mm.get_torch_device()
+        self.load_device = common.device()
         self.offload_device = torch.device("cpu")
         self.engine = self.shallow = None
         self.want_shallow = False
@@ -246,7 +245,7 @@ class TrtModel:
             logger.info(f"Not keeping the {label} in RAM: {refits.explain()}.")
             return
         start = time.time()
-        torch.cuda.current_stream().synchronize()
+        torch.cuda.current_stream(self.load_device).synchronize()
         blobs = dict(entry.blobs) if entry is not None else {}
         signatures = dict(entry.signatures) if entry is not None else {}
         made = []
@@ -334,7 +333,7 @@ class TrtModel:
                 continue
             self.applied[role] = {}
             refits.drop(self.record.key, role)  # the copy kept in RAM holds the old weights
-            torch.cuda.current_stream().synchronize()  # no inference in flight while the weights change
+            torch.cuda.current_stream(self.load_device).synchronize()  # no inference in flight while the weights change
             seconds = engine.refit(changed, weights.tensor)
             self.applied[role] = wanted
             refit = {"seconds": seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
@@ -540,7 +539,7 @@ def _wrap_get_free_memory(original):
     def get_free_memory(dev=None, torch_free_too=False):
         result = original(dev, torch_free_too)
         try:
-            device = torch.device(dev if dev is not None else common.mm().get_torch_device())
+            device = torch.device(dev if dev is not None else common.device())
             if device.type != "cuda":
                 return result
             driver = int(torch.cuda.mem_get_info(device)[0])
@@ -579,7 +578,7 @@ class Pass:
         self.schedule = self.tracker = None
         if hacks:
             try:
-                self.tracker = fresh.Tracker(model.model_sampling, common.mm().get_torch_device(), model.diffusion_model.out_channels)
+                self.tracker = fresh.Tracker(model.model_sampling, common.device(), model.diffusion_model.out_channels)
                 self.schedule = speed.Schedule(*speed_settings())
             except Exception as e:
                 notify(f"Speed Hacks failed ({e}), so this pass runs without them.", e)
@@ -766,7 +765,7 @@ class Pass:
                 if failed is not None and failed.opened and not failed.loaded:
                     _unload(failed, keep=False)
                 self.fall_back(f"Couldn't load the {record.arch.name} {record.label} ({e})", _unexpected(e))
-        stream = torch.cuda.current_stream().cuda_stream
+        stream = torch.cuda.current_stream(self.model.load_device).cuda_stream
         hack = None
         if self.schedule is not None and not self.schedule.idle and self.model.shallow_loaded:
             with self._speed_hacks():
@@ -976,7 +975,7 @@ def _call_bytes(model: TrtModel, x) -> int:
     if found is None:
         return 0
     profile, shapes = found
-    act = model.engine.estimate_activation_bytes(profile, shapes, torch.cuda.current_stream().cuda_stream)
+    act = model.engine.estimate_activation_bytes(profile, shapes, torch.cuda.current_stream(model.load_device).cuda_stream)
     io = model.engine.io_bytes()
     return act + sum(io.values())
 

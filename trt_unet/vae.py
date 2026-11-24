@@ -158,7 +158,7 @@ def strip_dtype(vae):
     if dtype == torch.float32:
         try:
             mm = common.mm()
-            if not getattr(mm.args, "vae_in_fp32", False) and mm.should_use_fp16(mm.get_torch_device()):
+            if not getattr(mm.args, "vae_in_fp32", False) and mm.should_use_fp16(common.device()):
                 return torch.float16
         except Exception:
             pass
@@ -206,7 +206,7 @@ PLANNED = 1.2  # TensorRT's decode activation memory / peak() (4.32 GiB at 1472x
 
 def gpu_vram():
     try:
-        return int(torch.cuda.get_device_properties(common.mm().get_torch_device()).total_memory)
+        return int(torch.cuda.get_device_properties(common.device()).total_memory)
     except Exception:
         return None
 

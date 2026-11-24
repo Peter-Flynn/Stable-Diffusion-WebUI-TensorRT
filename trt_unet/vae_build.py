@@ -209,7 +209,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
     skipped = 0
     try:
         dtype, sdtype = engine_dtype(vae), strip_dtype(vae)
-        cfg, vram, device = config(vae), gpu_vram(), common.mm().get_torch_device()
+        cfg, vram, device = config(vae), gpu_vram(), common.device()
         asked = shapes_for(profiles, cfg, dtype, vram)
         strip_wanted = strips_wanted(vae, profiles, cfg, sdtype)
         enc_wanted = encoder_wanted(vae, profiles, dtype, sdtype, vram)
@@ -402,7 +402,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             "encoder": enc_meta,
             "trt": common.trt_version(),
             "gpu": common.gpu_tag(),
-            "gpu_name": torch.cuda.get_device_name(),
+            "gpu_name": torch.cuda.get_device_name(common.device()),
             "created": time.strftime("%Y-%m-%d %H:%M"),
         }
         if strips_error:

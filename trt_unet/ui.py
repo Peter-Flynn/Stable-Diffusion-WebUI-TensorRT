@@ -59,7 +59,7 @@ def _machine():
     try:
         import torch
 
-        vram = torch.cuda.get_device_properties(common.mm().get_torch_device()).total_memory
+        vram = torch.cuda.get_device_properties(common.device()).total_memory
     except Exception:
         pass
     try:

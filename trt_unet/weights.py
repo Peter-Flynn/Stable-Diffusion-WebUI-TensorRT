@@ -104,7 +104,7 @@ class EffectiveWeights:
         if not patches and convert is None:
             return base.to(device)
         # Two steps: one .to(device, float32) would convert on the CPU first. copy=True because convert and patch work in place.
-        weight = base.to(common.mm().get_torch_device()).to(torch.float32, copy=True)
+        weight = base.to(common.device()).to(torch.float32, copy=True)
         if convert is not None:
             weight = convert(weight, inplace=True)
         if patches:

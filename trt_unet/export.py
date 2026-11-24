@@ -184,7 +184,7 @@ def _as_shallow(unet, x, timesteps, context, *rest):
 
 @common.inference_mode
 def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float16) -> dict:
-    device = device or common.mm().get_torch_device()
+    device = device or common.device()
     unet = _fresh_unet(unet_config(patcher), device, dtype)
     names = [n for n in INPUTS if n != "y" or arch.adm_channels]
     inputs = [
@@ -252,8 +252,9 @@ def _builder_env() -> dict:
         else:
             del env["LD_PRELOAD"]
     try:
-        index = common.mm().get_torch_device().index
-        index = torch.cuda.current_device() if index is None else index
+        index = common.device().index
+        if index is None:
+            return env
     except Exception:
         return env
     visible = [d.strip() for d in env.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip()]
@@ -480,7 +481,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 "stripped": result["stripped"],
                 "trt": common.trt_version(),
                 "gpu": common.gpu_tag(),
-                "gpu_name": torch.cuda.get_device_name(),
+                "gpu_name": torch.cuda.get_device_name(common.device()),
                 "created": time.strftime("%Y-%m-%d %H:%M"),
             })
             if hacks:

@@ -147,7 +147,7 @@ class _Side:
     def _refit(self, which, e):
         key, exponent = self._holds(which)
         get, names = self.model.weights(2.0 ** -exponent), self.names[which]
-        torch.cuda.current_stream().synchronize()
+        torch.cuda.current_stream(self.model.load_device).synchronize()
         e.refit(list(names), lambda name, device: get(names[name], device))
         self.applied[which] = (key, exponent)
 
@@ -190,11 +190,10 @@ class VaeModel:
     def __init__(self, record: Record):
         from .engine import Arena
 
-        mm = common.mm()
         self.record = record
         self.owner = f"VAE engines ({os.path.basename(record.base)})"
         self.model = TensorRTVAE()
-        self.load_device = mm.get_torch_device()
+        self.load_device = common.device()
         self.offload_device = torch.device("cpu")
         self.arena = Arena()
         self.vae = None
@@ -278,7 +277,7 @@ class VaeModel:
         key = (False, n, h, w, out_gpu, whole)
         if key not in self.needs:
             cfg, size = self.record.meta["config"], self.record.dtype.itemsize
-            stream = torch.cuda.current_stream().cuda_stream
+            stream = torch.cuda.current_stream(self.load_device).cuda_stream
             c, zc = cfg["mid_channels"], cfg["latent_channels"]
             act = self.decoder.part_probe(PRE).estimate_activation_bytes(0, {"latent": (n, zc, h, w)}, stream)
             lat, z = n * c * h * w * size, n * zc * h * w * (size + 4)
@@ -295,7 +294,7 @@ class VaeModel:
         key = (True, n, *mid, pixels_gpu, h, w)  # key[:4] matches the `attention` key that invalidates it
         if key not in self.needs:
             cfg, size = self.record.encoder["config"], self.record.dtype.itemsize
-            stream = torch.cuda.current_stream().cuda_stream
+            stream = torch.cuda.current_stream(self.load_device).cuda_stream
             act = max(
                 self.encoder.part_probe(ENCODE_PRE).estimate_activation_bytes(0, {"image": (n, cfg["in_channels"], h, w)}, stream),
                 self.encoder.part_probe(ENCODE_POST).estimate_activation_bytes(0, {"x": (n, c, *mid), "attention": (n, c, *mid)}, stream),
@@ -315,7 +314,7 @@ class VaeModel:
         c, moments = cfg["mid_channels"], cfg["moments"] * h * w
         wide, lat = c * h * w * 4, c * h * w * size
         shapes = {"x": (1, c, h, w), "attention": (1, c, h, w)}
-        act = self.encoder.part_probe(ENCODE_POST).estimate_activation_bytes(0, shapes, torch.cuda.current_stream().cuda_stream)
+        act = self.encoder.part_probe(ENCODE_POST).estimate_activation_bytes(0, shapes, torch.cuda.current_stream(self.load_device).cuda_stream)
         work = self.attention.get((True, 1, h, w), 0)
         cast = lat if size != 4 else 0
         return max(4 * wide + work, 4 * wide + cast, act + max(wide, lat) + lat + moments * (size + (4 if size != 4 else 0)))
@@ -440,20 +439,21 @@ class _Peak:
     # Nested blocks reset PyTorch's peak counter, so the outer block carries what it saw before.
     carried = 0
 
-    def __init__(self):
+    def __init__(self, device=None):
+        self.device = device or common.device()
         self.base = self.held = 0
 
     def __enter__(self):
-        _Peak.carried = max(_Peak.carried, torch.cuda.max_memory_allocated())
-        self.base = torch.cuda.memory_allocated()
+        _Peak.carried = max(_Peak.carried, torch.cuda.max_memory_allocated(self.device))
+        self.base = torch.cuda.memory_allocated(self.device)
         self.outer = _Peak.carried
         _Peak.carried = 0
-        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_peak_memory_stats(self.device)
         return self
 
     def __exit__(self, *exc):
-        self.held = max(_Peak.carried, torch.cuda.max_memory_allocated()) - self.base
-        _Peak.carried = max(self.outer, _Peak.carried, torch.cuda.max_memory_allocated())
+        self.held = max(_Peak.carried, torch.cuda.max_memory_allocated(self.device)) - self.base
+        _Peak.carried = max(self.outer, _Peak.carried, torch.cuda.max_memory_allocated(self.device))
         return False
 
 
@@ -576,11 +576,11 @@ def _ran_out(model: VaeModel, error) -> str:
     said = f"in {frame.name}, {os.path.basename(frame.filename)}:{frame.lineno}"
     error.__traceback__ = None
     with contextlib.suppress(Exception):
-        said += f"; {common.gib(torch.cuda.mem_get_info()[0])} was free"
+        said += f"; {common.gib(torch.cuda.mem_get_info(model.load_device)[0])} was free"
     model.release()
     gc.collect()
     with contextlib.suppress(Exception):
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(model.load_device)
         torch.cuda.empty_cache()
     return said
 
@@ -591,7 +591,7 @@ def _make_way(model: VaeModel):
         model.encoder.drop()
         model.release()
         gc.collect()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(model.load_device)
         torch.cuda.empty_cache()
 
 
@@ -679,7 +679,7 @@ def _attention(model: VaeModel, vae, q, k, v, encoding: bool = False):
 def _run(model: VaeModel, vae, samples_in, n: int):
     side, record = model.decoder, model.record
     dtype, device = record.dtype, model.load_device
-    stream = torch.cuda.current_stream().cuda_stream
+    stream = torch.cuda.current_stream(device).cuda_stream
     pre, post = side.engine(PRE), side.engine(POST)
     pixels = None
     for start in range(0, samples_in.shape[0], n):
@@ -703,7 +703,7 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
     model.beside = not engines
     side, record = model.decoder, model.record
     dtype, sdtype, device = record.dtype, record.strips_dtype, model.load_device
-    stream = torch.cuda.current_stream().cuda_stream
+    stream = torch.cuda.current_stream(device).cuda_stream
     cfg = record.meta["config"]
     decoder = strips.Decode(vae.first_stage_model, cfg["padding"], side.runner_for, sdtype, device, _copy_stream(device), model.arena, side.activations, set(side.kinds), side.scale)
     b, _, h, w = samples_in.shape
@@ -872,7 +872,7 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
 def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
     model.beside = not engines
     side, record, device = model.encoder, model.record, model.load_device
-    dtype, sdtype, stream = record.dtype, record.strips_dtype, torch.cuda.current_stream().cuda_stream
+    dtype, sdtype, stream = record.dtype, record.strips_dtype, torch.cuda.current_stream(device).cuda_stream
     cfg = record.encoder["config"]
     fsm = vae.first_stage_model
     encoder = strips.Encode(fsm, cfg["padding"], side.runner_for, sdtype, device, _copy_stream(device), model.arena, side.activations, set(side.kinds), side.scale)
@@ -938,7 +938,7 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
 
 def _encode_images(model: VaeModel, vae, image):
     side, record = model.encoder, model.record
-    stream = torch.cuda.current_stream().cuda_stream
+    stream = torch.cuda.current_stream(model.load_device).cuda_stream
     image = image.to(device=model.load_device, dtype=record.dtype)
     mid = side.engine(ENCODE_PRE).infer({"image": image}, 0, stream)
     del image

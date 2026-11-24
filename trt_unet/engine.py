@@ -10,7 +10,7 @@ from collections import deque
 import tensorrt as trt
 import torch
 
-from . import gpu
+from . import common, gpu
 from .common import gib, logger
 
 # The refitter prepares host weights on one CPU thread by default, and scans every weight for NaN/Inf. The weights are
@@ -31,7 +31,6 @@ _DTYPES = {
     trt.DataType.INT64: torch.int64,
     trt.DataType.BOOL: torch.bool,
 }
-DEVICE = "cuda"
 
 
 def torch_dtype(dtype):
@@ -171,16 +170,15 @@ class Arena:
 
     def get(self, size: int):
         if self.memory is None or self.memory.numel() < size:
-            from . import common
-
+            dev = common.device()
             self.release()  # bumps the version even if the allocation below fails, so nothing stays bound to freed memory
             try:
-                self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=DEVICE)
+                self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=dev)
             except torch.cuda.OutOfMemoryError:
                 if not common.pooled():
                     raise
                 common.trim()  # PyTorch's freed blocks may be unusable for this size until returned to the driver
-                self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=DEVICE)
+                self.memory = torch.empty(max(size, 1), dtype=torch.uint8, device=dev)
             self.version += 1
         return self.memory
 
@@ -380,19 +378,20 @@ class Engine:
 
     def infer(self, feed: dict, profile: int, stream: int, into: dict = None) -> dict:
         self._prepare(profile, {name: tuple(feed[name].shape) for name, is_input, _ in self.io if is_input}, stream)
+        dev = common.device()
         outputs = {}
         for name, is_input, dtype in self.io:
             if is_input:
                 t = feed[name]
-                if t.dtype != dtype or t.device.type != torch.device(DEVICE).type or not t.is_contiguous():
-                    t = feed[name] = t.to(device=DEVICE, dtype=dtype).contiguous()
+                if t.dtype != dtype or t.device != dev or not t.is_contiguous():
+                    t = feed[name] = t.to(device=dev, dtype=dtype).contiguous()
             else:
                 shape = tuple(self.context.get_tensor_shape(name))
                 given = (into or {}).get(name)
-                if given is not None and tuple(given.shape) == shape and given.dtype == dtype and given.is_contiguous():
+                if given is not None and tuple(given.shape) == shape and given.dtype == dtype and given.device == dev and given.is_contiguous():
                     t = outputs[name] = given
                 else:
-                    t = outputs[name] = torch.empty(shape, dtype=dtype, device=DEVICE)
+                    t = outputs[name] = torch.empty(shape, dtype=dtype, device=dev)
             self.context.set_tensor_address(name, t.data_ptr())
         LOGGER.clear()
         if self.ran:
@@ -406,7 +405,7 @@ class Engine:
             self.ran = True
             gpu.proven()
         if PROFILE:
-            torch.cuda.current_stream().synchronize()
+            torch.cuda.current_stream(dev).synchronize()
             try:
                 self.context.report_to_profiler()
             except Exception:

@@ -27,6 +27,8 @@ from dataclasses import asdict, dataclass, replace
 import torch
 import torch.nn.functional as F
 
+from . import common
+
 STRIP_BYTES = 128 * 2**20  # a strip of a stage's largest tensor is at most this; engines' profiles are sized from it
 CONV, UP, PROJ, OUT, BLOCK, UPCONV, UPBLOCK = "conv", "up", "proj", "out", "block", "upconv", "upblock"
 IN, DOWN = "in", "down"
@@ -633,7 +635,7 @@ def release_pinned():
     t = _pinned["tensor"]
     if t is not None and _pinned["kind"] == "registered":
         try:
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(common.device())
             torch.cuda.cudart().cudaHostUnregister(t.data_ptr())
         except Exception:
             pass
@@ -902,7 +904,7 @@ class Decode:
                 if stats_last[key] == n:
                     stats.pop(key, None)
         if self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            torch.cuda.current_stream(self.device).wait_stream(self.copy_stream)
         return held, stats.get(len(found) - 1)
 
     def _sweep(self, n: int, stage: Stage, held: dict, stats: dict, plan: Plan, io):
@@ -1099,7 +1101,7 @@ class EngineRunner:
         self.engines = None
 
     def _stream(self) -> int:
-        return torch.cuda.current_stream().cuda_stream
+        return torch.cuda.current_stream(common.device()).cuda_stream
 
     def __call__(self, feed: dict, outputs: dict, last: bool = False) -> dict:
         if self.engines is None:

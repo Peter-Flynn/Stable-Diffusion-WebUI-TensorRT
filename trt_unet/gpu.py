@@ -10,11 +10,12 @@ import threading
 
 import torch
 
+from . import common
 from .common import gib, logger
 
 _lock = threading.RLock()
 # An "owner" is the model an engine belongs to (TrtModel.owner, VaeModel.owner).
-_live = {}  # address given to TensorRT -> (address PyTorch allocated, bytes, owner)
+_live = {}  # address given to TensorRT -> (address PyTorch allocated, bytes, owner, device)
 _ledger = {}  # owner -> bytes TensorRT currently holds through PyTorch's allocator
 _peaks = {}
 _held = {}  # owner -> VRAM its engines hold: the growth in in_use() across their loads (counts any allocator)
@@ -39,11 +40,18 @@ def _allocate(size: int, alignment: int) -> int:
     if size <= 0:
         return 0
     alignment = max(int(alignment or 1), 1)
-    extra = alignment - 1  # wherever PyTorch's block starts, it contains an aligned address with `size` bytes after it
+    dev = common.device()
+    # PyTorch's native allocator aligns to 512 bytes and cudaMallocAsync to 256; requesting exact `size` for
+    # <= 256-byte alignments avoids pushing power-of-two buffers across allocator block boundaries.
+    extra = 0 if alignment <= 256 else alignment - 1
     base = None
     for again in (False, True):
         try:
-            base = torch.cuda.caching_allocator_alloc(size + extra, torch.cuda.current_device())
+            base = torch.cuda.caching_allocator_alloc(size + extra, dev.index)
+            if not extra and base % alignment:
+                torch.cuda.caching_allocator_delete(base)
+                base, extra = None, alignment - 1
+                base = torch.cuda.caching_allocator_alloc(size + extra, dev.index)
             break
         except torch.cuda.OutOfMemoryError:
             break
@@ -59,7 +67,7 @@ def _allocate(size: int, alignment: int) -> int:
     address = (base + alignment - 1) // alignment * alignment
     with _lock:
         owner = _owners[-1] if _owners else None
-        _live[address] = (base, size, owner)
+        _live[address] = (base, size, owner, dev)
         _ledger[owner] = _ledger.get(owner, 0) + size
         if owner in _peaks:
             _peaks[owner] = max(_peaks[owner], _ledger[owner])
@@ -74,10 +82,10 @@ def _free(memory) -> bool:
         entry = _live.pop(address, None)
     if entry is None:
         return False
-    base, size, owner = entry
+    base, size, owner, dev = entry
     for again in (False, True):
         try:
-            torch.cuda.synchronize()  # TensorRT may still be using it on a stream of its own
+            torch.cuda.synchronize(dev)  # TensorRT may still be using it on a stream of its own
             torch.cuda.caching_allocator_delete(base)
             break
         except Exception as e:  # a stale CUDA error, as in _allocate
@@ -181,10 +189,10 @@ def retire():
         entries = list(_live.values())
         _live.clear()
         _ledger.clear()
-    for base, _, _ in entries:
+    for base, _, _, dev in entries:
         for again in (False, True):
             try:
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(dev)
                 torch.cuda.caching_allocator_delete(base)
                 break
             except Exception:
@@ -216,8 +224,9 @@ def ledger(name) -> int:
 def in_use() -> int:
     # VRAM in use by anyone: the driver's used memory less PyTorch's unused cache. An engine load's growth in this is its
     # true size wherever TensorRT got the memory.
-    free, total = torch.cuda.mem_get_info()
-    stats = torch.cuda.memory_stats()
+    dev = common.device()
+    free, total = torch.cuda.mem_get_info(dev)
+    stats = torch.cuda.memory_stats(dev)
     return total - free - int(stats.get("reserved_bytes.all.current", 0)) + int(stats.get("allocated_bytes.all.current", 0))
 
 

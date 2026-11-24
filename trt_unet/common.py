@@ -78,6 +78,22 @@ def mm():
     return model_management
 
 
+def device() -> torch.device:
+    # reForge records the selected GPU on the main thread in model_management.current_device; get_torch_device() reads
+    # torch.cuda.current_device(), which is per-thread and defaults to 0 on Gradio and TensorRT worker threads.
+    try:
+        m = mm()
+        dev = getattr(m, "current_device", None)
+        if dev is None:
+            dev = m.get_torch_device()
+        dev = torch.device(dev)
+        if dev.type == "cuda" and dev.index is None:
+            return torch.device("cuda", torch.cuda.current_device())
+        return dev
+    except Exception:
+        return torch.device("cuda", torch.cuda.current_device())
+
+
 def inference_mode(fn):
     # reForge creates and moves its weights under torch.inference_mode(). Loading or unloading a model outside it
     # breaks weights restored after a LoRA ("Inference tensors do not track version counter").
@@ -90,7 +106,7 @@ def inference_mode(fn):
 
 
 def gpu_tag() -> str:
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability(device())
     return f"sm{major}{minor}"
 
 
@@ -282,8 +298,9 @@ def memory(when: str):
     if not logger.isEnabledFor(logging.DEBUG):
         return
     try:
-        free, total = torch.cuda.mem_get_info()
-        stats = torch.cuda.memory_stats()
+        dev = device()
+        free, total = torch.cuda.mem_get_info(dev)
+        stats = torch.cuda.memory_stats(dev)
         allocated, reserved = (int(stats.get(f"{k}_bytes.all.current", 0)) for k in ("allocated", "reserved"))
         lines = [
             f"VRAM      {gib(total - free)} used of {gib(total)}; PyTorch has {gib(allocated)} allocated, {gib(max(0, reserved - allocated))} cached",
