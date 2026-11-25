@@ -209,7 +209,17 @@ def label(name: str) -> str:
 TENSOR_LIMIT = 2**31 - 1  # max elements in one tensor for TensorRT's kernels (Myelin)
 RESERVE = 2**30  # VRAM left out of the budget: CUDA context, engine weights, kernel scratch
 RETRY_SHARE = 0.75
+RETRY_SHARES = (0.75, 0.55, 0.40, 0.25)
 PLANNED = 1.2  # TensorRT's decode activation memory / peak() (4.32 GiB at 1472x1024 in FP32, TensorRT 11.4)
+PLANNED_FP16 = 1.4  # Scaled-FP16 whole engines hold an extra buffer (7.00 GiB vs 6.00 GiB BF16 at 2048x2048)
+
+
+def planned(dtype=None) -> float:
+    return PLANNED_FP16 if scaled(dtype) else PLANNED
+
+
+def encoder_planned(dtype=None) -> float:
+    return PLANNED_FP16 if scaled(dtype) else 1.0
 
 
 def gpu_vram():
@@ -248,9 +258,9 @@ def peak(cfg: dict, b: int, h: int, w: int) -> int:
     )
 
 
-def excess(cfg: dict, b: int, h: int, w: int, budget) -> tuple:
+def excess(cfg: dict, b: int, h: int, w: int, budget, dtype=None) -> tuple:
     tensor = largest_tensor(cfg, b, h, w) / TENSOR_LIMIT
-    memory = peak(cfg, b, h, w) * PLANNED / budget if budget else 0.0
+    memory = peak(cfg, b, h, w) * planned(dtype) / budget if budget else 0.0
     if budget is not None and budget <= 0:
         memory = math.inf
     return max(tensor, memory), "tensor" if tensor >= memory else "memory"
@@ -279,10 +289,10 @@ def shapes_for(profiles: list, cfg: dict, dtype=None, vram=None, share: float = 
     lo_h, lo_w = min(p.height[0] for p in profiles) // 8, min(p.width[0] for p in profiles) // 8
     hi_h, hi_w = max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8
     full_h, full_w = hi_h, hi_w
-    hi_h, hi_w = _shrunk(hi_h, hi_w, lambda h, w: excess(cfg, 1, h, w, budget)[0])
+    hi_h, hi_w = _shrunk(hi_h, hi_w, lambda h, w: excess(cfg, 1, h, w, budget, dtype)[0])
     fits = TENSOR_LIMIT // largest_tensor(cfg, 1, hi_h, hi_w)
     if budget is not None:
-        fits = min(fits, int(budget / (peak(cfg, 1, hi_h, hi_w) * PLANNED)))
+        fits = min(fits, int(budget / (peak(cfg, 1, hi_h, hi_w) * planned(dtype))))
     batch = max(1, min(MAX_BATCH, max(p.batch[2] for p in profiles), fits))
     zc, c = cfg["latent_channels"], cfg["mid_channels"]
 
@@ -309,9 +319,9 @@ def encoder_peak(cfg: dict, b: int, h: int, w: int) -> int:  # a block's input, 
     return max(b * 3 * max(incoming, own) * pixels for incoming, own, pixels in _encoder_levels(cfg, h, w))
 
 
-def encoder_excess(cfg: dict, b: int, h: int, w: int, budget) -> tuple:
+def encoder_excess(cfg: dict, b: int, h: int, w: int, budget, dtype=None) -> tuple:
     tensor = encoder_largest(cfg, b, h, w) / TENSOR_LIMIT
-    memory = encoder_peak(cfg, b, h, w) / budget if budget else 0.0
+    memory = encoder_peak(cfg, b, h, w) * encoder_planned(dtype) / budget if budget else 0.0
     if budget is not None and budget <= 0:
         memory = math.inf
     return max(tensor, memory), "tensor" if tensor >= memory else "memory"
@@ -322,10 +332,10 @@ def encoder_shapes(profiles: list, cfg: dict, dtype=None, vram=None, share: floa
     lo_h, lo_w = min(p.height[0] for p in profiles) // 8 * 8, min(p.width[0] for p in profiles) // 8 * 8
     hi_h, hi_w = max(p.height[2] for p in profiles) // 8 * 8, max(p.width[2] for p in profiles) // 8 * 8
     full_h, full_w = hi_h, hi_w
-    hi_h, hi_w = _shrunk(hi_h, hi_w, lambda h, w: encoder_excess(cfg, 1, h, w, budget)[0], 8)
+    hi_h, hi_w = _shrunk(hi_h, hi_w, lambda h, w: encoder_excess(cfg, 1, h, w, budget, dtype)[0], 8)
     fits = TENSOR_LIMIT // encoder_largest(cfg, 1, hi_h, hi_w)
     if budget is not None:
-        fits = min(fits, int(budget / encoder_peak(cfg, 1, hi_h, hi_w)))
+        fits = min(fits, int(budget / (encoder_peak(cfg, 1, hi_h, hi_w) * encoder_planned(dtype))))
     batch = max(1, min(MAX_BATCH, max(p.batch[2] for p in profiles), fits))
     lo_h, lo_w = min(lo_h, hi_h), min(lo_w, hi_w)
     opt_h, opt_w = min(max(profiles[0].height[1] // 8 * 8, lo_h), hi_h), min(max(profiles[0].width[1] // 8 * 8, lo_w), hi_w)

@@ -268,8 +268,16 @@ def build(job, logger, progress, strip=True):
     builder = trt.Builder(logger)
     cache_path = job.get("timing_cache")
     cache = _load_timing_cache(builder, cache_path, logger)
-    _build_one(builder, cache, job, logger, progress, strip=strip)
-    _save_timing_cache(cache, cache_path)
+    timed = False
+    try:
+        _build_one(builder, cache, job, logger, progress, strip=strip)
+        timed = True
+    except NoEngine:
+        timed = True
+        raise
+    finally:
+        if timed:
+            _save_timing_cache(cache, cache_path)
 
 
 def build_batch(batch_job, logger, send_progress):

@@ -11,7 +11,7 @@ import torch
 from . import common, store, strips
 from .common import logger
 from .vae import (
-    ENCODE_POST, ENCODE_PRE, ENCODE_STRIP, ENCODER, EXPONENT, POST, PRE, RETRY_SHARE, Record, config, digest, dtype_name,
+    ENCODE_POST, ENCODE_PRE, ENCODE_STRIP, ENCODER, EXPONENT, POST, PRE, RETRY_SHARES, Record, config, digest, dtype_name,
     encoder_config, encoder_excess, encoder_shapes, encoder_wanted, engine_dtype, excess, folder, gpu_vram, is_decoder_weight,
     is_encoder_weight, loaded_vae, parts_missing, path_prefix, records_matching, remove_record, scaled, shapes_for,
     strip_dtype, strips_wanted, unsupported, vram_budget, weight_bytes, why_smaller,
@@ -267,7 +267,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             wanted_h, wanted_w = max(p.height[2] for p in profiles) // 8, max(p.width[2] for p in profiles) // 8
             b, _, h, w = asked[POST]["x"][2]
             if (h, w) != (wanted_h, wanted_w):
-                cause = excess(cfg, 1, wanted_h, wanted_w, vram_budget(dtype, vram))[1]
+                cause = excess(cfg, 1, wanted_h, wanted_w, vram_budget(dtype, vram), dtype)[1]
                 further = "in strips" if strip_wanted else "on PyTorch"
                 logger.info(
                     f"The VAE decoder's engines take whole images up to {w * 8}x{h * 8} ({b} at a time) rather than "
@@ -277,7 +277,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             wanted_h, wanted_w = max(p.height[2] for p in profiles) // 8 * 8, max(p.width[2] for p in profiles) // 8 * 8
             b, _, h, w = enc_wanted["shapes"][ENCODE_PRE]["image"][2]
             if (h, w) != (wanted_h, wanted_w):
-                cause = encoder_excess(enc_wanted["config"], 1, wanted_h, wanted_w, vram_budget(dtype, vram))[1]
+                cause = encoder_excess(enc_wanted["config"], 1, wanted_h, wanted_w, vram_budget(dtype, vram), dtype)[1]
                 further = "in strips" if enc_wanted["strips"] else "on PyTorch"
                 logger.info(
                     f"The VAE encoder's engines take whole images up to {w}x{h} ({b} at a time) rather than "
@@ -396,10 +396,19 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                     continue
                 if export.CANCEL.is_set() or str(result.get("error")) == "cancelled":
                     raise _Cancelled()
-                smaller = retry_fn() if part == retry_part and not tries and warned and dtype is not None and vram else None
-                if smaller is None or smaller == plan_shapes:
+                err_low = str(result.get("error") or "").lower()
+                oom = bool(warned) or (tries > 0 and "all backend strategies failed" in err_low)
+                smaller = None
+                if part == retry_part and oom and dtype is not None and vram:
+                    while tries < len(RETRY_SHARES):
+                        cand = retry_fn(RETRY_SHARES[tries])
+                        tries += 1
+                        if cand != plan_shapes:
+                            smaller = cand
+                            break
+                if smaller is None:
                     return plan_shapes, str(result.get("error"))
-                tries, plan_shapes = 1, smaller
+                plan_shapes = smaller
                 if retry_part == POST:
                     b, _, h, w = plan_shapes[POST]["x"][2]
                     size = f"{w * 8}x{h * 8}"
@@ -413,7 +422,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             [p for p in (POST, PRE) if p in todo],  # post first: it may need a retry at a smaller size
             shapes,
             POST,
-            lambda: {**shapes, POST: shapes_for(profiles, cfg, dtype, vram, RETRY_SHARE)[POST]},
+            lambda share: {**shapes, POST: shapes_for(profiles, cfg, dtype, vram, share)[POST]},
             "decoder",
         )
         if dec_error:
@@ -426,7 +435,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
                 list(ENCODER),
                 enc_wanted["shapes"],
                 ENCODE_PRE,
-                lambda: encoder_shapes(profiles, enc_wanted["config"], dtype, vram, RETRY_SHARE),
+                lambda share: encoder_shapes(profiles, enc_wanted["config"], dtype, vram, share),
                 "encoder",
             )
             if enc_error:
