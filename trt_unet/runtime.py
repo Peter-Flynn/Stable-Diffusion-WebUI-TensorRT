@@ -5,6 +5,7 @@
 # refits.py). Before anything loads, _fits checks the engine and the pass's working memory (working.py) can fit in
 # VRAM at all; if not, the pass runs on PyTorch. During a pass the PyTorch UNet stays patched but unloaded, in RAM.
 import contextlib
+import inspect
 import math
 import os
 import sys
@@ -1409,6 +1410,50 @@ def _wrap_reconstruct_multicond_batch(original):
     return reconstruct_multicond_batch
 
 
+def _needs_async_offload_fix(ldm_ops, mm) -> bool:
+    # With --async-offload (NUM_STREAMS > 1), reForge's cast_bias_weight allocates cast/offloaded weight and bias
+    # tensors on an offload stream and syncs current_stream onto it, without calling record_stream(current_stream).
+    # Under --cuda-malloc's shared driver pool, freeing those temporaries on the offload stream lets the next layer
+    # overwrite weights still being read by current_stream (corrupting large CLIP batches and alternating prompts).
+    if getattr(mm, "NUM_STREAMS", 1) <= 1 or (ldm_ops, "cast_bias_weight") in _installed:
+        return False
+    cbw = getattr(ldm_ops, "cast_bias_weight", None)
+    if not callable(cbw):
+        return False
+    orig = getattr(cbw, "_trt_original", cbw)
+    try:
+        cbw_src = inspect.getsource(orig)
+    except (OSError, TypeError):
+        return callable(getattr(mm, "get_offload_stream", None))
+    if "get_offload_stream" not in cbw_src or "record_stream" in cbw_src:
+        return False
+    cast_to = getattr(mm, "cast_to", None)
+    if callable(cast_to):
+        try:
+            if "record_stream" in inspect.getsource(cast_to):
+                return False
+        except (OSError, TypeError):
+            pass
+    return True
+
+
+def _wrap_cast_bias_weight(original):
+    def cast_bias_weight(s, *args, **kwargs):
+        result = original(s, *args, **kwargs)
+        if isinstance(result, tuple) and len(result) == 2 and getattr(common.mm(), "NUM_STREAMS", 1) > 1:
+            weight, bias = result
+            orig_w = getattr(s, "weight", None)
+            if isinstance(weight, torch.Tensor) and weight is not orig_w and weight.is_cuda:
+                weight.record_stream(torch.cuda.current_stream(weight.device))
+            orig_b = getattr(s, "bias", None)
+            if isinstance(bias, torch.Tensor) and bias is not orig_b and bias.is_cuda:
+                bias.record_stream(torch.cuda.current_stream(bias.device))
+        return result
+
+    cast_bias_weight._trt_original = original
+    return cast_bias_weight
+
+
 def _hook_failed(message: str):
     if message not in _hook_failures:
         _hook_failures.add(message)
@@ -1427,6 +1472,14 @@ def install_hooks():
     _rebind(common.mm(), "free_memory", _wrap_free_memory)
     _rebind(common.mm(), "get_free_memory", _wrap_get_free_memory)
     _rebind(common.mm(), "unload_all_models", _wrap_unload_all)
+    try:
+        from ldm_patched.modules import ops as ldm_ops
+
+        if _needs_async_offload_fix(ldm_ops, common.mm()):
+            _rebind(ldm_ops, "cast_bias_weight", _wrap_cast_bias_weight)
+            logger.debug("Applied record_stream workaround for reForge's --async-offload cast_bias_weight.")
+    except Exception as e:
+        logger.debug(f"Couldn't check reForge's cast_bias_weight for --async-offload workaround: {e}")
     try:
         from ldm_patched.modules import sd as ldm_sd
 

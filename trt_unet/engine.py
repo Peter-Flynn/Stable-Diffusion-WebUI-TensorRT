@@ -324,69 +324,98 @@ class Engine:
             raise RuntimeError("TensorRT could not serialize the engine" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
         return serialized
 
+    # Under --cuda-malloc, TensorRT's ~Refitter() teardown scales super-linearly with the number of weights refitted in
+    # a single Refitter instance (~4.0s at 1,680 SDXL weights vs ~1.2s across 2 balanced chunks). Chunking large refits
+    # (with get_missing_weights() companion closure per chunk) + gpu.refit_pool() cuts --cuda-malloc refits >3x.
+    ASYNC_REFIT_CHUNK = 850
+
     def refit(self, names, tensor_for) -> float:
         dev = common.device()
+        names = list(names)
         with common.on_device(dev):
             torch.cuda.synchronize(dev)
             for other in list(Engine.instances):
                 if other.engine is self.engine:
                     other._drop_context()
-            keep, gpu_batch, gpu_bytes, start = [], [], 0, time.perf_counter()
+            start = time.perf_counter()
             batch_limit = 32 * 2**20  # bounds extra VRAM while letting LoRA/FP8 kernels queue without per-weight syncs
-            refitter = trt.Refitter(self.engine, LOGGER)
-            try:
-                for setting, value in REFITTER_SETTINGS.items():
+            if gpu.backend() == "cudaMallocAsync" and len(names) > self.ASYNC_REFIT_CHUNK:
+                n_chunks = math.ceil(len(names) / self.ASYNC_REFIT_CHUNK)
+                step = math.ceil(len(names) / n_chunks)
+                chunks = [names[i : i + step] for i in range(0, len(names), step)]
+            else:
+                chunks = [names]
+            done = set()
+            with self._taking(), gpu.refit_pool():
+                for idx, raw_batch in enumerate(chunks):
+                    batch = [n for n in raw_batch if n not in done] if len(chunks) > 1 else raw_batch
+                    if len(chunks) > 1 and not batch:
+                        continue
+                    keep, gpu_batch, gpu_bytes = [], [], 0
+                    refitter = trt.Refitter(self.engine, LOGGER)
                     try:
-                        setattr(refitter, setting, value)
-                    except (AttributeError, TypeError) as e:
-                        if setting not in _unsettable:
-                            _unsettable.add(setting)
-                            logger.debug(f"Couldn't set the refitter's {setting}: {e}")
+                        for setting, value in REFITTER_SETTINGS.items():
+                            try:
+                                setattr(refitter, setting, value)
+                            except (AttributeError, TypeError) as e:
+                                if setting not in _unsettable:
+                                    _unsettable.add(setting)
+                                    logger.debug(f"Couldn't set the refitter's {setting}: {e}")
 
-                def bind(name, proto, t):
-                    if t.numel() != proto.size:
-                        raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
-                    keep.append(t)
-                    if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), trt.TensorLocation.HOST):
-                        raise RuntimeError(f"TensorRT rejected weight {name}")
+                        def bind(name, proto, t):
+                            if t.numel() != proto.size:
+                                raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
+                            keep.append(t)
+                            if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), trt.TensorLocation.HOST):
+                                raise RuntimeError(f"TensorRT rejected weight {name}")
 
-                def flush():
-                    nonlocal gpu_bytes
-                    while gpu_batch:
-                        name, proto, t = gpu_batch.pop(0)
-                        bind(name, proto, t.to("cpu"))
-                    gpu_bytes = 0
+                        def flush():
+                            nonlocal gpu_bytes
+                            while gpu_batch:
+                                name, proto, t = gpu_batch.pop(0)
+                                bind(name, proto, t.to("cpu"))
+                            gpu_bytes = 0
 
-                def put(name):
-                    nonlocal gpu_bytes
-                    proto = refitter.get_weights_prototype(name)
-                    t = tensor_for(name, None).to(dtype=torch_dtype(proto.dtype)).contiguous()
-                    if t.is_cuda:
-                        gpu_batch.append((name, proto, t))
-                        gpu_bytes += t.numel() * t.element_size()
-                        if gpu_bytes >= batch_limit:
+                        def put(name):
+                            nonlocal gpu_bytes
+                            proto = refitter.get_weights_prototype(name)
+                            t = tensor_for(name, None).to(dtype=torch_dtype(proto.dtype)).contiguous()
+                            if t.is_cuda:
+                                gpu_batch.append((name, proto, t))
+                                gpu_bytes += t.numel() * t.element_size()
+                                if gpu_bytes >= batch_limit:
+                                    flush()
+                            else:
+                                bind(name, proto, t)
+
+                        LOGGER.clear()
+                        seen_in_chunk = set()
+                        for name in batch:
+                            if name not in seen_in_chunk:
+                                put(name)
+                                seen_in_chunk.add(name)
+                        flush()
+                        while True:
+                            missing = [n for n in refitter.get_missing_weights() if n not in seen_in_chunk]
+                            if not missing:
+                                break
+                            for name in missing:
+                                put(name)
+                                seen_in_chunk.add(name)
                             flush()
-                    else:
-                        bind(name, proto, t)
-
-                LOGGER.clear()
-                for name in names:
-                    put(name)
-                flush()
-                for name in refitter.get_missing_weights():
-                    put(name)
-                flush()
-                with self._taking():
-                    try:
-                        ok = refitter.refit_cuda_engine()
+                        done.update(seen_in_chunk)
+                        try:
+                            ok = refitter.refit_cuda_engine()
+                        finally:
+                            refitter.release_refit_resources()  # otherwise the refit's scratch VRAM stays allocated for the engine's lifetime
                     finally:
-                        refitter.release_refit_resources()  # otherwise the refit's scratch VRAM stays allocated for the engine's lifetime
-            finally:
-                refitter = None  # py::keep_alive pins self.engine if left in an exception traceback
-                gpu_batch.clear()
-                keep.clear()  # an exception's traceback holds this frame, and with it GBs of weights
-        if not ok:
-            raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
+                        refitter = None  # py::keep_alive pins self.engine if left in an exception traceback
+                        gpu_batch.clear()
+                        keep.clear()  # an exception's traceback holds this frame, and with it GBs of weights
+                    if not ok:
+                        raise RuntimeError("Refitting the engine failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
+                    if idx + 1 < len(chunks):
+                        gpu.promote_pool()
         return time.perf_counter() - start
 
     def _set_shapes(self, profile: int, shapes: dict, stream: int):
