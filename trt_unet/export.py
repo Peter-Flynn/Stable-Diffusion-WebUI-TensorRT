@@ -56,6 +56,39 @@ def quiet_warnings(seen: set = None):
                 logger.debug(f"While exporting: {message}")
 
 
+@contextlib.contextmanager
+def fast_weightless_export():
+    # With export_params=False and randomized weights, TorchScript ONNX export spends tens of seconds hashing all
+    # weight tensors to deduplicate identical ones and copying them into shape-type inference even though weight inputs
+    # already carry their shapes and dtypes. Strip floating-point weights from those passes; keep integer buffers.
+    c = getattr(torch, "_C", None)
+    orig_dedup = getattr(c, "_jit_pass_onnx_deduplicate_initializers", None)
+    orig_sti = getattr(c, "_jit_pass_onnx_graph_shape_type_inference", None)
+    patched = []
+    try:
+        if orig_dedup is not None:
+            c._jit_pass_onnx_deduplicate_initializers = lambda *args, **kwargs: None
+            patched.append(("_jit_pass_onnx_deduplicate_initializers", orig_dedup))
+        if orig_sti is not None:
+            def _shape_type_inference(graph, params_dict, *args, **kwargs):
+                if isinstance(params_dict, dict):
+                    params_dict = {k: v for k, v in params_dict.items() if not (isinstance(v, torch.Tensor) and v.is_floating_point())}
+                return orig_sti(graph, params_dict, *args, **kwargs)
+            c._jit_pass_onnx_graph_shape_type_inference = _shape_type_inference
+            patched.append(("_jit_pass_onnx_graph_shape_type_inference", orig_sti))
+    except Exception:
+        for name, orig in patched:
+            with contextlib.suppress(Exception):
+                setattr(c, name, orig)
+        patched.clear()
+    try:
+        yield
+    finally:
+        for name, orig in patched:
+            with contextlib.suppress(Exception):
+                setattr(c, name, orig)
+
+
 def _attention(q, k, v, mask=None, upcast=False, scale=None):
     # Exported as plain matmul + softmax, which TensorRT fuses. q and k are each multiplied by sqrt(scale) rather than
     # the product by scale, so q.k can't overflow FP16.
@@ -216,7 +249,7 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
     axes = {k: v for k, v in DYNAMIC_AXES.items() if k in names or k == "latent"}
     logger.info(f"Exporting the {arch.name} UNet to ONNX.")
     shallow = True
-    with _traceable_attention(), quiet_warnings():
+    with _traceable_attention(), fast_weightless_export(), quiet_warnings():
         try:
             deep = speed.full_forward(unet, *inputs)[1]
             scale = inputs[0].shape[2] // deep.shape[2]
@@ -388,16 +421,23 @@ def run_builder(job_path: str, progress=None) -> dict:
     return result
 
 
-def _build_plan(job: dict, folder: str, step) -> dict:
-    for strip in (True, False):
+def _build_plan(job: dict, folder: str, step, strip: bool = True) -> dict:
+    for s in ((True, False) if strip else (False,)):
         with open(os.path.join(folder, "job.json"), "w", encoding="utf-8") as f:
-            json.dump({**job, "strip": strip}, f)
+            json.dump({**job, "strip": s}, f)
         result = run_builder(os.path.join(folder, "job.json"), step)
-        result["stripped"] = strip
+        result["stripped"] = s
         if not result.get("retry_without_strip"):
             return result
         logger.info("TensorRT couldn't leave the weights out of the engine, so it's building one with placeholder weights: a larger file, as fast.")
     return result
+
+
+def _build_batch(batch_job: dict, folder: str, step) -> dict:
+    job_path = os.path.join(folder, "batch.json")
+    with open(job_path, "w", encoding="utf-8") as f:
+        json.dump(batch_job, f)
+    return run_builder(job_path, step)
 
 
 SHALLOW_SHARE = 0.15

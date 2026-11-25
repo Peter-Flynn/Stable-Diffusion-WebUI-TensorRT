@@ -261,6 +261,7 @@ class TrtModel:
         todo = [role for role in loaded if entry is None or entry.signatures.get(role) != self.applied[role]]
         if not todo:
             return
+        todo.sort(key=lambda r: 0 if r == "shallow" else 1)  # tiny shallow fills in background while unet serializes
         if not refits.room(sum(self._serialized_size(role) for role in todo), key):
             logger.info(f"Not keeping the {label} in RAM: {refits.explain()}.")
             return
@@ -271,16 +272,25 @@ class TrtModel:
         made = []
         try:
             for role in todo:
-                made.append(refits.store(loaded[role].serialize))
+
+                def _failed(err, blob, k=key, r=role, lbl=label):
+                    logger.warning(f"Couldn't keep the {lbl} in RAM, so loading it again will refit it: {err}")
+                    refits.drop(k, r, blob=blob)
+
+                made.append(refits.store_async(loaded[role].serialize(), on_error=_failed))
                 blobs[role], signatures[role] = made[-1], dict(self.applied[role])
         except BaseException:
             for blob in made:
                 blob.free()
+            for blob in made:
+                blob.wait_fill()
             raise
         kept = refits.Kept(signatures, blobs, label, self._source())
         if not refits.put(key, kept, expected=entry):
             for blob in made:
                 blob.free()
+            for blob in made:
+                blob.wait_fill()
             return
         count, total = refits.held()
         logger.info(f"Kept the {label} in RAM ({common.gib(kept.nbytes)}, {time.time() - start:.1f}s); {count} kept in all, {common.gib(total)}.")

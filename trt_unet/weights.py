@@ -97,19 +97,26 @@ class EffectiveWeights:
         patches = self.patches.get(PREFIX + name)
         return self.base_version, _identity(patches) if patches else None
 
-    def tensor(self, name: str, device="cpu") -> torch.Tensor:
-        base = self.base(name)
-        patches = self.patches.get(PREFIX + name)
+    def needs_gpu(self, name: str) -> bool:
+        return bool(self.patches.get(PREFIX + name) or self.converters.get(name) is not None)
+
+    def apply_on_gpu(self, name: str, gpu_base: torch.Tensor, dtype=torch.float16) -> torch.Tensor:
+        # copy=True because convert and patch work in place.
+        weight = gpu_base.to(torch.float32, copy=True)
         convert = self.converters.get(name)
-        if not patches and convert is None:
-            return base if device is None else base.to(device)
-        # Two steps: one .to(device, float32) would convert on the CPU first. copy=True because convert and patch work in place.
-        weight = base.to(common.device()).to(torch.float32, copy=True)
         if convert is not None:
             weight = convert(weight, inplace=True)
+        patches = self.patches.get(PREFIX + name)
         if patches:
             from ldm_patched.modules.lora import calculate_weight
 
             weight = calculate_weight(patches, weight, PREFIX + name)
-        weight = weight.to(torch.float16)
+        return weight.to(dtype)
+
+    def tensor(self, name: str, device="cpu", dtype=torch.float16) -> torch.Tensor:
+        base = self.base(name)
+        if not self.needs_gpu(name):
+            return base if device is None else base.to(device)
+        # Two steps: one .to(device, float32) would convert on the CPU first.
+        weight = self.apply_on_gpu(name, base.to(common.device()), dtype)
         return weight if device is None else weight.to(device)

@@ -137,7 +137,7 @@ def _export(module, halves: dict, work: str, first, loaded: dict, seen: set = No
     if fp32_gn:
         torch.nn.functional.group_norm = export._fp32_group_norm
     try:
-        with export.quiet_warnings(seen):
+        with export.fast_weightless_export(), export.quiet_warnings(seen):
             for part, (_, inputs, outputs, axes) in halves.items():
                 path = os.path.join(work, f"vae_{part}.onnx")
                 torch.onnx.export(parts[part], args[part], path, input_names=inputs, output_names=outputs, dynamic_axes=axes, **export.ONNX_KWARGS)
@@ -189,7 +189,7 @@ def export_strips(vae, work: str, dtype, device, names, encoding: bool = False, 
     found = [s for each in every_way(module, cfg["padding"]) for s in each]
     loaded = vae.first_stage_model.state_dict(keep_vars=True)
     result = {}
-    with export.quiet_warnings(seen):
+    with export.fast_weightless_export(), export.quiet_warnings(seen):
         for name in names:
             stage = next(s for s in found if s.kind.name == name)
             kind, part = stage.kind, strips.StageModule(stage, module)
@@ -299,15 +299,52 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         def build_kinds(kinds: dict, prefix: str, what: str) -> tuple:
             nonlocal done, total, skipped
             metas = {}
-            for i, name in enumerate(kinds):
+            names = list(kinds)
+            if not names:
+                return metas, None
+            retry_no_strip = None
+            if len(names) > 1:
                 if export.CANCEL.is_set():
                     raise _Cancelled()
-                result = export._build_plan(job(prefix + name, kinds[name]), work, step(f"engine {i + 1} of {len(kinds)} for {what} in strips"))
+                base_done = done
+                batch_jobs = [
+                    {**job(prefix + name, kinds[name]), "key": name, "label": f"engine {i + 1} of {len(names)} for {what} in strips"}
+                    for i, name in enumerate(names)
+                ]
+                batch_step = (lambda f, t: progress((base_done + f * len(names)) / max(1, total), t)) if progress else None
+                batch_res = export._build_batch(
+                    {"timing_cache": store.timing_cache_path(), "optimization_level": optimization_level, "strip": True, "jobs": batch_jobs},
+                    work,
+                    batch_step,
+                )
+                skipped += batch_res.get("memory_warnings") or 0
+                if export.CANCEL.is_set() or str(batch_res.get("error")) == "cancelled":
+                    raise _Cancelled()
+                for item in batch_res.get("results") or ():
+                    if item.get("ok") and item.get("key") in kinds:
+                        name = item["key"]
+                        built[prefix + name] = {"ok": True, "stripped": item.get("stripped", True)}
+                        metas[name] = {"shapes": kinds[name], "weights": sorted(graphs[prefix + name]), "stripped": item.get("stripped", True)}
+                        done += 1
+                if batch_res["ok"] and len(metas) == len(names):
+                    return metas, None
+                if batch_res.get("retry_without_strip"):
+                    retry_no_strip = batch_res.get("failed_key")
+                # Remaining strips fall back to isolated single-engine subprocesses (handles retry_without_strip or OOM).
+                names = [name for name in names if name not in metas]
+            for i, name in enumerate(names):
+                if export.CANCEL.is_set():
+                    raise _Cancelled()
+                idx = len(metas) + 1
+                use_strip = name != retry_no_strip
+                if not use_strip:
+                    logger.info("TensorRT couldn't leave the weights out of the engine, so it's building one with placeholder weights: a larger file, as fast.")
+                result = export._build_plan(job(prefix + name, kinds[name]), work, step(f"engine {idx} of {len(kinds)} for {what} in strips"), strip=use_strip)
                 skipped += result.get("memory_warnings") or 0
                 if not result["ok"]:
                     if export.CANCEL.is_set() or str(result.get("error")) == "cancelled":
                         raise _Cancelled()
-                    total -= len(kinds) - i
+                    total -= len(names) - i
                     larger = "decodes" if what == "decoding" else "encodes"
                     logger.warning(f"Couldn't build the VAE engines for {what} in strips, so larger {larger} run on PyTorch: {result.get('error')}")
                     return metas, str(result.get("error"))

@@ -88,7 +88,7 @@ PROBES = 8
 # A latent scale alpha(sigma) below which a call's noise isn't removed: a flow model's first steps, near sigma = 1
 LATENT = 0.01
 # Engines record this; one built with another has a different shallow graph. Raise the version when shallow() changes.
-SIGNATURE = {"version": 11, "window": WINDOW, "uncond": UNCOND, "grid": GRID}
+SIGNATURE = {"version": 12, "window": WINDOW, "uncond": UNCOND, "grid": GRID}
 
 IMAGES = [f"{name}{m}" for m in range(1, WINDOW + 1) for name in ("hx", "hr", "hd", "hu")[: 4 if m <= UNCOND else 3]]
 VECTORS = [f"hv{m}" for m in range(1, WINDOW + 1)]
@@ -137,20 +137,22 @@ def _view(v):
 
 
 def _residual(y, columns):
+    # Coalesced (n, k, D) layout with elementwise multiply-sum over D: skinny (n, k, D) @ (n, D, 1) MatMuls launch one
+    # block per batch item in TensorRT, spending ~20 ms on L4 vs <0.5 ms here.
     n = y.shape[0]
     basis = None
     for column in columns:
-        a = column.reshape(n, -1, 1)
+        a = column.reshape(n, 1, -1)
         v = a
         if basis is not None:
             for _ in range(2):
-                v = v - basis @ (basis.transpose(1, 2) @ v)
-        length = (v * v).sum(1, keepdim=True).sqrt()
-        q = torch.where(length > DROP * (a * a).sum(1, keepdim=True).sqrt(), v / length.clamp_min(1e-30), torch.zeros_like(v))
-        basis = q if basis is None else torch.cat([basis, q], 2)
-    r = y.reshape(n, -1, 1)
+                v = v - (basis * (basis * v).sum(2, keepdim=True)).sum(1, keepdim=True)
+        length = (v * v).sum(2, keepdim=True).sqrt()
+        q = torch.where(length > DROP * (a * a).sum(2, keepdim=True).sqrt(), v / length.clamp_min(1e-30), torch.zeros_like(v))
+        basis = q if basis is None else torch.cat([basis, q], 1)
+    r = y.reshape(n, 1, -1)
     for _ in range(2):
-        r = r - basis @ (basis.transpose(1, 2) @ r)
+        r = r - (basis * (basis * r).sum(2, keepdim=True)).sum(1, keepdim=True)
     return r.reshape(y.shape)
 
 
@@ -510,11 +512,16 @@ class Tracker:
         n = entry.shape[0]
         k = full.shape[0] // n
         sigma, x = entry.sigma.repeat(k), entry.x.repeat(k, 1, 1, 1)
-        blocks = self.sampling.calculate_denoised(sigma, full.float(), x).reshape(k, n, -1).permute(1, 2, 0).double()
-        changed = self.sampling.calculate_denoised(sigma, checked.float(), x).reshape(k, n, -1).permute(1, 2, 0).double()
-        output = entry.denoised.reshape(n, -1, 1).double()
-        gram = blocks.transpose(1, 2) @ blocks
+        blocks = self.sampling.calculate_denoised(sigma, full.float(), x).reshape(k, n, -1).permute(1, 2, 0)
+        diff = self.sampling.calculate_denoised(sigma, checked.float(), x).reshape(k, n, -1).permute(1, 2, 0) - blocks
+        output = entry.denoised.reshape(n, -1, 1)
+        b64 = blocks.double()
+        del blocks
+        bt = b64.transpose(1, 2)
+        gram = bt @ b64
+        rhs = bt @ output.double()
+        del b64, bt
         ridge = 1e-12 * gram.diagonal(dim1=1, dim2=2).sum(1).clamp_min(1e-30).reshape(n, 1, 1) * torch.eye(k, dtype=gram.dtype, device=gram.device)
-        weights = torch.linalg.solve_ex(gram + ridge, blocks.transpose(1, 2) @ output)[0]
-        error = (changed - blocks) @ weights
+        weights = torch.linalg.solve_ex(gram + ridge, rhs)[0].float()
+        error = diff @ weights
         return (error.norm() / output.norm().clamp_min(1e-30)).float()

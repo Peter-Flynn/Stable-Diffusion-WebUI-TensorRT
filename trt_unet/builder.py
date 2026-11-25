@@ -145,6 +145,11 @@ class Progress(trt.IProgressMonitor):
             self.cancel = True
 
 
+    def close(self):
+        for name in list(self.phases):
+            self._close(name)
+
+
 def _send(prefix, payload):
     sys.stdout.write(prefix + json.dumps(payload) + "\n")
     sys.stdout.flush()
@@ -168,8 +173,45 @@ class NoEngine(RuntimeError):
     pass
 
 
-def build(job, logger, progress, strip=True):
-    builder = trt.Builder(logger)
+def _load_timing_cache(builder, cache_path, logger):
+    config = builder.create_builder_config()
+    try:
+        try:
+            data = b""
+            if cache_path and os.path.isfile(cache_path):
+                with open(cache_path, "rb") as f:
+                    data = f.read()
+            cache = config.create_timing_cache(data)
+            if cache is None:
+                raise ValueError("TensorRT rejected the timing cache")
+        except Exception as e:
+            log("WARNING", f"The timing cache couldn't be read, so this build starts without it: {e}")
+            logger.errors.clear()
+            cache = config.create_timing_cache(b"")
+        finally:
+            data = b""
+        return cache
+    finally:
+        del config
+
+
+def _save_timing_cache(cache, cache_path):
+    if not cache_path or cache is None:
+        return
+    tmp = cache_path + ".tmp"
+    try:
+        serialized = cache.serialize()
+        if serialized is not None:
+            with open(tmp, "wb") as f:
+                f.write(memoryview(serialized))
+            os.replace(tmp, cache_path)
+    except Exception as e:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        log("DEBUG", f"Couldn't save the timing cache: {e}")
+
+
+def _build_one(builder, cache, job, logger, progress, strip=True):
     network = builder.create_network(0)  # strongly typed: layer precisions come from the FP16 ONNX graph
     parser = trt.OnnxParser(network, logger)
     # The ONNX parser opens files through narrow (ANSI) paths on Windows, which fail on e.g. a Japanese user folder name:
@@ -199,22 +241,6 @@ def build(job, logger, progress, strip=True):
     if any(lo != hi for shapes in job["profiles"] for lo, _, hi in shapes.values()):
         config.set_preview_feature(trt.PreviewFeature.RUNTIME_ACTIVATION_RESIZE_10_10, True)
     config.progress_monitor = progress
-
-    cache_path = job.get("timing_cache")
-    try:
-        data = b""
-        if cache_path and os.path.isfile(cache_path):
-            with open(cache_path, "rb") as f:
-                data = f.read()
-        cache = config.create_timing_cache(data)
-        if cache is None:
-            raise ValueError("TensorRT rejected the timing cache")
-    except Exception as e:
-        log("WARNING", f"The timing cache couldn't be read, so this build starts without it: {e}")
-        logger.errors.clear()
-        cache = config.create_timing_cache(b"")
-    finally:
-        data = b""
     if cache is not None:
         config.set_timing_cache(cache, ignore_mismatch=True)
 
@@ -226,26 +252,63 @@ def build(job, logger, progress, strip=True):
                 profile.set_shape(name, min=lo, opt=opt, max=hi)
         config.add_optimization_profile(profile)
 
-    plan = builder.build_serialized_network(network, config)
+    try:
+        plan = builder.build_serialized_network(network, config)
+    finally:
+        progress.close()
     if plan is None:
         said = logger.errors[-1] if logger.errors else logger.memory_example
         raise NoEngine("TensorRT returned no engine" + (f": {said}" if said else ""))
     with open(job["plan"], "wb") as f:
         f.write(memoryview(plan))
-    del plan
-    if cache_path:
-        tmp = cache_path + ".tmp"
-        try:
-            tc = config.get_timing_cache()
-            serialized = tc.serialize() if tc is not None else None
-            if serialized is not None:
-                with open(tmp, "wb") as f:
-                    f.write(memoryview(serialized))
-                os.replace(tmp, cache_path)
-        except Exception as e:
-            with contextlib.suppress(OSError):
-                os.remove(tmp)
-            log("DEBUG", f"Couldn't save the timing cache: {e}")
+    del plan, config, parser, network
+
+
+def build(job, logger, progress, strip=True):
+    builder = trt.Builder(logger)
+    cache_path = job.get("timing_cache")
+    cache = _load_timing_cache(builder, cache_path, logger)
+    _build_one(builder, cache, job, logger, progress, strip=strip)
+    _save_timing_cache(cache, cache_path)
+
+
+def build_batch(batch_job, logger, send_progress):
+    # Builds a group of small engines (VAE strips) in one process sharing one trt.Builder and one in-memory
+    # ITimingCache, avoiding per-engine CUDA/TRT startup and repeated cache serialization.
+    jobs = batch_job["jobs"]
+    builder = trt.Builder(logger)
+    cache_path = batch_job.get("timing_cache")
+    cache = _load_timing_cache(builder, cache_path, logger)
+    default_strip = batch_job.get("strip", True)
+    default_opt = batch_job.get("optimization_level")
+    results, n = [], max(1, len(jobs))
+    any_built = False
+    try:
+        for i, sub in enumerate(jobs):
+            sub_strip = sub.get("strip", default_strip)
+            sub_job = {
+                **sub,
+                "optimization_level": sub.get("optimization_level", default_opt),
+            }
+            label = sub.get("label") or os.path.basename(sub["plan"])
+            log("DEBUG", f"Building {os.path.basename(sub['plan'])} with TensorRT {trt.__version__}.")
+            logger.errors.clear()
+            logger.memory_example = None
+            sub_send = lambda f, t, i=i, label=label: send_progress((i + f) / n, f"{label}: {t}")
+            try:
+                _build_one(builder, cache, sub_job, logger, Progress(sub_send), strip=sub_strip)
+                any_built = True
+                results.append({"key": sub["key"], "ok": True, "stripped": sub_strip})
+            except Exception as e:
+                error = str(e) or type(e).__name__
+                if not isinstance(e, RuntimeError):
+                    log("DEBUG", f"The build failed:\n{traceback.format_exc().rstrip()}")
+                retry = sub_strip and isinstance(e, NoEngine) and any(w in " ".join(logger.errors).lower() for w in ("refit", "strip", "weight"))
+                return {"ok": False, "error": error, "failed_key": sub["key"], "retry_without_strip": retry, "results": results}
+        return {"ok": True, "error": None, "results": results}
+    finally:
+        if any_built:
+            _save_timing_cache(cache, cache_path)
 
 
 def _exit_with_parent():
@@ -272,10 +335,13 @@ def main(job_path):
     try:
         with open(job_path, encoding="utf-8") as f:
             job = json.load(f)
-        strip = job.get("strip", True)
-        log("DEBUG", f"Building {os.path.basename(job['plan'])} with TensorRT {trt.__version__}.")
-        build(job, logger, Progress(_progress_sender()), strip=strip)
-        result["ok"] = True
+        if "jobs" in job:
+            result = build_batch(job, logger, _progress_sender())
+        else:
+            strip = job.get("strip", True)
+            log("DEBUG", f"Building {os.path.basename(job['plan'])} with TensorRT {trt.__version__}.")
+            build(job, logger, Progress(_progress_sender()), strip=strip)
+            result["ok"] = True
     except Exception as e:
         result["error"] = str(e) or type(e).__name__
         if not isinstance(e, RuntimeError):

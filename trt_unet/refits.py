@@ -24,6 +24,7 @@
 # Keeping one needs RAM for it while it's copied (on Windows, twice its size: TensorRT's copy and ours), with FLOOR of
 # RAM left free. Engines kept earlier make way, least recently used first, except any loaded since this engine's
 # previous load (_may_go).
+import concurrent.futures
 import contextlib
 import ctypes
 import mmap
@@ -45,10 +46,16 @@ PAGE = mmap.PAGESIZE
 # Linux: the copy releases each CHUNK as soon as it's written, so at most this much of it is held that the kernel can't
 # take back: small next to an engine (GBs).
 CHUNK = 64 << 20
+_FILL_SUB = 8 << 20  # L3-friendly sub-chunk for parallel memcpy + page-marking inside each CHUNK
+_TAKE_STEP = 512  # 512 pages = 32 KiB of first cachelines: fits in L1d so each page is touched once
 # Linux's values on every architecture. Python's mmap module defines the names only if its build's headers had them.
 _MADV_DONTNEED, _MADV_FREE, _MADV_DONTFORK, _MADV_HUGEPAGE = 4, 8, 10, 14
 _MARKS = (0x5452545245464954, 0x4B45505452414D53)  # any nonzero words: a page the kernel took back reads as zeros
 _OFFER_PRIORITY = 2  # VmOfferPriorityLow: Windows discards lower priorities first, and a kept engine can be refitted
+
+
+def _fill_workers() -> int:
+    return min(4, max(1, (os.cpu_count() or 2) // 2))
 
 
 class _Memory:
@@ -59,12 +66,48 @@ class _Memory:
         self.size = -(-nbytes // PAGE) * PAGE
         self._state = threading.Lock()
         self._open = self._doomed = self._freed = False
+        self._fill_done = threading.Event()
+        self._fill_done.set()
+        self._fill_error = None
+
+    def start_fill(self):
+        with self._state:
+            self._fill_error = None
+            self._fill_done.clear()
+
+    def _end_fill(self, error=None) -> bool:
+        # Records fill result and releases failed/doomed memory while keeping _fill_done unset so waiters wait until
+        # on_error and _pending_fills cleanup finish. Returns True iff on_error should be notified.
+        with self._state:
+            self._fill_error = error
+            report = error is not None and not self._doomed
+            if error is not None or self._doomed:
+                self._release()
+            return report
+
+    def _complete_fill(self):
+        # Holds _state across the final _doomed check and _fill_done.set() so free() cannot miss _release().
+        with self._state:
+            if self._fill_error is not None or self._doomed:
+                self._release()
+            self._fill_done.set()
+
+    def finish_fill(self, error=None):
+        with self._state:
+            self._fill_error = error
+            if error is not None or self._doomed:
+                self._release()
+            self._fill_done.set()
+
+    def wait_fill(self):
+        self._fill_done.wait()
 
     @contextlib.contextmanager
     def open(self):
+        self._fill_done.wait()
         with self._state:
             try:
-                whole = not self._freed and not self._doomed and self._take()
+                whole = not self._freed and not self._doomed and self._fill_error is None and self._take()
             except Exception as e:
                 logger.warning(f"Couldn't check a kept engine's memory: {e}")
                 whole = False
@@ -87,9 +130,9 @@ class _Memory:
                     self._release()
 
     def free(self):
-        # Memory that's open is freed when open() exits
+        # Memory that's open or filling is freed when open()/fill exits
         with self._state:
-            if self._open:
+            if self._open or not self._fill_done.is_set():
                 self._doomed = True
             else:
                 self._release()
@@ -99,10 +142,11 @@ class _Memory:
         return self._freed or self._doomed
 
     def resident(self) -> int:
-        return 0 if self.freed else self.size
+        return 0 if self.freed or not self._fill_done.is_set() else self.size
 
     def intact(self) -> bool:
-        return not self.freed
+        self._fill_done.wait()
+        return not self.freed and self._fill_error is None
 
 
 class _LinuxMemory(_Memory):
@@ -133,41 +177,79 @@ class _LinuxMemory(_Memory):
         data = np.frombuffer(source, dtype=np.uint8)
         target = np.frombuffer(self._map, dtype=np.uint8)
         words = self._words()
+        saved = self._saved
         address = data.ctypes.data
         returned = -(-address // PAGE) * PAGE  # the source's first whole page
+        workers = _fill_workers() if self.size >= (16 << 20) else 1
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+
+        def copy_mark(span):
+            s, e = span
+            if s < self.nbytes:
+                target[s : min(e, self.nbytes)] = data[s : min(e, self.nbytes)]
+            ps = slice(s // PAGE, e // PAGE)
+            saved[ps] = words[ps, :2]
+            words[ps, 0] = _MARKS[0]
+            words[ps, 1] = _MARKS[1]
+
         try:
             for start in range(0, self.size, CHUNK):
+                if self._doomed:
+                    return
                 end = min(start + CHUNK, self.size)
-                if start < self.nbytes:
-                    target[start : min(end, self.nbytes)] = data[start : min(end, self.nbytes)]
-                pages = slice(start // PAGE, end // PAGE)
-                self._saved[pages] = words[pages, :2]
-                words[pages, 0], words[pages, 1] = _MARKS
+                if pool is None:
+                    copy_mark((start, end))
+                else:
+                    spans = [(s, min(s + _FILL_SUB, end)) for s in range(start, end, _FILL_SUB)]
+                    list(pool.map(copy_mark, spans))
                 self._map.madvise(_MADV_FREE, start, end - start)
                 copied = (address + min(end, self.nbytes)) // PAGE * PAGE
                 if consume and copied > returned:
                     _libc().madvise(returned, copied - returned, _MADV_DONTNEED)
                     returned = copied
         finally:
-            del words, target, data
+            if pool is not None:
+                pool.shutdown(wait=True)
+            del words, target, data, saved
 
     def _take(self) -> bool:
         words = self._words()
+        saved = self._saved
+        n_pages = self.size // PAGE
+        w = sv = None
         try:
-            if not (words[:, 0] == _MARKS[0]).all():
-                return False
-            words[:, 0] = self._saved[:, 0]
-            if not (words[:, 1] == _MARKS[1]).all():
-                return False
-            words[:, 1] = self._saved[:, 1]
+            for s in range(0, n_pages, _TAKE_STEP):
+                e = min(s + _TAKE_STEP, n_pages)
+                w = words[s:e]
+                sv = saved[s:e]
+                if not (w[:, 0] == _MARKS[0]).all():
+                    return False
+                w[:, 0] = sv[:, 0]
+                if not (w[:, 1] == _MARKS[1]).all():
+                    return False
+                w[:, 1] = sv[:, 1]
             return True
         finally:
-            del words
+            del w, sv, words, saved
 
     def _give(self) -> bool:
         words = self._words()
+        n_pages = self.size // PAGE
         try:
-            words[:, 0], words[:, 1] = _MARKS
+            if n_pages >= 4096 and (os.cpu_count() or 1) >= 2:
+                mid = n_pages // 2
+
+                def mark(span):
+                    a, b = span
+                    for s in range(a, b, _TAKE_STEP):
+                        w = words[s : min(s + _TAKE_STEP, b)]
+                        w[:, 0] = _MARKS[0]
+                        w[:, 1] = _MARKS[1]
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    list(pool.map(mark, ((0, mid), (mid, n_pages))))
+            else:
+                words[:, 0], words[:, 1] = _MARKS
             self._map.madvise(_MADV_FREE)
             return True
         except OSError:
@@ -189,20 +271,26 @@ class _LinuxMemory(_Memory):
             self._map.madvise(_MADV_DONTNEED)
 
     def _pagemap_present(self):
-        want, raw = self.size // PAGE * 8, b""
+        want = self.size // PAGE * 8
+        buf = bytearray(want)
+        mv = memoryview(buf)
         try:
-            with open("/proc/self/pagemap", "rb") as f:
-                while len(raw) < want:
-                    more = os.pread(f.fileno(), want - len(raw), self._address // PAGE * 8 + len(raw))
-                    if not more:
+            with open("/proc/self/pagemap", "rb", buffering=0) as f:
+                f.seek(self._address // PAGE * 8)
+                got = 0
+                while got < want:
+                    n = f.readinto(mv[got:])
+                    if not n:
                         return None
-                    raw += more
+                    got += n
         except OSError:
             return None
-        return int(np.count_nonzero(np.frombuffer(raw, dtype=np.uint64) >> np.uint64(63))) * PAGE  # bit 63: present
+        finally:
+            mv.release()
+        return int(np.count_nonzero(np.frombuffer(buf, dtype=np.uint64) >> np.uint64(63))) * PAGE  # bit 63: present
 
     def resident(self) -> int:
-        if self.freed or self._open or not self.pagemap:
+        if self.freed or self._open or not self._fill_done.is_set() or not self.pagemap:
             return super().resident()
         present = self._pagemap_present()
         if present is None:
@@ -211,7 +299,8 @@ class _LinuxMemory(_Memory):
         return present
 
     def intact(self) -> bool:
-        return self.resident() == self.size
+        self._fill_done.wait()
+        return self._fill_error is None and self.resident() == self.size
 
 
 _k32 = None
@@ -270,10 +359,29 @@ class _WindowsMemory(_Memory):
     def fill(self, source, consume: bool = False):
         data = np.frombuffer(source, dtype=np.uint8)
         target = np.frombuffer((ctypes.c_ubyte * self.size).from_address(self._address), dtype=np.uint8)
+        workers = _fill_workers() if self.nbytes >= (16 << 20) else 1
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+
+        def copy_span(span):
+            s, e = span
+            target[s:e] = data[s:e]
+
         try:
-            target[: self.nbytes] = data
+            for start in range(0, self.nbytes, CHUNK):
+                if self._doomed:
+                    return
+                end = min(start + CHUNK, self.nbytes)
+                if pool is None:
+                    copy_span((start, end))
+                else:
+                    spans = [(s, min(s + _FILL_SUB, end)) for s in range(start, end, _FILL_SUB)]
+                    list(pool.map(copy_span, spans))
         finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
             del target, data
+        if self._doomed:
+            return
         rc = _kernel32().OfferVirtualMemory(self._address, self.size, _OFFER_PRIORITY)
         if rc != 0:
             raise OSError(f"OfferVirtualMemory failed (error {rc})")
@@ -357,9 +465,13 @@ class Kept:
     def resident(self) -> int:
         return sum(memory.resident() for memory in self.blobs.values())
 
-    def free(self):
+    def free(self, wait: bool = False):
         for memory in self.blobs.values():
             memory.free()
+        if wait:
+            for memory in self.blobs.values():
+                if hasattr(memory, "wait_fill"):
+                    memory.wait_fill()
 
     @property
     def orphaned(self) -> bool:
@@ -371,6 +483,8 @@ _uses = {}  # engine key -> (load count at its previous load, load count at its 
 _count = 0
 _lock = threading.RLock()
 _watcher = None
+_fill_exec = None
+_pending_fills = set()
 
 
 _last = {}
@@ -456,6 +570,13 @@ def _give_back():
         pass
 
 
+def _wait_pending():
+    with _lock:
+        pending = list(_pending_fills)
+    for m in pending:
+        m.wait_fill()
+
+
 def store(serialize):
     # Runs serialize() (returning a buffer nothing else uses) and copies the result into memory the OS can take back;
     # the serialized copy is freed by the time this returns.
@@ -476,6 +597,61 @@ def store(serialize):
         _give_back()
 
 
+def store_async(source, on_error=None):
+    # Hands a serialized buffer to a single-worker background thread so engine.unload() and the next engine's load can
+    # overlap with the RAM copy. open(), room() and clear() synchronize automatically with any in-flight fill.
+    global _fill_exec
+    kind, why = _supported()
+    if kind is None:
+        del source
+        _give_back()
+        raise RuntimeError(why)
+    try:
+        memory = kind(memoryview(source).nbytes)
+    except BaseException:
+        del source
+        _give_back()
+        raise
+    memory.start_fill()
+    with _lock:
+        if _fill_exec is None:
+            _fill_exec = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="trt-refit-fill")
+        _pending_fills.add(memory)
+        executor = _fill_exec
+
+    def _run():
+        nonlocal source
+        err = None
+        try:
+            if not memory._doomed:
+                memory.fill(source, consume=True)
+        except BaseException as e:
+            err = e
+        finally:
+            source = None
+            _give_back()
+            report = memory._end_fill(err)
+            try:
+                if report and on_error is not None:
+                    with contextlib.suppress(Exception):
+                        on_error(err, memory)
+            finally:
+                with _lock:
+                    _pending_fills.discard(memory)
+                memory._complete_fill()
+
+    try:
+        executor.submit(_run)
+    except BaseException:
+        with _lock:
+            _pending_fills.discard(memory)
+        source = None
+        _give_back()
+        memory.finish_fill(RuntimeError("couldn't schedule background RAM fill"))
+        raise
+    return memory
+
+
 def get(key: str):
     with _lock:
         entry = _kept.pop(key, None)
@@ -484,10 +660,12 @@ def get(key: str):
         return entry
 
 
-def drop(key: str, role: str = None):
+def drop(key: str, role: str = None, blob=None):
     with _lock:
         entry = _kept.get(key)
         if entry is None:
+            return
+        if blob is not None and entry.blobs.get(role) is not blob:
             return
         if role in (None, "unet"):
             del _kept[key]
@@ -509,7 +687,8 @@ def clear():
         _kept.clear()
         _uses.clear()
     for entry in entries:
-        entry.free()
+        entry.free(wait=True)
+    _wait_pending()
 
 
 def held() -> tuple:
@@ -538,6 +717,7 @@ def _may_go(k: str, key: str) -> bool:
 
 
 def room(nbytes: int, key: str = None) -> bool:
+    _wait_pending()
     _last.clear()
     kind, why = _supported()
     if kind is None:
@@ -578,7 +758,7 @@ def room(nbytes: int, key: str = None) -> bool:
             dropped.append(_kept.pop(k))
     for entry in dropped:
         logger.info(f"Dropped the {entry.label} from RAM ({gib(entry.nbytes)}) to make room for another.")
-        entry.free()
+        entry.free(wait=True)
     return fits(supply, commit)
 
 
@@ -587,6 +767,13 @@ def put(key: str, entry: Kept, expected: Kept = None) -> bool:
     with _lock:
         if expected is not None and _kept.get(key) is not expected:
             return False  # _trim_commit() or another caller dropped expected while new roles were serializing
+        bad = [r for r, m in entry.blobs.items() if getattr(m, "_fill_error", None) is not None or m.freed]
+        if bad:
+            if "unet" in bad or len(bad) == len(entry.blobs):
+                return False
+            blobs = {r: m for r, m in entry.blobs.items() if r not in bad}
+            signatures = {r: s for r, s in entry.signatures.items() if r not in bad}
+            entry = Kept(signatures, blobs, entry.label, entry.source)
         old = _kept.pop(key, None)
         _kept[key] = entry
         if _watcher is None and _commit_limited():
