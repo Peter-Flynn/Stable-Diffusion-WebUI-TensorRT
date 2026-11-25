@@ -6,15 +6,14 @@
 # 512 channels wide, which TensorRT's fused attention doesn't cover: unfused it would hold the whole score matrix,
 # ~17 GB in FP32 at 2048x2048), and a "post" engine for the rest. The encoder's are "encode-pre" and "encode-post".
 #
-# Whole-image engines run in reForge's VAE precision (BF16, or FP32 where that would be FP16), never FP16: VAE
-# activations exceed FP16's range (SDXL's do), and computing each GroupNorm in FP32 inside an FP16 graph is only fast in
-# TensorRT with an FP32 copy of the tensor, which at whole-image sizes costs as much as FP32 or doesn't fit (measured:
-# GroupNorm was 85% of decode time without it).
+# Whole-image engines run in BF16 where reForge uses BF16, in scaled FP16 (2^-EXPONENT between GroupNorms, with
+# FP32 GroupNorm reductions) on GPUs with fast FP16 and without --vae-in-fp32, and in FP32 otherwise. Because every
+# nonlinearity (SiLU, attention softmax) follows a GroupNorm whose output is scale-invariant, scaling activations and
+# conv biases (scaled_bias) by 2^-EXPONENT keeps SDXL's large VAE activations safely inside FP16 range while halving
+# VRAM and running ~1.8-4x faster than FP32.
 #
-# Strip engines (strips.py) run in FP16 where the GPU is fast at it, with the GroupNorm split across engines. They can't
-# overflow, because every nonlinearity (SiLU, the attention softmax) directly follows a GroupNorm, whose output doesn't
-# depend on its input's scale. Everything between two GroupNorms is therefore linear, and runs multiplied by 2^-EXPONENT
-# if the conv biases added along the way are multiplied too (scaled_bias). The last GroupNorm removes the scale.
+# Strip engines (strips.py) run in FP16 where the GPU is fast at it, with the GroupNorm split across engines. They use
+# the same 2^-EXPONENT scaling and can raise the exponent dynamically if an unusual VAE overflows.
 import contextlib
 import glob
 import hashlib
@@ -150,6 +149,15 @@ def dtype_name(dtype) -> str:
 
 
 def engine_dtype(vae):
+    if vae.vae_dtype == torch.bfloat16:
+        return torch.bfloat16
+    if vae.vae_dtype in (torch.float16, torch.float32):
+        try:
+            mm = common.mm()
+            if not getattr(mm.args, "vae_in_fp32", False) and mm.should_use_fp16(common.device()):
+                return torch.float16
+        except Exception:
+            pass
     return torch.float32 if vae.vae_dtype == torch.float16 else vae.vae_dtype
 
 
@@ -377,6 +385,14 @@ class Record:
         return scaled(self.strips_dtype)
 
     @property
+    def whole_exponent(self) -> int:
+        return int(self.meta.get("whole_exponent") or 0)
+
+    @property
+    def whole_scale(self) -> float:
+        return 2.0 ** -self.whole_exponent
+
+    @property
     def loadable(self) -> bool:
         try:
             return self.meta["gpu"] == common.gpu_tag() and common.trt_tag(self.meta["trt"]) == common.trt_tag()
@@ -487,8 +503,9 @@ def record_for(arch_id: str, vae):
     except Exception as e:
         common.notify(f"Couldn't look up the VAE engines: {e}")
         return None
-    wanted = (engine_dtype(vae), strip_dtype(vae))
-    return next((r for r in matching if (r.dtype, r.strips_dtype) == wanted), matching[0] if matching else None)
+    dtype, sdtype = engine_dtype(vae), strip_dtype(vae)
+    want_exp = EXPONENT if scaled(dtype) else 0
+    return next((r for r in matching if (r.dtype, r.strips_dtype, r.whole_exponent) == (dtype, sdtype, want_exp)), matching[0] if matching else None)
 
 
 def remove_record(base: str):
@@ -548,7 +565,8 @@ def encoder_wanted(vae, profiles: list, dtype, sdtype, vram) -> dict:
 
 def records_matching(arch_id: str, vae, dtype, sdtype) -> list:
     wanted = digest(vae)
-    return [r for r in records(arch_id) if r.meta.get("digest") == wanted and (r.dtype, r.strips_dtype) == (dtype, sdtype)]
+    want_exp = EXPONENT if scaled(dtype) else 0
+    return [r for r in records(arch_id) if r.meta.get("digest") == wanted and (r.dtype, r.strips_dtype, r.whole_exponent) == (dtype, sdtype, want_exp)]
 
 
 def strips_wanted(vae, profiles: list, cfg: dict, dtype, encoding: bool = False) -> dict:

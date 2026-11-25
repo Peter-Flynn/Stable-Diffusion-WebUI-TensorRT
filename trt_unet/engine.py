@@ -390,18 +390,37 @@ class Engine:
             use_device = device_budget >= (128 << 20)
 
             # Double-buffered pinned-H2D + preallocated GPU staging avoids per-weight pageable stalls and allocator
-            # churn when computing LoRA/FP8 weights on GPU.
+            # churn when computing LoRA/FP8 weights on GPU. Standard LoRA (up, down) tensors are packed alongside base
+            # into the same slot so one async DMA transfers all of them for in-place FP32 addmm_.
             pins = gpu_bufs = copy_stream = compute_stream = ev_copy = ev_use = None
             pin_size = 0
+            has_fast_lora = (
+                can_pipe
+                and callable(getattr(source, "fast_lora", None))
+                and callable(getattr(source, "apply_fast_lora", None))
+            )
+            fast_map = {}
+            align16 = lambda n: (n + 15) & ~15
             if can_pipe:
                 cpu_gpu_sizes = []
                 for n in names:
                     if source.needs_gpu(n):
+                        items = source.fast_lora(n) if has_fast_lora else None
+                        if items is not None:
+                            fast_map[n] = items
                         b = source.base(n)
-                        if type(b) is torch.Tensor and not b.is_cuda and b.is_contiguous():
-                            nb = b.numel() * b.element_size()
-                            if nb > 0:
-                                cpu_gpu_sizes.append(nb)
+                        if type(b) is torch.Tensor:
+                            pack_nb = 0
+                            if not b.is_cuda and b.is_contiguous():
+                                pack_nb += align16(b.numel() * b.element_size())
+                            if items is not None:
+                                for up, down, _ in items:
+                                    if not up.is_cuda:
+                                        pack_nb += align16(up.numel() * up.element_size())
+                                    if not down.is_cuda:
+                                        pack_nb += align16(down.numel() * down.element_size())
+                            if pack_nb > 0:
+                                cpu_gpu_sizes.append(pack_nb)
                 if len(cpu_gpu_sizes) >= 2:
                     pin_size = min(32 << 20, max(cpu_gpu_sizes))
                     if 2 * pin_size <= max(0, free_b - (256 << 20)) // 4:
@@ -419,6 +438,7 @@ class Engine:
                             pins = gpu_bufs = copy_stream = compute_stream = ev_copy = ev_use = None
 
             done, pos = set(), 0
+            slot_used = [False, False]
             try:
                 with self._taking(), gpu.refit_pool():
                     while pos < len(names):
@@ -504,34 +524,95 @@ class Engine:
                             for name, proto, dt in host_items:
                                 put(name, proto, dt)
                             if gpu_items:
-                                slot_used = [False, False]
 
                                 def stage(idx, name):
                                     base = source.base(name)
                                     if type(base) is not torch.Tensor:
-                                        return None, None
-                                    if base.is_cuda:
-                                        return None, base
-                                    nb = base.numel() * base.element_size()
-                                    if pins is None or not base.is_contiguous() or nb == 0 or nb > pin_size:
-                                        return None, base.to(dev)
+                                        return None, None, None
+                                    items = fast_map.get(name)
+                                    base_on_dev = base.is_cuda and base.device == dev
+                                    if items is None:
+                                        if base_on_dev:
+                                            return None, base, None
+                                        nb = base.numel() * base.element_size()
+                                        if pins is None or base.is_cuda or not base.is_contiguous() or nb == 0 or nb > pin_size:
+                                            return None, base.to(dev), None
+                                        slot = idx & 1
+                                        if slot_used[slot]:
+                                            ev_copy[slot].synchronize()
+                                        pv = pins[slot][:nb].view(base.dtype).view(base.shape)
+                                        pv.copy_(base)
+                                        gv = gpu_bufs[slot][:nb].view(base.dtype).view(base.shape)
+                                        with torch.cuda.stream(copy_stream):
+                                            if slot_used[slot]:
+                                                copy_stream.wait_event(ev_use[slot])
+                                            gv.copy_(pv, non_blocking=True)
+                                            ev_copy[slot].record(copy_stream)
+                                        slot_used[slot] = True
+                                        return slot, gv, None
+
+                                    tensors = [base]
+                                    scales = []
+                                    for up, down, sc in items:
+                                        tensors.append(up)
+                                        tensors.append(down)
+                                        scales.append(sc)
+                                    if all(t.is_cuda and t.device == dev for t in tensors):
+                                        return None, base, items
+                                    can_pack = pins is not None and (base_on_dev or (not base.is_cuda and base.is_contiguous()))
+                                    offsets = []
+                                    total = 0
+                                    if can_pack:
+                                        for ti, t in enumerate(tensors):
+                                            if t.is_cuda:
+                                                if t.device != dev:
+                                                    can_pack = False
+                                                    break
+                                                offsets.append(None)
+                                            else:
+                                                if ti > 0 and not t.is_contiguous():
+                                                    t = tensors[ti] = t.contiguous()
+                                                nb = t.numel() * t.element_size()
+                                                if nb == 0:
+                                                    can_pack = False
+                                                    break
+                                                offsets.append((total, nb, t.dtype, t.shape))
+                                                total = align16(total + nb)
+                                    if not can_pack or total == 0 or total > pin_size:
+                                        g_base = base if base_on_dev else base.to(dev)
+                                        g_items = [
+                                            (
+                                                u if (u.is_cuda and u.device == dev) else u.to(dev),
+                                                d if (d.is_cuda and d.device == dev) else d.to(dev),
+                                                sc,
+                                            )
+                                            for u, d, sc in items
+                                        ]
+                                        return None, g_base, g_items
                                     slot = idx & 1
                                     if slot_used[slot]:
                                         ev_copy[slot].synchronize()
-                                    pv = pins[slot][:nb].view(base.dtype).view(base.shape)
-                                    pv.copy_(base)
-                                    gv = gpu_bufs[slot][:nb].view(base.dtype).view(base.shape)
+                                    pbuf, gbuf = pins[slot], gpu_bufs[slot]
+                                    for t, spec in zip(tensors, offsets):
+                                        if spec is not None:
+                                            off, nb, tdt, sh = spec
+                                            pbuf[off : off + nb].view(tdt).view(sh).copy_(t)
                                     with torch.cuda.stream(copy_stream):
                                         if slot_used[slot]:
                                             copy_stream.wait_event(ev_use[slot])
-                                        gv.copy_(pv, non_blocking=True)
+                                        gbuf[:total].copy_(pbuf[:total], non_blocking=True)
                                         ev_copy[slot].record(copy_stream)
                                     slot_used[slot] = True
-                                    return slot, gv
+                                    gviews = [
+                                        t if spec is None else gbuf[spec[0] : spec[0] + spec[1]].view(spec[2]).view(spec[3])
+                                        for t, spec in zip(tensors, offsets)
+                                    ]
+                                    g_items = [(gviews[1 + 2 * i], gviews[2 + 2 * i], scales[i]) for i in range(len(scales))]
+                                    return slot, gviews[0], g_items
 
                                 staged = stage(0, gpu_items[0][0])
                                 for idx, (name, proto, dt) in enumerate(gpu_items):
-                                    slot, gpu_base = staged
+                                    slot, gpu_base, gpu_lora = staged
                                     if idx + 1 < len(gpu_items):
                                         staged = stage(idx + 1, gpu_items[idx + 1][0])
                                     if gpu_base is None:
@@ -539,7 +620,10 @@ class Engine:
                                         continue
                                     if slot is not None:
                                         compute_stream.wait_event(ev_copy[slot])
-                                    w = source.apply_on_gpu(name, gpu_base, dt).contiguous()
+                                    if gpu_lora is not None:
+                                        w = source.apply_fast_lora(gpu_base, gpu_lora, dt).contiguous()
+                                    else:
+                                        w = source.apply_on_gpu(name, gpu_base, dt).contiguous()
                                     if slot is not None:
                                         ev_use[slot].record(compute_stream)
                                     bind_tensor(name, proto, w)

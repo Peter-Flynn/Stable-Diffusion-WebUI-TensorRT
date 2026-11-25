@@ -1,9 +1,10 @@
 # Runs reForge's UNet on TensorRT engines. A hook on UNetModel.forward sends each UNet call of a sampling pass (a Pass)
 # to the engine whose profile fits its shapes; anything an engine can't run falls back to PyTorch for the rest of the
-# pass. Each engine is a model in reForge's model manager (TrtModel). Only one is in VRAM at a time, and the manager
-# evicts engines only as a last resort, because loading one means refitting every weight (or restoring it from RAM,
-# refits.py). Before anything loads, _fits checks the engine and the pass's working memory (working.py) can fit in
-# VRAM at all; if not, the pass runs on PyTorch. During a pass the PyTorch UNet stays patched but unloaded, in RAM.
+# pass. Each engine is a model in reForge's model manager (TrtModel). Multiple engines stay resident in VRAM when there
+# is room for them alongside the pass's working memory, evicting least-recently-used engines first when VRAM is needed;
+# the manager evicts engines only as a last resort, because loading one means refitting every weight (or restoring it
+# from RAM, refits.py). Before anything loads, _fits checks the engine and the pass's working memory (working.py) can fit
+# in VRAM at all; if not, the pass runs on PyTorch. During a pass the PyTorch UNet stays patched but unloaded, in RAM.
 import contextlib
 import inspect
 import math
@@ -25,6 +26,8 @@ from .weights import EffectiveWeights
 
 _models = {}
 _last_used = {}
+_use_order = {}  # record.key -> monotonic use tick for LRU eviction among resident TrtModels
+_use_tick = 0
 _pass = None
 
 
@@ -34,6 +37,13 @@ class Fallback(Exception):
 
 class TensorRTUNet:
     pass
+
+
+class _Shape:
+    __slots__ = ("shape",)
+
+    def __init__(self, shape: tuple):
+        self.shape = shape
 
 
 def call_bytes(model, patcher, x) -> int:
@@ -144,7 +154,11 @@ class TrtModel:
                 try:
                     kept = self._kept()
                     need = self.full(shallow, kept)
-                    common.make_room(common.padded(need) if not attempt else common.obtainable(self.load_device) - common.reserve(), self.load_device)
+                    if not attempt:
+                        common.make_room(common.padded(need), self.load_device)
+                    else:
+                        with _evictable():
+                            common.make_room(common.obtainable(self.load_device) - common.reserve(), self.load_device)
                     with gpu.loading(self.owner) as load:
                         engine = self._engines()
                         self.applied = {}
@@ -318,8 +332,11 @@ class TrtModel:
         if not self.loaded or self.shallow is None or self.shallow.loaded:
             return
         kept = self._kept() if self.weights is not None else None
-        need = self.full(True, kept) - self.full(False, kept)
-        common.make_room(common.padded(need), self.load_device, _loaded_entries(self))
+        need = common.padded(self.full(True, kept) - self.full(False, kept))
+        keep = _loaded_entries(self)
+        if common.make_room(need, self.load_device, keep) < need:
+            with _evictable():
+                common.make_room(need, self.load_device, keep)
         start = time.time()
         load = {}
         try:
@@ -372,40 +389,61 @@ class TrtModel:
             self.applied[role] = {}
             refits.drop(self.record.key, role)  # the copy kept in RAM holds the old weights
             torch.cuda.current_stream(self.load_device).synchronize()  # no inference in flight while the weights change
-            engine_mod.LOGGER.clear()
-            failures = gpu.failures()
-            try:
-                seconds = engine.refit(changed, weights.tensor)
-            except Exception as e:
-                if role != "shallow" or not drop_shallow:
-                    raise
-                ran_out = isinstance(e, torch.cuda.OutOfMemoryError) or gpu.failures() != failures or engine_mod.LOGGER.out_of_memory
-                if retry_shallow_oom and ran_out:
-                    raise
-                notify(f"Couldn't refit the Speed Hacks part of the {self.name}, so it runs without Speed Hacks: {e}")
-                e.__traceback__ = None
-                if gpu.counting(self.owner):
-                    engine.unload()
-                elif gpu.attached():
-                    before, prev_extra = gpu.ledger(self.owner), engine.extra
-                    engine.unload()
-                    base_freed = max(0, before - gpu.ledger(self.owner) - prev_extra)
-                    if base_freed:
-                        gpu.unloaded(self.owner, base_freed)
-                else:
-                    engine.release_activations()
-                    try:
-                        before = gpu.in_use()
-                    except Exception:
-                        before = None
-                    engine.unload()
-                    if before is not None:
-                        with contextlib.suppress(Exception):
-                            base_freed = max(0, before - gpu.in_use())
-                            if base_freed:
-                                gpu.unloaded(self.owner, base_freed)
-                self.applied.pop("shallow", None)
-                self.want_shallow, self.shallow_failed = False, True
+            can_retry_unet = role == "unet" and not gpu.counting(self.owner)
+            if can_retry_unet and len(changed) >= 16 and common.free(self.load_device) < (1 << 30):
+                # Free evictable non-engines (CLIP/VAE) before a large live refit so GPU staging fits without touching other UNet engines.
+                keep_engines = [
+                    lm for lm in common.mm().current_loaded_models
+                    if lm.model is not None and (lm.model is self or self.is_clone(lm.model) or getattr(lm.model, "evicted_last", False))
+                ]
+                common.make_room(1 << 30, self.load_device, keep_engines)
+            seconds = None
+            dropped = False
+            for attempt in (0, 1) if can_retry_unet else (0,):
+                engine_mod.LOGGER.clear()
+                failures = gpu.failures()
+                try:
+                    seconds = engine.refit(changed, weights.tensor)
+                    break
+                except Exception as e:
+                    ran_out = isinstance(e, torch.cuda.OutOfMemoryError) or gpu.failures() != failures or engine_mod.LOGGER.out_of_memory
+                    if can_retry_unet and ran_out and not attempt:
+                        e.__traceback__ = None
+                        with _evictable():
+                            common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.load_device, keep_loaded=_loaded_entries(self))
+                        common.trim()
+                        continue
+                    if role != "shallow" or not drop_shallow:
+                        raise
+                    if retry_shallow_oom and ran_out:
+                        raise
+                    notify(f"Couldn't refit the Speed Hacks part of the {self.name}, so it runs without Speed Hacks: {e}")
+                    e.__traceback__ = None
+                    if gpu.counting(self.owner):
+                        engine.unload()
+                    elif gpu.attached():
+                        before, prev_extra = gpu.ledger(self.owner), engine.extra
+                        engine.unload()
+                        base_freed = max(0, before - gpu.ledger(self.owner) - prev_extra)
+                        if base_freed:
+                            gpu.unloaded(self.owner, base_freed)
+                    else:
+                        engine.release_activations()
+                        try:
+                            before = gpu.in_use()
+                        except Exception:
+                            before = None
+                        engine.unload()
+                        if before is not None:
+                            with contextlib.suppress(Exception):
+                                base_freed = max(0, before - gpu.in_use())
+                                if base_freed:
+                                    gpu.unloaded(self.owner, base_freed)
+                    self.applied.pop("shallow", None)
+                    self.want_shallow, self.shallow_failed = False, True
+                    dropped = True
+                    break
+            if dropped:
                 continue
             self.applied[role] = wanted
             refit = {"seconds": seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
@@ -452,6 +490,7 @@ def release_all():
         _unload(model, keep=False)
     _models.clear()
     _last_used.clear()
+    _use_order.clear()
     vae_run.release_all()
     refits.clear()
     common.mm().soft_empty_cache(force=True)
@@ -597,14 +636,28 @@ def _wrap_free_memory(original):
             keep.extend(lm for lm in extra if lm not in keep)
         mm = common.mm()
         engines = []
-        if not _evicting and not getattr(mm, "DISABLE_SMART_MEMORY", False):
+        if not getattr(mm, "DISABLE_SMART_MEMORY", False):
             engines = [lm for lm in mm.current_loaded_models if getattr(lm.model, "evicted_last", False) and lm.device == device and lm not in keep]
+        if _evicting:
+            if len(engines) <= 1:
+                return original(memory_required, device, keep)
+            unloaded = original(memory_required, device, keep + engines)
+            ordered = sorted(engines, key=lambda lm: _use_order.get(getattr(getattr(lm.model, "record", None), "key", None), 0))
+            for i in range(1, len(ordered) + 1):
+                if mm.get_free_memory(device) >= memory_required:
+                    break
+                unloaded += original(memory_required, device, keep + ordered[i:])
+            return unloaded
         if not engines:
             return original(memory_required, device, keep)
         unloaded = original(memory_required, device, keep + engines)
         short = memory_required - mm.get_free_memory(device)
         if 0 < short <= sum(lm.model_loaded_memory() for lm in engines):
-            unloaded += original(memory_required, device, keep)
+            ordered = sorted(engines, key=lambda lm: _use_order.get(getattr(getattr(lm.model, "record", None), "key", None), 0))
+            for i in range(1, len(ordered) + 1):
+                unloaded += original(memory_required, device, keep + ordered[i:])
+                if mm.get_free_memory(device) >= memory_required:
+                    break
         return unloaded
 
     free_memory._trt_original = original
@@ -671,6 +724,7 @@ class Pass:
         self.arch_id = arch.id
         self.shapes, self.takes_y = [r.profile_shapes[j] for r, j in self.slots], bool(arch.adm_channels)
         self.channels, self.context_dim = arch.in_channels, arch.context_dim
+        self._x_shape = tuple(x.shape)
         self.shape = (x.shape[0] * 2, *x.shape[1:])
         self.fallback = None
         self.checked = self.shallow_checked = False
@@ -681,20 +735,51 @@ class Pass:
         if hacks:
             self._watch_apply_model(model)
 
-    def use(self, record):
+    def _need_for(self, model: TrtModel, want_shallow: bool, call_shape: tuple = None) -> int:
+        if model.loaded:
+            load_need = model._serialized_size("shallow") if want_shallow and not model.shallow_loaded else 0
+        else:
+            load_need = model.full(want_shallow, model._kept(self.weights))
+        if call_shape is not None:
+            padded, h, w = call_shape
+            calls = max(
+                working.call_bytes(model.record.arch, self.patcher, padded, w * 8, h * 8),
+                model.took.get((self._x_shape[0], h, w), 0),
+            )
+        else:
+            b, _, h, w = self._x_shape
+            calls = max(call_bytes(model, self.patcher, _Shape(self._x_shape)), model.took.get((b, h, w), 0))
+        return common.padded(load_need + calls)
+
+    def use(self, record, call_shape=None):
+        global _use_tick
         model = model_for(record)
+        want_shallow = bool(self.schedule is not None and model.hacks is not None and not model.shallow_failed)
         if model is not self.model or not model.loaded:
-            for other in list(_models.values()):
-                if other is not model and other.opened:
-                    _unload(other)
+            was_loaded = model.loaded
             self._hold()
+            for other in list(_models.values()):
+                if other is not model and other.opened and not other.loaded:
+                    _unload(other, keep=False)
+            others = sorted(
+                (other for other in _models.values() if other is not model and other.loaded),
+                key=lambda m: _use_order.get(m.record.key, 0),
+            )
+            if others:
+                need = self._need_for(model, want_shallow, call_shape)
+                while others and common.obtainable(model.load_device, keep=[model], engines=False) - common.reserve() < need:
+                    _unload(others.pop(0))
             model.weights = self.weights
-            model.want_shallow = bool(self.schedule is not None and model.hacks is not None and not model.shallow_failed)
+            model.want_shallow = want_shallow
             with torch.inference_mode(), _keeping(self.patcher):
                 common.register(model)
+            if was_loaded and _use_order.get(record.key) != _use_tick:
+                refits.used(record.key)
             self.model = model
             self._hold(model, self.patcher)
         _last_used[self.arch_id] = record.key
+        _use_tick += 1
+        _use_order[record.key] = _use_tick
         model.sync()
         if self.schedule is not None and model.hacks and not model.shallow_loaded and not model.shallow_failed:
             model.want_shallow = True
@@ -706,8 +791,14 @@ class Pass:
         return model
 
     def preferred(self) -> set:
+        if self.model is not None and self.model.loaded:
+            key = self.model.record.key
+            return {i for i, (r, _) in enumerate(self.slots) if r.key == key}
         key = _last_used.get(self.arch_id)
-        return {i for i, (r, _) in enumerate(self.slots) if r.key == key}
+        if key is None:
+            return set()
+        keys = {key} | {r.key for r, _ in self.slots if (m := _models.get(r.key)) is not None and m.loaded}
+        return {i for i, (r, _) in enumerate(self.slots) if r.key in keys}
 
     def _hold(self, *models):
         if self._keep is not None:
@@ -855,7 +946,7 @@ class Pass:
             try:
                 if self.model is not None and self.model.loaded:
                     self.model.engine.release_activations()
-                self.use(record)
+                self.use(record, (padded, h, w))
             except Exception as e:
                 failed = _models.get(record.key)
                 if failed is not None and failed.opened and not failed.loaded:
@@ -929,7 +1020,8 @@ class Pass:
         except torch.cuda.OutOfMemoryError as e:
             clear(e)
             self.model.engine.release_activations()
-            common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
+            with _evictable():
+                common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
             common.mm().soft_empty_cache(force=True)
             try:
                 return self._infer(feed, profile, stream, hack, retry=True)
@@ -1104,7 +1196,11 @@ def _make_room_for_activations(model: TrtModel, patcher, x):
         most = " (the most for any size its profile takes: it gave no figure for this one)" if model.engine.size_is_most else ""
         logger.debug(f"TensorRT takes {common.gib(takes)} to run the {model.name} at {_sizes(x)}{most}, more than the {common.gib(counted)} estimated.")
     need = common.padded(max(takes, counted))
-    free = common.make_room(need, model.load_device, _loaded_entries(model, patcher))
+    keep = _loaded_entries(model, patcher)
+    free = common.make_room(need, model.load_device, keep)
+    if free < need:
+        with _evictable():
+            free = common.make_room(need, model.load_device, keep)
     if free < need:
         model.took[tuple(x.shape[i] for i in (0, 2, 3))] = takes  # so _fits rejects these sizes before loading next time
         raise RuntimeError(f"running it at {_sizes(x)} needs {common.gib(need)} of VRAM besides the engine, and only {common.gib(free)} could be freed")

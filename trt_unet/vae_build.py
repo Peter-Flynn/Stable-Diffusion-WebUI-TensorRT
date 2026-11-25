@@ -11,10 +11,10 @@ import torch
 from . import common, store, strips
 from .common import logger
 from .vae import (
-    ENCODE_POST, ENCODE_PRE, ENCODE_STRIP, ENCODER, POST, PRE, RETRY_SHARE, Record, config, digest, dtype_name, encoder_config,
-    encoder_excess, encoder_shapes, encoder_wanted, engine_dtype, excess, folder, gpu_vram, is_decoder_weight, is_encoder_weight,
-    loaded_vae, parts_missing, path_prefix, records_matching, remove_record, shapes_for, strip_dtype, strips_wanted, unsupported,
-    vram_budget, weight_bytes, why_smaller,
+    ENCODE_POST, ENCODE_PRE, ENCODE_STRIP, ENCODER, EXPONENT, POST, PRE, RETRY_SHARE, Record, config, digest, dtype_name,
+    encoder_config, encoder_excess, encoder_shapes, encoder_wanted, engine_dtype, excess, folder, gpu_vram, is_decoder_weight,
+    is_encoder_weight, loaded_vae, parts_missing, path_prefix, records_matching, remove_record, scaled, shapes_for,
+    strip_dtype, strips_wanted, unsupported, vram_budget, weight_bytes, why_smaller,
 )
 
 
@@ -124,7 +124,7 @@ def _randomize(module):  # identical tensors (GroupNorm's ones/zeros) get merged
     return module
 
 
-def _export(module, halves: dict, work: str, first, loaded: dict, seen: set = None, fp32_gn: bool = False) -> dict:
+def _export(module, halves: dict, work: str, first, loaded: dict, seen: set = None, fp32_gn: bool = False, scale_exponent: int = 0) -> dict:
     from . import export
 
     _randomize(module)
@@ -134,7 +134,29 @@ def _export(module, halves: dict, work: str, first, loaded: dict, seen: set = No
     exported = {k: list(v.shape) for k, v in module.state_dict(keep_vars=True).items()}
     result = {}
     orig_gn = torch.nn.functional.group_norm
-    if fp32_gn:
+    orig_silu = torch.nn.functional.silu
+    ldm_m = orig_nl = None
+    if scale_exponent > 0:
+        scale = 2.0 ** -scale_exponent
+        scale2 = scale * scale
+
+        def _scaled_gn(inp, num_groups, weight=None, bias=None, eps=1e-5):
+            return export._fp32_group_norm(inp, num_groups, weight, bias, eps * scale2)
+
+        def _scaled_silu(inp, inplace=False):
+            return orig_silu(inp, inplace=False) * scale
+
+        torch.nn.functional.group_norm = _scaled_gn
+        torch.nn.functional.silu = _scaled_silu
+        try:
+            import ldm_patched.ldm.modules.diffusionmodules.model as _ldm_m
+
+            if callable(getattr(_ldm_m, "nonlinearity", None)):
+                ldm_m, orig_nl = _ldm_m, _ldm_m.nonlinearity
+                _ldm_m.nonlinearity = lambda inp: orig_silu(inp, inplace=False) * scale
+        except Exception:
+            pass
+    elif fp32_gn:
         torch.nn.functional.group_norm = export._fp32_group_norm
     try:
         with export.fast_weightless_export(), export.quiet_warnings(seen):
@@ -144,6 +166,9 @@ def _export(module, halves: dict, work: str, first, loaded: dict, seen: set = No
                 result[part] = export._weightless_graph(path, inputs, (exported, loaded))
     finally:
         torch.nn.functional.group_norm = orig_gn
+        torch.nn.functional.silu = orig_silu
+        if ldm_m is not None:
+            ldm_m.nonlinearity = orig_nl
     return result
 
 
@@ -152,7 +177,7 @@ _LARGER = {0: "batch", 2: "image_height", 3: "image_width"}
 
 
 @common.inference_mode
-def export_onnx(vae, work: str, dtype, device, seen: set = None, fp32_gn: bool = False) -> dict:
+def export_onnx(vae, work: str, dtype, device, seen: set = None, fp32_gn: bool = False, scale_exponent: int = 0) -> dict:
     cfg = config(vae)
     halves = {
         PRE: (_Pre, ["latent"], ["x", "q", "k", "v"], {n: _AXES for n in ("latent", "x", "q", "k", "v")}),
@@ -160,11 +185,11 @@ def export_onnx(vae, work: str, dtype, device, seen: set = None, fp32_gn: bool =
     }
     latent = torch.randn(1, cfg["latent_channels"], 32, 32, dtype=dtype, device=device)
     loaded = {k: list(v.shape) for k, v in vae.first_stage_model.state_dict(keep_vars=True).items() if is_decoder_weight(k)}
-    return {"config": cfg, **_export(fresh(cfg, device, dtype), halves, work, latent, loaded, seen, fp32_gn)}
+    return {"config": cfg, **_export(fresh(cfg, device, dtype), halves, work, latent, loaded, seen, fp32_gn, scale_exponent)}
 
 
 @common.inference_mode
-def export_encoder_onnx(vae, work: str, dtype, device, seen: set = None, fp32_gn: bool = False) -> dict:
+def export_encoder_onnx(vae, work: str, dtype, device, seen: set = None, fp32_gn: bool = False, scale_exponent: int = 0) -> dict:
     cfg = encoder_config(vae)
     halves = {
         ENCODE_PRE: (_EncodePre, ["image"], ["x", "q", "k", "v"], {"image": _LARGER, **{n: _AXES for n in ("x", "q", "k", "v")}}),
@@ -172,7 +197,7 @@ def export_encoder_onnx(vae, work: str, dtype, device, seen: set = None, fp32_gn
     }
     image = torch.randn(1, cfg["in_channels"], 128, 128, dtype=dtype, device=device)
     loaded = {k: list(v.shape) for k, v in vae.first_stage_model.state_dict(keep_vars=True).items() if is_encoder_weight(k)}
-    return {"config": cfg, **_export(fresh_encoder(cfg, device, dtype), halves, work, image, loaded, seen, fp32_gn)}
+    return {"config": cfg, **_export(fresh_encoder(cfg, device, dtype), halves, work, image, loaded, seen, fp32_gn, scale_exponent)}
 
 
 @common.inference_mode
@@ -265,12 +290,13 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         if progress:
             progress(0.0, "exporting the graphs")
         graphs, seen_warnings = {}, set()
+        whole_exp = EXPONENT if scaled(dtype) else 0
         small_fp32_gn = lambda span: dtype in (torch.float16, torch.bfloat16) and (span[0][2:] != span[2][2:]) and max(span[2][2:]) <= 49
         if PRE in todo or POST in todo:
-            graphs.update(export_onnx(vae, work, dtype, device, seen_warnings, fp32_gn=small_fp32_gn(asked[PRE]["latent"])))
+            graphs.update(export_onnx(vae, work, dtype, device, seen_warnings, fp32_gn=small_fp32_gn(asked[PRE]["latent"]), scale_exponent=whole_exp))
         if ENCODE_PRE in todo:
             enc_span = enc_wanted["shapes"][ENCODE_POST]["x"]
-            graphs.update({part: names for part, names in export_encoder_onnx(vae, work, dtype, device, seen_warnings, fp32_gn=small_fp32_gn(enc_span)).items() if part in ENCODER})
+            graphs.update({part: names for part, names in export_encoder_onnx(vae, work, dtype, device, seen_warnings, fp32_gn=small_fp32_gn(enc_span), scale_exponent=whole_exp).items() if part in ENCODER})
         if enc_kinds_todo:
             graphs.update(export_strips(vae, work, sdtype, device, enc_kinds_todo, encoding=True, seen=seen_warnings))
         if kinds_todo:
@@ -434,7 +460,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
         strip_meta.update(built_kinds)
         if strips_error:
             strip_meta = {}  # decoding in strips needs every kind
-        identity = [digest(vae), dtype_name(dtype), dtype_name(sdtype), shapes, sorted((k, v["shapes"]) for k, v in strip_meta.items())]
+        identity = [digest(vae), dtype_name(dtype), dtype_name(sdtype), whole_exp, shapes, sorted((k, v["shapes"]) for k, v in strip_meta.items())]
         if enc_meta is not None:
             identity.append([enc_meta["digest"], enc_meta["shapes"], sorted((k, v["shapes"]) for k, v in (enc_meta.get("strips") or {}).items())])
         key = hashlib.sha1(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:10]
@@ -458,6 +484,8 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             "gpu_name": torch.cuda.get_device_name(common.device()),
             "created": time.strftime("%Y-%m-%d %H:%M"),
         }
+        if whole_exp:
+            meta["whole_exponent"] = whole_exp
         if strips_error:
             meta["strips_error"], meta["strips_asked"] = strips_error, strip_wanted
         if enc_error:

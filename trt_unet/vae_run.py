@@ -19,7 +19,7 @@ from . import common, gpu, store, strips
 from .common import logger, notify
 from .vae import (
     ENCODE_POST, ENCODE_PRE, ENCODER, EXPONENT, EXPONENT_MAX, EXPONENT_STEP, POST, PRE, Record, dtype_name, encoder_digest,
-    encoder_unsupported, engine_dtype, is_decoder_weight, is_encoder_weight, label, precisions, record_for, scaled_bias,
+    encoder_unsupported, engine_dtype, is_decoder_weight, is_encoder_weight, label, precisions, record_for, scaled, scaled_bias,
     strip_dtype, unsupported, weight_bytes,
 )
 
@@ -164,7 +164,7 @@ class _Side:
         return e
 
     def _holds(self, which) -> tuple:
-        return self.key, 0 if isinstance(which, str) else self.exponent
+        return self.key, self.model.record.whole_exponent if isinstance(which, str) else self.exponent
 
     def _refit(self, which, e):
         key, exponent = self._holds(which)
@@ -366,9 +366,14 @@ class VaeModel:
 _models = {}
 _told = set()
 _exponents = {}  # weights key -> exponent, for VAEs that overflowed EXPONENT; None: overflowed every exponent
+_whole_overflowed = set()  # (encoding, weights key) that overflowed Scaled-FP16 whole engines
 
 
 class _Overflow(Exception):
+    pass
+
+
+class _WholeOverflow(Exception):
     pass
 
 
@@ -528,6 +533,10 @@ def _copy_stream(device):
     return _copy_streams[device]
 
 
+def _whole_label(record: Record) -> str:
+    return label(record.meta["dtype"]) + (f" scaled by 2^-{record.whole_exponent}" if record.whole_exponent else "")
+
+
 def _in_strips(record: Record, side: _Side) -> str:
     return label(dtype_name(record.strips_dtype)) + (f" scaled by 2^-{side.exponent}" if record.scaled else "")
 
@@ -574,7 +583,8 @@ def decode(vae, samples_in):
     if not whole and found is None:
         return None
     wanted = (engine_dtype(vae), strip_dtype(vae))
-    if (record.dtype, record.strips_dtype) != wanted and record.base not in _told:
+    want_exp = EXPONENT if scaled(wanted[0]) else 0
+    if (record.dtype, record.strips_dtype, record.whole_exponent) != (*wanted, want_exp) and record.base not in _told:
         _told.add(record.base)
         logger.info(
             f"The VAE engines were built in {precisions(record.dtype, record.strips_dtype)}, and would now be built in "
@@ -595,7 +605,7 @@ def _run_with_retries(model: VaeModel, side: _Side, vae, key: str, size: tuple, 
     again = True
     try:
         while True:
-            if whole and (not decoding, *size) in model.failed:
+            if whole and ((not decoding, *size) in model.failed or (model.record.whole_exponent and (not decoding, side.key) in _whole_overflowed)):
                 whole = False
             if found is not None and model.record.scaled and _exponents.get(side.key, EXPONENT) is None:
                 found = None
@@ -604,6 +614,14 @@ def _run_with_retries(model: VaeModel, side: _Side, vae, key: str, size: tuple, 
             try:
                 with torch.inference_mode():
                     return fn(whole, found, again)
+            except _WholeOverflow:
+                model.release()
+                _whole_overflowed.add((not decoding, side.key))
+                whole = False
+                dest = "in strips" if found is not None else "on PyTorch"
+                logger.info(
+                    f"The VAE {role} engines produced NaN/Inf values in {_whole_label(model.record)}, so this VAE's {role} runs {dest} from now on."
+                )
             except _Overflow:
                 _outgrew(side, role)
             except torch.cuda.OutOfMemoryError as e:
@@ -766,7 +784,7 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found, retry_whole: b
                     if pixels is not None:
                         at_once = f", {n} at a time" if n < b else ""
                         logger.info(
-                            f"Decoded {images} on the VAE engines in {time.time() - start:.2f}s: whole{at_once}, in {label(record.meta['dtype'])}, "
+                            f"Decoded {images} on the VAE engines in {time.time() - start:.2f}s: whole{at_once}, in {_whole_label(record)}, "
                             f"{_beside(engines)}. {_counted(peak.held + act, need)}{_did(side)}."
                         )
                     return pixels
@@ -820,24 +838,132 @@ def _whole_failed(model: VaeModel, encoding: bool, h: int, w: int, what: str, er
     return " (the engines failed to run it whole)"
 
 
+_triton_softmax = None  # None: untested, False: unavailable/failed, (triton, k1, k2): ready
+
+
+def _get_triton_softmax():
+    global _triton_softmax
+    if _triton_softmax is not None:
+        return _triton_softmax if _triton_softmax is not False else None
+    try:
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _softmax_1pass(X, stride_b, stride_row, N, scale, BLOCK_N: tl.constexpr):
+            row = tl.program_id(0).to(tl.int64)
+            batch = tl.program_id(1).to(tl.int64)
+            base = X + batch * stride_b + row * stride_row
+            cols = tl.arange(0, BLOCK_N)
+            mask = cols < N
+            x = tl.load(base + cols, mask=mask, other=-float("inf")).to(tl.float32) * scale
+            m = tl.max(x, 0)
+            p = tl.where(mask, tl.math.exp2((x - m) * 1.4426950408889634), 0.0)
+            p = p / tl.sum(p, 0)
+            tl.store(base + cols, p, mask=mask)
+
+        @triton.jit
+        def _softmax_2pass(X, stride_b, stride_row, N, scale, BLOCK_N: tl.constexpr):
+            row = tl.program_id(0).to(tl.int64)
+            batch = tl.program_id(1).to(tl.int64)
+            base = X + batch * stride_b + row * stride_row
+            m = -float("inf")
+            l = 0.0
+            for off in range(0, N, BLOCK_N):
+                cols = off + tl.arange(0, BLOCK_N)
+                mask = cols < N
+                x = tl.load(base + cols, mask=mask, other=-float("inf")).to(tl.float32) * scale
+                m_new = tl.maximum(m, tl.max(x, 0))
+                prev = tl.where(m > -float("inf"), l * tl.math.exp2((m - m_new) * 1.4426950408889634), 0.0)
+                l = prev + tl.sum(tl.where(mask, tl.math.exp2((x - m_new) * 1.4426950408889634), 0.0), 0)
+                m = m_new
+            inv_l = 1.0 / l
+            for off in range(0, N, BLOCK_N):
+                cols = off + tl.arange(0, BLOCK_N)
+                mask = cols < N
+                x = tl.load(base + cols, mask=mask, other=-float("inf")).to(tl.float32) * scale
+                p = tl.math.exp2((x - m) * 1.4426950408889634) * inv_l
+                tl.store(base + cols, p, mask=mask)
+
+        _triton_softmax = (triton, _softmax_1pass, _softmax_2pass)
+        return _triton_softmax
+    except Exception:
+        _triton_softmax = False
+        return None
+
+
 def _bmm_attention(q, k, v):
+    global _triton_softmax
     # Head dim 512 exceeds FlashAttention/cuDNN limits (256), so PyTorch SDPA falls back to CUTLASS efficient
-    # attention. Pre-scaled chunked cuBLAS bmm runs 23-31% faster on BF16 with equal or lower VRAM and writes directly
-    # into contiguous (B, C, H, W).
+    # attention. Chunked cuBLAS bmm with in-place Triton row-softmax eliminates the separate probs buffer (2-3x less
+    # peak VRAM) and runs faster across 1024^2..2048^2; pure PyTorch bmm+softmax serves as zero-dependency fallback.
     b, c, h, w = q.shape
     n = h * w
-    # scores_buf and softmax's probs coexist per chunk, so total temporary VRAM is 2 * b * q_chunk * n * item.
-    per_q = max(1, 2 * b * n * q.element_size())
+    scale = c ** -0.5
     budget = 256 << 20
     with contextlib.suppress(Exception):
         free_b = common._free_now(q.device, trim_cache=False) - common.reserve()
         budget = min(budget, max(16 << 20, free_b // 3))
-    raw_q = budget // per_q
-    q_chunk = min(1024, n, (raw_q // 64 * 64) if raw_q >= 64 else max(1, raw_q))
     out = torch.empty((b, c, n), device=q.device, dtype=q.dtype)
-    q_scaled = q.mul_(c ** -0.5).reshape(b, c, n).transpose(1, 2)
     k_mat = k.reshape(b, c, n)
     v_mat = v.reshape(b, c, n)
+
+    q_prescaled = False
+    kernels = _get_triton_softmax()
+    if kernels is not None:
+        triton_mod, k1, k2 = kernels
+        # In-place Triton softmax needs only scores_buf (1x temp buffer instead of 2x).
+        per_q = max(1, b * n * q.element_size())
+        raw_q = budget // per_q
+        q_chunk = min(1024, n, (raw_q // 64 * 64) if raw_q >= 64 else max(1, raw_q))
+        tries = list(dict.fromkeys(min(q_chunk, x) for x in (q_chunk, 256, 64, 16, 4, 1)))
+        # BF16 has FP32 exponent range so q @ k never overflows and scale fuses into Triton (saving a full pass over q);
+        # FP16 pre-scales q in-place before bmm so q @ k stays safely in FP16 range with zero extra VRAM.
+        if q.dtype == torch.bfloat16:
+            q_mat, k_scale = q.reshape(b, c, n).transpose(1, 2), scale
+        else:
+            q.mul_(scale)
+            q_prescaled = True
+            q_mat, k_scale = q.reshape(b, c, n).transpose(1, 2), 1.0
+        one_pass_bn = max(16, triton_mod.next_power_of_2(n)) if n <= 16384 else 0
+        one_pass_nw = 16 if one_pass_bn >= 16384 else (8 if one_pass_bn >= 4096 else 4)
+        triton_failed = False
+        with common.on_device(q.device):
+            for idx, qc in enumerate(tries):
+                scores_buf = s = None
+                try:
+                    scores_buf = torch.empty((b, qc, n), device=q.device, dtype=q.dtype)
+                    for i in range(0, n, qc):
+                        j = min(i + qc, n)
+                        rows = j - i
+                        s = scores_buf[:, :rows]
+                        torch.bmm(q_mat[:, i:j], k_mat, out=s)
+                        if one_pass_bn:
+                            k1[(rows, b)](s, s.stride(0), s.stride(1), n, k_scale, BLOCK_N=one_pass_bn, num_warps=one_pass_nw)
+                        else:
+                            k2[(rows, b)](s, s.stride(0), s.stride(1), n, k_scale, BLOCK_N=16384, num_warps=8)
+                        torch.bmm(v_mat, s.transpose(1, 2), out=out[:, :, i:j])
+                    scores_buf = s = None
+                    return out.reshape(b, c, h, w)
+                except torch.cuda.OutOfMemoryError:
+                    scores_buf = s = None
+                    if idx == len(tries) - 1:
+                        raise
+                    torch.cuda.empty_cache()
+                except Exception as e:
+                    scores_buf = s = None
+                    _triton_softmax = False
+                    triton_failed = True
+                    logger.debug(f"Triton VAE attention softmax unavailable ({e}); falling back to PyTorch.")
+                    break
+        if not triton_failed:
+            return out.reshape(b, c, h, w)
+
+    # Pure PyTorch fallback: scores_buf and softmax's probs coexist per chunk (2 * b * q_chunk * n * item).
+    per_q = max(1, 2 * b * n * q.element_size())
+    raw_q = budget // per_q
+    q_chunk = min(1024, n, (raw_q // 64 * 64) if raw_q >= 64 else max(1, raw_q))
+    q_scaled = (q if q_prescaled else q.mul_(scale)).reshape(b, c, n).transpose(1, 2)
     tries = list(dict.fromkeys(min(q_chunk, x) for x in (q_chunk, 256, 64, 16, 4, 1)))
     for idx, qc in enumerate(tries):
         scores_buf = s = probs = None
@@ -864,7 +990,7 @@ def _attention(model: VaeModel, vae, q, k, v, encoding: bool = False):
     attention = (fsm.encoder if encoding else fsm.decoder).mid.attn_1.optimized_attention
     key = (encoding, q.shape[0], q.shape[2], q.shape[3])
     use_bmm = (
-        q.is_cuda and q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16
+        q.is_cuda and q.dtype in (torch.bfloat16, torch.float16) and k.dtype == q.dtype and v.dtype == q.dtype
         and q.ndim == 4 and q.shape == k.shape == v.shape and q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     )
     with _Peak() as peak:
@@ -896,19 +1022,24 @@ def _finish_output(vae, image, device):
 
 def _run(model: VaeModel, vae, samples_in, n: int):
     side, record = model.decoder, model.record
-    dtype, device = record.dtype, model.load_device
+    dtype, device, wscale = record.dtype, model.load_device, record.whole_scale
     stream = torch.cuda.current_stream(device).cuda_stream
     pre, post = side.engine(PRE), side.engine(POST)
     b = samples_in.shape[0]
     pixels = None
     for start in range(0, b, n):
-        z = vae._to_vae_latent(samples_in[start:start + n]).to(device=device, dtype=dtype)
+        z = vae._to_vae_latent(samples_in[start:start + n])
+        z = (z.to(device=device, dtype=torch.float32) * wscale).to(dtype) if wscale != 1.0 else z.to(device=device, dtype=dtype)
         mid = pre.infer({"latent": z}, 0, stream)
         del z
         h = _attention(model, vae, mid.pop("q"), mid.pop("k"), mid.pop("v"))
+        if wscale != 1.0:
+            h = (h.float() * wscale).to(dtype)
         image = post.infer({"x": mid.pop("x"), "attention": h}, 0, stream)["image"]
         del h
         if not torch.isfinite(image).all():
+            if record.whole_exponent:
+                raise _WholeOverflow()
             notify(f"The VAE decoder engines produced NaN/Inf values in {label(record.meta['dtype'])}, so this decode runs on PyTorch.")
             return None
         out = _finish_output(vae, image, device)
@@ -925,7 +1056,7 @@ def _run(model: VaeModel, vae, samples_in, n: int):
 def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, engines: bool):
     model.beside = not engines
     side, record = model.decoder, model.record
-    dtype, sdtype, device = record.dtype, record.strips_dtype, model.load_device
+    dtype, sdtype, device, wscale = record.dtype, record.strips_dtype, model.load_device, record.whole_scale
     stream = torch.cuda.current_stream(device).cuda_stream
     cfg = record.meta["config"]
     decoder = strips.Decode(vae.first_stage_model, cfg["padding"], side.runner_for, sdtype, device, _copy_stream(device), model.arena, side.activations, set(side.kinds), side.scale)
@@ -947,20 +1078,27 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
         else:
             model.release()
             common.trim()
-        z = vae._to_vae_latent(samples_in[i:i + 1]).to(device=device, dtype=dtype)
+        z = vae._to_vae_latent(samples_in[i:i + 1])
+        z = (z.to(device=device, dtype=torch.float32) * wscale).to(dtype) if wscale != 1.0 else z.to(device=device, dtype=dtype)
         mid = side.engine(PRE).infer({"latent": z}, 0, stream)
         del z
         x = mid.pop("x")
         attended = _attention(model, vae, mid.pop("q"), mid.pop("k"), mid.pop("v"))
         del mid
+        if record.whole_exponent and (not torch.isfinite(x).all() or not torch.isfinite(attended).all()):
+            notify(f"The VAE decoder's pre engine produced NaN/Inf values in {_whole_label(record)}, so this decode runs on PyTorch.")
+            return None, ""
         model.release()
         common.trim()
         if plan is None:
             plan = _plan_strips(model, decoder, h, w, beside, engines)
             if plan is None:
                 return _NO_ROOM
-        if side.scale != 1.0:  # scaled in FP32, before the strips convert to FP16
-            x, attended = x.float().mul_(side.scale), attended.float().mul_(side.scale)
+        x_factor = side.scale / wscale
+        if x_factor != 1.0:  # scaled in FP32, before the strips convert to FP16
+            x = x.float() * x_factor
+        if side.scale != 1.0:
+            attended = attended.float() * side.scale
         inputs = [x, attended]
         del x, attended
         with _Peak() as peak:
@@ -1123,7 +1261,7 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found, retry_whole: bool 
                 else:
                     at_once = f", {n} at a time" if n < b else ""
                     logger.info(
-                        f"Encoded {images} on the VAE engines in {time.time() - start:.2f}s: whole{at_once}, in {label(record.meta['dtype'])}, "
+                        f"Encoded {images} on the VAE engines in {time.time() - start:.2f}s: whole{at_once}, in {_whole_label(record)}, "
                         f"{_beside(engines)}. {_counted(peak.held + act, need)}{_did(side)}."
                     )
                     return samples
@@ -1172,7 +1310,8 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found, retry_whole: bool 
 def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
     model.beside = not engines
     side, record, device = model.encoder, model.record, model.load_device
-    dtype, sdtype, stream = record.dtype, record.strips_dtype, torch.cuda.current_stream(device).cuda_stream
+    dtype, sdtype, wscale = record.dtype, record.strips_dtype, record.whole_scale
+    stream = torch.cuda.current_stream(device).cuda_stream
     cfg = record.encoder["config"]
     fsm = vae.first_stage_model
     encoder = strips.Encode(fsm, cfg["padding"], side.runner_for, sdtype, device, _copy_stream(device), model.arena, side.activations, set(side.kinds), side.scale)
@@ -1222,11 +1361,14 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
         del q, k, v
         if i == 0:
             report = _strips_report(plan, peak.held, plan.vram + beside)
-        x = (x.float().div_(side.scale) if side.scale != 1.0 else x).to(dtype)  # encode-post is unscaled
+        x_factor = wscale / side.scale
+        x = (x.float() * x_factor if x_factor != 1.0 else x).to(dtype)
+        if wscale != 1.0:
+            attended = (attended.float() * wscale).to(dtype)
         moments = side.engine(ENCODE_POST).infer({"x": x, "attention": attended}, 0, stream)["moments"]
         del x, attended
         if not torch.isfinite(moments).all():
-            notify(f"The VAE encoder engines produced NaN/Inf values in {label(record.meta['dtype'])}, so this encode runs on PyTorch.")
+            notify(f"The VAE encoder engines produced NaN/Inf values in {_whole_label(record)}, so this encode runs on PyTorch.")
             return None, ""
         out = fsm.regularization(moments.float())[0].to(vae.output_device).float()
         out = vae._from_vae_latent(out)
@@ -1242,14 +1384,19 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
 
 def _encode_images(model: VaeModel, vae, image):
     side, record = model.encoder, model.record
+    wscale = record.whole_scale
     stream = torch.cuda.current_stream(model.load_device).cuda_stream
-    image = image.to(device=model.load_device, dtype=record.dtype)
+    image = (image.to(device=model.load_device, dtype=torch.float32) * wscale).to(record.dtype) if wscale != 1.0 else image.to(device=model.load_device, dtype=record.dtype)
     mid = side.engine(ENCODE_PRE).infer({"image": image}, 0, stream)
     del image
     attended = _attention(model, vae, mid.pop("q"), mid.pop("k"), mid.pop("v"), encoding=True)
+    if wscale != 1.0:
+        attended = (attended.float() * wscale).to(record.dtype)
     moments = side.engine(ENCODE_POST).infer({"x": mid.pop("x"), "attention": attended}, 0, stream)["moments"]
     del attended, mid
     if not torch.isfinite(moments).all():
+        if record.whole_exponent:
+            raise _WholeOverflow()
         notify(f"The VAE encoder engines produced NaN/Inf values in {label(record.meta['dtype'])}, so this encode runs on PyTorch.")
         return None
     return vae.first_stage_model.regularization(moments.float())[0]

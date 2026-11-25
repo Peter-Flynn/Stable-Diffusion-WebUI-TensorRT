@@ -97,10 +97,70 @@ class EffectiveWeights:
         patches = self.patches.get(PREFIX + name)
         return self.base_version, _identity(patches) if patches else None
 
+    _LORA_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
     def needs_gpu(self, name: str) -> bool:
         return bool(self.patches.get(PREFIX + name) or self.converters.get(name) is not None)
 
+    def fast_lora(self, name: str):
+        # Standard LoRA weights (up @ down) can be staged alongside base in pinned memory and merged via in-place FP32
+        # addmm_, avoiding per-weight synchronous H2D copies and intermediate lora_diff allocations. Anything unusual
+        # (converters, DoRA, LoCon mid weights, offsets, custom functions, strength_model != 1, LoHa/LoKr) returns None.
+        if self.converters.get(name) is not None:
+            return None
+        patches = self.patches.get(PREFIX + name)
+        if not patches:
+            return None
+        base = self.base(name)
+        if type(base) is not torch.Tensor or base.ndim < 2 or base.shape[0] <= 0:
+            return None
+        rows, total = base.shape[0], base.numel()
+        items = []
+        for entry in patches:
+            if not isinstance(entry, (tuple, list)) or len(entry) < 5:
+                return None
+            strength, v, strength_model, offset, func = entry[:5]
+            if strength_model != 1.0 or offset is not None or func is not None:
+                return None
+            if type(v).__name__ == "LoRAAdapter" and type(v).__module__.endswith(".lora") and hasattr(v, "weights"):
+                ws = v.weights
+            elif isinstance(v, tuple) and len(v) == 2 and v[0] == "lora":
+                ws = v[1]
+            else:
+                return None
+            if not isinstance(ws, (tuple, list)) or len(ws) < 6:
+                return None
+            up, down, alpha, mid, dora_scale, reshape = ws[:6]
+            if mid is not None or dora_scale is not None or reshape is not None:
+                return None
+            if type(up) is not torch.Tensor or type(down) is not torch.Tensor:
+                return None
+            if up.dtype not in self._LORA_DTYPES or down.dtype not in self._LORA_DTYPES:
+                return None
+            if up.ndim < 2 or down.ndim < 2 or down.shape[0] <= 0 or up.shape[0] != rows:
+                return None
+            rank = up.numel() // rows
+            in_cols = down.numel() // down.shape[0]
+            if rank != down.shape[0] or rows * in_cols != total:
+                return None
+            scale = float(strength) * (float(alpha) / float(down.shape[0]) if alpha is not None else 1.0)
+            items.append((up, down, scale))
+        return items
+
+    @staticmethod
+    def apply_fast_lora(gpu_base: torch.Tensor, gpu_items: list, dtype=torch.float16) -> torch.Tensor:
+        weight = gpu_base.to(torch.float32, copy=True, memory_format=torch.contiguous_format)
+        flat = weight.reshape(weight.shape[0], -1)
+        for up, down, scale in gpu_items:
+            if scale != 0.0:
+                flat.addmm_(up.to(torch.float32).flatten(start_dim=1), down.to(torch.float32).flatten(start_dim=1), alpha=scale)
+        return weight.to(dtype)
+
     def apply_on_gpu(self, name: str, gpu_base: torch.Tensor, dtype=torch.float16) -> torch.Tensor:
+        items = self.fast_lora(name)
+        if items is not None:
+            dev = gpu_base.device
+            return self.apply_fast_lora(gpu_base, [(u.to(dev), d.to(dev), s) for u, d, s in items], dtype)
         # copy=True because convert and patch work in place.
         weight = gpu_base.to(torch.float32, copy=True)
         convert = self.converters.get(name)
