@@ -278,13 +278,15 @@ class Tracker:
         self.current = None  # the Entry of the denoiser call in progress
         self.noisy = False  # a fit in this pass left a residual above NOISY
         self.read = False  # a status has been read
-        self.blocked = False  # the latest status read had noise left in on some image
+        self.measured = False  # finish() ran _measure() on the latest step
+        self.blocked = False  # a status read for the latest step had noise left in on some image
         self.check = None  # (Entry, age, [full output rows], [checked rows]) until the denoiser's output is in
         self.jump = -1  # index of the latest denoiser call read whose x fell below JUMP against the latest of its size
         self._last = {}  # x's shape -> x in FP32 of the latest denoiser call of that size
         self._statuses = Readback()  # (reasons, shares) of shallow-graph runs
         self._jumps = Readback()  # JUMP comparisons
-        self._probe_at, self._probe_gap = 0, 1
+        self._probe_at, self._probe_gap, self._probe_step = 0, 1, None
+        self._status_step, self._bad = None, set()
         self._constants = {}
 
     def _constant(self, shape, value=0.0, dtype=torch.float32):
@@ -294,6 +296,7 @@ class Tracker:
         return self._constants[key]
 
     def begin(self, index: int, x):
+        self.current = None
         self._collect()
         newest = self.history[-1] if self.history else None
         if newest is not None and (newest.index != index - 1 or newest.shape != tuple(x.shape)):
@@ -340,28 +343,36 @@ class Tracker:
         self._collect()
         return origin >= self.jump
 
+    def anchored(self, entry, origin) -> bool:
+        # fresh.shallow() needs the previous step and at least one valid history anchor at/before origin; without an
+        # anchor every hx column is zeroed and the residual becomes x (or all of sigma * eps), falsely stripping it.
+        newest = self.history[-1] if self.history else None
+        return newest is not None and newest.index == entry.index - 1 and any(
+            p.index <= origin or (p.origin == origin and p.removed is not None and p.index not in self._bad)
+            for p in self.history
+        )
+
     def safe(self, entry, origin) -> bool:
         # Whether a shallow call may run: on a deep feature that is valid(). One the fit can't follow (entry None) only
-        # once a status showed the pass adds no noise. A tracked one always on a pass without noise (before the first
-        # status, its graph removes what noise it finds), and with noise while the window holds the calls the fit needs
-        # and no status says it fails.
+        # once a status showed the pass adds no noise. A tracked one needs an anchor in history (and, with noise, no
+        # status saying the fit failed).
         if not self.valid(origin):
             return False
         if entry is None:
             return self.read and not self.noisy
-        if not self.noisy:
-            return True
-        newest = self.history[-1] if self.history else None
-        if self.blocked or newest is None or newest.index != entry.index - 1:
+        if self.noisy and self.blocked:
             return False
-        return any(p.index <= origin or p.origin == origin for p in self.history)
+        return self.anchored(entry, origin)
 
     def probe(self, index: int) -> bool:
         # Whether a call that runs in full because safe() refused also runs the shallow engine, whose status can show the
-        # fit working again. While statuses keep showing it failing, each probe waits twice as long as the last (up to
-        # PROBES evaluations), so a pass the fit can't follow costs little more than one without Speed Hacks.
+        # fit working again. All slots of the chosen step probe together; while statuses keep showing it failing, each
+        # probe waits twice as long as the last (up to PROBES evaluations).
+        if index == self._probe_step:
+            return True
         if index < self._probe_at:
             return False
+        self._probe_step = index
         self._probe_at, self._probe_gap = index + self._probe_gap, min(2 * self._probe_gap, PROBES)
         return True
 
@@ -411,18 +422,28 @@ class Tracker:
         self.status(outputs)
 
     def status(self, outputs: dict):
-        self._statuses.send(None, outputs["reason"], outputs["share"])
+        step = self.current.index if self.current is not None else None
+        self._statuses.send(step, outputs["reason"], outputs["share"])
 
     def _collect(self):
         for index, ((cosine,),) in self._jumps.ready():
             if cosine < JUMP:
                 self.jump = max(self.jump, index)
-        for _, (reasons, shares) in self._statuses.ready():
+        got = False
+        skip = self.current.index if self.current is not None else None
+        for step, (reasons, shares) in self._statuses.ready(skip=skip):
+            got = True
             self.read = True
             self.noisy = self.noisy or any(s > NOISY for s in shares)
-            self.blocked = any(r > 0 for r in reasons)
-            if not self.blocked:
-                self._probe_at, self._probe_gap = 0, 1
+            failed = any(r > 0 for r in reasons)
+            if step is not None and failed:
+                self._bad.add(step)
+            if step is not None and step == self._status_step:
+                self.blocked = self.blocked or failed
+            else:
+                self._status_step, self.blocked = step, failed
+        if got and not self.blocked and not self._statuses.pending:
+            self._probe_at, self._probe_gap, self._probe_step = 0, 1, None
 
     def add_check(self, entry, full, checked, age: int):
         if self.check is None or self.check[0] is not entry:
@@ -433,6 +454,7 @@ class Tracker:
     def finish(self, output, x=None, sigma=None, eps: bool = False):
         # After the denoiser returned its output (eps for a timestep sampler) for x and sigma, its arguments: completes the
         # step's Entry, and returns a pending check's (error, age) or None
+        self.measured = False
         entry, self.current = self.current, None
         check, self.check = self.check, None
         if entry is None:
@@ -442,10 +464,11 @@ class Tracker:
             return None
         if entry.x is None:
             # No UNet call of the step was on the whole image (tiled diffusion sends tiles): the denoiser's own x and
-            # sigma, and the fit in PyTorch until a status says whether the pass adds noise
+            # sigma, and the fit in PyTorch until a step shows fresh noise (2-call ancestral/churn samplers add noise
+            # after step 0's second call, so stopping at the first read misses them)
             entry.x = x.to(torch.float32, memory_format=torch.contiguous_format, copy=True)
             entry.sigma = sigma.reshape(-1).to(torch.float32).expand(entry.shape[0]).clone(memory_format=torch.contiguous_format)
-            if not self.read and not self._statuses.pending:
+            if not self.noisy:
                 self._measure(entry)
         if eps:
             entry.denoised = entry.x - entry.sigma.reshape(-1, 1, 1, 1) * output.float()
@@ -469,6 +492,7 @@ class Tracker:
         share = excess / entry.sigma ** 2
         reason = torch.where(_white(noise) | (share <= NOISY), 0.0, 2.0)
         self.status({"reason": reason, "share": share})
+        self.measured = True
 
     def release(self):
         self.history.clear()

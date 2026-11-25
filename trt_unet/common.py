@@ -50,8 +50,8 @@ class Readback:
         event.record(torch.cuda.current_stream(dev))
         self._pending.append((tag, host, event))
 
-    def ready(self):
-        while self._pending and self._pending[0][2].query():
+    def ready(self, skip=None):
+        while self._pending and (skip is None or self._pending[0][0] != skip) and self._pending[0][2].query():
             tag, host, event = self._pending.popleft()
             rows = host.tolist()
             self._spare.setdefault(tuple(host.shape), []).append((host, event))

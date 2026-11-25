@@ -179,7 +179,7 @@ def suspect(failures_before: int, name=None) -> bool:
     # that take addresses differently than documented would fail every load), no allocation failed since
     # `failures_before` (that's running out of VRAM), and no other owner holds memory through it (retire() frees it all).
     with _lock:
-        others = any(n for o, n in _ledger.items() if o is not None and o != name)
+        others = any(n for o, n in _ledger.items() if o != name)
         return _allocator is not None and not _proven and _failures == failures_before and not others
 
 

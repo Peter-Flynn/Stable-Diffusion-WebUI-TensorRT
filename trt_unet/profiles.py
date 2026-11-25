@@ -19,7 +19,19 @@ class Profile:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Profile":
-        return cls(*(tuple(int(v) for v in d[f]) for f in FIELDS))
+        if not isinstance(d, dict):
+            raise TypeError("profile must be a dict")
+        values = []
+        for f in FIELDS:
+            raw = d[f]
+            if not isinstance(raw, (list, tuple)) or len(raw) != 3 or any(isinstance(v, bool) or not isinstance(v, int) for v in raw):
+                raise ValueError(f"invalid profile field {f}")
+            lo, opt, hi = raw
+            lowest = 8 if f in ("width", "height") else 1
+            if not (lowest <= lo <= opt <= hi):
+                raise ValueError(f"invalid bounds for {f}: {(lo, opt, hi)}")
+            values.append((lo, opt, hi))
+        return cls(*values)
 
     def to_dict(self) -> dict:
         return {f: list(getattr(self, f)) for f in FIELDS}

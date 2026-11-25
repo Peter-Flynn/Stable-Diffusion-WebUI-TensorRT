@@ -49,36 +49,68 @@ class Logger(trt.ILogger):
             log("DEBUG", f"Builder warning: {msg}")
 
 
+# TensorRT 11 spends ~95% of build time inside subphases of "Building engine from subgraph" (total=1) without advancing
+# its parent step counter between sibling phases, causing top-level step fractions to latch and stall during timing.
+_TRT11_RANGES = {
+    "Cloning network graph": (0.00, 0.02),
+    "Preparing graph for optimization": (0.02, 0.05),
+    "Optimizing graph": (0.05, 0.12),
+    "Timing graph nodes": (0.12, 0.72),
+    "Timing tensor reformats": (0.72, 0.92),
+    "Determining refit engines": (0.92, 0.98),
+}
+
+
 class Progress(trt.IProgressMonitor):
     def __init__(self, callback, max_depth=1):
         trt.IProgressMonitor.__init__(self)
         self.callback, self.max_depth = callback, max_depth
-        self.phases, self.top, self.fraction, self.cancel = {}, None, 0.0, False
+        self.phases, self.top, self.fraction, self.cancel, self._trt11 = {}, None, 0.0, False, False
 
     def _close(self, name):
         phase = self.phases.pop(name, None)
         if phase and phase["bar"] is not None:
             phase["bar"].close()
 
+    def _progress_of(self, name) -> float:
+        phase = self.phases[name]
+        done = phase["n"]
+        child = next((k for k, p in self.phases.items() if p["parent"] == name), None)
+        if child is not None and done < phase["total"]:
+            done += self._progress_of(child)
+        return min(done / phase["total"], 1.0)
+
     def _report(self):
-        top = self.phases.get(self.top)
-        if top is None:
+        if self.top not in self.phases:
             return
-        fraction, text = top["n"], self.top
-        child = next((p for p in self.phases.values() if p["parent"] == self.top), None)
-        if child is not None:
-            fraction += child["n"] / child["total"]
-            text = f"{self.top}: {max(self.phases.items(), key=lambda kv: kv[1]['depth'])[0]}"
-        self.fraction = max(self.fraction, min(fraction / top["total"], 1.0))
+        deepest = max(self.phases.items(), key=lambda kv: kv[1]["depth"])[0]
+        text = f"{self.top}: {deepest}" if deepest != self.top else self.top
+        if self._trt11:
+            top = self.phases[self.top]
+            if top["n"] >= top["total"]:
+                frac = 1.0
+            else:
+                frac = self.fraction
+                for name, (lo, hi) in _TRT11_RANGES.items():
+                    if name in self.phases:
+                        frac = lo + (hi - lo) * self._progress_of(name)
+                        break
+        else:
+            frac = self._progress_of(self.top)
+        self.fraction = max(self.fraction, frac)
         self.callback(self.fraction, text)
 
     def phase_start(self, phase_name, parent_phase, num_steps):
         try:
-            self._close(phase_name)
             if parent_phase is None:
-                depth, self.top, self.fraction = 0, phase_name, 0.0
+                for name in list(self.phases):
+                    self._close(name)
+                depth, self.top, self._trt11 = 0, phase_name, False
             else:
+                self._close(phase_name)
                 depth = self.phases.get(parent_phase, {}).get("depth", self.max_depth) + 1
+                if phase_name in _TRT11_RANGES:
+                    self._trt11 = True
             bar = tqdm(total=num_steps, desc=phase_name, leave=False, position=depth, dynamic_ncols=True) if depth < self.max_depth else None
             self.phases[phase_name] = {"bar": bar, "depth": depth, "parent": parent_phase, "total": max(int(num_steps), 1), "n": 0}
             self._report()
@@ -96,13 +128,18 @@ class Progress(trt.IProgressMonitor):
                 self._report()
             return not self.cancel
         except KeyboardInterrupt:
+            self.cancel = True
             return False
 
     def phase_finish(self, phase_name):
         try:
             phase = self.phases.get(phase_name)
             if phase is not None:
-                self.step_complete(phase_name, phase["total"])
+                if phase["bar"] is not None:
+                    phase["bar"].update(phase["total"] - phase["bar"].n)
+                phase["n"] = phase["total"]
+                if phase_name == self.top or (self._trt11 and phase_name in _TRT11_RANGES):
+                    self._report()
             self._close(phase_name)
         except KeyboardInterrupt:
             self.cancel = True
@@ -114,13 +151,14 @@ def _send(prefix, payload):
 
 
 def _progress_sender(min_interval=0.5):
-    last = {"time": 0.0, "text": None}
+    last = {"time": 0.0, "text": None, "fraction": -1.0}
 
     def send(fraction, text):
         now = time.monotonic()
-        if text == last["text"] and fraction < 1.0 and now - last["time"] < min_interval:
+        done_now = fraction >= 1.0 and last["fraction"] < 1.0
+        if text == last["text"] and not done_now and now - last["time"] < min_interval:
             return
-        last.update(time=now, text=text)
+        last.update(time=now, text=text, fraction=float(fraction))
         _send(PROGRESS, {"fraction": float(fraction), "text": str(text)})
 
     return send
@@ -163,17 +201,22 @@ def build(job, logger, progress, strip=True):
     config.progress_monitor = progress
 
     cache_path = job.get("timing_cache")
-    data = b""
-    if cache_path and os.path.isfile(cache_path):
-        with open(cache_path, "rb") as f:
-            data = f.read()
     try:
+        data = b""
+        if cache_path and os.path.isfile(cache_path):
+            with open(cache_path, "rb") as f:
+                data = f.read()
         cache = config.create_timing_cache(data)
+        if cache is None:
+            raise ValueError("TensorRT rejected the timing cache")
     except Exception as e:
         log("WARNING", f"The timing cache couldn't be read, so this build starts without it: {e}")
+        logger.errors.clear()
         cache = config.create_timing_cache(b"")
-    del data
-    config.set_timing_cache(cache, ignore_mismatch=True)
+    finally:
+        data = b""
+    if cache is not None:
+        config.set_timing_cache(cache, ignore_mismatch=True)
 
     present = {network.get_input(i).name for i in range(network.num_inputs)}  # SDXL's shallow UNet has no prompt input
     for shapes in job["profiles"]:
@@ -191,9 +234,18 @@ def build(job, logger, progress, strip=True):
         f.write(memoryview(plan))
     del plan
     if cache_path:
-        with open(cache_path + ".tmp", "wb") as f:
-            f.write(memoryview(config.get_timing_cache().serialize()))
-        os.replace(cache_path + ".tmp", cache_path)
+        tmp = cache_path + ".tmp"
+        try:
+            tc = config.get_timing_cache()
+            serialized = tc.serialize() if tc is not None else None
+            if serialized is not None:
+                with open(tmp, "wb") as f:
+                    f.write(memoryview(serialized))
+                os.replace(tmp, cache_path)
+        except Exception as e:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            log("DEBUG", f"Couldn't save the timing cache: {e}")
 
 
 def _exit_with_parent():

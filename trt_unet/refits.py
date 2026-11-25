@@ -274,8 +274,9 @@ class _WindowsMemory(_Memory):
             target[: self.nbytes] = data
         finally:
             del target, data
-        if not self._give():
-            raise OSError(f"OfferVirtualMemory failed (error {ctypes.get_last_error()})")
+        rc = _kernel32().OfferVirtualMemory(self._address, self.size, _OFFER_PRIORITY)
+        if rc != 0:
+            raise OSError(f"OfferVirtualMemory failed (error {rc})")
 
     def _take(self) -> bool:
         return _kernel32().ReclaimVirtualMemory(self._address, self.size) == 0  # ERROR_BUSY (170): some was discarded
@@ -421,8 +422,8 @@ def memory(reads: int = 1) -> tuple:
     supply, swap, total = _measure(reads)
     if sys.platform.startswith("linux"):
         with _lock:
-            entries = list(_kept.values())
-        supply += sum(entry.resident() for entry in entries)
+            blobs = [m for entry in _kept.values() for m in entry.blobs.values()]
+        supply += sum(m.resident() for m in blobs)
     return supply, swap, total
 
 
@@ -491,9 +492,13 @@ def drop(key: str, role: str = None):
         if role in (None, "unet"):
             del _kept[key]
             gone = list(entry.blobs.values())
+        elif role in entry.blobs or role in entry.signatures:
+            gone = [entry.blobs[role]] if role in entry.blobs else []
+            blobs = {k: v for k, v in entry.blobs.items() if k != role}
+            signatures = {k: v for k, v in entry.signatures.items() if k != role}
+            _kept[key] = Kept(signatures, blobs, entry.label, entry.source)
         else:
-            gone = [entry.blobs.pop(role)] if role in entry.blobs else []
-            entry.signatures.pop(role, None)
+            gone = []
     for memory in gone:
         memory.free()
 
@@ -514,8 +519,8 @@ def held() -> tuple:
 
 def resident() -> int:
     with _lock:
-        entries = list(_kept.values())
-    return sum(entry.resident() for entry in entries)
+        blobs = [m for entry in _kept.values() for m in entry.blobs.values()]
+    return sum(m.resident() for m in blobs)
 
 
 def used(key: str):
@@ -577,9 +582,11 @@ def room(nbytes: int, key: str = None) -> bool:
     return fits(supply, commit)
 
 
-def put(key: str, entry: Kept):
+def put(key: str, entry: Kept, expected: Kept = None) -> bool:
     global _watcher
     with _lock:
+        if expected is not None and _kept.get(key) is not expected:
+            return False  # _trim_commit() or another caller dropped expected while new roles were serializing
         old = _kept.pop(key, None)
         _kept[key] = entry
         if _watcher is None and _commit_limited():
@@ -589,6 +596,7 @@ def put(key: str, entry: Kept):
         for memory in old.blobs.values():
             if not any(memory is kept for kept in entry.blobs.values()):
                 memory.free()
+    return True
 
 
 def _commit_limited() -> bool:

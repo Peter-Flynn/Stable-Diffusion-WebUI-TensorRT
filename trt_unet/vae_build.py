@@ -124,7 +124,7 @@ def _randomize(module):  # identical tensors (GroupNorm's ones/zeros) get merged
     return module
 
 
-def _export(module, halves: dict, work: str, first, loaded: dict) -> dict:
+def _export(module, halves: dict, work: str, first, loaded: dict, seen: set = None, fp32_gn: bool = False) -> dict:
     from . import export
 
     _randomize(module)
@@ -133,11 +133,17 @@ def _export(module, halves: dict, work: str, first, loaded: dict) -> dict:
     args = {one: (first,), two: (x, torch.randn_like(x))}
     exported = {k: list(v.shape) for k, v in module.state_dict(keep_vars=True).items()}
     result = {}
-    for part, (_, inputs, outputs, axes) in halves.items():
-        path = os.path.join(work, f"vae_{part}.onnx")
-        with export.quiet_warnings():
-            torch.onnx.export(parts[part], args[part], path, input_names=inputs, output_names=outputs, dynamic_axes=axes, **export.ONNX_KWARGS)
-        result[part] = export._weightless_graph(path, inputs, (exported, loaded))
+    orig_gn = torch.nn.functional.group_norm
+    if fp32_gn:
+        torch.nn.functional.group_norm = export._fp32_group_norm
+    try:
+        with export.quiet_warnings(seen):
+            for part, (_, inputs, outputs, axes) in halves.items():
+                path = os.path.join(work, f"vae_{part}.onnx")
+                torch.onnx.export(parts[part], args[part], path, input_names=inputs, output_names=outputs, dynamic_axes=axes, **export.ONNX_KWARGS)
+                result[part] = export._weightless_graph(path, inputs, (exported, loaded))
+    finally:
+        torch.nn.functional.group_norm = orig_gn
     return result
 
 
@@ -146,7 +152,7 @@ _LARGER = {0: "batch", 2: "image_height", 3: "image_width"}
 
 
 @common.inference_mode
-def export_onnx(vae, work: str, dtype, device) -> dict:
+def export_onnx(vae, work: str, dtype, device, seen: set = None, fp32_gn: bool = False) -> dict:
     cfg = config(vae)
     halves = {
         PRE: (_Pre, ["latent"], ["x", "q", "k", "v"], {n: _AXES for n in ("latent", "x", "q", "k", "v")}),
@@ -154,11 +160,11 @@ def export_onnx(vae, work: str, dtype, device) -> dict:
     }
     latent = torch.randn(1, cfg["latent_channels"], 32, 32, dtype=dtype, device=device)
     loaded = {k: list(v.shape) for k, v in vae.first_stage_model.state_dict(keep_vars=True).items() if is_decoder_weight(k)}
-    return {"config": cfg, **_export(fresh(cfg, device, dtype), halves, work, latent, loaded)}
+    return {"config": cfg, **_export(fresh(cfg, device, dtype), halves, work, latent, loaded, seen, fp32_gn)}
 
 
 @common.inference_mode
-def export_encoder_onnx(vae, work: str, dtype, device) -> dict:
+def export_encoder_onnx(vae, work: str, dtype, device, seen: set = None, fp32_gn: bool = False) -> dict:
     cfg = encoder_config(vae)
     halves = {
         ENCODE_PRE: (_EncodePre, ["image"], ["x", "q", "k", "v"], {"image": _LARGER, **{n: _AXES for n in ("x", "q", "k", "v")}}),
@@ -166,11 +172,11 @@ def export_encoder_onnx(vae, work: str, dtype, device) -> dict:
     }
     image = torch.randn(1, cfg["in_channels"], 128, 128, dtype=dtype, device=device)
     loaded = {k: list(v.shape) for k, v in vae.first_stage_model.state_dict(keep_vars=True).items() if is_encoder_weight(k)}
-    return {"config": cfg, **_export(fresh_encoder(cfg, device, dtype), halves, work, image, loaded)}
+    return {"config": cfg, **_export(fresh_encoder(cfg, device, dtype), halves, work, image, loaded, seen, fp32_gn)}
 
 
 @common.inference_mode
-def export_strips(vae, work: str, dtype, device, names, encoding: bool = False) -> dict:
+def export_strips(vae, work: str, dtype, device, names, encoding: bool = False, seen: set = None) -> dict:
     from . import export
 
     if encoding:
@@ -183,18 +189,18 @@ def export_strips(vae, work: str, dtype, device, names, encoding: bool = False) 
     found = [s for each in every_way(module, cfg["padding"]) for s in each]
     loaded = vae.first_stage_model.state_dict(keep_vars=True)
     result = {}
-    for name in names:
-        stage = next(s for s in found if s.kind.name == name)
-        kind, part = stage.kind, strips.StageModule(stage, module)
-        path = os.path.join(work, f"{prefix}{name}.onnx")
-        with export.quiet_warnings():
+    with export.quiet_warnings(seen):
+        for name in names:
+            stage = next(s for s in found if s.kind.name == name)
+            kind, part = stage.kind, strips.StageModule(stage, module)
+            path = os.path.join(work, f"{prefix}{name}.onnx")
             torch.onnx.export(
                 part, strips.example_inputs(kind, dtype, device), path, input_names=list(kind.inputs()),
                 output_names=list(kind.outputs()), dynamic_axes=strips.dynamic_axes(kind), **export.ONNX_KWARGS,
             )
-        own = {k: list(v.shape) for k, v in part.state_dict(keep_vars=True).items()}
-        theirs = {k: list(loaded[stage.weights[k]].shape) for k in own}
-        result[key + name] = export._weightless_graph(path, kind.inputs(), (own, theirs), quiet=True)
+            own = {k: list(v.shape) for k, v in part.state_dict(keep_vars=True).items()}
+            theirs = {k: list(loaded[stage.weights[k]].shape) for k in own}
+            result[key + name] = export._weightless_graph(path, kind.inputs(), (own, theirs), quiet=True)
     del module, found
     return result
 
@@ -258,15 +264,17 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             raise _Cancelled()
         if progress:
             progress(0.0, "exporting the graphs")
-        graphs = {}
+        graphs, seen_warnings = {}, set()
+        small_fp32_gn = lambda span: dtype in (torch.float16, torch.bfloat16) and (span[0][2:] != span[2][2:]) and max(span[2][2:]) <= 49
         if PRE in todo or POST in todo:
-            graphs.update(export_onnx(vae, work, dtype, device))
+            graphs.update(export_onnx(vae, work, dtype, device, seen_warnings, fp32_gn=small_fp32_gn(asked[PRE]["latent"])))
         if ENCODE_PRE in todo:
-            graphs.update({part: names for part, names in export_encoder_onnx(vae, work, dtype, device).items() if part in ENCODER})
+            enc_span = enc_wanted["shapes"][ENCODE_POST]["x"]
+            graphs.update({part: names for part, names in export_encoder_onnx(vae, work, dtype, device, seen_warnings, fp32_gn=small_fp32_gn(enc_span)).items() if part in ENCODER})
         if enc_kinds_todo:
-            graphs.update(export_strips(vae, work, sdtype, device, enc_kinds_todo, encoding=True))
+            graphs.update(export_strips(vae, work, sdtype, device, enc_kinds_todo, encoding=True, seen=seen_warnings))
         if kinds_todo:
-            graphs.update(export_strips(vae, work, sdtype, device, kinds_todo))
+            graphs.update(export_strips(vae, work, sdtype, device, kinds_todo, seen=seen_warnings))
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()  # the trace's VRAM, back to the driver for the builder process

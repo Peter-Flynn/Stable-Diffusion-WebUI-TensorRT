@@ -498,8 +498,11 @@ def remove_record(base: str):
 
 
 def delete_for(arch_id: str, gpu: str, trt: str):
-    for path in glob.glob(os.path.join(glob.escape(folder(arch_id)), f"{gpu}-{common.trt_tag(trt)}-*.json")):
+    prefix = glob.escape(f"{gpu}-{common.trt_tag(trt)}")
+    for path in glob.glob(os.path.join(glob.escape(folder(arch_id)), f"{prefix}-*.json")):
         remove_record(path[: -len(".json")])
+    with contextlib.suppress(OSError):
+        os.rmdir(folder(arch_id))
 
 
 def available() -> bool:

@@ -9,6 +9,7 @@ import contextlib
 import gc
 import hashlib
 import os
+import sys
 import time
 import traceback
 
@@ -99,7 +100,20 @@ class _Side:
         if e is not None and e.loaded:
             if self.applied.get(which) != self._holds(which):
                 start = time.time()
-                self._refit(which, e)
+                for attempt in (0, 1):
+                    engine_mod.LOGGER.clear()
+                    failures = gpu.failures()
+                    try:
+                        self._refit(which, e)
+                        break
+                    except Exception as error:
+                        ran_out = isinstance(error, torch.cuda.OutOfMemoryError) or gpu.failures() != failures or engine_mod.LOGGER.out_of_memory
+                        if not ran_out or attempt:
+                            if model.beside and ran_out:
+                                raise _BesideNoRoom() from None
+                            raise
+                        model.recovered_failures += gpu.failures() - failures
+                        model.free_all()
                 self.refits, self.refit_seconds = self.refits + 1, self.refit_seconds + time.time() - start
             return e
         start = time.time()
@@ -108,7 +122,9 @@ class _Side:
             room += os.path.getsize(plan)
         e = Engine(plan, model.arena, model.owner)
         for attempt in (0, 1):
-            model.make_room(common.padded(room) if not attempt else room)
+            if not attempt:
+                model.make_room(common.padded(room))
+            engine_mod.LOGGER.clear()
             load, failures = {}, gpu.failures()
             try:
                 with gpu.loading(model.owner) as load:
@@ -134,10 +150,13 @@ class _Side:
                 # gpu.suspect ignores memory held by model.owner, which this VAE's other engines share; gpu.retire() would free it.
                 alone = not model.decoder.engines and not model.encoder.engines
                 if past and alone and not ran_out and engine_mod.own_allocator(failures, model.owner, error):
+                    common.trim()
+                    model.make_room(common.padded(room))
                     continue
                 if gpu.attached() and not ran_out:  # didn't run out: more room won't help
                     raise
-                room = model.obtainable(not model.beside)
+                model.recovered_failures += gpu.failures() - failures
+                model.free_all()
                 logger.info(f"Loading {os.path.basename(plan)} ran out of VRAM ({error}); freeing all there is and trying again.")
         self.sizes[which] = load["grew"]
         self.engines[which] = e
@@ -150,6 +169,7 @@ class _Side:
     def _refit(self, which, e):
         key, exponent = self._holds(which)
         get, names = self.model.weights(2.0 ** -exponent), self.names[which]
+        self.applied.pop(which, None)
         torch.cuda.current_stream(self.model.load_device).synchronize()
         e.refit(list(names), lambda name, device: get(names[name], device))
         self.applied[which] = (key, exponent)
@@ -207,6 +227,10 @@ class VaeModel:
         self.attention = {}  # (encoding, n, h, w) -> working memory the PyTorch attention actually took; invalidates `needs`
         self.failed = set()  # (encoding, h, w) TensorRT failed to run whole: those run in strips from then on
         self.beside = False  # the current way runs beside the UNet engines, so making room must not evict them
+        self.recovered_failures = 0  # attempt-0 TorchAllocator failures retried and recovered inside _Side._get()
+
+    def failures(self) -> int:
+        return gpu.failures() - self.recovered_failures
 
     @property
     def loaded(self) -> bool:
@@ -277,6 +301,18 @@ class VaeModel:
         if self.beside:
             keep += [lm for lm in common.mm().current_loaded_models if getattr(lm.model, "evicted_last", False)]
         return common.make_room(nbytes, self.load_device, keep)
+
+    def free_all(self):
+        from . import runtime
+
+        self.decoder.drop(self.using)
+        self.encoder.drop(self.using)
+        keep = _own(self)
+        if self.beside:
+            keep += [lm for lm in common.mm().current_loaded_models if getattr(lm.model, "evicted_last", False)]
+        with runtime._evictable():
+            common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.load_device, keep_loaded=keep)
+        common.trim()
 
     def need(self, n: int, h: int, w: int, out_gpu: bool = False, whole: bool = True) -> tuple:
         key = (False, n, h, w, out_gpu, whole)
@@ -550,7 +586,7 @@ def decode(vae, samples_in):
     if not whole and found is None:
         return None
     side = model.decoder
-    return _run_with_retries(model, side, vae, _key(vae), (h, w), whole, found, lambda w_, f_: _decode(model, vae, samples_in, w_, f_))
+    return _run_with_retries(model, side, vae, _key(vae), (h, w), whole, found, lambda w_, f_, a_: _decode(model, vae, samples_in, w_, f_, a_))
 
 
 def _run_with_retries(model: VaeModel, side: _Side, vae, key: str, size: tuple, whole: bool, found, fn):
@@ -568,7 +604,7 @@ def _run_with_retries(model: VaeModel, side: _Side, vae, key: str, size: tuple, 
                 return None
             try:
                 with torch.inference_mode():
-                    return fn(whole, found)
+                    return fn(whole, found, again)
             except _Overflow:
                 _outgrew(side, role)
             except torch.cuda.OutOfMemoryError as e:
@@ -579,6 +615,8 @@ def _run_with_retries(model: VaeModel, side: _Side, vae, key: str, size: tuple, 
                     logger.warning(f"The VAE engines ran out of VRAM, so this {noun} runs on PyTorch.")
                     _make_way(model)
                     return None
+                model.beside = False
+                model.free_all()
                 again = False
     finally:
         model.release()
@@ -589,9 +627,19 @@ def _run_with_retries(model: VaeModel, side: _Side, vae, key: str, size: tuple, 
 def _ran_out(model: VaeModel, error) -> str:
     # A run can run out of VRAM even though room was made: memory PyTorch freed isn't always reusable for the next
     # request (with --cuda-malloc it stays in the driver's pool, fragmented). Frees everything and lets the caller retry.
-    frame = traceback.extract_tb(error.__traceback__)[-1]
-    said = f"in {frame.name}, {os.path.basename(frame.filename)}:{frame.lineno}"
-    error.__traceback__ = None
+    inner = error.__context__ if error.__context__ is not None and error.__context__.__traceback__ is not None else error
+    frames = traceback.extract_tb(inner.__traceback__) if inner.__traceback__ is not None else ()
+    said = f"in {frames[-1].name}, {os.path.basename(frames[-1].filename)}:{frames[-1].lineno}" if frames else str(error)
+    stack, seen = [error], set()
+    while stack:
+        cur = stack.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        for linked in (cur.__cause__, cur.__context__):
+            if linked is not None:
+                stack.append(linked)
+        cur.__traceback__ = cur.__cause__ = cur.__context__ = None
     with contextlib.suppress(Exception):
         said += f"; {common.gib(torch.cuda.mem_get_info(model.load_device)[0])} was free"
     model.release()
@@ -618,7 +666,9 @@ def _profiled(where: str):
     profile_report(where)
 
 
-def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
+def _decode(model: VaeModel, vae, samples_in, whole: bool, found, retry_whole: bool = True):
+    from . import engine as engine_mod
+
     b, _, h, w = samples_in.shape
     side, record = model.decoder, model.record
     images = f"{b} image{'' if b == 1 else 's'} of {w * 8}x{h * 8}"
@@ -630,26 +680,89 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
         need, act = model.need(n, h, w, out_gpu)
         return need + held_out, act
 
-    passed = ""
+    passed, beside_oom = "", False
     for engines in (False, True):
+        model.beside = not engines
+        if engines and beside_oom:
+            model.use(side, (PRE, POST) if whole else (PRE,), strips=not whole, load=False)
+            model.free_all()
         if whole:
             model.use(side, (PRE, POST), load=False)
+            engine_mod.LOGGER.clear()
+            failures = model.failures()
             try:
                 n, need, act, can = _fit(model, min(b, record.max_batch), need_for, engines, lambda: model.use(side, (PRE, POST)))
             except _BesideNoRoom:
+                beside_oom = True
                 n, passed = 0, " (the VAE engines didn't fit beside the UNet engine)"
+            except torch.cuda.OutOfMemoryError as e:
+                if not engines:
+                    beside_oom = True
+                    _ran_out(model, e)
+                    if not retry_whole and found is not None:
+                        whole, n, passed = False, 0, " (whole ran out of VRAM)"
+                    else:
+                        n, passed = 0, " (ran out of VRAM beside the UNet engine)"
+                elif not retry_whole and found is not None:
+                    _ran_out(model, e)
+                    whole, n, passed = False, 0, " (whole ran out of VRAM)"
+                else:
+                    raise
+            except RuntimeError as e:
+                if model.failures() != failures or engine_mod.LOGGER.out_of_memory:
+                    if not engines:
+                        beside_oom = True
+                        _ran_out(model, e)
+                        if not retry_whole and found is not None:
+                            whole, n, passed = False, 0, " (whole ran out of VRAM)"
+                        else:
+                            n, passed = 0, " (ran out of VRAM beside the UNet engine)"
+                    elif not retry_whole and found is not None:
+                        _ran_out(model, e)
+                        whole, n, passed = False, 0, " (whole ran out of VRAM)"
+                    else:
+                        raise torch.cuda.OutOfMemoryError(str(e)) from None
+                else:
+                    raise
             else:
                 if not n:
                     passed = _passed(need, can)
             if n:
                 start = time.time()
+                engine_mod.LOGGER.clear()
+                failures = model.failures()
                 try:
                     with _Peak() as peak:
                         pixels = _run(model, vae, samples_in, n)
-                except torch.cuda.OutOfMemoryError:
-                    raise
+                except torch.cuda.OutOfMemoryError as e:
+                    if not engines:
+                        beside_oom = True
+                        _ran_out(model, e)
+                        if not retry_whole and found is not None:
+                            whole, passed = False, " (whole ran out of VRAM)"
+                        else:
+                            passed = " (ran out of VRAM beside the UNet engine)"
+                    elif not retry_whole and found is not None:
+                        _ran_out(model, e)
+                        whole, passed = False, " (whole ran out of VRAM)"
+                    else:
+                        raise
                 except RuntimeError as e:
-                    whole, passed = False, _whole_failed(model, False, h, w, f"decode {w * 8}x{h * 8}", e, found is not None)
+                    if model.failures() != failures or engine_mod.LOGGER.out_of_memory:
+                        if not engines:
+                            beside_oom = True
+                            _ran_out(model, e)
+                            if not retry_whole and found is not None:
+                                whole, passed = False, " (whole ran out of VRAM)"
+                            else:
+                                passed = " (ran out of VRAM beside the UNet engine)"
+                        elif not retry_whole and found is not None:
+                            _ran_out(model, e)
+                            whole, passed = False, " (whole ran out of VRAM)"
+                        else:
+                            raise torch.cuda.OutOfMemoryError(str(e)) from None
+                    else:
+                        whole, passed = False, _whole_failed(model, False, h, w, f"decode {w * 8}x{h * 8}", e, found is not None)
                 else:
                     if pixels is not None:
                         at_once = f", {n} at a time" if n < b else ""
@@ -663,10 +776,30 @@ def _decode(model: VaeModel, vae, samples_in, whole: bool, found):
             model.use(side, (PRE,), strips=True, load=False)
             model.release()
             start = time.time()
+            engine_mod.LOGGER.clear()
+            failures = model.failures()
             try:
                 result = _run_strips(model, vae, samples_in, found, out_gpu, engines)
             except _BesideNoRoom:
+                beside_oom = True
                 result = _NO_ROOM
+            except torch.cuda.OutOfMemoryError as e:
+                if not engines:
+                    beside_oom = True
+                    _ran_out(model, e)
+                    result = _NO_ROOM
+                else:
+                    raise
+            except RuntimeError as e:
+                if model.failures() != failures or engine_mod.LOGGER.out_of_memory:
+                    if not engines:
+                        beside_oom = True
+                        _ran_out(model, e)
+                        result = _NO_ROOM
+                    else:
+                        raise torch.cuda.OutOfMemoryError(str(e)) from None
+                else:
+                    raise
             if result is not _NO_ROOM:
                 pixels, report = result
                 if pixels is not None:
@@ -809,29 +942,69 @@ def encode(vae, pixel_samples):
     if not whole and found is None:
         return None
     side = model.encoder
-    return _run_with_retries(model, side, vae, _key(vae, encoder=True), (h // 8, w // 8), whole, found, lambda w_, f_: _encode(model, vae, pixels, w_, f_))
+    return _run_with_retries(model, side, vae, _key(vae, encoder=True), (h // 8, w // 8), whole, found, lambda w_, f_, a_: _encode(model, vae, pixels, w_, f_, a_))
 
 
-def _encode(model: VaeModel, vae, pixels, whole: bool, found):
+def _encode(model: VaeModel, vae, pixels, whole: bool, found, retry_whole: bool = True):
+    from . import engine as engine_mod
+
     b, _, h, w = pixels.shape
     side, record = model.encoder, model.record
     images = f"{b} image{'' if b == 1 else 's'} of {w}x{h}"
     common.register(model)
     pixels_gpu = pixels.is_cuda
-    passed = "" if whole else " (larger than the engines take whole)"
+    passed, beside_oom = "" if whole else " (larger than the engines take whole)", False
     for engines in (False, True):
+        model.beside = not engines
+        if engines and beside_oom:
+            model.use(side, ENCODER if whole else (ENCODE_POST,), strips=not whole, load=False)
+            model.free_all()
         if whole:
             model.use(side, ENCODER, load=False)
+            engine_mod.LOGGER.clear()
+            failures = model.failures()
             try:
                 n, need, act, can = _fit(model, min(b, record.encode_batch), lambda n: model.need_encode(n, h, w, pixels_gpu), engines, lambda: model.use(side, ENCODER))
             except _BesideNoRoom:
+                beside_oom = True
                 n, passed = 0, " (the VAE engines didn't fit beside the UNet engine)"
+            except torch.cuda.OutOfMemoryError as e:
+                if not engines:
+                    beside_oom = True
+                    _ran_out(model, e)
+                    if not retry_whole and found is not None:
+                        whole, n, passed = False, 0, " (whole ran out of VRAM)"
+                    else:
+                        n, passed = 0, " (ran out of VRAM beside the UNet engine)"
+                elif not retry_whole and found is not None:
+                    _ran_out(model, e)
+                    whole, n, passed = False, 0, " (whole ran out of VRAM)"
+                else:
+                    raise
+            except RuntimeError as e:
+                if model.failures() != failures or engine_mod.LOGGER.out_of_memory:
+                    if not engines:
+                        beside_oom = True
+                        _ran_out(model, e)
+                        if not retry_whole and found is not None:
+                            whole, n, passed = False, 0, " (whole ran out of VRAM)"
+                        else:
+                            n, passed = 0, " (ran out of VRAM beside the UNet engine)"
+                    elif not retry_whole and found is not None:
+                        _ran_out(model, e)
+                        whole, n, passed = False, 0, " (whole ran out of VRAM)"
+                    else:
+                        raise torch.cuda.OutOfMemoryError(str(e)) from None
+                else:
+                    raise
             else:
                 if not n:
                     passed = _passed(need, can)
             if n:
                 start = time.time()
                 samples = None
+                engine_mod.LOGGER.clear()
+                failures = model.failures()
                 try:
                     with _Peak() as peak:
                         for at in range(0, b, n):
@@ -844,10 +1017,35 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
                                 samples = torch.empty((b,) + tuple(out.shape[1:]), device=vae.output_device)
                             samples[at:at + n] = out
                             del latent, out
-                except torch.cuda.OutOfMemoryError:
-                    raise
+                except torch.cuda.OutOfMemoryError as e:
+                    if not engines:
+                        beside_oom = True
+                        _ran_out(model, e)
+                        if not retry_whole and found is not None:
+                            whole, passed = False, " (whole ran out of VRAM)"
+                        else:
+                            passed = " (ran out of VRAM beside the UNet engine)"
+                    elif not retry_whole and found is not None:
+                        _ran_out(model, e)
+                        whole, passed = False, " (whole ran out of VRAM)"
+                    else:
+                        raise
                 except RuntimeError as e:
-                    whole, passed = False, _whole_failed(model, True, h // 8, w // 8, f"encode {w}x{h}", e, found is not None)
+                    if model.failures() != failures or engine_mod.LOGGER.out_of_memory:
+                        if not engines:
+                            beside_oom = True
+                            _ran_out(model, e)
+                            if not retry_whole and found is not None:
+                                whole, passed = False, " (whole ran out of VRAM)"
+                            else:
+                                passed = " (ran out of VRAM beside the UNet engine)"
+                        elif not retry_whole and found is not None:
+                            _ran_out(model, e)
+                            whole, passed = False, " (whole ran out of VRAM)"
+                        else:
+                            raise torch.cuda.OutOfMemoryError(str(e)) from None
+                    else:
+                        whole, passed = False, _whole_failed(model, True, h // 8, w // 8, f"encode {w}x{h}", e, found is not None)
                 else:
                     at_once = f", {n} at a time" if n < b else ""
                     logger.info(
@@ -860,10 +1058,30 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found):
             model.use(side, (ENCODE_POST,), strips=True, load=False)
             model.release()
             start = time.time()
+            engine_mod.LOGGER.clear()
+            failures = model.failures()
             try:
                 result = _encode_strips(model, vae, pixels, found, engines)
             except _BesideNoRoom:
+                beside_oom = True
                 result = _NO_ROOM
+            except torch.cuda.OutOfMemoryError as e:
+                if not engines:
+                    beside_oom = True
+                    _ran_out(model, e)
+                    result = _NO_ROOM
+                else:
+                    raise
+            except RuntimeError as e:
+                if model.failures() != failures or engine_mod.LOGGER.out_of_memory:
+                    if not engines:
+                        beside_oom = True
+                        _ran_out(model, e)
+                        result = _NO_ROOM
+                    else:
+                        raise torch.cuda.OutOfMemoryError(str(e)) from None
+                else:
+                    raise
             if result is not _NO_ROOM:
                 samples, report = result
                 if samples is not None:

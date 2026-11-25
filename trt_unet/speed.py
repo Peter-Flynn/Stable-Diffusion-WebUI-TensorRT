@@ -149,10 +149,12 @@ class Schedule:
         self.sigmas = None
         self._levels = None  # the sigmas of the steps this pass samples, negated (ascending), once known
         self._probed = False
+        self._probed_at = None
         self._checked_at = -math.inf  # evaluation index of the latest check
         # The sampler's steps, from its callback (reForge's state.sampling_step): the evaluation before each callback is
         # taken as a step's first, and the evaluations between two callbacks as the evaluations per step.
         self._step = None
+        self._start = None  # evaluation index of the pass's first denoiser call
         self._anchor = None  # index of the latest evaluation followed by a callback
         self.per = None
         self.slot = 0
@@ -171,8 +173,9 @@ class Schedule:
         self._readback = Readback()
         # A prompt that moves again within STALE evaluations (an extension blending or alternating prompts every step)
         # is seen a call late each time, so its calls run in full for the rest of the pass.
-        self._moved = {}  # (slot, key) -> evaluation index of the latest move read
+        self._moved = {}  # (slot, key) -> (evaluation index, origin) of the latest move read
         self.volatile = set()  # (slot, key)
+        self._missed = {}  # (slot, key) -> overdue first-of-step checks skipped at age == 1 on multi-call samplers
 
     def begin(self, index: int, total, steps, step, sigma):
         # step: reForge's state.sampling_step; sigma: the denoiser's, a GPU tensor read in the first call()
@@ -201,21 +204,49 @@ class Schedule:
         self._undecided = None if self.idle or self.done else (total, steps, step, sigma)
         if self.done:
             self.deep.clear()
+            self._missed.clear()
         else:
             for k in [k for k, kept in self.deep.items() if index - kept[3] > STALE]:
                 del self.deep[k]
+                self._missed.pop(k, None)
 
     def _follow(self, index, step):
         if self._step is None:
-            self._step = step
+            self._step, self._start = step, index
         elif step != self._step:
             self._step = step
             if self._anchor is not None and index - 1 > self._anchor:
                 self.per = index - 1 - self._anchor
             self._anchor = index - 1
+            if not self._probed and self._probed_at is not None:
+                if self._probed_at == self._anchor or (self.per is not None and self._first(self._probed_at)):
+                    self._probed = True
+                else:
+                    self._probed_at = None
+        elif not self._probed and self._probed_at is not None and self._anchor is not None and self._probed_at > self._anchor:
+            self._probed_at = None
 
     def _first(self, index) -> bool:
         return self.per is not None and (index - self._anchor) % self.per == 0
+
+    def _probe_turn(self, index, fallback_per=None) -> bool:
+        if self.per is not None:
+            return self._first(index)
+        if self._anchor is not None and self._start is not None and self._anchor > self._start:
+            return index - self._anchor >= self._anchor - self._start
+        return fallback_per is None or fallback_per <= 1 or (index - (self._start or 0)) % fallback_per == 0
+
+    def _probed_ok(self, index) -> bool:
+        # Unverified probes wait for a confirming callback unless the sampler emits no callbacks at all
+        return self._probed or (self._probed_at is not None and self._anchor is None and index - self._probed_at >= 4)
+
+    def can_probe(self) -> bool:
+        return self.index is not None and self._probe_turn(self.index)
+
+    def step_known(self) -> bool:
+        if self._start is None or self.index is None:
+            return False
+        return (self._anchor is not None and self._anchor > self._start) or self.index - self._start > 4
 
     def _decide(self, index, total, steps, step, sigma) -> tuple:
         if self._levels is None and self.sigmas is not None and len(self.sigmas) > steps:
@@ -229,7 +260,11 @@ class Schedule:
             # their final call is at total - 2.
             per = max(1, total // steps)
             start, end = round(self.warmup * total), total - max(per, round(self.tail * total))
-            region, probe = start <= index < end, index == start - 1 and index >= 1
+            region = start <= index < end
+            if 2 <= start and not self._probed_ok(index) and (region or index == start - 1):
+                region, probe = False, self._probed_at is None and self._probe_turn(index, per)
+            else:
+                probe = False
         if probe:
             return False, "probe"
         if not region:
@@ -249,12 +284,16 @@ class Schedule:
         # rounding.
         position = max(bisect.bisect_right(self._levels, -sigma * (1 - 1e-4)) - 1, step + 1 if index else 0)
         region = start <= position < end
-        # The probe is the call before the first shallow one, or the first call placed past start if none was
-        # placed just before it
-        if 2 <= start and not self._probed and (region or position == start - 1):
-            self._probed = True
-            return False, True
+        # The probe is a step's first call before the first shallow one (or the first such call placed past start);
+        # multi-call ancestral/churn samplers add no noise on later calls of a step, so probing there misses noise.
+        if 2 <= start and not self._probed_ok(index) and (region or position == start - 1):
+            return False, self._probed_at is None and self._probe_turn(index)
         return region, False
+
+    def mark_probed(self):
+        if self.index is None or (self.per is not None and self._first(self.index)):
+            self._probed = True
+        self._probed_at = self.index
 
     def _check_due(self, index) -> bool:
         gap = index - self._checked_at
@@ -271,6 +310,7 @@ class Schedule:
 
     def checked(self, error, age: int):
         self._checked_at = self.index
+        self._missed.clear()
         self._readback.send(("check", self.index, age), error)
 
     def _collect(self):
@@ -282,12 +322,15 @@ class Schedule:
             where, origin = a, b
             if value <= MOVED:
                 continue
-            if self.index - self._moved.get(where, -math.inf) <= STALE:
-                self.volatile.add(where)
-            self._moved[where] = self.index
+            prev = self._moved.get(where)
+            if prev is None or prev[1] != origin:  # two in-flight shallow calls on the same origin report one move
+                if prev is not None and self.index - prev[0] <= STALE:
+                    self.volatile.add(where)
+                self._moved[where] = (self.index, origin)
             kept = self.deep.get(where)
             if kept is not None and kept[1] == origin:
                 del self.deep[where]
+                self._missed.pop(where, None)
 
     def call(self, key: tuple) -> tuple:
         # (slot, deep feature or None, index of the call that computed it, (deep feature, index) that this checked or
@@ -299,16 +342,27 @@ class Schedule:
             self.region, self.kind = self._decide(self.index, *self._undecided)
             self._undecided = None
         slot, self.slot = self.slot, self.slot + 1
-        kept = self.deep.get((slot, key))
-        if kept is None or (slot, key) in self.volatile:
+        where = (slot, key)
+        kept = self.deep.get(where)
+        if kept is None or where in self.volatile:
             self.full_calls += 1
             return slot, None, None, None, None
         kept[3] = self.index
-        if self.region and self._wait(self.index - kept[1]):
+        age = self.index - kept[1]
+        # On multi-call-per-step samplers, an out-of-phase kept[1] can phase-lock due full calls off _first(), starving
+        # checks; re-align on a due first-of-step call at age >= 2, or after 2 consecutive age-1 misses.
+        off_phase = self.kind == "check" and self.per > 1 and not self._first(kept[1])
+        realign = off_phase and (age >= 2 or self._missed.get(where, 0) >= 2)
+        if self.region and not realign and self._wait(age):
+            if off_phase:
+                self._missed[where] = self._missed.get(where, 0) + 1
             self.shallow_calls += 1
             return slot, kept[0], kept[1], None, None
+        if realign:
+            self._missed.pop(where, None)
         self.full_calls += 1
-        return slot, None, None, (kept[0], kept[1]) if self.kind else None, self.kind
+        kind = None if (realign and age < 2) else self.kind
+        return slot, None, None, (kept[0], kept[1]) if kind else None, kind
 
     def compare(self, slot: int, key: tuple, prompt: tuple):
         # For a shallow call: how far the prompt (its tensors: context and SDXL's y) moved from the one its deep feature
@@ -339,4 +393,5 @@ class Schedule:
 
     def release(self):
         self.deep.clear()
+        self._missed.clear()
         self._readback.clear()

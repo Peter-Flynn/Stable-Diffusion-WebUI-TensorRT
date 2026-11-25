@@ -42,13 +42,17 @@ if "dynamo" in inspect.signature(torch.onnx.export).parameters:
 
 
 @contextlib.contextmanager
-def quiet_warnings():
+def quiet_warnings(seen: set = None):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         try:
             yield
         finally:
             for message in dict.fromkeys(f"{w.category.__name__}: {w.message}" for w in caught):
+                if seen is not None:
+                    if message in seen:
+                        continue
+                    seen.add(message)
                 logger.debug(f"While exporting: {message}")
 
 
@@ -84,11 +88,25 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, sca
     return _attention(query, key, value, attn_mask, scale=scale)
 
 
+_ORIG_GROUP_NORM = F.group_norm
+
+
+def _fp32_group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
+    # TensorRT 11's Myelin __myl_Gnor / __myl_GnorSilu kernels corrupt dynamic FP16/BF16 GroupNorm when C <= 640 and
+    # max spatial size <= 49 (e.g. SDXL input_blocks.7.0 in 320-1536, SD 1.5 in 256-768). Computing GroupNorm in FP32
+    # avoids those kernels while Myelin still fuses the casts into the reduction.
+    if input.dtype in (torch.float16, torch.bfloat16):
+        w = None if weight is None else weight.float()
+        b = None if bias is None else bias.float()
+        return _ORIG_GROUP_NORM(input.float(), num_groups, w, b, eps).to(input.dtype)
+    return _ORIG_GROUP_NORM(input, num_groups, weight, bias, eps)
+
+
 @contextlib.contextmanager
 def _traceable_attention():
     import ldm_patched.ldm.modules.attention as attention
 
-    swaps = [(F, "scaled_dot_product_attention", _sdpa)]
+    swaps = [(F, "scaled_dot_product_attention", _sdpa), (F, "group_norm", _fp32_group_norm)]
     swaps += [(attention, name, _optimized_attention) for name in ("optimized_attention", "optimized_attention_masked")]
     originals = [(owner, name, getattr(owner, name)) for owner, name, _ in swaps]
     for owner, name, fn in swaps:
@@ -291,7 +309,8 @@ def _exited(proc, block=False) -> bool:
 
 def _kill_tree(proc):
     if os.name == "nt":
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with contextlib.suppress(OSError):
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with contextlib.suppress(OSError):
             proc.kill()
     else:
@@ -397,7 +416,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
     common.mm().soft_empty_cache(force=True)
     folder = store.work_dir(arch)
     shutil.rmtree(folder, ignore_errors=True)
-    os.makedirs(folder)
+    os.makedirs(folder, exist_ok=True)
     records, result, memory_warnings, hack_errors = [], {"ok": True}, 0, []
     before = {r.engine_key: r for r in store.engines(arch.id)}
     vae_part = vae_mod.needs_build(arch, profiles) if profiles else ""
@@ -484,6 +503,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 "weights": job["weights"],
                 "weight_bytes": sum(math.prod(s) * 2 for s in shapes.values()),
                 "stripped": result["stripped"],
+                "graph": store.GRAPH_VERSION,
                 "trt": common.trt_version(),
                 "gpu": common.gpu_tag(),
                 "gpu_name": torch.cuda.get_device_name(common.device()),
@@ -497,16 +517,19 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                 meta["speed_hacks_retried"] = replaced is not None and "speed_hacks_error" in replaced.meta
             records.append(store.save(arch, job["plan"], meta, shallow_plan))
             logger.info(f"Built the {what} in {duration(time.time() - start)} ({gib(records[-1].disk_bytes)}).")
-        if vae_part and result["ok"] and not CANCEL.is_set():
-            start = time.time()
-            logger.info(f"Building the engines for {vae_part}.")
-            step = (lambda f, t: progress((len(groups) + f) / total, f"VAE: {t}")) if progress else None
-            vae_record, vae_error, skipped = vae_build.build(arch, profiles, folder, optimization_level, step)
-            memory_warnings += skipped
-            if vae_record is not None:
-                logger.info(f"Built the VAE engines in {duration(time.time() - start)}.")
-            elif vae_error == "cancelled" or CANCEL.is_set():
+        if vae_part and result["ok"]:
+            if CANCEL.is_set():
                 result = {"ok": False, "error": "cancelled"}
+            else:
+                start = time.time()
+                logger.info(f"Building the engines for {vae_part}.")
+                step = (lambda f, t: progress((len(groups) + f) / total, f"VAE: {t}")) if progress else None
+                vae_record, vae_error, skipped = vae_build.build(arch, profiles, folder, optimization_level, step)
+                memory_warnings += skipped
+                if vae_record is not None:
+                    logger.info(f"Built the VAE engines in {duration(time.time() - start)}.")
+                elif vae_error == "cancelled" or CANCEL.is_set():
+                    result = {"ok": False, "error": "cancelled"}
         if memory_warnings:
             logger.info(f"TensorRT skipped {memory_warnings} kernels that needed more VRAM than was free, so the largest sizes may run a little slower.")
         return {**result, "records": records, "memory_warnings": memory_warnings, "hack_errors": hack_errors, "vae": vae_record, "vae_error": vae_error}

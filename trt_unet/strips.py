@@ -807,9 +807,17 @@ class Decode:
             out_rows, width, _ = self.geometry(st, h, w)
             cap = min(out_rows, runners[n].rows(width))
             cap -= cap % st.kind.step
-            if cap < min_rows(st.kind):
+            lo = min_rows(st.kind)
+            if cap < lo or (lo > st.kind.step and cap == lo and 0 < out_rows % cap < lo):
                 return None
-            rows.append(min(cap, max(min_rows(st.kind), cap // div // st.kind.step * st.kind.step)))
+            r0 = min(cap, max(lo, cap // div // st.kind.step * st.kind.step))
+            r = r0
+            if lo > st.kind.step and 0 < out_rows % r < lo:
+                while r > lo and 0 < out_rows % r < lo:
+                    r -= st.kind.step
+                if 0 < out_rows % r < lo:
+                    r = r0 if r0 > lo else min(cap, lo + st.kind.step)
+            rows.append(r)
         widths = [self.geometry(st, h, w)[1] for st in found]
         acts = [self._activation(runners[n], st.kind, rows[n], widths[n]) for n, st in enumerate(found)]
         act = max(acts)
@@ -901,6 +909,8 @@ class Decode:
         return self._out(held[len(plan.stages) - 1].t)
 
     def _out(self, t):
+        if not t.is_cuda and self.copy_stream is not None:
+            self.copy_stream.synchronize()  # permute() below materializes on CPU before the H2D copy
         out = torch.empty((1, t.shape[1], t.shape[0], t.shape[2]), dtype=t.dtype, device=self.device)
         out[0].copy_(t.permute(1, 0, 2))
         return out
@@ -924,13 +934,20 @@ class Decode:
             for _, key in st.norms:
                 stats_last[key] = n
         stats = {}
-        for n, stage in enumerate(found):
-            stats[n] = self._sweep(n, stage, held, stats, plan, io)
-            for _, key in stage.norms:
-                if stats_last[key] == n:
-                    stats.pop(key, None)
-        if self.copy_stream is not None:
-            torch.cuda.current_stream(self.device).wait_stream(self.copy_stream)
+        try:
+            for n, stage in enumerate(found):
+                stats[n] = self._sweep(n, stage, held, stats, plan, io)
+                for _, key in stage.norms:
+                    if stats_last[key] == n:
+                        stats.pop(key, None)
+        except BaseException:
+            if self.copy_stream is not None:
+                with contextlib.suppress(Exception):
+                    self.copy_stream.synchronize()
+            raise
+        finally:
+            if self.copy_stream is not None:
+                torch.cuda.current_stream(self.device).wait_stream(self.copy_stream)
         return held, stats.get(len(found) - 1)
 
     def _sweep(self, n: int, stage: Stage, held: dict, stats: dict, plan: Plan, io):
@@ -966,6 +983,13 @@ class Decode:
         result_stats = Stats() if kind.groups else None
         per_group = kind.cout // kind.groups * width if kind.groups else 0
         strips = [(a, min(a + rows, out_rows)) for a in range(0, out_rows, rows)]
+        lo = min_rows(kind)
+        if len(strips) >= 2 and strips[-1][1] - strips[-1][0] < lo:
+            need = lo - (strips[-1][1] - strips[-1][0])
+            a0, b0 = strips[-2]
+            if b0 - a0 - need >= lo:
+                strips[-2] = (a0, b0 - need)
+                strips[-1] = (b0 - need, strips[-1][1])
         copy = self.copy_stream if (x_stage or res_stage or out_stage) else None
         compute = torch.cuda.current_stream(self.device) if copy is not None else None
         if copy is not None:
@@ -1027,65 +1051,67 @@ class Decode:
                 stored[slot] = torch.cuda.Event()
                 stored[slot].record(copy)
 
-        if x_stage or res_stage:
-            load(0)
-        pending = None  # an in-place output, stored only after the next strip has read the input rows it overwrites
-        for k, (a, b) in enumerate(strips):
-            r = b - a
-            sh = feed_shapes(kind, r, width)
-            want = source_rows(stage, a, b, rows_in)
-            x = x_flat[:math.prod(sh["x"])].view(sh["x"])
-            staged = {}
+        try:
             if x_stage or res_stage:
-                if k + 1 < len(strips):
-                    load(k + 1)
-                staged, event = loaded.pop(k)
-                if event is not None:
-                    compute.wait_event(event)
-            if "x" in staged:
-                x[0].copy_(staged["x"].permute(1, 0, 2))
-            else:
-                gather(x, src, want)
-            feed = {"x": x}
-            if res is not None:
-                rv = res_flat[:math.prod(sh["res"])].view(sh["res"])
-                if "res" in staged:
-                    rv[0].copy_(staged["res"].permute(1, 0, 2))
+                load(0)
+            pending = None  # an in-place output, stored only after the next strip has read the input rows it overwrites
+            for k, (a, b) in enumerate(strips):
+                r = b - a
+                sh = feed_shapes(kind, r, width)
+                want = source_rows(stage, a, b, rows_in)
+                x = x_flat[:math.prod(sh["x"])].view(sh["x"])
+                staged = {}
+                if x_stage or res_stage:
+                    if k + 1 < len(strips):
+                        load(k + 1)
+                    staged, event = loaded.pop(k)
+                    if event is not None:
+                        compute.wait_event(event)
+                if "x" in staged:
+                    x[0].copy_(staged["x"].permute(1, 0, 2))
                 else:
-                    gather(rv, res, list(range(a, b)))
-                feed["res"] = rv
-            if staged and compute is not None:
-                done = torch.cuda.Event()
-                done.record(compute)
-                consumed[k % 2] = done
+                    gather(x, src, want)
+                feed = {"x": x}
+                if res is not None:
+                    rv = res_flat[:math.prod(sh["res"])].view(sh["res"])
+                    if "res" in staged:
+                        rv[0].copy_(staged["res"].permute(1, 0, 2))
+                    else:
+                        gather(rv, res, list(range(a, b)))
+                    feed["res"] = rv
+                if staged and compute is not None:
+                    done = torch.cuda.Event()
+                    done.record(compute)
+                    consumed[k % 2] = done
+                if pending is not None:
+                    store(*pending)
+                    pending = None
+                for name, flat in keep_flats.items():
+                    keep_list = _keep_rows(stage, a, b, out_rows, second=name == "keep2")
+                    keep = flat[:len(keep_list)].view(1, 1, -1, 1)
+                    keep.fill_(1.0 if kind.op == OUT else self.scale)
+                    for i, inside in enumerate(keep_list):
+                        if not inside:
+                            keep[:, :, i].zero_()
+                    feed[name] = keep
+                feed.update(fixed)
+                outputs = {}
+                if has_out:
+                    outputs["out"] = out_flats[k % len(out_flats)][:kind.cout * r * width].view(1, kind.cout, r, width)
+                result = runner(feed, outputs, r != rows)
+                if result_stats is not None:
+                    result_stats.add(per_group * r, result["mean"], result["m2"])
+                if out is None:
+                    continue
+                if lag:
+                    pending = (k, a, b, outputs["out"])
+                else:
+                    store(k, a, b, outputs["out"])
             if pending is not None:
                 store(*pending)
-                pending = None
-            for name, flat in keep_flats.items():
-                keep_list = _keep_rows(stage, a, b, out_rows, second=name == "keep2")
-                keep = flat[:len(keep_list)].view(1, 1, -1, 1)
-                keep.fill_(1.0 if kind.op == OUT else self.scale)
-                for i, inside in enumerate(keep_list):
-                    if not inside:
-                        keep[:, :, i].zero_()
-                feed[name] = keep
-            feed.update(fixed)
-            outputs = {}
-            if has_out:
-                outputs["out"] = out_flats[k % len(out_flats)][:kind.cout * r * width].view(1, kind.cout, r, width)
-            result = runner(feed, outputs, r != rows)
-            if result_stats is not None:
-                result_stats.add(per_group * r, result["mean"], result["m2"])
-            if out is None:
-                continue
-            if lag:
-                pending = (k, a, b, outputs["out"])
-            else:
-                store(k, a, b, outputs["out"])
-        if pending is not None:
-            store(*pending)
-        if copy is not None:
-            compute.wait_stream(copy)
+        finally:
+            if copy is not None:
+                compute.wait_stream(copy)
         return result_stats
 
     def _out_size(self, stage: Stage, src: Held) -> tuple:

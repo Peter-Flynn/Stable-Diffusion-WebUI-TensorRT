@@ -19,6 +19,7 @@ from .profiles import Profile
 PER_PROFILE, MERGED = "per_profile", "merged"
 SHALLOW = ".shallow.plan"
 MODES = (PER_PROFILE, MERGED)
+GRAPH_VERSION = 2  # bumped when the exported UNet ONNX graph changes (2: FP32 GroupNorm for TRT 11 Myelin bug)
 
 
 def root() -> str:
@@ -119,12 +120,16 @@ class Record:
     @property
     def shallow_plan(self):
         name = (self.meta.get("speed_hacks") or {}).get("plan")
-        return os.path.join(os.path.dirname(self.plan), name) if name else None
+        return os.path.join(os.path.dirname(self.plan), name) if _plain_name(name) else None
 
     @property
     def speed_hacks(self):
         hacks = self.meta.get("speed_hacks")
         return hacks if hacks and hacks.get("fresh") == fresh.SIGNATURE else None
+
+    @property
+    def stale_graph(self) -> bool:
+        return self.meta.get("graph", 1) != GRAPH_VERSION
 
     @property
     def stale_speed_hacks(self) -> bool:  # built with another fresh.SIGNATURE: a different shallow graph
@@ -174,12 +179,61 @@ class Record:
         return total
 
 
+def _plain_name(s) -> bool:
+    return isinstance(s, str) and bool(s) and s not in (".", "..") and "/" not in s and "\\" not in s and os.path.basename(s) == s
+
+
+def _safe_tag(s) -> bool:
+    return _plain_name(s) and not any(c in s for c in "*?[")
+
+
+def _valid_shapes(shapes) -> bool:
+    if not isinstance(shapes, dict):
+        return False
+    checks = (("sample", 4), ("encoder_hidden_states", 3)) + ((("y", 2),) if "y" in shapes else ())
+    for name, dims in checks:
+        bounds = shapes.get(name)
+        if not isinstance(bounds, list) or len(bounds) != 3:
+            return False
+        if any(not isinstance(s, list) or len(s) != dims or any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in s) for s in bounds):
+            return False
+        if not all(lo <= opt <= hi for lo, opt, hi in zip(*bounds)):
+            return False
+    return True
+
+
 def _read(meta_path: str):
     plan = meta_path[: -len(".json")] + ".plan"
     try:
         record = Record(plan, common.read_json(meta_path))
+        hacks_meta = record.meta.get("speed_hacks")
+        if hacks_meta is not None:
+            if not isinstance(hacks_meta, dict):
+                raise TypeError("invalid speed_hacks metadata")
+            if "plan" in hacks_meta and not _plain_name(hacks_meta["plan"]):
+                raise ValueError("invalid shallow engine plan name")
         if os.path.isfile(plan) and (record.shallow_plan is None or os.path.isfile(record.shallow_plan)):
-            record.arch
+            if record.mode not in MODES:
+                raise ValueError(f"unknown engine mode {record.mode!r}")
+            if not _safe_tag(record.meta["gpu"]) or not _safe_tag(record.meta["trt"]):
+                raise ValueError("invalid gpu or trt metadata")
+            arch = record.arch
+            if arch.id != os.path.basename(os.path.dirname(meta_path)):
+                raise ValueError("arch id does not match engine folder")
+            _ = record.group, record.index, record.weight_bytes
+            if not isinstance(record.meta["gpu_name"], str) or not isinstance(record.meta["created"], str):
+                raise TypeError("invalid engine metadata fields")
+            profs, shapes, indexes = record.profiles, record.profile_shapes, record.indexes
+            if not isinstance(shapes, list) or not profs or len(indexes) != len(profs) or len(shapes) != len(profs):
+                raise ValueError("mismatched profiles, indexes, or shapes")
+            if not all(_valid_shapes(s) for s in shapes):
+                raise ValueError("invalid profile shapes")
+            if record.speed_hacks is not None:
+                if record.shallow_plan is None:
+                    raise ValueError("missing shallow engine plan")
+                wb = record.speed_hacks["weight_bytes"]
+                if isinstance(wb, bool) or not isinstance(wb, int) or wb < 0:
+                    raise ValueError("invalid shallow weight_bytes")
             return record
     except Exception as e:
         common.notify(f"Ignoring {meta_path}, which couldn't be read: {e}")
@@ -252,12 +306,43 @@ def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
     return deleted
 
 
+def _draft_path(arch_id: str) -> str:
+    return os.path.join(root(), arch_id, ".draft")
+
+
+def save_draft(arch_id: str, profiles: list):
+    path = _draft_path(arch_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump([p.to_dict() for p in profiles], f)
+    os.replace(path + ".tmp", path)
+
+
+def load_draft(arch_id: str):
+    try:
+        with open(_draft_path(arch_id), encoding="utf-8") as f:
+            data = json.load(f)
+        return [Profile.from_dict(d) for d in data] if isinstance(data, list) and data else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def clear_draft(arch_id: str):
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(_draft_path(arch_id))
+
+
 def delete(group: list):
     for record in group:
         base = record.plan[: -len(".plan")]
         for path in (record.plan, base + ".json", base + SHALLOW):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(path)
+    for arch_id in {r.meta["arch"]["id"] for r in group if r.loadable}:
+        if not engines(arch_id):
+            clear_draft(arch_id)
     for folder in {os.path.dirname(r.plan) for r in group}:
         if not glob.glob(os.path.join(glob.escape(folder), "*.plan")):
-            shutil.rmtree(folder, ignore_errors=True)
+            shutil.rmtree(os.path.join(folder, ".build"), ignore_errors=True)
+            with contextlib.suppress(OSError):
+                os.rmdir(folder)  # leaves folder intact if .draft or another GPU/TRT's vae/ remains

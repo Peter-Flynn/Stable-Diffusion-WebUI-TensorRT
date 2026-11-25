@@ -102,9 +102,10 @@ def runtime():
 def _deserialize(plan, owner):
     global _runtime
     before = gpu.failures()
+    had_live = gpu.ledger(owner) > 0 or any(e.loaded for e in Engine.instances)
     with gpu.owner(owner):
         engine = runtime().deserialize_cuda_engine(plan)
-    if engine is not None or LOGGER.out_of_memory or not gpu.suspect(before, owner):
+    if engine is not None or LOGGER.out_of_memory or had_live or not gpu.suspect(before, owner):
         return engine
     own = trt.Runtime(LOGGER)
     engine = own.deserialize_cuda_engine(plan)
@@ -118,7 +119,7 @@ def _deserialize(plan, owner):
 
 def own_allocator(failures_before: int, owner, error) -> bool:
     global _runtime
-    if not gpu.suspect(failures_before, owner):
+    if any(e.loaded for e in Engine.instances) or not gpu.suspect(failures_before, owner):
         return False
     _set_aside.append(_runtime)
     with common.on_device():
@@ -284,9 +285,25 @@ class Engine:
             self._reset_context_state()
         return self.context
 
+    def _drop_context(self):
+        # TensorRT 11 keeps stale dynamic-resize state in live IExecutionContexts across refit_cuda_engine(), causing
+        # execute_async_v3() to allocate max-profile scratch on every call (+11.9 GiB on SDXL VAE post, +1.1 GiB on UNet).
+        if self.context is not None:
+            with common.on_device(), gpu.owner(self.owner):
+                before = gpu.ledger(self.owner)
+                self.context = None
+                freed = min(self.extra, max(0, before - gpu.ledger(self.owner)))
+                if freed:
+                    self.extra -= freed
+                    gpu.unloaded(self.owner, freed)
+            self._reset_context_state()
+
     def unload(self):
         if self.context is not None or self.engine is not None:
-            with common.on_device(), gpu.owner(self.owner):
+            dev = common.device()
+            with common.on_device(dev), gpu.owner(self.owner):
+                with contextlib.suppress(Exception):
+                    torch.cuda.synchronize(dev)
                 self.context = None  # before the engine it belongs to
                 self.engine = None
         self._reset_context_state()
@@ -308,46 +325,51 @@ class Engine:
         return serialized
 
     def refit(self, names, tensor_for) -> float:
-        with common.on_device():
-            refitter = trt.Refitter(self.engine, LOGGER)
-            for setting, value in REFITTER_SETTINGS.items():
-                try:
-                    setattr(refitter, setting, value)
-                except (AttributeError, TypeError) as e:
-                    if setting not in _unsettable:
-                        _unsettable.add(setting)
-                        logger.debug(f"Couldn't set the refitter's {setting}: {e}")
+        dev = common.device()
+        with common.on_device(dev):
+            torch.cuda.synchronize(dev)
+            for other in list(Engine.instances):
+                if other.engine is self.engine:
+                    other._drop_context()
             keep, gpu_batch, gpu_bytes, start = [], [], 0, time.perf_counter()
             batch_limit = 32 * 2**20  # bounds extra VRAM while letting LoRA/FP8 kernels queue without per-weight syncs
-
-            def bind(name, proto, t):
-                if t.numel() != proto.size:
-                    raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
-                keep.append(t)
-                if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), trt.TensorLocation.HOST):
-                    raise RuntimeError(f"TensorRT rejected weight {name}")
-
-            def flush():
-                nonlocal gpu_bytes
-                while gpu_batch:
-                    name, proto, t = gpu_batch.pop(0)
-                    bind(name, proto, t.to("cpu"))
-                gpu_bytes = 0
-
-            def put(name):
-                nonlocal gpu_bytes
-                proto = refitter.get_weights_prototype(name)
-                t = tensor_for(name, None).to(dtype=torch_dtype(proto.dtype)).contiguous()
-                if t.is_cuda:
-                    gpu_batch.append((name, proto, t))
-                    gpu_bytes += t.numel() * t.element_size()
-                    if gpu_bytes >= batch_limit:
-                        flush()
-                else:
-                    bind(name, proto, t)
-
-            LOGGER.clear()
+            refitter = trt.Refitter(self.engine, LOGGER)
             try:
+                for setting, value in REFITTER_SETTINGS.items():
+                    try:
+                        setattr(refitter, setting, value)
+                    except (AttributeError, TypeError) as e:
+                        if setting not in _unsettable:
+                            _unsettable.add(setting)
+                            logger.debug(f"Couldn't set the refitter's {setting}: {e}")
+
+                def bind(name, proto, t):
+                    if t.numel() != proto.size:
+                        raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
+                    keep.append(t)
+                    if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), t.numel()), trt.TensorLocation.HOST):
+                        raise RuntimeError(f"TensorRT rejected weight {name}")
+
+                def flush():
+                    nonlocal gpu_bytes
+                    while gpu_batch:
+                        name, proto, t = gpu_batch.pop(0)
+                        bind(name, proto, t.to("cpu"))
+                    gpu_bytes = 0
+
+                def put(name):
+                    nonlocal gpu_bytes
+                    proto = refitter.get_weights_prototype(name)
+                    t = tensor_for(name, None).to(dtype=torch_dtype(proto.dtype)).contiguous()
+                    if t.is_cuda:
+                        gpu_batch.append((name, proto, t))
+                        gpu_bytes += t.numel() * t.element_size()
+                        if gpu_bytes >= batch_limit:
+                            flush()
+                    else:
+                        bind(name, proto, t)
+
+                LOGGER.clear()
                 for name in names:
                     put(name)
                 flush()
@@ -360,6 +382,7 @@ class Engine:
                     finally:
                         refitter.release_refit_resources()  # otherwise the refit's scratch VRAM stays allocated for the engine's lifetime
             finally:
+                refitter = None  # py::keep_alive pins self.engine if left in an exception traceback
                 gpu_batch.clear()
                 keep.clear()  # an exception's traceback holds this frame, and with it GBs of weights
         if not ok:
@@ -396,8 +419,9 @@ class Engine:
         return self.size
 
     def estimate_activation_bytes(self, profile: int, shapes: dict, stream: int) -> int:
-        with common.on_device():
-            self._set_shapes(profile, shapes, stream)
+        dev = common.device()
+        with common.on_device(dev), _non_default_stream(dev, stream) as run_stream:
+            self._set_shapes(profile, shapes, run_stream)
             return self.activation_bytes()
 
     def io_bytes(self) -> dict:
@@ -406,13 +430,31 @@ class Engine:
     def infer(self, feed: dict, profile: int, stream: int, into: dict = None) -> dict:
         dev = common.device()
         with common.on_device(dev):
-            self._prepare(profile, {name: tuple(feed[name].shape) for name, is_input, _ in self.io if is_input}, stream)
-            outputs = {}
+            side = None if stream else _exec_entry(dev)[0]
+            shapes = {}
             for name, is_input, dtype in self.io:
                 if is_input:
                     t = feed[name]
                     if t.dtype != dtype or t.device != dev or not t.is_contiguous():
                         t = feed[name] = t.to(device=dev, dtype=dtype).contiguous()
+                        if side is not None:
+                            t.record_stream(side)
+                    shapes[name] = tuple(t.shape)
+            # Context creation and optimization-profile switches run on the execution stream; arena/output allocations
+            # then run on PyTorch's current stream before the ready event so cudaMallocAsync orders them ahead of side.
+            if self.context is None or profile != self.profile:
+                with _non_default_stream(dev, stream) as run_stream:
+                    self._set_shapes(profile, shapes, run_stream)
+            else:
+                self._set_shapes(profile, shapes, stream)
+            if not self.memory_bound or self.bound_version != self.arena.version or self.arena.memory is None:
+                memory = self.arena.get(self.activation_bytes())
+                self.context.set_device_memory(memory.data_ptr(), memory.numel())
+                self.memory_bound, self.bound_version = True, self.arena.version
+            outputs = {}
+            for name, is_input, dtype in self.io:
+                if is_input:
+                    t = feed[name]
                 else:
                     shape = tuple(self.context.get_tensor_shape(name))
                     given = (into or {}).get(name)
@@ -422,11 +464,12 @@ class Engine:
                         t = outputs[name] = torch.empty(shape, dtype=dtype, device=dev)
                 self.context.set_tensor_address(name, t.data_ptr())
             LOGGER.clear()
-            if self.ran:
-                ran = self.context.execute_async_v3(stream)
-            else:
-                with self._taking("as it first ran"):  # a context allocates more on its first run
-                    ran = self.context.execute_async_v3(stream)
+            with _non_default_stream(dev, stream) as run_stream:
+                if self.ran:
+                    ran = self.context.execute_async_v3(run_stream)
+                else:
+                    with self._taking("as it first ran"):  # a context allocates more on its first run
+                        ran = self.context.execute_async_v3(run_stream)
             if not ran:
                 raise RuntimeError("TensorRT inference failed" + (f": {LOGGER.errors[-1]}" if LOGGER.errors else ""))
             if not self.ran:
@@ -443,3 +486,38 @@ class Engine:
     def release_activations(self):
         self.arena.release()
         self.memory_bound = False
+
+
+_exec_streams = {}  # device index -> (Stream, ready Event, done Event)
+
+
+def _device_index(dev) -> int:
+    return dev.index if dev.index is not None else torch.cuda.current_device()
+
+
+def _exec_entry(dev):
+    index = _device_index(dev)
+    entry = _exec_streams.get(index)
+    if entry is None:
+        entry = _exec_streams[index] = (torch.cuda.Stream(device=dev), torch.cuda.Event(), torch.cuda.Event())
+    return entry
+
+
+@contextlib.contextmanager
+def _non_default_stream(dev, stream: int):
+    # TensorRT 11 inserts host cudaStreamSynchronize() calls on multi-stream engines given the default stream (0).
+    # When PyTorch is on stream 0, run TensorRT (and any TorchAllocator allocations it triggers) on a cached
+    # non-blocking stream ordered against stream 0 by GPU events.
+    if stream:
+        yield stream
+        return
+    side, ready, done = _exec_entry(dev)
+    current = torch.cuda.current_stream(dev)
+    ready.record(current)
+    side.wait_event(ready)
+    try:
+        with torch.cuda.stream(side):
+            yield side.cuda_stream
+    finally:
+        done.record(side)
+        current.wait_event(done)

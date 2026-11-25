@@ -1,3 +1,4 @@
+import contextlib
 import json
 import re
 import threading
@@ -18,6 +19,7 @@ NEW = "New profile"
 FIELD_LABELS = {"width": "Width", "height": "Height", "batch": "Batch size", "tokens": "Prompt tokens"}
 LEVEL_LABELS = {"min": "min", "opt": "optimal", "max": "max"}
 BUILDING = threading.Event()
+_BUILD_LOCK = threading.Lock()
 # Per process: each WebUI start with no engines asks for the mode again, even if one was saved before.
 SETTLED = threading.Event()
 MODE_LABELS = {store.PER_PROFILE: "Per-profile engines", store.MERGED: "Merged engine"}
@@ -154,7 +156,7 @@ def _keys(draft) -> list:
 def _plan(draft, records, mode):
     keys = _keys(draft)
     wanted = store.wanted_keys([Profile.from_dict(d) for d in draft], mode) if draft else set()
-    built = {r.engine_key for r in records if not r.retry_speed_hacks}
+    built = {r.engine_key for r in records if not r.retry_speed_hacks and not r.stale_graph}
     if mode == store.MERGED:
         todo = list(range(len(draft))) if draft and not wanted <= built else []
     else:
@@ -201,13 +203,18 @@ def _status(sd_model, arch, records, asking=False) -> str:
     vae_engines = _vae_status(arch)
     if vae_engines:
         lines.append(vae_engines)
+    old_graph = [r for r in records if r.stale_graph]
+    if old_graph:
+        n = len(old_graph)
+        lines.append(f"**{_n(n, 'engine')} {'needs' if n == 1 else 'need'} rebuilding for an updated UNet graph** (fixes TensorRT 11 GroupNorm artifacts). Building again updates {'it' if n == 1 else 'them'}.")
     stale = [r for r in records if r.stale_speed_hacks]
     if stale:
         lines.append(f"Speed Hacks are off for {_n(len(stale), 'engine')}: their Speed Hacks part is from another version of this extension. Building again rebuilds them.")
     failed = [r for r in records if r.speed_hacks is None and not r.stale_speed_hacks]
     if failed:
         retry = "building again retries once" if any(r.retry_speed_hacks for r in failed) else "to try again, delete them and build again"
-        lines.append(f"Speed Hacks couldn't be built for {_n(len(failed), 'engine')} (`{failed[0].meta['speed_hacks_error']}`), so they run without them; {retry}.")
+        reason = failed[0].meta.get("speed_hacks_error") or "not built"
+        lines.append(f"Speed Hacks couldn't be built for {_n(len(failed), 'engine')} (`{reason}`), so they run without them; {retry}.")
     return "\n\n".join(lines)
 
 
@@ -250,13 +257,17 @@ def _draft_view(draft: list, records, mode, vae_part: str = "") -> str:
     if not draft:
         return "*No profiles. Add at least one to build an engine.*"
     todo, extra = _plan(draft, records, mode)
-    exists = {r.engine_key for r in records}
-    keys = store.wanted_keys([Profile.from_dict(d) for d in draft], mode) if mode == store.MERGED else None
+    by_key = {r.engine_key: r for r in records}
+    merged_key = next(iter(store.wanted_keys([Profile.from_dict(d) for d in draft], mode))) if mode == store.MERGED else None
     rows = ["| # | Width | Height | Batch size | Prompt tokens | Engine |", "|:-:|:-:|:-:|:-:|:-:|:-:|"]
     for i, (d, key) in enumerate(zip(draft, _keys(draft))):
         p = Profile.from_dict(d)
-        again = (keys or {key}) <= exists
-        state = ("**to rebuild** (Speed Hacks)" if again else "**to build**") if i in todo else "built"
+        rec = by_key.get(merged_key or key)
+        if i in todo:
+            why = "graph update" if rec is not None and rec.stale_graph else "Speed Hacks"
+            state = f"**to rebuild** ({why})" if rec is not None else "**to build**"
+        else:
+            state = "built"
         rows.append(f"| {i + 1} | {_span(p.width)} | {_span(p.height)} | {_span(p.batch)} | {_span(p.tokens)} | {state} |")
     rows.append("\n*Ranges show min-max (optimal).*")
     if mode == store.MERGED:
@@ -301,10 +312,10 @@ def _draft_outputs(draft, records, select=None):
 
 
 def _groups() -> dict:
-    groups = {}
+    by_group = {}
     for r in store.records():
-        groups.setdefault(f"{r.arch.label} · {r.meta['gpu_name']}, TensorRT {r.meta['trt']}", []).append(r)
-    return groups
+        by_group.setdefault(r.group, []).append(r)
+    return {f"{rs[-1].arch.label} · {rs[-1].meta['gpu_name']}, TensorRT {rs[-1].meta['trt']}": rs for rs in by_group.values()}
 
 
 def _engines_view(arch) -> str:
@@ -325,8 +336,12 @@ def refresh(draft=None, draft_arch=None, selected=None):
     sd_model, _, arch, records = _current()
     form = [gr.update()] * (len(FIELDS) * 3)
     if arch is not None and (draft is None or draft_arch != arch.id):
+        saved = store.load_draft(arch.id)
         source = records or _stale(arch)
-        draft = [p.to_dict() for p in (store.profiles_of(source) if source else default_profiles(arch.adm_channels))]
+        if saved is not None:
+            draft = [p.to_dict() for p in saved]
+        else:
+            draft = [p.to_dict() for p in (store.profiles_of(source) if source else default_profiles(arch.adm_channels))]
         form = [v for f in FIELDS for v in getattr(default_profiles(arch.adm_channels)[0], f)]
     elif arch is None:
         draft = []
@@ -400,8 +415,19 @@ def _same_as(draft, profile, skip=None):
     return next((i for i, k in enumerate(_keys(draft)) if k == key and i != skip), None)
 
 
-def add_profile(draft, *values):
-    records = _current()[3]
+def _sync_draft(arch, draft_arch, draft, records):
+    if arch is None or arch.id != draft_arch or store.load_draft(arch.id) is None:
+        return
+    todo, extra = _plan(draft, records, store.mode())
+    vae_part = _vae_part(draft) if draft else ""
+    if not draft or (not todo and not extra and not vae_part):
+        store.clear_draft(arch.id)
+    else:
+        store.save_draft(arch.id, [Profile.from_dict(d) for d in draft])
+
+
+def add_profile(draft, draft_arch, *values):
+    _, _, arch, records = _current()
     profile, note = _read_profile(values)
     if profile is None:
         return (draft, *_draft_outputs(draft, records), note)
@@ -409,11 +435,12 @@ def add_profile(draft, *values):
     if same is not None:
         return (draft, *_draft_outputs(draft, records, select=same), f"That's profile #{same + 1} already.")
     draft = list(draft) + [profile.to_dict()]
+    _sync_draft(arch, draft_arch, draft, records)
     return (draft, *_draft_outputs(draft, records, select=len(draft) - 1), note)
 
 
-def save_profile(draft, choice, *values):
-    records = _current()[3]
+def save_profile(draft, draft_arch, choice, *values):
+    _, _, arch, records = _current()
     index = _index(choice)
     profile, note = _read_profile(values)
     if profile is None or index is None or index >= len(draft):
@@ -423,14 +450,17 @@ def save_profile(draft, choice, *values):
         return (draft, *_draft_outputs(draft, records, select=index), f"That's profile #{same + 1} already; #{index + 1} is unchanged.")
     draft = list(draft)
     draft[index] = profile.to_dict()
+    _sync_draft(arch, draft_arch, draft, records)
     return (draft, *_draft_outputs(draft, records, select=index), note)
 
 
-def remove_profile(draft, choice):
+def remove_profile(draft, draft_arch, choice):
+    _, _, arch, records = _current()
     index = _index(choice)
     if index is not None and index < len(draft):
         draft = [d for i, d in enumerate(draft) if i != index]
-    return (draft, *_draft_outputs(draft, _current()[3]), "")
+        _sync_draft(arch, draft_arch, draft, records)
+    return (draft, *_draft_outputs(draft, records), "")
 
 
 def _outcome(arch, todo: int, deleted: int, result, mode) -> str:
@@ -491,8 +521,10 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
 
     from . import export
 
-    export.CANCEL.clear()
+    if not _BUILD_LOCK.acquire(blocking=False):
+        return "### A build is already running\nWait for it to finish or cancel it.", draft
     BUILDING.set()
+    arch = profile_list = None
     try:
         with queue_lock:
             _, patcher, arch, records = _current()
@@ -516,17 +548,31 @@ def build(draft, draft_arch, optimization_level, progress=gr.Progress()):
                         result = export.build(
                             arch, patcher, [(i, profile_list[i]) for i in todo], int(optimization_level), lambda f, t: progress(f, desc=t), mode, profiles=profile_list,
                         )
-                deleted = store.keep_only(arch.id, profile_list, mode) if result["ok"] else 0
+                if result["ok"]:
+                    store.clear_draft(arch.id)
+                    deleted = store.keep_only(arch.id, profile_list, mode)
+                else:
+                    store.save_draft(arch.id, profile_list)
+                    deleted = 0
                 message = _outcome(arch, len(todo), deleted, result, mode)
     except Exception as e:
+        if arch is not None and profile_list:
+            with contextlib.suppress(OSError):
+                store.save_draft(arch.id, profile_list)
         common.logger.error(f"The build failed: {e}", exc_info=True)
         message = f"### The build failed\n`{e}`"
     finally:
         BUILDING.clear()
+        export.CANCEL.clear()
+        _BUILD_LOCK.release()
     return message, draft
 
 
 def _build_started():
+    from . import export
+
+    if not BUILDING.is_set() and not _BUILD_LOCK.locked():
+        export.CANCEL.clear()
     return gr.update(interactive=False), gr.update(visible=True), "", gr.update(interactive=False)
 
 
@@ -545,8 +591,10 @@ def delete_engine(choice, draft, draft_arch):
             group = _groups().get(choice)
             if group:
                 _release_engines()
+                dropped = {r.key for r in group}
+                if not any(r.group == group[0].group for r in store.records() if r.key not in dropped):
+                    vae_mod.delete_for(group[0].meta["arch"]["id"], group[0].meta["gpu"], group[0].meta["trt"])
                 store.delete(group)
-                vae_mod.delete_for(group[0].meta["arch"]["id"], group[0].meta["gpu"], group[0].meta["trt"])
                 common.logger.info(f"Deleted {_n(len(group), 'engine')}: {choice}.")
     return refresh(draft, draft_arch)
 
@@ -664,9 +712,9 @@ def on_ui_tabs():
         mode_confirm.click(choose_mode, [mode_radio, draft, draft_arch], outputs, **quiet)
         mode_radio.change(change_mode, [mode_radio, draft, draft_arch], outputs, **quiet)
         selector.change(select_profile, [draft, selector], [*numbers, save_button, remove_button], **quiet)
-        add_button.click(add_profile, [draft, *numbers], [*draft_outputs, note], **quiet)
-        save_button.click(save_profile, [draft, selector, *numbers], [*draft_outputs, note], **quiet)
-        remove_button.click(remove_profile, [draft, selector], [*draft_outputs, note], **quiet)
+        add_button.click(add_profile, [draft, draft_arch, *numbers], [*draft_outputs, note], **quiet)
+        save_button.click(save_profile, [draft, draft_arch, selector, *numbers], [*draft_outputs, note], **quiet)
+        remove_button.click(remove_profile, [draft, draft_arch, selector], [*draft_outputs, note], **quiet)
         build_button.click(_build_started, None, [build_button, cancel_button, result, mode_radio], queue=False, **quiet).then(
             build, [draft, draft_arch, level], [result, draft]
         ).then(refresh, [draft, draft_arch], outputs, **quiet)

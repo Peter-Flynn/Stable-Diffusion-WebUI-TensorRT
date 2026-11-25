@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import weakref
 from dataclasses import asdict, dataclass
 
@@ -33,7 +34,27 @@ class Arch:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Arch":
-        return cls(**{k: d[k] for k in cls.__dataclass_fields__})
+        if not isinstance(d, dict):
+            raise TypeError("arch must be a dict")
+        id_, family = d["id"], d["family"]
+        if (
+            not isinstance(id_, str)
+            or not id_
+            or id_ in (".", "..")
+            or "/" in id_
+            or "\\" in id_
+            or os.path.basename(id_) != id_
+            or not isinstance(family, str)
+            or not family
+        ):
+            raise ValueError("invalid arch id or family")
+        ints = {}
+        for k, lo in (("in_channels", 1), ("context_dim", 1), ("adm_channels", 0), ("multiple", 1)):
+            v = d[k]
+            if isinstance(v, bool) or not isinstance(v, int) or v < lo:
+                raise ValueError(f"invalid arch field {k}: {v!r}")
+            ints[k] = v
+        return cls(id=id_, family=family, **ints)
 
 
 def loaded_model():
@@ -57,11 +78,18 @@ def _supported(module, patcher):
     if type(module) is not UNetModel or getattr(module, "predict_codebook_ids", False):
         return None
     config = unet_config(patcher)
+    in_ch, ctx = config.get("in_channels"), config.get("context_dim")
     if (
         config.get("dims", 2) != 2
         or config.get("num_classes") not in (None, "sequential")
         or config.get("use_temporal_attention")
         or config.get("use_temporal_resblock")
+        or isinstance(in_ch, bool)
+        or not isinstance(in_ch, int)
+        or in_ch < 1
+        or isinstance(ctx, bool)
+        or not isinstance(ctx, int)
+        or ctx < 1
     ):
         return None
     return config
@@ -86,7 +114,7 @@ def detect(patcher=None):
             id=f"{family.lower()}-{digest[:10]}",
             family=family,
             in_channels=int(config["in_channels"]),
-            context_dim=int(config.get("context_dim") or 0),
+            context_dim=int(config["context_dim"]),
             adm_channels=int(adm),
             multiple=8 * 2 ** (len(config.get("channel_mult", (1, 2, 4, 4))) - 1),  # VAE 8x, then 2x per UNet downsampling
         )

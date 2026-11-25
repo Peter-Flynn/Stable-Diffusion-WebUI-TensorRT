@@ -53,7 +53,7 @@ class TrtModel:
 
     def __init__(self, record: store.Record):
         self.record = record
-        self.owner = f"{record.arch.label} {record.label}"  # key into gpu.py's per-owner accounting: must be unique
+        self.owner = f"{record.arch.label} {record.label} ({record.engine_key})"  # key into gpu.py's per-owner accounting: must be unique
         self.name = f"{record.arch.name} {record.label}"
         self.hacks = record.speed_hacks
         self.model = TensorRTUNet()
@@ -149,7 +149,7 @@ class TrtModel:
                         self.applied = {}
                         plan_seconds = self._load("unet", engine, kept)
                     with gpu.loading(self.owner) as rest:
-                        refit, more, kept = self._load_engines(kept)
+                        refit, more, kept = self._load_engines(kept, retry_oom=not attempt)
                     load["failures"] = load.get("failures", 0) + rest.get("failures", 0)
                     plan_seconds += more
                     break
@@ -178,18 +178,25 @@ class TrtModel:
             if not self.loaded:
                 self.want_shallow = False
 
-    def _load_engines(self, kept) -> tuple:
+    def _load_engines(self, kept, retry_oom: bool = False) -> tuple:
+        from . import engine as engine_mod
+
         plan_seconds = 0.0
         kept = kept if "unet" in self.applied else None
         if self.want_shallow and self.shallow is not None:
+            engine_mod.LOGGER.clear()
+            failures = gpu.failures()
             try:
                 plan_seconds += self._load("shallow", self.shallow, kept)
             except Exception as e:
+                ran_out = isinstance(e, torch.cuda.OutOfMemoryError) or gpu.failures() != failures or engine_mod.LOGGER.out_of_memory
+                if retry_oom and ran_out:
+                    raise
                 notify(f"Couldn't load the Speed Hacks part of the {self.name}, so it runs without Speed Hacks: {e}")
                 self.shallow.unload()
                 self.applied.pop("shallow", None)
                 self.want_shallow, self.shallow_failed = False, True
-        refit = self.sync(quiet=True)
+        refit = self.sync(quiet=True, retry_shallow_oom=retry_oom)
         return refit, plan_seconds, kept
 
     def _discard(self):
@@ -270,7 +277,10 @@ class TrtModel:
                 blob.free()
             raise
         kept = refits.Kept(signatures, blobs, label, self._source())
-        refits.put(key, kept)
+        if not refits.put(key, kept, expected=entry):
+            for blob in made:
+                blob.free()
+            return
         count, total = refits.held()
         logger.info(f"Kept the {label} in RAM ({common.gib(kept.nbytes)}, {time.time() - start:.1f}s); {count} kept in all, {common.gib(total)}.")
 
@@ -304,7 +314,7 @@ class TrtModel:
         try:
             with gpu.loading(self.owner) as load:
                 self._load("shallow", self.shallow, kept)
-                self.sync(quiet=True)
+                self.sync(quiet=True, drop_shallow=False)
         except Exception:
             self.shallow.unload()
             gpu.unloaded(self.owner, load.get("grew", 0))
@@ -334,7 +344,9 @@ class TrtModel:
             logger.info(f"Unloaded the {self.name}.")
         return self.model
 
-    def sync(self, quiet=False):
+    def sync(self, quiet=False, retry_shallow_oom: bool = False, drop_shallow: bool = True):
+        from . import engine as engine_mod
+
         weights = self.weights
         weights.refresh()
         total = None
@@ -349,7 +361,41 @@ class TrtModel:
             self.applied[role] = {}
             refits.drop(self.record.key, role)  # the copy kept in RAM holds the old weights
             torch.cuda.current_stream(self.load_device).synchronize()  # no inference in flight while the weights change
-            seconds = engine.refit(changed, weights.tensor)
+            engine_mod.LOGGER.clear()
+            failures = gpu.failures()
+            try:
+                seconds = engine.refit(changed, weights.tensor)
+            except Exception as e:
+                if role != "shallow" or not drop_shallow:
+                    raise
+                ran_out = isinstance(e, torch.cuda.OutOfMemoryError) or gpu.failures() != failures or engine_mod.LOGGER.out_of_memory
+                if retry_shallow_oom and ran_out:
+                    raise
+                notify(f"Couldn't refit the Speed Hacks part of the {self.name}, so it runs without Speed Hacks: {e}")
+                e.__traceback__ = None
+                if gpu.counting(self.owner):
+                    engine.unload()
+                elif gpu.attached():
+                    before, prev_extra = gpu.ledger(self.owner), engine.extra
+                    engine.unload()
+                    base_freed = max(0, before - gpu.ledger(self.owner) - prev_extra)
+                    if base_freed:
+                        gpu.unloaded(self.owner, base_freed)
+                else:
+                    engine.release_activations()
+                    try:
+                        before = gpu.in_use()
+                    except Exception:
+                        before = None
+                    engine.unload()
+                    if before is not None:
+                        with contextlib.suppress(Exception):
+                            base_freed = max(0, before - gpu.in_use())
+                            if base_freed:
+                                gpu.unloaded(self.owner, base_freed)
+                self.applied.pop("shallow", None)
+                self.want_shallow, self.shallow_failed = False, True
+                continue
             self.applied[role] = wanted
             refit = {"seconds": seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
             total = refit if total is None else {k: total[k] + refit[k] for k in refit}
@@ -383,6 +429,8 @@ def _unload(model: TrtModel, keep: bool = True):
 def end_pass():
     global _pass
     p, _pass = _pass, None
+    _prompt_seen.clear()
+    _prompt_reps.clear()
     if p is not None:
         p.end()
 
@@ -669,7 +717,7 @@ class Pass:
         original = model.apply_model
 
         def apply_model(*args, **kwargs):
-            if self.schedule is not None and not self.schedule.idle and not self.schedule.done:
+            if self.schedule is not None and self.tracker is not None and not self.schedule.idle and not self.schedule.done:
                 with self._speed_hacks():
                     x = args[0] if args else kwargs.get("x")
                     t = args[1] if len(args) > 1 else kwargs.get("t")
@@ -681,19 +729,32 @@ class Pass:
         self._watching = True
 
     @contextlib.contextmanager
-    def _speed_hacks(self):
+    def _speed_hacks(self, rethrow_oom: bool = False):
+        from . import engine as engine_mod
+
         # Speed Hacks' own work: an error in it turns them off for the rest of the pass, and the engine keeps running
+        engine_mod.LOGGER.clear()
+        failures = gpu.failures()
         try:
             yield
         except torch.cuda.OutOfMemoryError:
-            raise
+            if rethrow_oom:
+                raise
+            self.drop_speed_hacks("Speed Hacks ran out of VRAM")
         except Exception as e:
-            self.drop_speed_hacks(f"Speed Hacks failed ({e})", _unexpected(e))
+            if gpu.failures() != failures or engine_mod.LOGGER.out_of_memory:
+                if rethrow_oom:
+                    raise torch.cuda.OutOfMemoryError(str(e)) from None
+                self.drop_speed_hacks("Speed Hacks ran out of VRAM")
+            else:
+                self.drop_speed_hacks(f"Speed Hacks failed ({e})", _unexpected(e))
 
     def drop_speed_hacks(self, reason: str, error: Exception = None):
         notify(f"{reason}, so the rest of this pass runs without them.", error)
         if self.schedule is not None:
             self.schedule.release()
+        if self.tracker is not None:
+            self.tracker.release()
         self.schedule = self.tracker = None
 
     @staticmethod
@@ -715,7 +776,9 @@ class Pass:
             self.model.engine.release_activations()
         if self.schedule is not None:
             self.schedule.release()
-        self.tracker = None
+        if self.tracker is not None:
+            self.tracker.release()
+        self.schedule = self.tracker = None
 
     def _hint_batching(self):
         # reForge decides how many conds to batch into one UNet call from the UNet's memory_required(). Overridden for
@@ -800,24 +863,30 @@ class Pass:
                     slot, deep, origin, stale, kind = self.schedule.call(key)
                     planned_shallow = deep is not None
                     entry = self.tracker.call(feed["sample"], b)
-                    if kind is not None and not self.tracker.valid(stale[1]):
+                    if kind is not None and (not self.tracker.valid(stale[1]) or (entry is not None and not self.tracker.anchored(entry, stale[1]))):
                         stale = kind = None
-                    if deep is not None and not self.tracker.safe(entry, origin):
+                    if deep is not None and not (self.tracker.safe(entry, origin) and (entry is not None or self.schedule.step_known())):
                         # Noise the fit can't remove for this call, or for a call the fit can't follow, noise not yet ruled
                         # out. It runs in full, and a tracked one may also probe (fresh.Tracker.probe) when on the same path.
-                        probe = entry is not None and self.tracker.valid(origin) and self.tracker.probe(self.schedule.index)
-                        stale, kind = ((deep, origin), "probe") if probe else (None, None)
+                        probe = (
+                            entry is not None
+                            and self.tracker.valid(origin)
+                            and self.tracker.anchored(entry, origin)
+                            and self.schedule.can_probe()
+                            and self.tracker.probe(self.schedule.index)
+                        )
+                        stale, kind = ((deep, origin), "retry") if probe else (None, None)
                         deep = origin = None
                         planned_shallow = False
                         self.schedule.ran_full()
                     if deep is not None:
                         self.schedule.compare(slot, key, prompt)
-                    hack = (slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b)
+                    hack = [slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b]
                 if hack is None and planned_shallow and self.started is not None:
                     self.started.ran_full()
         out = self._infer_with_room(feed, profile, stream, hack)
         # A shallow call whose Speed Hacks failed ran on the full engine instead
-        shallow = hack is not None and hack[2] is not None and self.schedule is not None
+        shallow = bool(hack) and hack[2] is not None and self.schedule is not None
         if not shallow and not self.checked:
             self.checked = True
             if not torch.isfinite(out).all():
@@ -832,26 +901,48 @@ class Pass:
         return out[:b].to(x.dtype)
 
     def _infer_with_room(self, feed, profile, stream, hack=None):
+        def clear(error):
+            stack, seen = [error], set()
+            while stack:
+                cur = stack.pop()
+                if id(cur) in seen:
+                    continue
+                seen.add(id(cur))
+                for linked in (cur.__cause__, cur.__context__):
+                    if linked is not None:
+                        stack.append(linked)
+                cur.__traceback__ = cur.__cause__ = cur.__context__ = None
+
         try:
             return self._infer(feed, profile, stream, hack)
-        except torch.cuda.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError as e:
+            clear(e)
             self.model.engine.release_activations()
             common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
             common.mm().soft_empty_cache(force=True)
             try:
-                return self._infer(feed, profile, stream, hack)
-            except torch.cuda.OutOfMemoryError:
+                return self._infer(feed, profile, stream, hack, retry=True)
+            except torch.cuda.OutOfMemoryError as e:
+                clear(e)
+                if hack and hack[2] is not None and self.schedule is not None and self.started is not None:
+                    self.started.ran_full()
+                if hack:
+                    hack.clear()
                 self.fall_back("The engine ran out of VRAM")
 
-    def _infer(self, feed, profile, stream, hack=None):
-        # hack: (slot, Schedule key, deep feature or None, index of the call that computed it, (deep feature, index) to
-        # check or probe this full call against or None, "check"/"probe"/None, fresh.Entry or None, reForge's
-        # cond_or_uncond, rows before padding)
+    def _infer(self, feed, profile, stream, hack=None, retry: bool = False):
+        from . import engine as engine_mod
+
+        # hack: [slot, Schedule key, deep feature or None, index of the call that computed it, (deep feature, index) to
+        # check or probe this full call against or None, "check"/"probe"/"retry"/None, fresh.Entry or None, reForge's
+        # cond_or_uncond, rows before padding]
         slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b = hack or (None,) * 9
+        engine_mod.LOGGER.clear()
+        failures = gpu.failures()
         try:
             if deep is not None and self.schedule is not None:
                 # A shallow call that fails runs in full below
-                with self._speed_hacks():
+                with self._speed_hacks(rethrow_oom=not retry):
                     outputs = self.model.shallow.infer({**feed, "deep": deep, **self.tracker.inputs(entry, origin, feed["sample"])}, profile, stream)
                     if entry is not None:
                         self.tracker.after_shallow(entry, outputs, origin)
@@ -859,6 +950,14 @@ class Pass:
                     return outputs["latent"]
                 if self.started is not None:
                     self.started.ran_full()
+                deep = stale = entry = None
+                if hack is not None:
+                    hack.clear()
+                if retry:
+                    self.model.engine.release_activations()
+                    common.mm().soft_empty_cache(force=True)
+            engine_mod.LOGGER.clear()
+            failures = gpu.failures()
             outputs = self.model.engine.infer(feed, profile, stream)
             out = outputs["latent"]
             if slot is not None and "deep" in outputs and self.schedule is not None:
@@ -870,12 +969,16 @@ class Pass:
                         self.tracker.status(shallow)
                         if kind == "check":
                             self.tracker.add_check(entry, out[:b], shallow["latent"][:b], self.schedule.index - stale[1])
+                        elif kind == "probe":
+                            self.schedule.mark_probed()
                     if entry is not None:
                         self.tracker.after_call(entry, out[:b], cond_or_uncond)
             return out
         except torch.cuda.OutOfMemoryError:
             raise
         except Exception as e:
+            if gpu.failures() != failures or engine_mod.LOGGER.out_of_memory:
+                raise torch.cuda.OutOfMemoryError(str(e)) from None
             self.fall_back(f"The engine failed ({e})", _unexpected(e))
 
 
@@ -899,6 +1002,9 @@ def _engine_records(patcher, x):
     if not profiles.covers_size([s for r in records for s in r.profile_shapes], h, w, b):
         notify(f"No {arch.name} profile covers {w * 8}x{h * 8} at batch size {b}, so this pass runs on PyTorch. Add one in the TensorRT tab.")
         return None, False
+    stale_graph = sum(r.stale_graph for r in records)
+    if stale_graph:
+        notify(f"{stale_graph} of the {arch.name} engines were built with an older UNet graph that can produce artifacts on TensorRT 11. Build again in the TensorRT tab to update them.")
     hacks = chosen == SPEED_HACKS and any(r.speed_hacks for r in records)
     stale = sum(r.stale_speed_hacks for r in records) if chosen == SPEED_HACKS else 0
     failed = sum(not r.speed_hacks for r in records) - stale if chosen == SPEED_HACKS else 0
@@ -925,6 +1031,7 @@ def _begin(records, hacks, patcher, x, prepare):
             _no_free -= 1
             mm.vram_state = prev_state
         p = Pass(records, patcher, x, hacks)
+        record = None
         try:
             b, _, h, w = x.shape
             prefer = p.preferred()
@@ -936,6 +1043,10 @@ def _begin(records, hacks, patcher, x, prepare):
             model = p.use(record)
             _make_room_for_activations(model, patcher, x)
         except Exception as e:
+            if record is not None:
+                failed = _models.get(record.key)
+                if failed is not None and failed.opened and not failed.loaded:
+                    _unload(failed, keep=False)
             notify(f"Couldn't run the engine ({e}), so this pass runs on PyTorch.", _unexpected(e))
             p.end()
             _load_torch_unet(patcher, (x.shape[0] * 2, *x.shape[1:]))
@@ -954,7 +1065,7 @@ def _unexpected(error):  # the error, for its traceback, unless a RuntimeError: 
 def _fits(model: TrtModel, p: Pass, x):
     shallow = bool(model.hacks and p.schedule is not None and not model.shallow_failed)
     calls = max(call_bytes(model, p.patcher, x), model.took.get(tuple(x.shape[i] for i in (0, 2, 3)), 0))
-    held = gpu.held(model.owner)
+    held = model.loaded_size()
     if model.loaded:
         engine = held + (model._serialized_size("shallow") if shallow and not model.shallow_loaded else 0)
     else:
@@ -1119,8 +1230,11 @@ def _wrap_denoiser(original):
         active = _pass
         if active is not None and active.schedule is not None and active.tracker is not None and active.tracker.current is not None:
             try:
+                tiled = active.tracker.current.x is None
                 # Timestep samplers (DDIM, PLMS, UniPC) get eps back
                 checked = active.tracker.finish(denoised, x, sigma, eps=bool(getattr(self, "classic_ddim_eps_estimation", False)))
+                if (active.tracker.measured or (tiled and active.tracker.noisy)) and active.schedule.kind == "probe":
+                    active.schedule.mark_probed()
                 if checked is not None:
                     active.schedule.checked(*checked)
             except Exception as e:
@@ -1217,9 +1331,54 @@ def _rebind(owner, name, wrap):  # also replaces references other modules took w
 _hook_failures = set()  # install_hooks runs every generation: log each failure once
 
 
-# Per CFG denoiser call of a Speed Hacks pass, which scheduled prompt each prompt in the batch uses: ids of the conds
-# reForge's prompt_parser picked (they live as long as the generation), or None where the schedules weren't readable.
+# Per CFG denoiser call of a Speed Hacks pass, which scheduled prompt each prompt in the batch uses. For multi-entry
+# schedules (e.g. [a|b]), reForge slices each step into a fresh dict/tensor view, so equal conds are canonicalized by
+# value to a shared rep id; single-entry schedules take id() directly with no GPU work.
 _prompts = []
+_prompt_seen = {}  # id(cond) -> (cond, rep id), cleared at pass end, capped at 128
+_prompt_reps = []  # [(rep id, cond), ...], capped at 32
+
+
+def _same_cond(a, b) -> bool:
+    if a is b:
+        return True
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_same_cond(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)):
+        return len(a) == len(b) and all(_same_cond(x, y) for x, y in zip(a, b))
+    if isinstance(a, torch.Tensor):
+        return a.shape == b.shape and a.dtype == b.dtype and a.device == b.device and bool(torch.equal(a, b))
+    if hasattr(a, "dtype") and hasattr(a, "shape") and hasattr(a, "tobytes"):
+        if a.shape != b.shape or a.dtype != b.dtype:
+            return False
+        if a.dtype == object:
+            return all(_same_cond(x, y) for x, y in zip(a.flat, b.flat))
+        if getattr(a.dtype, "hasobject", False):
+            return all(_same_cond(tuple(x), tuple(y)) for x, y in zip(a.flat, b.flat))
+        return bool((a == b).all())
+    return bool(a == b)
+
+
+def _cond_key(schedule, step) -> int:
+    if len(schedule) == 1:
+        return id(schedule[0].cond)
+    cond = next((e.cond for e in schedule if step <= e.end_at_step), schedule[0].cond)
+    cid = id(cond)
+    entry = _prompt_seen.get(cid)
+    if entry is not None and entry[0] is cond:
+        return entry[1]
+    for rep_id, rep in _prompt_reps:
+        if _same_cond(cond, rep):
+            if len(_prompt_seen) < 128:
+                _prompt_seen[cid] = (cond, rep_id)
+            return rep_id
+    if len(_prompt_reps) < 32:
+        _prompt_reps.append((cid, cond))
+        if len(_prompt_seen) < 128:
+            _prompt_seen[cid] = (cond, cid)
+    return cid
 
 
 def _note_prompts(schedules_of, step):
@@ -1227,8 +1386,7 @@ def _note_prompts(schedules_of, step):
     if _pass is None or _pass.schedule is None or _pass.schedule.idle or _pass.schedule.done or _pass.fallback is not None:
         return
     try:
-        # prompt_parser's choice: the first schedule entry whose end_at_step the step hasn't passed
-        _prompts.append(tuple(id(next((e.cond for e in s if step <= e.end_at_step), s[0].cond)) for s in schedules_of()))
+        _prompts.append(tuple(_cond_key(s, step) for s in schedules_of()))
     except Exception:
         _prompts.append(None)
 
