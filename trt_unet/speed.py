@@ -84,49 +84,49 @@ def deep_block(unet, branch: int = BRANCH) -> int:
 
 
 def _embedding(unet, x, timesteps, y):
-    from ldm_patched.ldm.modules.diffusionmodules.util import timestep_embedding
+    from . import compat
 
-    emb = unet.time_embed(timestep_embedding(timesteps, unet.model_channels, repeat_only=False).to(x.dtype))
+    emb = unet.time_embed(compat.timestep_embedding(timesteps, unet.model_channels, repeat_only=False).to(x.dtype))
     if unet.num_classes is not None:
         emb = emb + unet.label_emb(y)
     return emb
 
 
-# full_forward and shallow_forward mirror reForge's UNetModel._forward, minus patches and ControlNet (runtime.py sends
+# full_forward and shallow_forward mirror reForge/Neo's UNetModel._forward, minus patches and ControlNet (runtime.py sends
 # those passes to PyTorch). Keep them in sync with it.
 def full_forward(unet, x, timesteps, context, y=None, branch: int = BRANCH):
-    from ldm_patched.ldm.modules.diffusionmodules.openaimodel import forward_timestep_embed
+    from . import compat
 
     options = {"original_shape": list(x.shape), "transformer_index": 0}
     emb = _embedding(unet, x, timesteps, y)
     hs, h = [], x
     for module in unet.input_blocks:
-        h = forward_timestep_embed(module, h, emb, context, options)
+        h = compat.forward_block(module, h, emb, context, options)
         hs.append(h)
     if unet.middle_block is not None:
-        h = forward_timestep_embed(unet.middle_block, h, emb, context, options)
+        h = compat.forward_block(unet.middle_block, h, emb, context, options)
     deep, at = None, deep_block(unet, branch)
     for i, module in enumerate(unet.output_blocks):
         if i == at:
             deep = h
         h = torch.cat([h, hs.pop()], dim=1)
-        h = forward_timestep_embed(module, h, emb, context, options, hs[-1].shape if hs else None)
+        h = compat.forward_block(module, h, emb, context, options, hs[-1].shape if hs else None)
     return unet.out(h.type(x.dtype)), deep
 
 
 def shallow_forward(unet, x, timesteps, context, y, deep, branch: int = BRANCH):
-    from ldm_patched.ldm.modules.diffusionmodules.openaimodel import forward_timestep_embed
+    from . import compat
 
     options = {"original_shape": list(x.shape), "transformer_index": 0}
     emb = _embedding(unet, x, timesteps, y)
     hs, h = [], x
     for module in unet.input_blocks[: branch + 1]:
-        h = forward_timestep_embed(module, h, emb, context, options)
+        h = compat.forward_block(module, h, emb, context, options)
         hs.append(h)
     h = deep
     for module in unet.output_blocks[deep_block(unet, branch):]:
         h = torch.cat([h, hs.pop()], dim=1)
-        h = forward_timestep_embed(module, h, emb, context, options, hs[-1].shape if hs else None)
+        h = compat.forward_block(module, h, emb, context, options, hs[-1].shape if hs else None)
     return unet.out(h.type(x.dtype))
 
 

@@ -20,7 +20,7 @@ import torch
 from modules import sd_unet
 
 from . import arch as arch_mod
-from . import common, fresh, gpu, profiles, refits, speed, store, strips, working
+from . import common, compat, fresh, gpu, profiles, refits, speed, store, strips, working
 from . import vae_run
 from .common import inference_mode, logger, notify
 from .weights import EffectiveWeights
@@ -66,7 +66,10 @@ class _CallTorch(Exception):
 
 
 class TensorRTUNet:
-    pass
+    gguf_baked = True
+
+    def parameters(self):
+        return iter(())
 
 
 class _Shape:
@@ -92,7 +95,7 @@ class DoesNotFit(RuntimeError):
 
 
 class TrtModel:
-    # Implements the parts of ModelPatcher that reForge's LoadedModel calls, so the model manager can hold an engine
+    # Implements the parts of ModelPatcher that reForge/Neo's LoadedModel calls, so the model manager can hold an engine
     # (and its Speed Hacks partner) like any model. Its size is what gpu.py measured once loaded, an estimate before.
     parent = None
     evicted_last = True
@@ -154,11 +157,18 @@ class TrtModel:
     def current_loaded_device(self):
         return self.load_device if self.loaded else self.offload_device
 
+    @property
+    def current_device(self):
+        return self.current_loaded_device()
+
     def model_dtype(self):
         return torch.float16
 
     def model_patches_to(self, *args):
         pass
+
+    def model_patches_models(self):
+        return []
 
     def lowvram_patch_counter(self):
         return 0
@@ -580,10 +590,16 @@ class SpeedHacksOption(sd_unet.SdUnetOption):
         return TrtUnet(self)
 
 
-class TrtUnet(sd_unet.SdUnet):
+class TrtUnet(getattr(sd_unet, "SdUnet", object)):
     def __init__(self, option: SpeedHacksOption):
         super().__init__()
         self.option = option
+
+    def activate(self):
+        pass
+
+    def deactivate(self):
+        pass
 
     def forward(self, *args, **kwargs):
         raise RuntimeError("TensorRT engines run through the UNet's own forward")
@@ -596,24 +612,45 @@ def list_unets(options: list):
     options.append(_SPEED_HACKS_OPTION)
 
 
+_EXTRA_TRANSFORMER_OPTIONS = (
+    "block_modifiers",
+    "block_inner_modifiers",
+    "group_norm_wrapper",
+    "optimized_attention_override",
+)
+
+
 def _unsupported(patcher) -> str:
     if getattr(patcher, "controlnet_linked_list", None) is not None:
         return "ControlNet"
     if getattr(patcher, "extra_concat_condition", None) is not None:
         return "extra input channels (inpainting add-ons)"
-    module = getattr(getattr(patcher, "model", None), "diffusion_model", None)
+    kmodel = getattr(patcher, "model", None)
+    if getattr(kmodel, "_torch_compile_config", None) or getattr(getattr(kmodel, "apply_model", None), "_torch_compile_wrapper", False):
+        return "torch.compile"
+    module = getattr(kmodel, "diffusion_model", None)
     if module is not None:
         paddings = {m.padding_mode for m in module.modules() if isinstance(m, torch.nn.Conv2d) and m.padding_mode != "zeros"}
         if paddings:
             return "tiling (circular padding)" if paddings == {"circular"} else f"non-zero conv padding ({', '.join(sorted(paddings))})"
     options = patcher.model_options.get("transformer_options", {})
     kinds = sorted({k for group in ("patches", "patches_replace") for k, v in options.get(group, {}).items() if v})
+    for extra in _EXTRA_TRANSFORMER_OPTIONS:
+        if options.get(extra):
+            kinds.append(extra)
     if options.get("wrappers", {}).get("diffusion_model"):
         kinds.append("UNet wrappers")
     if any(k.startswith("diffusion_model.") for k in getattr(patcher, "object_patches", {})):
         kinds.append("replaced UNet modules")
-    if any(v for k, v in (getattr(patcher, "weight_wrapper_patches", None) or {}).items() if k.startswith("diffusion_model.")):
-        kinds.append("weight wrappers")
+    wrappers = [
+        w for k, v in (getattr(patcher, "weight_wrapper_patches", None) or {}).items()
+        if k.startswith("diffusion_model.") and v for w in v
+    ]
+    if wrappers:
+        if not all(compat.is_online_lora_patch(w) for w in wrappers):
+            kinds.append("weight wrappers")
+        elif compat.has_scheduled_lora():
+            kinds.append("scheduled LoRAs")
     if getattr(patcher, "hook_patches", None):
         kinds.append("scheduled weights")
     return f"UNet patches ({', '.join(kinds)})" if kinds else ""
@@ -737,6 +774,16 @@ def _wrap_unload_all(original):
 def _load_torch_unet(patcher, shape):
     estimate = patcher.model_options.get("memory_peak_estimation_modifier", patcher.memory_required)
     required = estimate(list(shape)) + getattr(patcher, "extra_preserved_memory_during_sampling", 0)
+    if callable(getattr(patcher, "has_online_lora", None)) and patcher.has_online_lora():
+        try:
+            from backend import utils as neo_utils
+
+            required += neo_utils.nested_compute_size(
+                patcher.weight_wrapper_patches,
+                element_size=neo_utils.dtype_to_element_size(patcher.model.computation_dtype),
+            )
+        except Exception:
+            pass
     with _evictable():
         common.mm().load_models_gpu([patcher], memory_required=required)
 
@@ -756,7 +803,7 @@ class Pass:
         self.schedule = self.tracker = None
         if hacks:
             try:
-                self.tracker = fresh.Tracker(model.model_sampling, common.device(), model.diffusion_model.out_channels)
+                self.tracker = fresh.Tracker(compat.model_sampling(model), common.device(), model.diffusion_model.out_channels)
                 self.schedule = speed.Schedule(*speed_settings())
             except Exception as e:
                 notify(f"Speed Hacks failed ({e}), so this pass runs without them.", e)
@@ -829,7 +876,7 @@ class Pass:
         # Hold references to the UNet's existing CPU weights before partially_load moves them to VRAM so unloading
         # simply restores the CPU pointers (~50ms) instead of copying 4.8 GiB back over PCIe (~3.3s). Skipped on
         # RAM-constrained hosts so we never hold extra RAM pressure when free RAM is tight.
-        # Under NO_VRAM with LoRAs, reForge attaches tiny LowVramPatch hooks (a few KB in loaded_size) while leaving
+        # Under NO_VRAM with LoRAs, reForge/Neo attaches tiny LowVramPatch hooks (a few KB in loaded_size) while leaving
         # every weight parameter on CPU; verify parameters directly instead of requiring loaded_size() == 0.
         if self._torch_snap is not None or self.patcher.loaded_size() > (16 << 20) or getattr(self.patcher, "backup", None):
             return
@@ -838,6 +885,7 @@ class Pass:
             or getattr(self.patcher, "is_injected", False)
             or getattr(self.patcher, "ejected", False)
             or getattr(self.patcher, "weight_wrapper_patches", None)
+            or getattr(self.patcher, "pinned", None)
         ):
             return
         model = getattr(self.patcher, "model", None)
@@ -857,7 +905,7 @@ class Pass:
         for mod in model.modules():
             for name, p in mod._parameters.items():
                 if p is not None:
-                    if p.device != off:
+                    if p.device != off or type(p) is not torch.nn.Parameter or type(p.data) is not torch.Tensor:
                         return
                     params.append((mod, name, p, p.data))
             for name, b in mod._buffers.items():
@@ -866,7 +914,7 @@ class Pass:
             a = {}
             for k in ("weight_function", "bias_function"):
                 a[k] = list(mod.__dict__[k]) if k in mod.__dict__ else _MISSING
-            for k in ("ldm_patched_cast_weights", "prev_ldm_patched_cast_weights", "ldm_patched_patched_weights"):
+            for k in compat.SNAPSHOT_ATTRS:
                 a[k] = mod.__dict__.get(k, _MISSING)
             if a:
                 attrs.append((mod, a))
@@ -874,16 +922,21 @@ class Pass:
             getattr(model, "model_lowvram", True),
             getattr(model, "lowvram_patch_counter", 0),
             getattr(model, "model_loaded_weight_memory", 0),
-            getattr(model, "device", off),
+            model.__dict__.get("device", _MISSING),
             getattr(model, "current_weight_patches_uuid", None),
             getattr(self.patcher, "patches_uuid", None),
+            self.patcher.__dict__.get("current_device", _MISSING),
+            model.__dict__.get("model_offload_buffer_memory", _MISSING),
         )
         self._torch_snap = (params, bufs, attrs, state)
 
     def _restore_torch_snap(self, snap):
         params, bufs, attrs, state = snap
         with torch.inference_mode():
-            self.patcher.unpatch_hooks()
+            if hasattr(self.patcher, "unpatch_hooks"):
+                self.patcher.unpatch_hooks()
+            if hasattr(self.patcher, "unpin_all_weights"):
+                self.patcher.unpin_all_weights()
             self.patcher.backup.clear()
             for mod, name, p, cpu_data in params:
                 p.data = cpu_data
@@ -899,24 +952,33 @@ class Pass:
                     else:
                         mod.__dict__[k] = v
             m = self.patcher.model
-            m.model_lowvram, m.lowvram_patch_counter, m.model_loaded_weight_memory, m.device, m.current_weight_patches_uuid, _ = state
+            m.model_lowvram, m.lowvram_patch_counter, m.model_loaded_weight_memory, m_dev, m.current_weight_patches_uuid, _, p_dev, offload_buf = state
+            if m_dev is _MISSING:
+                m.__dict__.pop("device", None)
+            else:
+                m.device = m_dev
+            if p_dev is not _MISSING:
+                self.patcher.current_device = p_dev
+            if offload_buf is not _MISSING:
+                m.model_offload_buffer_memory = offload_buf
 
     def _fast_load_torch_unet(self, dev: torch.device):
         # Streams CPU UNet parameters into <=64 MiB GPU slabs (ordered by ModelPatcher._load_list() so partially_unload
         # releases them incrementally) via double-buffered pinned DMA and merges standard LoRAs in-place on GPU, so
-        # reForge's partially_load() only performs bookkeeping instead of 1,680 pageable copies.
+        # reForge/Neo's partially_load() only performs bookkeeping instead of 1,680 pageable copies.
         if self._torch_snap is None or dev.type != "cuda":
             return
-        if getattr(common.mm(), "PIN_SHARED_MEMORY", False):
+        if compat.pin_shared_memory(common.mm()):
             return
-        load_list_fn = getattr(self.patcher, "_load_list", None)
-        if not callable(load_list_fn):
+        entries = compat.load_list_entries(self.patcher)
+        if entries is None:
             return
         model = self.patcher.model
         off = torch.device(self.patcher.offload_device)
         if off.type != "cpu":
             return
         patches = getattr(self.patcher, "patches", None) or {}
+        wwp = getattr(self.patcher, "weight_wrapper_patches", None) or {}
         self.weights.refresh()
         use_lora = (
             bool(patches)
@@ -941,7 +1003,7 @@ class Pass:
         lora_mods = []
         seen_p = set()
 
-        for _, prefix, mod, param_names in sorted(load_list_fn()):
+        for prefix, mod, param_names in entries:
             mod_patched = []
             mod_direct = []
             for name in param_names:
@@ -964,17 +1026,18 @@ class Pass:
                     d = p.data
                     nb = d.numel() * d.element_size()
                     mod_direct.append((p, d, nb, align256(nb)))
-            # Patched modules without ldm_patched_cast_weights are skipped by ModelPatcher.partially_unload(); leave the
-            # whole module to reForge so it can never pin a shared slab.
-            if mod_patched and not hasattr(mod, "ldm_patched_cast_weights"):
+            # Patched modules without cast_weights/parameters_manual_cast are skipped by ModelPatcher.partially_unload();
+            # leave the whole module to reForge/Neo so it can never pin a shared slab.
+            if mod_patched and not compat.has_cast_weights(mod):
                 continue
             mod_lora = []
-            if mod_patched and use_lora and not getattr(mod, "ldm_patched_patched_weights", False):
+            if mod_patched and use_lora and not compat.is_patched_weights(mod):
                 cand = []
                 ok_mod = True
                 for name, full_key, p in mod_patched:
                     if (
                         not full_key.startswith(prefix_dm)
+                        or full_key in wwp
                         or p.device != off
                         or param_refs[id(p)] != 1
                         or type(p.data) is not torch.Tensor
@@ -1164,7 +1227,7 @@ class Pass:
                 compute_stream.synchronize()
                 synced = True
                 for mod in lora_mods:
-                    mod.ldm_patched_patched_weights = True
+                    compat.mark_patched_weights(mod)
                 self._torch_fast_loaded = True
         except BaseException as e:
             failed = True
@@ -1196,12 +1259,19 @@ class Pass:
             return
         self._torch_partial = False
         base_loaded = snap[3][2] if snap is not None else 0
-        if not force and not fast_loaded and self.patcher.loaded_size() <= base_loaded:
+        cur_uuid = getattr(self.patcher.model, "current_weight_patches_uuid", None)
+        ext_unloaded = (
+            snap is not None
+            and cur_uuid != snap[3][4]
+            and self.patcher.loaded_size() <= base_loaded
+            and not _loaded_entries(self.patcher)
+        )
+        if not force and (ext_unloaded or (not fast_loaded and self.patcher.loaded_size() <= base_loaded)):
             self.weights.refresh()
             return
         restored = False
         if snap is not None and (force or fast_loaded or bool(_loaded_entries(self.patcher))):
-            if getattr(self.patcher, "patches_uuid", None) == snap[3][5]:
+            if getattr(self.patcher, "patches_uuid", None) == snap[3][5] and (force or cur_uuid == snap[3][4]):
                 try:
                     dev = common.device()
                     if dev.type == "cuda":
@@ -1703,13 +1773,22 @@ class Pass:
             self.weights.params.clear()
 
     def _hint_batching(self):
-        # reForge decides how many conds to batch into one UNet call from the UNet's memory_required(). Overridden for
+        # reForge/Neo decides how many conds to batch into one UNet call from the UNet's memory_required(). Overridden for
         # the pass: 0 for any batch some profile runs while TensorRT is active (the engine's memory is already
         # allocated), the model's real estimate while paused in _torch_mode, and infinite whenever no profile covers
-        # the combined batch/context so reForge splits it into profile-compatible calls (allowing TensorRT to resume).
+        # the combined batch/context so the sampler splits it into profile-compatible calls (allowing TensorRT to resume).
         shapes = self.shapes
         model = self.patcher.model
         base_fn = getattr(type(model), "memory_required", None)
+        base_takes_cond = False
+        if callable(base_fn):
+            try:
+                params = list(inspect.signature(base_fn).parameters.values())
+                base_takes_cond = len(params) >= 3 or any(
+                    p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD) for p in params
+                )
+            except (TypeError, ValueError):
+                base_takes_cond = False
 
         def memory_required(input_shape, cond_shapes={}):
             b, _, h, w = input_shape[:4]
@@ -1718,7 +1797,7 @@ class Pass:
             if profiles.select(shapes, b, h, w, context) is None:
                 return float("inf")
             if self._torch_mode and callable(base_fn):
-                return base_fn(model, input_shape, cond_shapes)
+                return base_fn(model, input_shape, cond_shapes) if base_takes_cond else base_fn(model, input_shape)
             return 0
 
         model.memory_required = memory_required
@@ -2251,6 +2330,8 @@ def _wrap_forward(original):
                     p.fall_back("TensorRT engines can't apply ControlNet")
                 if any(v for g in ("patches", "patches_replace") for v in transformer_options.get(g, {}).values()):
                     p.fall_back("TensorRT engines can't apply UNet patches")
+                if any(transformer_options.get(k) for k in _EXTRA_TRANSFORMER_OPTIONS):
+                    p.fall_back("TensorRT engines can't apply UNet patches")
                 if (transformer_options.get("wrappers") or {}).get("diffusion_model"):
                     p.fall_back("TensorRT engines can't apply UNet wrappers")
                 return p.run(x, timesteps, context, y, transformer_options.get("cond_or_uncond"))
@@ -2336,7 +2417,7 @@ def _wrap_cleanup(original):
 
 
 def _wrap_close(original):
-    # reForge closes the processing object however a generation ended. One that failed mid-pass never reached
+    # reForge/Neo closes the processing object however a generation ended. One that failed mid-pass never reached
     # sampling_cleanup, and its pass would keep the engine and UNet unevictable until the next generation.
     def close(self, *args, **kwargs):
         end_pass()
@@ -2422,9 +2503,10 @@ def _wrap_get_sigmas(original):
 
 
 def _wrap_vae_decode(original):
-    def decode(self, samples_in, vae_options={}):
-        # Only on the generation's thread: reForge's progress endpoint decodes "Full" live previews on another thread
-        # while this one is sampling on the UNet engine.
+    def decode(self, samples_in, *args, **kwargs):
+        # Only on the generation's thread: reForge/Neo's progress endpoint decodes "Full" live previews on another
+        # thread while this one is sampling on the UNet engine.
+        vae_options = args[0] if args else kwargs.get("vae_options")
         if not vae_options and setting() in (AUTOMATIC, SPEED_HACKS) and threading.get_ident() == _generation_thread:
             try:
                 pixels = vae_run.decode(self, samples_in)
@@ -2432,7 +2514,7 @@ def _wrap_vae_decode(original):
                     return pixels
             except Exception as e:
                 notify(f"The VAE decoder engines failed ({e}), so this decode runs on PyTorch.", e)
-        return original(self, samples_in, vae_options)
+        return original(self, samples_in, *args, **kwargs)
 
     decode._trt_original = original
     return decode
@@ -2451,6 +2533,17 @@ def _wrap_vae_encode(original):
 
     encode._trt_original = original
     return encode
+
+
+def _wrap_vae_reload(original):
+    def wrapped(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        finally:
+            vae_run.invalidate_weights()
+
+    wrapped._trt_original = original
+    return wrapped
 
 
 _installed = set()  # (owner, name) hooks already installed, so another extension wrapping on top doesn't cause double-wrapping
@@ -2613,38 +2706,45 @@ def _hook_failed(message: str):
 
 
 def install_hooks():
-    from ldm_patched.ldm.modules.diffusionmodules import openaimodel
     from modules import processing
-    from modules_forge import forge_sampler
 
-    _hook(openaimodel.UNetModel, "forward", _wrap_forward)
+    sampler_mod = compat.sampling_module()
+    _hook(compat.unet_class(), "forward", _wrap_forward)
     _hook(processing.StableDiffusionProcessing, "close", _wrap_close)
-    _rebind(forge_sampler, "sampling_prepare", _wrap_prepare)
-    _rebind(forge_sampler, "sampling_cleanup", _wrap_cleanup)
+    _rebind(sampler_mod, "sampling_prepare", _wrap_prepare)
+    _rebind(sampler_mod, "sampling_cleanup", _wrap_cleanup)
     _rebind(common.mm(), "free_memory", _wrap_free_memory)
     _rebind(common.mm(), "get_free_memory", _wrap_get_free_memory)
     _rebind(common.mm(), "unload_all_models", _wrap_unload_all)
-    try:
-        from ldm_patched.modules import ops as ldm_ops
+    if not compat.is_neo():
+        try:
+            from ldm_patched.modules import ops as ldm_ops
 
-        if _needs_async_offload_fix(ldm_ops, common.mm()):
-            _rebind(ldm_ops, "cast_bias_weight", _wrap_cast_bias_weight)
-            logger.debug("Applied record_stream workaround for reForge's --async-offload cast_bias_weight.")
-    except Exception as e:
-        logger.debug(f"Couldn't check reForge's cast_bias_weight for --async-offload workaround: {e}")
+            if _needs_async_offload_fix(ldm_ops, common.mm()):
+                _rebind(ldm_ops, "cast_bias_weight", _wrap_cast_bias_weight)
+                logger.debug("Applied record_stream workaround for reForge's --async-offload cast_bias_weight.")
+        except Exception as e:
+            logger.debug(f"Couldn't check reForge's cast_bias_weight for --async-offload workaround: {e}")
     try:
-        from ldm_patched.modules import sd as ldm_sd
-
-        _hook(ldm_sd.VAE, "decode", _wrap_vae_decode)
-        _hook(ldm_sd.VAE, "encode", _wrap_vae_encode)
+        vae_cls = compat.vae_class()
+        _hook(vae_cls, "decode", _wrap_vae_decode)
+        _hook(vae_cls, "encode", _wrap_vae_encode)
     except Exception as e:
-        _hook_failed(f"Couldn't hook reForge's VAE, so it always runs on PyTorch: {e}")
+        _hook_failed(f"Couldn't hook the WebUI's VAE, so it always runs on PyTorch: {e}")
+    try:
+        from modules import sd_vae
+
+        for fn_name in ("reload_vae_weights", "restore_vae_weights"):
+            if callable(getattr(sd_vae, fn_name, None)):
+                _rebind(sd_vae, fn_name, _wrap_vae_reload)
+    except Exception as e:
+        logger.debug(f"Couldn't hook sd_vae reload helpers: {e}")
     try:
         from modules import sd_samplers_cfg_denoiser
 
         _hook(sd_samplers_cfg_denoiser.CFGDenoiser, "forward", _wrap_denoiser)
     except Exception as e:
-        _hook_failed(f"Couldn't hook reForge's CFG denoiser, so Speed Hacks never skip a step: {e}")
+        _hook_failed(f"Couldn't hook the WebUI's CFG denoiser, so Speed Hacks never skip a step: {e}")
     try:
         from modules import sd_samplers_kdiffusion
 
@@ -2656,14 +2756,14 @@ def install_hooks():
             if "get_sigmas" in cls.__dict__:
                 _hook(cls, "get_sigmas", _wrap_get_sigmas)
     except Exception as e:
-        _hook_failed(f"Couldn't hook reForge's sampler schedules, so Speed Hacks place their start and end shares by call count: {e}")
+        _hook_failed(f"Couldn't hook the WebUI's sampler schedules, so Speed Hacks place their start and end shares by call count: {e}")
     try:
         from modules import prompt_parser
 
         _rebind(prompt_parser, "reconstruct_cond_batch", _wrap_reconstruct_cond_batch)
         _rebind(prompt_parser, "reconstruct_multicond_batch", _wrap_reconstruct_multicond_batch)
     except Exception as e:
-        _hook_failed(f"Couldn't hook reForge's prompt schedules, so Speed Hacks see prompt edits a call late: {e}")
+        _hook_failed(f"Couldn't hook the WebUI's prompt schedules, so Speed Hacks see prompt edits a call late: {e}")
 
 
 def new_batch():  # each batch starts on the engine that fits it best, not the one the last batch ended on

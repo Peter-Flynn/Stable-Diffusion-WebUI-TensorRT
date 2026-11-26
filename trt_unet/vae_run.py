@@ -15,7 +15,7 @@ import traceback
 
 import torch
 
-from . import common, gpu, store, strips
+from . import common, compat, gpu, store, strips
 from .common import logger, notify
 from .vae import (
     ENCODE_POST, ENCODE_PRE, ENCODER, EXPONENT, EXPONENT_MAX, EXPONENT_STEP, POST, PRE, Record, dtype_name, encoder_digest,
@@ -25,7 +25,10 @@ from .vae import (
 
 
 class TensorRTVAE:
-    pass
+    gguf_baked = True
+
+    def parameters(self):
+        return iter(())
 
 
 class _Side:
@@ -242,11 +245,18 @@ class VaeModel:
     def current_loaded_device(self):
         return self.load_device if self.active else self.offload_device
 
+    @property
+    def current_device(self):
+        return self.current_loaded_device()
+
     def model_dtype(self):
         return self.record.dtype
 
     def model_patches_to(self, *args):
         pass
+
+    def model_patches_models(self):
+        return []
 
     def lowvram_patch_counter(self):
         return 0
@@ -370,6 +380,10 @@ class _BesideNoRoom(Exception):
 
 
 _weights_keys = {}
+
+
+def invalidate_weights():
+    _weights_keys.clear()
 
 
 def _key(vae, encoder: bool = False) -> str:
@@ -997,8 +1011,6 @@ def _bmm_attention(q, k, v):
 
 
 def _attention(model: VaeModel, vae, q, k, v, encoding: bool = False):
-    fsm = vae.first_stage_model
-    attention = (fsm.encoder if encoding else fsm.decoder).mid.attn_1.optimized_attention
     key = (encoding, q.shape[0], q.shape[2], q.shape[3])
     use_bmm = (
         q.is_cuda and q.dtype in (torch.bfloat16, torch.float16) and k.dtype == q.dtype and v.dtype == q.dtype
@@ -1008,7 +1020,7 @@ def _attention(model: VaeModel, vae, q, k, v, encoding: bool = False):
         if use_bmm:
             out = _bmm_attention(q, k, v)
         else:
-            out = attention(q, k, v)
+            out = compat.vae_attention(vae.first_stage_model, encoding)(q, k, v)
     work = max(0, peak.held - out.numel() * out.element_size())
     if work > model.attention.get(key, 0):
         model.attention[key] = work
@@ -1019,7 +1031,7 @@ def _attention(model: VaeModel, vae, q, k, v, encoding: bool = False):
 def _finish_output(vae, image, device):
     out_dev = torch.device(vae.output_device)
     if out_dev.type == "cuda":
-        return vae.process_output(image.to(out_dev).float())
+        return vae.process_output(image.to(device=out_dev, dtype=torch.float32, copy=image.device == out_dev and image.dtype == torch.float32))
     if image.is_cuda and image.dtype != torch.float32:
         # image.float(), process_output intermediate, and clamped output can coexist (~3x FP32 image bytes).
         need = image.numel() * 12 + (128 << 20)
@@ -1028,7 +1040,7 @@ def _finish_output(vae, image, device):
                 return vae.process_output(image.float()).to(out_dev)
             except torch.cuda.OutOfMemoryError:
                 pass
-    return vae.process_output(image.to(out_dev).float())
+    return vae.process_output(image.to(device=out_dev, dtype=torch.float32, copy=image.device == out_dev and image.dtype == torch.float32))
 
 
 def _run(model: VaeModel, vae, samples_in, n: int):
@@ -1039,7 +1051,7 @@ def _run(model: VaeModel, vae, samples_in, n: int):
     b = samples_in.shape[0]
     pixels = None
     for start in range(0, b, n):
-        z = vae._to_vae_latent(samples_in[start:start + n])
+        z = compat.vae_to_latent(vae, samples_in[start:start + n])
         z = (z.to(device=device, dtype=torch.float32) * wscale).to(dtype) if wscale != 1.0 else z.to(device=device, dtype=dtype)
         mid = pre.infer({"latent": z}, 0, stream)
         del z
@@ -1090,7 +1102,7 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
             model.release()
             if common.pooled() and common.free(device, trim=False) < before:
                 common.trim()
-        z = vae._to_vae_latent(samples_in[i:i + 1])
+        z = compat.vae_to_latent(vae, samples_in[i:i + 1])
         z = (z.to(device=device, dtype=torch.float32) * wscale).to(dtype) if wscale != 1.0 else z.to(device=device, dtype=dtype)
         mid = side.engine(PRE).infer({"latent": z}, 0, stream)
         del z
@@ -1143,7 +1155,7 @@ def encode(vae, pixel_samples):
     record = record_for(arch.id, vae) if arch is not None else None
     if record is None or record.encoder is None:
         return None
-    pixels = vae.vae_encode_crop_pixels(pixel_samples).movedim(-1, 1)
+    pixels = compat.vae_crop_pixels(vae, pixel_samples).movedim(-1, 1)
     b, c, h, w = pixels.shape
     if not record.has_encoder(encoder_digest(vae), c):
         return None
@@ -1233,7 +1245,7 @@ def _encode(model: VaeModel, vae, pixels, whole: bool, found, retry_whole: bool 
                             if latent is None:
                                 return None
                             out = latent.to(vae.output_device).float()
-                            out = vae._from_vae_latent(out)
+                            out = compat.vae_from_latent(vae, out)
                             del latent
                             if at == 0 and n >= b:
                                 samples = out
@@ -1386,8 +1398,8 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
         if not torch.isfinite(moments).all():
             notify(f"The VAE encoder engines produced NaN/Inf values in {_whole_label(record)}, so this encode runs on PyTorch.")
             return None, ""
-        out = fsm.regularization(moments.float())[0].to(vae.output_device).float()
-        out = vae._from_vae_latent(out)
+        out = compat.vae_regularize(fsm, moments).to(vae.output_device).float()
+        out = compat.vae_from_latent(vae, out)
         del moments
         if b == 1:
             return out, report
@@ -1415,7 +1427,7 @@ def _encode_images(model: VaeModel, vae, image):
             raise _WholeOverflow()
         notify(f"The VAE encoder engines produced NaN/Inf values in {label(record.meta['dtype'])}, so this encode runs on PyTorch.")
         return None
-    return vae.first_stage_model.regularization(moments.float())[0]
+    return compat.vae_regularize(vae.first_stage_model, moments)
 
 
 def _strips_report(plan, held: int, need: int) -> str:

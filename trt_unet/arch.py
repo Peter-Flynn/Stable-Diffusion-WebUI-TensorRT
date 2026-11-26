@@ -4,10 +4,15 @@ import os
 import weakref
 from dataclasses import asdict, dataclass
 
+from . import compat
+
 _IGNORED_CONFIG = {"dtype", "device", "operations", "disable_unet_model_creation"}
-# Left out of the architecture hash: scaled-FP8 checkpoints carry these per-layer scales, which weights.py folds
-# into the weights before refitting, so those checkpoints share engines with unscaled ones.
-_IGNORED_WEIGHTS = (".scale_weight", ".scale_input")
+# Left out of the architecture hash: scaled-FP8 / MixedPrecisionOps checkpoints carry these per-layer quantization
+# metadata keys, which weights.py dequantizes/folds before refitting, so quantized checkpoints share engines with FP16.
+_IGNORED_WEIGHTS = (
+    ".scale_weight", ".scale_input", ".weight_scale", ".weight_scale_2",
+    ".comfy_quant", ".input_scale", ".pre_quant_scale", ".weight_s_rel", ".weight_s_channel", ".weight_codebook",
+)
 NAMES = {"SD15": "SD 1.5", "SD20": "SD 2.x", "SDXL": "SDXL", "SDXLRefiner": "SDXL Refiner", "SSD1B": "SSD-1B"}
 _cache = {}
 
@@ -60,7 +65,8 @@ class Arch:
 def loaded_model():
     from modules import sd_models
 
-    return getattr(getattr(sd_models, "model_data", None), "sd_model", None)
+    sd_model = getattr(getattr(sd_models, "model_data", None), "sd_model", None)
+    return sd_model if compat.is_loaded_sd_model(sd_model) else None
 
 
 def unet_patcher(sd_model=None):
@@ -69,13 +75,18 @@ def unet_patcher(sd_model=None):
 
 
 def unet_config(patcher) -> dict:
-    return {k: v for k, v in patcher.model.model_config.unet_config.items() if k not in _IGNORED_CONFIG}
+    mc = compat.model_config(patcher)
+    return {k: v for k, v in mc.unet_config.items() if k not in _IGNORED_CONFIG}
 
 
 def _supported(module, patcher):
-    from ldm_patched.ldm.modules.diffusionmodules.openaimodel import UNetModel
-
-    if type(module) is not UNetModel or getattr(module, "predict_codebook_ids", False):
+    if type(module) is not compat.unet_class() or getattr(module, "predict_codebook_ids", False):
+        return None
+    mc = compat.model_config(patcher)
+    if mc is None or not hasattr(mc, "unet_config"):
+        return None
+    # Profiles and runtime assume an 8x latent-to-pixel VAE ratio (SD 1.5/2.x/SDXL); reject 16x models like Mugen.
+    if getattr(getattr(mc, "latent_format", None), "spacial_downscale_ratio", 8) != 8:
         return None
     config = unet_config(patcher)
     in_ch, ctx = config.get("in_channels"), config.get("context_dim")
@@ -106,8 +117,10 @@ def detect(patcher=None):
     arch = None
     config = _supported(module, patcher)
     if config is not None:
-        shapes = sorted((k, list(v.shape)) for k, v in module.state_dict(keep_vars=True).items() if not k.endswith(_IGNORED_WEIGHTS))
-        family = type(patcher.model.model_config).__name__
+        # Overlay named_parameters() on state_dict() so QuantizedTensor / ParameterGGUF report their logical shapes.
+        sd = {**module.state_dict(keep_vars=True), **dict(module.named_parameters())}
+        shapes = sorted((k, list(v.shape)) for k, v in sd.items() if not k.endswith(_IGNORED_WEIGHTS))
+        family = type(compat.model_config(patcher)).__name__
         digest = hashlib.sha256(json.dumps([sorted((k, repr(v)) for k, v in config.items()), shapes]).encode()).hexdigest()
         adm = (config.get("adm_in_channels") or 0) if config.get("num_classes") == "sequential" else 0
         arch = Arch(

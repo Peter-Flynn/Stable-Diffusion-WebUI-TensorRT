@@ -10,7 +10,7 @@ from modules.ui_common import refresh_symbol
 from modules.ui_components import ToolButton
 
 from . import arch as arch_mod
-from . import common, store
+from . import common, compat, store
 from . import vae as vae_mod
 from .profiles import FIELDS, PRESETS, Profile, default_profiles, presets_for
 
@@ -164,17 +164,47 @@ def _plan(draft, records, mode):
     return todo, sum(1 for r in records if r.engine_key not in wanted)
 
 
+def _pending_neo_checkpoint():
+    # Forge Neo updates forge_loading_parameters when a checkpoint is picked, but defers forge_model_reload() until
+    # the next generation. Detect when a checkpoint is selected in Neo's dropdown yet not loaded (or changed).
+    if not compat.is_neo():
+        return None
+    try:
+        from modules import sd_models
+
+        md = getattr(sd_models, "model_data", None)
+        params = getattr(md, "forge_loading_parameters", None) or {}
+        info = params.get("checkpoint_info")
+        if info is None or not callable(getattr(sd_models, "forge_model_reload", None)):
+            return None
+        if not compat.is_loaded_sd_model(getattr(md, "sd_model", None)) or getattr(md, "forge_hash", "") != str(params):
+            return info
+    except Exception:
+        pass
+    return None
+
+
 def _status(sd_model, arch, records, asking=False) -> str:
     try:
         version = common.trt_version()
     except Exception as e:
         return f"### TensorRT isn't available\n`{e}`\n\nRestart the WebUI: the extension installs or updates it."
-    if sd_model is None:
+    pending = _pending_neo_checkpoint()
+    if not compat.is_loaded_sd_model(sd_model):
+        if pending is not None:
+            return f"Checkpoint `{pending.model_name}` is selected, but Forge Neo hasn't loaded it yet. Click **Load selected checkpoint** (or generate an image first), then build engines."
         return "No checkpoint is loaded. Load one, then refresh this tab."
     name = sd_model.sd_checkpoint_info.model_name
+    pending_note = (
+        f"*Selected checkpoint `{pending.model_name}` isn't loaded yet — click **Load selected checkpoint** to switch before building.*"
+        if pending is not None else ""
+    )
     if arch is None:
-        return f"`{name}` isn't a model TensorRT engines can run (SD 1.x, SD 2.x and SDXL architectures are supported)."
+        base = f"`{name}` isn't a model TensorRT engines can run (SD 1.x, SD 2.x and SDXL architectures are supported)."
+        return f"{base}\n\n{pending_note}" if pending_note else base
     lines = [f"**Checkpoint:** `{name}` · **Architecture:** {arch.label} · **TensorRT** {version}"]
+    if pending_note:
+        lines.append(pending_note)
     if not records:
         stale = _stale(arch)
         if stale:
@@ -347,6 +377,7 @@ def refresh(draft=None, draft_arch=None, selected=None):
         draft = []
     engines = list(_groups())
     mode_outputs = _mode_outputs(selected)
+    pending = _pending_neo_checkpoint()
     return (
         _status(sd_model, arch, records, asking=not SETTLED.is_set()),
         arch.id if arch else None,
@@ -359,7 +390,23 @@ def refresh(draft=None, draft_arch=None, selected=None):
         gr.update(visible=bool(engines)),
         gr.update(visible=BUILDING.is_set()),
         *mode_outputs,
+        gr.update(visible=pending is not None and not BUILDING.is_set()),
     )
+
+
+def load_checkpoint(draft=None, draft_arch=None):
+    if compat.is_neo() and not BUILDING.is_set():
+        from modules import sd_models
+        from modules.call_queue import queue_lock
+
+        reload_fn = getattr(sd_models, "forge_model_reload", None)
+        if callable(reload_fn):
+            try:
+                with queue_lock:
+                    reload_fn()
+            except Exception as e:
+                common.notify(f"Couldn't load the selected checkpoint: {e}", e)
+    return refresh(draft, draft_arch)
 
 
 def choose_mode(label, draft, draft_arch):
@@ -657,6 +704,7 @@ def on_ui_tabs():
     with gr.Blocks(analytics_enabled=False) as tab:
         with gr.Row(equal_height=False):
             status = gr.Markdown(elem_id="trt_status")
+            load_button = gr.Button("Load selected checkpoint", size="sm", visible=False, elem_id="trt_load_checkpoint")
             refresh_button = ToolButton(value=refresh_symbol, elem_id="trt_refresh")
         draft, draft_arch = gr.State([]), gr.State(None)
         with gr.Column(variant="panel", elem_id="trt_mode"):
@@ -697,9 +745,11 @@ def on_ui_tabs():
                 delete_button = gr.Button("Delete engines", variant="stop", size="sm", visible=False, elem_id="trt_delete")
                 with gr.Accordion("How it works", open=False):
                     gr.Markdown(HELP)
+        for dynamic in (mode_radio, selector, preset, engine_choice):
+            dynamic.do_not_save_to_config = True
         draft_outputs = [draft, table, selector, build_button]
         mode_outputs = [mode_title, mode_radio, mode_help, mode_confirm, main]
-        outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, cancel_button, *mode_outputs]
+        outputs = [status, draft_arch, *draft_outputs, *numbers, preset, engines, engine_choice, delete_button, cancel_button, *mode_outputs, load_button]
         # Outputs null to the preset menu last, emptying it, so picking the same preset again still fires .change.
         preset.change(
             None, [preset, *numbers], [*numbers, preset],
@@ -708,6 +758,7 @@ def on_ui_tabs():
         quiet = {"show_progress": "hidden"}
         # javascript/tensorrt.js clicks this button whenever the tab is opened: the loaded checkpoint may have changed.
         refresh_button.click(refresh, [draft, draft_arch], outputs, **quiet)
+        load_button.click(load_checkpoint, [draft, draft_arch], outputs)
         tab.load(refresh, None, outputs, **quiet)
         mode_confirm.click(choose_mode, [mode_radio, draft, draft_arch], outputs, **quiet)
         mode_radio.change(change_mode, [mode_radio, draft, draft_arch], outputs, **quiet)

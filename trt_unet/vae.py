@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from . import common, store, strips
+from . import common, compat, store, strips
 
 PRE, POST = "pre", "post"
 ENCODE_PRE, ENCODE_POST = "encode-pre", "encode-post"
@@ -53,7 +53,14 @@ def unsupported(vae) -> str:
     decoder = getattr(fsm, "decoder", None)
     if decoder is None or type(decoder).__name__ != "Decoder":
         return "not an SD or SDXL VAE"
-    if getattr(vae, "latent_dim", 2) != 2 or getattr(vae, "upscale_ratio", 8) != 8 or getattr(vae, "extra_1d_channel", None) is not None:
+    if type(fsm).__name__ == "AutoencoderKLFlux2" or hasattr(fsm, "bn"):
+        return "packed latents"
+    if (
+        getattr(vae, "latent_dim", 2) != 2
+        or getattr(vae, "upscale_ratio", 8) != 8
+        or getattr(vae, "downscale_ratio", 8) != 8
+        or getattr(vae, "extra_1d_channel", None) is not None
+    ):
         return "not an image VAE with 8x upscaling"
     if getattr(vae, "packed_latent_channels", None) is not None or getattr(vae, "latent_bn_running_mean", None) is not None:
         return "packed latents"
@@ -94,7 +101,12 @@ def is_encoder_weight(name: str) -> bool:
     return name.startswith("encoder.") or name.startswith("quant_conv.")
 
 
-_ENCODES = {"AutoencodingEngine.encode": False, "AutoencodingEngineLegacy.encode": True}  # reForge encode -> applies quant_conv
+# reForge/Neo encode -> applies quant_conv (None = applies quant_conv when present on IntegratedAutoencoderKL)
+_ENCODES = {
+    "AutoencodingEngine.encode": False,
+    "AutoencodingEngineLegacy.encode": True,
+    "IntegratedAutoencoderKL.encode": None,
+}
 
 
 def encoder_unsupported(vae) -> str:
@@ -103,9 +115,13 @@ def encoder_unsupported(vae) -> str:
     if encoder is None or type(encoder).__name__ != "Encoder":
         return "not an SD or SDXL VAE's encoder"
     how = getattr(getattr(type(fsm), "encode", None), "__qualname__", "")
-    if how not in _ENCODES or not callable(getattr(fsm, "regularization", None)):
+    if how not in _ENCODES:
         return "a first stage model that encodes its own way"
-    if _ENCODES[how] and not isinstance(getattr(fsm, "quant_conv", None), torch.nn.Conv2d):
+    use_quant = _ENCODES[how]
+    if use_quant is not None and not callable(getattr(fsm, "regularization", None)):
+        return "a first stage model that encodes its own way"
+    qconv = getattr(fsm, "quant_conv", None)
+    if (use_quant is True and not isinstance(qconv, torch.nn.Conv2d)) or (use_quant is None and qconv is not None and not isinstance(qconv, torch.nn.Conv2d)):
         return "an unusual encoder"
     try:
         if getattr(vae, "downscale_ratio", 8) != 8 or 2 ** (encoder.num_resolutions - 1) != 8:
@@ -124,7 +140,8 @@ def encoder_unsupported(vae) -> str:
 def encoder_config(vae) -> dict:
     fsm = vae.first_stage_model
     e = fsm.encoder
-    quant = getattr(fsm, "quant_conv", None) if _ENCODES[type(fsm).encode.__qualname__] else None
+    use_quant = _ENCODES[type(fsm).encode.__qualname__]
+    quant = getattr(fsm, "quant_conv", None) if use_quant is not False else None
     out = int(e.conv_out.out_channels)
     return {
         "in_channels": int(e.conv_in.in_channels),
@@ -154,7 +171,7 @@ def engine_dtype(vae):
     if vae.vae_dtype in (torch.float16, torch.float32):
         try:
             mm = common.mm()
-            if not getattr(mm.args, "vae_in_fp32", False) and mm.should_use_fp16(common.device()):
+            if not compat.vae_in_fp32(mm) and mm.should_use_fp16(common.device()):
                 return torch.float16
         except Exception:
             pass
@@ -166,7 +183,7 @@ def strip_dtype(vae):
     if dtype == torch.float32:
         try:
             mm = common.mm()
-            if not getattr(mm.args, "vae_in_fp32", False) and mm.should_use_fp16(common.device()):
+            if not compat.vae_in_fp32(mm) and mm.should_use_fp16(common.device()):
                 return torch.float16
         except Exception:
             pass
@@ -424,7 +441,13 @@ class Record:
         return f"{self.base}.encode-strip-{kind}.plan"
 
     def encoder_strips_cover(self, found: list, h: int, w: int) -> bool:
-        return bool(self.encoder_strips) and self._post_encodes(h // 8, w // 8) and _kinds_cover(self.encoder_strips, found, w // 8)
+        return (
+            bool(self.encoder_strips)
+            and h % 8 == 0
+            and w % 8 == 0
+            and self._post_encodes(h // 8, w // 8)
+            and _kinds_cover(self.encoder_strips, found, w // 8)
+        )
 
     def _post_encodes(self, h: int, w: int) -> bool:
         lo, _, hi = self.encoder["shapes"][ENCODE_POST]["x"]

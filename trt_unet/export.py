@@ -152,15 +152,15 @@ def _fp32_group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
 
 @contextlib.contextmanager
 def _traceable_attention():
-    import ldm_patched.ldm.modules.attention as attention
+    from . import compat
 
     swaps = [(F, "scaled_dot_product_attention", _sdpa), (F, "group_norm", _fp32_group_norm)]
-    swaps += [(attention, name, _optimized_attention) for name in ("optimized_attention", "optimized_attention_masked")]
     originals = [(owner, name, getattr(owner, name)) for owner, name, _ in swaps]
     for owner, name, fn in swaps:
         setattr(owner, name, fn)
     try:
-        yield
+        with compat.patch_attention(_optimized_attention):
+            yield
     finally:
         for owner, name, fn in originals:
             setattr(owner, name, fn)
@@ -169,10 +169,9 @@ def _traceable_attention():
 def _fresh_unet(config: dict, device, dtype=torch.float16):
     # Random weights: tracing doesn't depend on values, and identical tensors (e.g. all-zero) get merged by the exporter,
     # losing weight names.
-    import ldm_patched.modules.ops as ops
-    from ldm_patched.ldm.modules.diffusionmodules.openaimodel import UNetModel
+    from . import compat
 
-    unet = UNetModel(**config, dtype=dtype, device=device, operations=ops.disable_weight_init).eval()
+    unet = compat.fresh_unet(config, device, dtype)
     for t in unet.state_dict(keep_vars=True).values():
         if t.is_floating_point():
             t.normal_(0, 0.02)
@@ -297,7 +296,8 @@ def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    loaded = {k: list(v.shape) for k, v in patcher.model.diffusion_model.state_dict(keep_vars=True).items()}
+    dm = patcher.model.diffusion_model
+    loaded = {k: list(v.shape) for k, v in {**dm.state_dict(keep_vars=True), **dict(dm.named_parameters())}.items()}
     result = {"unet": _weightless_graph(paths["unet"], names, (exported, loaded)), "shallow": None, "deep": info}
     if shallow:
         try:

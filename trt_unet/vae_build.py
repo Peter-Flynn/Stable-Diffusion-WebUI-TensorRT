@@ -8,7 +8,7 @@ import time
 
 import torch
 
-from . import common, store, strips
+from . import common, compat, store, strips
 from .common import logger
 from .vae import (
     ENCODE_POST, ENCODE_PRE, ENCODE_STRIP, ENCODER, EXPONENT, POST, PRE, RETRY_SHARES, Record, config, digest, dtype_name,
@@ -83,38 +83,12 @@ class _EncodePost(torch.nn.Module):
         return self.quant_conv(h) if self.quant_conv is not None else h
 
 
-def fresh(cfg: dict, device, dtype):  # traced instead of the loaded VAE, which carries reForge's offloading hooks
-    import ldm_patched.modules.ops as ops
-    from ldm_patched.ldm.modules.diffusionmodules.model import Decoder
-
-    module = torch.nn.Module()
-    module.decoder = Decoder(
-        ch=cfg["ch"], out_ch=cfg["out_ch"], ch_mult=cfg["ch_mult"], num_res_blocks=cfg["num_res_blocks"], attn_resolutions=[],
-        in_channels=3, resolution=256, z_channels=cfg["z_channels"], dropout=0.0,
-    )
-    if cfg["post_quant_conv"]:
-        module.post_quant_conv = ops.disable_weight_init.Conv2d(cfg["latent_channels"], cfg["z_channels"], 1)
-    for name, m in module.named_modules():
-        if name in cfg["padding"]:
-            m.padding_mode = cfg["padding"][name]
-    return module.to(device=device, dtype=dtype).eval()
+def fresh(cfg: dict, device, dtype):  # traced instead of the loaded VAE, which carries reForge/Neo offloading hooks
+    return compat.fresh_vae_decoder(cfg, device, dtype)
 
 
 def fresh_encoder(cfg: dict, device, dtype):
-    import ldm_patched.modules.ops as ops
-    from ldm_patched.ldm.modules.diffusionmodules.model import Encoder
-
-    module = torch.nn.Module()
-    module.encoder = Encoder(
-        ch=cfg["ch"], out_ch=cfg["in_channels"], ch_mult=cfg["ch_mult"], num_res_blocks=cfg["num_res_blocks"], attn_resolutions=[],
-        in_channels=cfg["in_channels"], resolution=256, z_channels=cfg["out_channels"], double_z=False, dropout=0.0,
-    )
-    if cfg["quant_conv"]:
-        module.quant_conv = ops.disable_weight_init.Conv2d(cfg["out_channels"], cfg["moments"], 1)
-    for name, m in module.named_modules():
-        if name in cfg["padding"]:
-            m.padding_mode = cfg["padding"][name]
-    return module.to(device=device, dtype=dtype).eval()
+    return compat.fresh_vae_encoder(cfg, device, dtype)
 
 
 def _randomize(module):  # identical tensors (GroupNorm's ones/zeros) get merged by the exporter, losing weight names
@@ -148,14 +122,10 @@ def _export(module, halves: dict, work: str, first, loaded: dict, seen: set = No
 
         torch.nn.functional.group_norm = _scaled_gn
         torch.nn.functional.silu = _scaled_silu
-        try:
-            import ldm_patched.ldm.modules.diffusionmodules.model as _ldm_m
-
-            if callable(getattr(_ldm_m, "nonlinearity", None)):
-                ldm_m, orig_nl = _ldm_m, _ldm_m.nonlinearity
-                _ldm_m.nonlinearity = lambda inp: orig_silu(inp, inplace=False) * scale
-        except Exception:
-            pass
+        _ldm_m = compat.vae_nonlinearity_module()
+        if _ldm_m is not None:
+            ldm_m, orig_nl = _ldm_m, _ldm_m.nonlinearity
+            _ldm_m.nonlinearity = lambda inp: orig_silu(inp, inplace=False) * scale
     elif fp32_gn:
         torch.nn.functional.group_norm = export._fp32_group_norm
     try:

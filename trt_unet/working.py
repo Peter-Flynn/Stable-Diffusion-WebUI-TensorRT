@@ -66,26 +66,19 @@ def _attention(q, k, v, heads, *args, **kwargs):  # stand-in: just the output's 
 
 
 def measure(config: dict, in_channels: int, context_dim: int, adm_channels: int, dtype=torch.float16) -> float:
-    import ldm_patched.ldm.modules.attention as attention
-    import ldm_patched.modules.ops as ops
-    from ldm_patched.ldm.modules.diffusionmodules.openaimodel import UNetModel
+    from . import compat
 
     side = PROBE
-    unet = UNetModel(**config, dtype=dtype, device="meta", operations=ops.disable_weight_init).eval()
+    unet = compat.fresh_unet(config, "meta", dtype)
     feed = [
         torch.empty(1, in_channels, side, side, dtype=dtype, device="meta"),
         torch.empty(1, dtype=dtype, device="meta"),
         torch.empty(1, 77, context_dim, dtype=dtype, device="meta"),
     ]
     y = torch.empty(1, adm_channels, dtype=dtype, device="meta") if adm_channels else None
-    originals = (attention.optimized_attention, attention.optimized_attention_masked)
     alive = _Alive()
-    attention.optimized_attention = attention.optimized_attention_masked = _attention
-    try:
-        with torch.no_grad(), alive:
-            unet(*feed, y=y)
-    finally:
-        attention.optimized_attention, attention.optimized_attention_masked = originals
+    with compat.patch_attention(_attention), torch.no_grad(), alive:
+        unet(*feed, y=y)
     return alive.most / (side * 8 * side * 8)
 
 

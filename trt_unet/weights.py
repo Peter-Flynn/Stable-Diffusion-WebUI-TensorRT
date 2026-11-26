@@ -3,7 +3,7 @@ import weakref
 
 import torch
 
-from . import common
+from . import common, compat
 
 PREFIX = "diffusion_model."
 
@@ -55,13 +55,32 @@ def checksum(t: torch.Tensor) -> int:
     return int(total)
 
 
+def _head_bytes(t: torch.Tensor, limit: int) -> torch.Tensor:
+    raw = t.detach()
+    if raw.element_size() == 1:
+        raw = raw.view(torch.uint8)
+    return raw.reshape(-1)[:limit].contiguous().view(torch.uint8).cpu()
+
+
+def _fingerprint_head(t) -> torch.Tensor:
+    qdata = getattr(t, "_qdata", None)
+    if isinstance(qdata, torch.Tensor):
+        head = _head_bytes(qdata, 16)
+        scale = getattr(getattr(t, "_params", None), "scale", None)
+        if isinstance(scale, torch.Tensor):
+            return torch.cat([head, _head_bytes(scale, 4)])
+        return head
+    return _head_bytes(t.data, 16)
+
+
 class EffectiveWeights:
     def __init__(self, patcher):
         self.patcher = patcher
         self.module = patcher.model.diffusion_model
         self.patches = getattr(patcher, "patches", {}) or {}
-        # Layers that store a weight in another form than they compute with (scaled-FP8 Linear: weight * scale_weight).
-        # reForge converts these before applying patches, and so does tensor().
+        self.wrappers = getattr(patcher, "weight_wrapper_patches", {}) or {}
+        # Layers that store a weight in another form than they compute with (scaled-FP8 / MixedPrecisionOps Linear).
+        # reForge/Neo converts these before applying patches, and so does tensor().
         self.converters = {
             f"{n}.{p}": getattr(m, f"convert_{p}")
             for n, m in self.module.named_modules()
@@ -71,9 +90,23 @@ class EffectiveWeights:
         self.refresh()
         self.base_version = (_Same(self.module), self._fingerprint())
 
-    def refresh(self):  # reForge replaces the module's parameters when it loads or unloads it
-        self.params = self.module.state_dict(keep_vars=True)
+    def refresh(self):  # reForge/Neo replaces the module's parameters when it loads or unloads it
+        # Overlay named_parameters() so QuantizedTensor / ParameterGGUF wrappers aren't unpacked to raw bytes.
+        self.params = {**self.module.state_dict(keep_vars=True), **dict(self.module.named_parameters())}
         self.backup = getattr(self.patcher, "backup", {}) or {}
+        self.patches = getattr(self.patcher, "patches", {}) or {}
+        self.wrappers = getattr(self.patcher, "weight_wrapper_patches", {}) or {}
+
+    def _patches_for(self, name: str):
+        full = PREFIX + name
+        baked = self.patches.get(full)
+        wrappers = self.wrappers.get(full)
+        if not wrappers:
+            return baked
+        online = [entry for w in wrappers if compat.is_online_lora_patch(w) for entry in w.patch]
+        if not online:
+            return baked
+        return (list(baked) if baked else []) + online
 
     def has(self, name: str) -> bool:
         return name in self.params or PREFIX + name in self.backup
@@ -82,33 +115,36 @@ class EffectiveWeights:
         backup = self.backup.get(PREFIX + name)
         if backup is None and name not in self.params:
             raise RuntimeError(f"The engine has a weight this UNet doesn't ({name}); rebuild the engine")
-        # reForge keeps the original of a weight it patched in place in `backup`. `.data` because a tensor moved outside
-        # inference mode has a broken version counter, and reading it directly raises.
-        return (getattr(backup, "weight", backup) if backup is not None else self.params[name]).data
+        # reForge/Neo keeps the original of a weight it patched in place in `backup`. Keep QuantizedTensor/ParameterGGUF
+        # wrappers intact so dequantization sees their metadata; use `.data` on plain Parameters for inference-mode safety.
+        src = getattr(backup, "weight", backup) if backup is not None else self.params[name]
+        if compat.is_quantized_weight(src):
+            return src
+        return src.data
 
     def _fingerprint(self) -> str:  # samples every weight: two checkpoints can differ in only a few layers (a merged LoRA)
-        heads = [self.base(n).reshape(-1)[:16].float().cpu() for n in sorted(self.params)]
+        heads = [_fingerprint_head(self.base(n)) for n in sorted(self.params)]
         return hashlib.sha256(torch.cat(heads).numpy().tobytes()).hexdigest() if heads else ""
 
     def is_patched(self, name: str) -> bool:
-        return bool(self.patches.get(PREFIX + name))
+        return bool(self._patches_for(name))
 
     def signature(self, name: str):
-        patches = self.patches.get(PREFIX + name)
+        patches = self._patches_for(name)
         return self.base_version, _identity(patches) if patches else None
 
     _LORA_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
     def needs_gpu(self, name: str) -> bool:
-        return bool(self.patches.get(PREFIX + name) or self.converters.get(name) is not None)
+        return bool(self._patches_for(name) or self.converters.get(name) is not None or compat.is_quantized_weight(self.base(name)))
 
     def fast_lora(self, name: str):
         # Standard LoRA weights (up @ down) can be staged alongside base in pinned memory and merged via in-place FP32
         # addmm_, avoiding per-weight synchronous H2D copies and intermediate lora_diff allocations. Anything unusual
-        # (converters, DoRA, LoCon mid weights, offsets, custom functions, strength_model != 1, LoHa/LoKr) returns None.
+        # (converters, quantized weights, DoRA, LoCon mid weights, offsets, custom functions, strength_model != 1, LoHa/LoKr) returns None.
         if self.converters.get(name) is not None:
             return None
-        patches = self.patches.get(PREFIX + name)
+        patches = self._patches_for(name)
         if not patches:
             return None
         base = self.base(name)
@@ -164,16 +200,10 @@ class EffectiveWeights:
         if items is not None:
             dev = gpu_base.device
             return self.apply_fast_lora(gpu_base, [(u.to(dev), d.to(dev), s) for u, d, s in items], dtype)
-        # copy=True because convert and patch work in place.
-        weight = gpu_base.to(torch.float32, copy=True)
-        convert = self.converters.get(name)
-        if convert is not None:
-            weight = convert(weight, inplace=True)
-        patches = self.patches.get(PREFIX + name)
+        weight = compat.dequantize_weight(gpu_base, self.converters.get(name))
+        patches = self._patches_for(name)
         if patches:
-            from ldm_patched.modules.lora import calculate_weight
-
-            weight = calculate_weight(patches, weight, PREFIX + name)
+            weight = compat.merge_weight(patches, weight, PREFIX + name)
         return weight.to(dtype)
 
     def tensor(self, name: str, device="cpu", dtype=torch.float16) -> torch.Tensor:

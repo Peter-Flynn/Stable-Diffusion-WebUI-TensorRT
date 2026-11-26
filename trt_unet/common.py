@@ -8,7 +8,10 @@ import sys
 
 import torch
 
+from . import compat
+
 logger = logging.getLogger("TensorRT")
+compat.setup_logger(logger)
 
 _notified = set()
 
@@ -79,25 +82,11 @@ def new_generation():
 
 
 def mm():
-    import ldm_patched.modules.model_management as model_management
-
-    return model_management
+    return compat.mm()
 
 
 def device() -> torch.device:
-    # reForge records the selected GPU on the main thread in model_management.current_device; get_torch_device() reads
-    # torch.cuda.current_device(), which is per-thread and defaults to 0 on Gradio and TensorRT worker threads.
-    try:
-        m = mm()
-        dev = getattr(m, "current_device", None)
-        if dev is None:
-            dev = m.get_torch_device()
-        dev = torch.device(dev)
-        if dev.type == "cuda" and dev.index is None:
-            return torch.device("cuda", torch.cuda.current_device())
-        return dev
-    except Exception:
-        return torch.device("cuda", torch.cuda.current_device())
+    return compat.device(mm())
 
 
 def on_device(dev=None):

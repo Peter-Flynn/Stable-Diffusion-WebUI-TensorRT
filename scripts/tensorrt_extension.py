@@ -21,7 +21,7 @@ class TensorRT(scripts.Script):
 try:
     runtime.install_hooks()
 except Exception as e:
-    logger.error(f"This extension needs reForge: {e}")
+    logger.error(f"This extension needs reForge or Forge Neo: {e}")
 script_callbacks.on_list_unets(runtime.list_unets)
 script_callbacks.on_ui_tabs(ui.on_ui_tabs)
 script_callbacks.on_ui_settings(ui.on_ui_settings)
