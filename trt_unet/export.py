@@ -125,14 +125,29 @@ _ORIG_GROUP_NORM = F.group_norm
 
 
 def _fp32_group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
-    # TensorRT 11's Myelin __myl_Gnor / __myl_GnorSilu kernels corrupt dynamic FP16/BF16 GroupNorm when C <= 640 and
-    # max spatial size <= 49 (e.g. SDXL input_blocks.7.0 in 320-1536, SD 1.5 in 256-768). Computing GroupNorm in FP32
-    # avoids those kernels while Myelin still fuses the casts into the reduction.
-    if input.dtype in (torch.float16, torch.bfloat16):
-        w = None if weight is None else weight.float()
-        b = None if bias is None else bias.float()
-        return _ORIG_GROUP_NORM(input.float(), num_groups, w, b, eps).to(input.dtype)
-    return _ORIG_GROUP_NORM(input, num_groups, weight, bias, eps)
+    # TensorRT 11's Myelin __myl_Gnor / __myl_GnorSilu kernels corrupt dynamic GroupNorm (in FP16, BF16, and FP32) when
+    # C <= 640 and max spatial size is small (e.g. SDXL input_blocks.7.0 in *-1024 profiles, SD 1.5 in 256-768),
+    # reading uninitialized activation memory (NaN or large artifacts). Decomposing into explicit FP32 reductions avoids
+    # __myl_Gnor completely and fuses Cast + GroupNorm + SiLU into a faster Myelin kernel.
+    if input.ndim < 3:
+        return _ORIG_GROUP_NORM(input, num_groups, weight, bias, eps)
+    y = input.float().reshape(input.shape[0], num_groups, -1)
+    mean = y.mean(dim=-1, keepdim=True)
+    diff = y - mean
+    var = (diff * diff).mean(dim=-1, keepdim=True)
+    y = (diff * torch.rsqrt(var + eps)).reshape_as(input)
+    axes = (0,) + (-1,) * (input.ndim - 2)
+    if weight is not None:
+        w = weight
+        for axis in axes:
+            w = w.unsqueeze(axis)
+        y = y * w.float()
+    if bias is not None:
+        b = bias
+        for axis in axes:
+            b = b.unsqueeze(axis)
+        y = y + b.float()
+    return y.to(input.dtype)
 
 
 @contextlib.contextmanager

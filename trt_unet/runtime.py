@@ -5,6 +5,7 @@
 # the manager evicts engines only as a last resort, because loading one means refitting every weight (or restoring it
 # from RAM, refits.py). Before anything loads, _fits checks the engine and the pass's working memory (working.py) can fit
 # in VRAM at all; if not, the pass runs on PyTorch. During a pass the PyTorch UNet stays patched but unloaded, in RAM.
+import collections
 import contextlib
 import inspect
 import math
@@ -29,9 +30,38 @@ _last_used = {}
 _use_order = {}  # record.key -> monotonic use tick for LRU eviction among resident TrtModels
 _use_tick = 0
 _pass = None
+_unet_arenas = {}  # (device.type, device.index) -> shared Arena across co-resident UNet TrtModels
+_BackupWeight = collections.namedtuple("Dimension", ["weight", "inplace_update"])
+
+
+def _unet_arena(dev):
+    from .engine import Arena
+
+    d = torch.device(dev)
+    key = (d.type, d.index)
+    arena = _unet_arenas.get(key)
+    if arena is None:
+        arena = _unet_arenas[key] = Arena()
+    return arena
+
+
+def _release_unet_arena(dev=None):
+    if dev is None:
+        for arena in list(_unet_arenas.values()):
+            arena.release()
+        return
+    d = torch.device(dev)
+    arena = _unet_arenas.get((d.type, d.index))
+    if arena is not None:
+        arena.release()
 
 
 class Fallback(Exception):
+    pass
+
+
+class _CallTorch(Exception):
+    # Raised by Pass.run to run a single mid-pass call on PyTorch while keeping the current TRT engine resident in VRAM.
     pass
 
 
@@ -46,10 +76,15 @@ class _Shape:
         self.shape = shape
 
 
-def call_bytes(model, patcher, x) -> int:
-    found = _call_shapes(model, x)
-    batch = found[1]["sample"][0] if found is not None else 2 * x.shape[0]
-    return working.call_bytes(model.record.arch, patcher, batch, x.shape[3] * 8, x.shape[2] * 8)
+def _took_key(model, x, unet_batch: int = None) -> tuple:
+    found = _call_shapes(model, x, unet_batch=unet_batch)
+    batch = found[1]["sample"][0] if found is not None else (unet_batch if unet_batch is not None else 2 * x.shape[0])
+    return (batch, x.shape[2], x.shape[3])
+
+
+def call_bytes(model, patcher, x, unet_batch: int = None) -> int:
+    batch, h, w = _took_key(model, x, unet_batch=unet_batch)
+    return working.call_bytes(model.record.arch, patcher, batch, w * 8, h * 8)
 
 
 class DoesNotFit(RuntimeError):
@@ -81,9 +116,9 @@ class TrtModel:
 
     def _engines(self):
         if self.engine is None:
-            from .engine import Arena, Engine
+            from .engine import Engine
 
-            arena = Arena()
+            arena = _unet_arena(self.load_device)
             self.engine = Engine(self.record.plan, arena, self.owner)
             if self.hacks:
                 self.shallow = Engine(self.record.shallow_plan, arena, self.owner)
@@ -390,7 +425,7 @@ class TrtModel:
             refits.drop(self.record.key, role)  # the copy kept in RAM holds the old weights
             torch.cuda.current_stream(self.load_device).synchronize()  # no inference in flight while the weights change
             can_retry_unet = role == "unet" and not gpu.counting(self.owner)
-            if can_retry_unet and len(changed) >= 16 and common.free(self.load_device) < (1 << 30):
+            if can_retry_unet and len(changed) >= 16 and common.free(self.load_device, at_least=1 << 30) < (1 << 30):
                 # Free evictable non-engines (CLIP/VAE) before a large live refit so GPU staging fits without touching other UNet engines.
                 keep_engines = [
                     lm for lm in common.mm().current_loaded_models
@@ -489,6 +524,8 @@ def release_all():
     for model in list(_models.values()):
         _unload(model, keep=False)
     _models.clear()
+    _release_unet_arena()
+    _unet_arenas.clear()
     _last_used.clear()
     _use_order.clear()
     vae_run.release_all()
@@ -704,6 +741,14 @@ def _load_torch_unet(patcher, shape):
         common.mm().load_models_gpu([patcher], memory_required=required)
 
 
+_MISSING = object()
+
+
+def _wraps_unet(patcher) -> bool:
+    options = getattr(patcher, "model_options", None) or {}
+    return bool(options.get("model_function_wrapper") or options.get("tiled_diffusion"))
+
+
 class Pass:
     def __init__(self, records: list, patcher, x, hacks: bool = False):
         self.patcher = patcher
@@ -721,21 +766,50 @@ class Pass:
         self.weights = EffectiveWeights(patcher)
         self.module = patcher.model.diffusion_model
         arch = records[0].arch
+        self.arch = arch
         self.arch_id = arch.id
         self.shapes, self.takes_y = [r.profile_shapes[j] for r, j in self.slots], bool(arch.adm_channels)
         self.channels, self.context_dim = arch.in_channels, arch.context_dim
         self._x_shape = tuple(x.shape)
         self.shape = (x.shape[0] * 2, *x.shape[1:])
         self.fallback = None
-        self.checked = self.shallow_checked = False
+        self.checked = set()
+        self.shallow_checked = set()
         self._keep = None
-        self._hint_batching()
+        options = getattr(patcher, "model_options", None) or {}
+        self._deferred = _wraps_unet(patcher)
+        self._deferred_seen = False
+        self._eval_id = 0
+        self._remaining_steps = None
+        self._last_step = None
+        self._step_evals = 0
+        self._evals_per_step = 1
+        self._cur_eval_id = -1
+        self._cur_eval_shapes = []
+        self._anchor = None  # (b, h, w, context_len, b * h * w) of the heaviest shape self.model has run
+        self._last_anchor_eval = -1
+        self._engine_eval = {}  # record.key -> last _eval_id it ran on
+        self._evicts_anchor = set()  # record keys proven to evict the anchor engine when loaded mid-pass
+        self._synced = {}  # record.key -> (patches_uuid, shallow_loaded) synced in this pass
+        self._torch_partial = False
+        self._torch_fast_loaded = False
+        self._no_coexist = False
+        self._torch_snap = None
+        self._torch_mode = False
+        self._torch_eval_id = -1
+        self._torch_eval_shapes = []
+        self._torch_joint_key = None
+        self._torch_stable_evals = 0
+        self._torch_resumes = 0
+        self._torch_logged = False
+        if not options.get("tiled_diffusion"):
+            self._hint_batching()
         self.started = self.schedule  # for end()'s report once Speed Hacks turn off mid-pass
         self._watching = False
         if hacks:
             self._watch_apply_model(model)
 
-    def _need_for(self, model: TrtModel, want_shallow: bool, call_shape: tuple = None) -> int:
+    def _need_for(self, model: TrtModel, want_shallow: bool, call_shape: tuple = None, min_calls: int = 0) -> int:
         if model.loaded:
             load_need = model._serialized_size("shallow") if want_shallow and not model.shallow_loaded else 0
         else:
@@ -744,12 +818,710 @@ class Pass:
             padded, h, w = call_shape
             calls = max(
                 working.call_bytes(model.record.arch, self.patcher, padded, w * 8, h * 8),
-                model.took.get((self._x_shape[0], h, w), 0),
+                model.took.get((padded, h, w), 0),
             )
         else:
-            b, _, h, w = self._x_shape
-            calls = max(call_bytes(model, self.patcher, _Shape(self._x_shape)), model.took.get((b, h, w), 0))
-        return common.padded(load_need + calls)
+            shape = _Shape(self._x_shape)
+            calls = max(call_bytes(model, self.patcher, shape), model.took.get(_took_key(model, shape), 0))
+        return common.padded(load_need + max(calls, min_calls))
+
+    def _snapshot_torch_cpu(self):
+        # Hold references to the UNet's existing CPU weights before partially_load moves them to VRAM so unloading
+        # simply restores the CPU pointers (~50ms) instead of copying 4.8 GiB back over PCIe (~3.3s). Skipped on
+        # RAM-constrained hosts so we never hold extra RAM pressure when free RAM is tight.
+        # Under NO_VRAM with LoRAs, reForge attaches tiny LowVramPatch hooks (a few KB in loaded_size) while leaving
+        # every weight parameter on CPU; verify parameters directly instead of requiring loaded_size() == 0.
+        if self._torch_snap is not None or self.patcher.loaded_size() > (16 << 20) or getattr(self.patcher, "backup", None):
+            return
+        if (
+            getattr(self.patcher, "weight_inplace_update", False)
+            or getattr(self.patcher, "is_injected", False)
+            or getattr(self.patcher, "ejected", False)
+            or getattr(self.patcher, "weight_wrapper_patches", None)
+        ):
+            return
+        model = getattr(self.patcher, "model", None)
+        if not isinstance(model, torch.nn.Module):
+            return
+        if getattr(model, "current_weight_patches_uuid", None) != getattr(self.patcher, "patches_uuid", None):
+            return
+        try:
+            if refits.memory()[0] < self.patcher.model_size() + (2 << 30):
+                return
+        except Exception:
+            return
+        off = torch.device(self.patcher.offload_device)
+        if off.type != "cpu":
+            return
+        params, bufs, attrs = [], [], []
+        for mod in model.modules():
+            for name, p in mod._parameters.items():
+                if p is not None:
+                    if p.device != off:
+                        return
+                    params.append((mod, name, p, p.data))
+            for name, b in mod._buffers.items():
+                if b is not None and b.device == off:
+                    bufs.append((mod, name, b))
+            a = {}
+            for k in ("weight_function", "bias_function"):
+                a[k] = list(mod.__dict__[k]) if k in mod.__dict__ else _MISSING
+            for k in ("ldm_patched_cast_weights", "prev_ldm_patched_cast_weights", "ldm_patched_patched_weights"):
+                a[k] = mod.__dict__.get(k, _MISSING)
+            if a:
+                attrs.append((mod, a))
+        state = (
+            getattr(model, "model_lowvram", True),
+            getattr(model, "lowvram_patch_counter", 0),
+            getattr(model, "model_loaded_weight_memory", 0),
+            getattr(model, "device", off),
+            getattr(model, "current_weight_patches_uuid", None),
+            getattr(self.patcher, "patches_uuid", None),
+        )
+        self._torch_snap = (params, bufs, attrs, state)
+
+    def _restore_torch_snap(self, snap):
+        params, bufs, attrs, state = snap
+        with torch.inference_mode():
+            self.patcher.unpatch_hooks()
+            self.patcher.backup.clear()
+            for mod, name, p, cpu_data in params:
+                p.data = cpu_data
+                mod._parameters[name] = p
+            for mod, name, cpu_buf in bufs:
+                mod._buffers[name] = cpu_buf
+            for mod, a in attrs:
+                for k, v in a.items():
+                    if v is _MISSING:
+                        mod.__dict__.pop(k, None)
+                    elif k in ("weight_function", "bias_function"):
+                        mod.__dict__[k] = list(v)
+                    else:
+                        mod.__dict__[k] = v
+            m = self.patcher.model
+            m.model_lowvram, m.lowvram_patch_counter, m.model_loaded_weight_memory, m.device, m.current_weight_patches_uuid, _ = state
+
+    def _fast_load_torch_unet(self, dev: torch.device):
+        # Streams CPU UNet parameters into <=64 MiB GPU slabs (ordered by ModelPatcher._load_list() so partially_unload
+        # releases them incrementally) via double-buffered pinned DMA and merges standard LoRAs in-place on GPU, so
+        # reForge's partially_load() only performs bookkeeping instead of 1,680 pageable copies.
+        if self._torch_snap is None or dev.type != "cuda":
+            return
+        if getattr(common.mm(), "PIN_SHARED_MEMORY", False):
+            return
+        load_list_fn = getattr(self.patcher, "_load_list", None)
+        if not callable(load_list_fn):
+            return
+        model = self.patcher.model
+        off = torch.device(self.patcher.offload_device)
+        if off.type != "cpu":
+            return
+        patches = getattr(self.patcher, "patches", None) or {}
+        self.weights.refresh()
+        use_lora = (
+            bool(patches)
+            and self.weights.patches is patches
+            and self.weights.module is getattr(model, "diffusion_model", None)
+        )
+        prefix_dm = "diffusion_model."
+        align256 = lambda n: (n + 255) & ~255
+        align16 = lambda n: (n + 15) & ~15
+        safe_dtypes = (torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.int32, torch.int64, torch.uint8, torch.int8)
+        lora_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+
+        param_refs = collections.Counter()
+        for mod in model.modules():
+            for p in mod._parameters.values():
+                if p is not None:
+                    param_refs[id(p)] += 1
+
+        slab_cap = 64 << 20
+        slab_groups = []
+        cur_direct, cur_lora, cur_bytes = [], [], 0
+        lora_mods = []
+        seen_p = set()
+
+        for _, prefix, mod, param_names in sorted(load_list_fn()):
+            mod_patched = []
+            mod_direct = []
+            for name in param_names:
+                p = mod._parameters.get(name)
+                if p is None or id(p) in seen_p:
+                    continue
+                seen_p.add(id(p))
+                full_key = f"{prefix}.{name}" if prefix else name
+                if full_key in patches:
+                    mod_patched.append((name, full_key, p))
+                elif (
+                    p.device == off
+                    and param_refs[id(p)] == 1
+                    and type(p.data) is torch.Tensor
+                    and p.data.dtype in safe_dtypes
+                    and p.data.is_contiguous()
+                    and p.numel() > 0
+                    and not callable(getattr(mod, f"convert_{name}", None))
+                ):
+                    d = p.data
+                    nb = d.numel() * d.element_size()
+                    mod_direct.append((p, d, nb, align256(nb)))
+            # Patched modules without ldm_patched_cast_weights are skipped by ModelPatcher.partially_unload(); leave the
+            # whole module to reForge so it can never pin a shared slab.
+            if mod_patched and not hasattr(mod, "ldm_patched_cast_weights"):
+                continue
+            mod_lora = []
+            if mod_patched and use_lora and not getattr(mod, "ldm_patched_patched_weights", False):
+                cand = []
+                ok_mod = True
+                for name, full_key, p in mod_patched:
+                    if (
+                        not full_key.startswith(prefix_dm)
+                        or p.device != off
+                        or param_refs[id(p)] != 1
+                        or type(p.data) is not torch.Tensor
+                        or p.data.dtype not in lora_dtypes
+                        or not p.data.is_contiguous()
+                        or p.numel() == 0
+                        or callable(getattr(mod, f"convert_{name}", None))
+                    ):
+                        ok_mod = False
+                        break
+                    short = full_key[len(prefix_dm):]
+                    if self.weights.params.get(short) is not p:
+                        ok_mod = False
+                        break
+                    items = self.weights.fast_lora(short)
+                    if items is None or any((u.is_cuda and u.device != dev) or (dn.is_cuda and dn.device != dev) for u, dn, _ in items):
+                        ok_mod = False
+                        break
+                    d = p.data
+                    nb = d.numel() * d.element_size()
+                    cand.append((full_key, p, d, items, nb, align256(nb)))
+                if ok_mod and cand:
+                    mod_lora = cand
+                    lora_mods.append(mod)
+            mod_bytes = sum(x[3] for x in mod_direct) + sum(x[5] for x in mod_lora)
+            if mod_bytes == 0:
+                continue
+            if cur_bytes > 0 and cur_bytes + mod_bytes > slab_cap:
+                slab_groups.append((cur_direct, cur_lora))
+                cur_direct, cur_lora, cur_bytes = [], [], 0
+            cur_direct.extend(mod_direct)
+            cur_lora.extend(mod_lora)
+            cur_bytes += mod_bytes
+        if cur_bytes > 0:
+            slab_groups.append((cur_direct, cur_lora))
+
+        slab_sizes = []
+        direct_plan = []
+        lora_plan = []
+        for slab_idx, (s_direct, s_lora) in enumerate(slab_groups):
+            s_off = 0
+            for p, d, nb, anb in s_direct:
+                direct_plan.append((slab_idx, s_off, p, d, nb, anb))
+                s_off += anb
+            for full_key, p, d, items, nb, anb in s_lora:
+                lora_plan.append((slab_idx, s_off, full_key, p, d, items, nb))
+                s_off += anb
+            slab_sizes.append(s_off)
+
+        total_aligned = sum(slab_sizes)
+        if total_aligned < (32 << 20):
+            return
+
+        slabs = []
+        pins = lora_gbufs = copy_stream = compute_stream = None
+        mutated = False
+        synced = False
+        failed = False
+        try:
+            with common.on_device(dev):
+                for s_total in slab_sizes:
+                    slabs.append(torch.empty(s_total, dtype=torch.uint8, device=dev))
+                chunk = min(slab_cap, total_aligned)
+                pins = [torch.empty(chunk, dtype=torch.uint8, pin_memory=True) for _ in range(2)]
+                max_lora_bytes = 0
+                if lora_plan:
+                    for _, _, _, _, _, items, _ in lora_plan:
+                        l_nb = 0
+                        for u, dn, _ in items:
+                            if not u.is_cuda:
+                                l_nb += align16(u.numel() * u.element_size())
+                            if not dn.is_cuda:
+                                l_nb += align16(dn.numel() * dn.element_size())
+                        if l_nb > max_lora_bytes:
+                            max_lora_bytes = l_nb
+                    if max_lora_bytes > 0:
+                        lora_gbufs = [torch.empty(max_lora_bytes, dtype=torch.uint8, device=dev) for _ in range(2)]
+                copy_stream = torch.cuda.Stream(device=dev)
+                compute_stream = torch.cuda.current_stream(dev)
+                ev_alloc = torch.cuda.Event()
+                ev_alloc.record(compute_stream)
+                copy_stream.wait_event(ev_alloc)
+                ev_copy = [torch.cuda.Event() for _ in range(2)]
+                ev_lora_use = [torch.cuda.Event() for _ in range(2)]
+                slot_used = [False, False]
+                lora_used = [False, False]
+
+                slot = 0
+                p_off = 0
+                cur_slab = -1
+                s_base = 0
+
+                def flush_direct():
+                    nonlocal slot, p_off
+                    if p_off <= 0:
+                        return
+                    with torch.cuda.stream(copy_stream):
+                        slabs[cur_slab][s_base : s_base + p_off].copy_(pins[slot][:p_off], non_blocking=True)
+                        ev_copy[slot].record(copy_stream)
+                    slot_used[slot] = True
+                    slot ^= 1
+                    if slot_used[slot]:
+                        ev_copy[slot].synchronize()
+                    p_off = 0
+
+                for slab_idx, s_off, p, d, nb, anb in direct_plan:
+                    if slab_idx != cur_slab or p_off + anb > chunk:
+                        flush_direct()
+                        cur_slab = slab_idx
+                        s_base = s_off
+                    view = slabs[slab_idx][s_off : s_off + nb].view(d.dtype).view(d.shape)
+                    if anb > chunk:
+                        view.copy_(d)
+                        s_base = s_off + anb
+                    else:
+                        pins[slot][p_off : p_off + nb].view(d.dtype).view(d.shape).copy_(d)
+                        p_off += anb
+                    mutated = True
+                    p.data = view
+                flush_direct()
+
+                if lora_plan:
+                    def stage_lora(idx):
+                        slab_idx, off_s, full_key, p, d, items, nb = lora_plan[idx]
+                        sview = slabs[slab_idx][off_s : off_s + nb].view(d.dtype).view(d.shape)
+                        base_end = align16(nb)
+                        l_specs = []
+                        l_total = 0
+                        cpu_tensors = []
+                        for u, dn, sc in items:
+                            pair = []
+                            for t in (u, dn):
+                                if t.is_cuda:
+                                    pair.append(t)
+                                else:
+                                    tc = t if t.is_contiguous() else t.contiguous()
+                                    tnb = tc.numel() * tc.element_size()
+                                    pair.append((l_total, tnb, tc.dtype, tc.shape))
+                                    cpu_tensors.append((l_total, tnb, tc))
+                                    l_total = align16(l_total + tnb)
+                            l_specs.append((pair[0], pair[1], sc))
+                        if base_end + l_total > chunk or (l_total > 0 and lora_gbufs is None):
+                            return None, sview, d, items, full_key, p
+                        sl = idx & 1
+                        if slot_used[sl]:
+                            ev_copy[sl].synchronize()
+                        pbuf = pins[sl]
+                        pbuf[:nb].view(d.dtype).view(d.shape).copy_(d)
+                        for loff, tnb, tc in cpu_tensors:
+                            pbuf[base_end + loff : base_end + loff + tnb].view(tc.dtype).view(tc.shape).copy_(tc)
+                        with torch.cuda.stream(copy_stream):
+                            if lora_used[sl]:
+                                copy_stream.wait_event(ev_lora_use[sl])
+                            slabs[slab_idx][off_s : off_s + nb].copy_(pbuf[:nb], non_blocking=True)
+                            if l_total > 0:
+                                lora_gbufs[sl][:l_total].copy_(pbuf[base_end : base_end + l_total], non_blocking=True)
+                            ev_copy[sl].record(copy_stream)
+                        slot_used[sl] = True
+                        gbuf = lora_gbufs[sl] if lora_gbufs is not None else None
+                        g_items = []
+                        for us, ds, sc in l_specs:
+                            ug = us if isinstance(us, torch.Tensor) else gbuf[us[0] : us[0] + us[1]].view(us[2]).view(us[3])
+                            dg = ds if isinstance(ds, torch.Tensor) else gbuf[ds[0] : ds[0] + ds[1]].view(ds[2]).view(ds[3])
+                            g_items.append((ug, dg, sc))
+                        return sl, sview, d, g_items, full_key, p
+
+                    staged = stage_lora(0)
+                    for idx in range(len(lora_plan)):
+                        sl, sview, d, g_items, full_key, p = staged
+                        if idx + 1 < len(lora_plan):
+                            staged = stage_lora(idx + 1)
+                        if sl is None:
+                            sview.copy_(d)
+                            g_ready = [(u if u.is_cuda else u.to(dev), dn if dn.is_cuda else dn.to(dev), sc) for u, dn, sc in g_items]
+                            EffectiveWeights.apply_fast_lora(sview, g_ready, d.dtype, out=sview)
+                            del g_ready
+                        else:
+                            compute_stream.wait_event(ev_copy[sl])
+                            EffectiveWeights.apply_fast_lora(sview, g_items, d.dtype, out=sview)
+                            ev_lora_use[sl].record(compute_stream)
+                            lora_used[sl] = True
+                        mutated = True
+                        p.data = sview
+                        self.patcher.backup[full_key] = _BackupWeight(d, False)
+
+                copy_stream.synchronize()
+                compute_stream.synchronize()
+                synced = True
+                for mod in lora_mods:
+                    mod.ldm_patched_patched_weights = True
+                self._torch_fast_loaded = True
+        except BaseException as e:
+            failed = True
+            if isinstance(e, Exception):
+                _clear_traceback(e)
+                logger.debug(f"Couldn't fast-upload PyTorch UNet weights; falling back to reForge loader: {e}")
+            else:
+                raise
+        finally:
+            if not synced:
+                if copy_stream is not None:
+                    with contextlib.suppress(Exception):
+                        copy_stream.synchronize()
+                if compute_stream is not None:
+                    with contextlib.suppress(Exception):
+                        compute_stream.synchronize()
+            if failed:
+                if mutated and self._torch_snap is not None:
+                    with contextlib.suppress(Exception):
+                        self._restore_torch_snap(self._torch_snap)
+                slabs.clear()
+                slabs = None
+            pins = lora_gbufs = None
+
+    def _unload_torch_weights(self, force: bool = False):
+        snap, self._torch_snap = self._torch_snap, None
+        fast_loaded, self._torch_fast_loaded = self._torch_fast_loaded, False
+        if not force and not self._torch_partial and not fast_loaded:
+            return
+        self._torch_partial = False
+        base_loaded = snap[3][2] if snap is not None else 0
+        if not force and not fast_loaded and self.patcher.loaded_size() <= base_loaded:
+            self.weights.refresh()
+            return
+        restored = False
+        if snap is not None and (force or fast_loaded or bool(_loaded_entries(self.patcher))):
+            if getattr(self.patcher, "patches_uuid", None) == snap[3][5]:
+                try:
+                    dev = common.device()
+                    if dev.type == "cuda":
+                        with contextlib.suppress(Exception):
+                            torch.cuda.synchronize(dev)
+                    self._restore_torch_snap(snap)
+                    restored = True
+                except Exception as e:
+                    logger.debug(f"Couldn't fast-restore temporary PyTorch UNet weights: {e}")
+        snap = None
+        if not restored:
+            try:
+                with torch.inference_mode():
+                    self.patcher.partially_unload(self.patcher.offload_device, sys.maxsize)
+            except Exception as e:
+                logger.debug(f"Couldn't offload temporary PyTorch UNet weights: {e}")
+        self.weights.refresh()
+        common.mm().soft_empty_cache(force=True)
+
+    def _rollback_torch_load(self):
+        if self._torch_snap is not None:
+            self._unload_torch_weights(force=True)
+            return
+        self._torch_partial = False
+        self._torch_fast_loaded = False
+        with contextlib.suppress(Exception):
+            with torch.inference_mode():
+                if hasattr(self.patcher, "detach"):
+                    self.patcher.detach()
+                else:
+                    self.patcher.partially_unload(self.patcher.offload_device, sys.maxsize)
+        with contextlib.suppress(Exception):
+            self.weights.refresh()
+        with contextlib.suppress(Exception):
+            common.mm().soft_empty_cache(force=True)
+
+    def _select(self, b: int, h: int, w: int, context: int):
+        choice = profiles.select(self.shapes, b, h, w, context, prefer=self.preferred())
+        if choice is None:
+            return None
+        if self.model is None or not self.model.loaded or self.slots[choice[0]][0].key == self.model.record.key:
+            return choice
+        # Prefer another engine already resident in VRAM over loading an unloaded one from RAM or disk.
+        loaded = {i for i, (r, _) in enumerate(self.slots) if (m := _models.get(r.key)) is not None and m.loaded}
+        if loaded:
+            alt = profiles.select(self.shapes, b, h, w, context, prefer=loaded)
+            if alt is not None and alt[0] in loaded:
+                return alt
+        return choice
+
+    def _joint_record(self, shapes: list):
+        if not shapes:
+            return None
+        valid = sorted(
+            i for i, (r, _) in enumerate(self.slots)
+            if all(any(profiles.fit(s, b, h, w, ctx) is not None for s in r.profile_shapes) for b, h, w, ctx in shapes)
+        )
+        if not valid:
+            return None
+        hb, hh, hw, hctx = max(shapes, key=lambda t: t[0] * t[1] * t[2])
+        subset = [self.shapes[i] for i in valid]
+        pref = {k for k, i in enumerate(valid) if (m := _models.get(self.slots[i][0].key)) is not None and m.loaded}
+        choice = profiles.select(subset, hb, hh, hw, hctx, prefer=pref)
+        return self.slots[valid[choice[0]]][0] if choice is not None else None
+
+    def _covers_anchor(self, record) -> bool:
+        if self._anchor is None:
+            return False
+        ab, ah, aw, actx, _ = self._anchor
+        return any(profiles.fit(s, ab, ah, aw, actx) is not None for s in record.profile_shapes)
+
+    def _anchor_act_bytes(self) -> int:
+        if self._anchor is not None and self.model is not None:
+            ab, ah, aw, _, _ = self._anchor
+            anchor_x = _Shape((ab, self.channels, ah, aw))
+            if self.model.loaded and self._covers_anchor(self.model.record):
+                anchor_model = self.model
+            else:
+                anchor_model = next(
+                    (
+                        m for m in _models.values()
+                        if m.loaded and m.record.arch.id == self.arch_id and self._covers_anchor(m.record)
+                    ),
+                    self.model,
+                )
+            return max(
+                call_bytes(anchor_model, self.patcher, anchor_x, unet_batch=ab),
+                anchor_model.took.get(_took_key(anchor_model, anchor_x, unet_batch=ab), 0),
+            )
+        if self.model is not None:
+            xs = _Shape(self._x_shape)
+            return max(call_bytes(self.model, self.patcher, xs), self.model.took.get(_took_key(self.model, xs), 0))
+        return 0
+
+    def _would_evict_current(self, target: TrtModel, want_shallow: bool, call_shape: tuple) -> bool:
+        if target.record.key in self._evicts_anchor:
+            return True
+        need = self._need_for(target, want_shallow, call_shape, min_calls=self._anchor_act_bytes())
+        # Only stale engines from earlier passes count as freely evictable; evicting an active engine of this pass thrashes.
+        active = {k for k, ev in self._engine_eval.items() if (self._eval_id - ev) <= 2}
+        active.add(self.model.record.key)
+        other_engines = sum(
+            other.loaded_size() for other in _models.values()
+            if other is not target and other.record.key not in active and other.loaded and other.load_device == target.load_device
+        )
+        arena = self.model.engine.arena.memory if self.model.engine is not None else None
+        act_bytes = arena.numel() if arena is not None else 0
+        res = common.reserve()
+        want = max(0, need - other_engines - act_bytes + res)
+        avail = common.obtainable(target.load_device, keep=[target], engines=False, at_least=want) + other_engines + act_bytes - res
+        return avail < need
+
+    def _torch_act_bytes(self, shape: tuple) -> int:
+        sb, sh, sw, _ = shape
+        est = working.call_bytes(self.arch, self.patcher, sb, sw * 8, sh * 8)
+        try:
+            model = self.patcher.model
+            fn = getattr(type(model), "memory_required", None)
+            if callable(fn):
+                pt = fn(model, [sb, self.channels, sh, sw])
+            else:
+                saved = model.__dict__.pop("memory_required", _MISSING)
+                try:
+                    pt = self.patcher.memory_required([sb, self.channels, sh, sw])
+                finally:
+                    if saved is not _MISSING:
+                        model.__dict__["memory_required"] = saved
+            if pt and pt != float("inf"):
+                est = max(est, int(pt))
+        except Exception:
+            pass
+        return est
+
+    def _can_coexist_torch(self, dev, shape: tuple) -> tuple:
+        if self._no_coexist or self.model is None:
+            return False, 0, 0
+        main_act = self._anchor_act_bytes()
+        side_act = self._torch_act_bytes(shape)
+        headroom = max(common.padded(main_act), common.padded(side_act), 1024 << 20)
+        keep_trt = [m for m in _models.values() if m.loaded]
+        missing = 0 if self._torch_partial else max(0, self.patcher.model_size() - self.patcher.loaded_size())
+        res = common.reserve()
+        want = headroom + missing
+        avail = common.obtainable(dev, keep=[self.patcher, *keep_trt], engines=False, at_least=want + res) - res
+        return avail >= want, headroom, missing
+
+    def _call_torch(self, why: str, shape: tuple):
+        dev = common.device()
+        if self.model is not None and self.model.loaded:
+            self.model.engine.release_activations()
+        coexist, headroom, missing = self._can_coexist_torch(dev, shape)
+        if coexist:
+            if not self._torch_logged:
+                self._torch_logged = True
+                logger.info(f"Running side calls on PyTorch while keeping the {self.model.name} in VRAM ({why}).")
+            if not self._torch_partial and missing > 0:
+                loading = False
+                try:
+                    keep = [
+                        lm for lm in common.mm().current_loaded_models
+                        if lm.model is not None and (
+                            lm.model is self.patcher
+                            or self.patcher.is_clone(lm.model)
+                            or getattr(lm.model, "evicted_last", False)
+                        )
+                    ]
+                    common.make_room(headroom + missing, dev, keep)
+                    self._snapshot_torch_cpu()
+                    loading = True
+                    with torch.inference_mode():
+                        self._fast_load_torch_unet(dev)
+                        # +1 MiB triggers reForge's full_load branch (strict >), avoiding lowvram tail-module loops.
+                        loaded = self.patcher.partially_load(dev, extra_memory=missing + (1 << 20))
+                    self._torch_partial = self._torch_partial or loaded > 0
+                except BaseException as e:
+                    if loading:
+                        self._rollback_torch_load()
+                    if not isinstance(e, Exception):
+                        raise
+                    _clear_traceback(e)
+                    if not loading:
+                        self._unload_torch_weights(force=True)
+                    logger.debug(f"Couldn't load PyTorch UNet beside the {self.model.name}: {e}")
+                    self.fall_back(f"Couldn't run a side call beside the {self.model.name} ({e})", _unexpected(e))
+            elif self._torch_partial and common.free(dev, at_least=headroom) < headroom:
+                keep = [
+                    lm for lm in common.mm().current_loaded_models
+                    if lm.model is not None and (
+                        lm.model is self.patcher
+                        or self.patcher.is_clone(lm.model)
+                        or getattr(lm.model, "evicted_last", False)
+                    )
+                ]
+                common.make_room(headroom, dev, keep)
+            raise _CallTorch()
+        self._enter_torch_mode(why, shape)
+        raise _CallTorch()
+
+    def _enter_torch_mode(self, why: str, shape: tuple):
+        prev = self.model
+        name = prev.name if prev is not None else "engine"
+        if not self._torch_logged:
+            self._torch_logged = True
+            logger.info(f"Pausing the {name} for PyTorch while mixed sizes run ({why}); TensorRT will resume once sizes settle.")
+        if self.schedule is not None:
+            self.schedule.deep.clear()
+            self.schedule._missed.clear()
+        self._hold(self.patcher)
+        for m in list(_models.values()):
+            if m.loaded or m.opened:
+                _unload(m, keep=m.loaded)
+        self.model = None
+        self._synced.clear()
+        self._torch_mode = True
+        self._torch_eval_id = self._eval_id
+        self._torch_eval_shapes = list(self._cur_eval_shapes) if self._cur_eval_id == self._eval_id else []
+        if shape not in self._torch_eval_shapes:
+            self._torch_eval_shapes.append(shape)
+        self._torch_joint_key = None
+        self._torch_stable_evals = 0
+        dev = common.device()
+        missing = max(0, self.patcher.model_size() - self.patcher.loaded_size())
+        need_act = max(
+            self._torch_act_bytes((self.shape[0], self.shape[2], self.shape[3], 0)),
+            self._torch_act_bytes(shape),
+        )
+        act_room = common.padded(need_act)
+        if not self._torch_partial and missing > 0:
+            loading = False
+            try:
+                keep = _loaded_entries(self.patcher)
+                had = common.make_room(missing + act_room, dev, keep)
+                avail = max(0, had - act_room)
+                budget = min(avail, missing)
+                if budget > 0:
+                    self._snapshot_torch_cpu()
+                    extra = missing + (1 << 20) if budget >= missing else budget
+                    loading = True
+                    with torch.inference_mode():
+                        if budget >= missing:
+                            self._fast_load_torch_unet(dev)
+                        loaded = self.patcher.partially_load(dev, extra_memory=extra)
+                    self._torch_partial = self._torch_partial or loaded > 0
+            except BaseException as e:
+                if loading:
+                    self._rollback_torch_load()
+                if not isinstance(e, Exception):
+                    raise
+                _clear_traceback(e)
+                if not loading:
+                    self._unload_torch_weights(force=True)
+                logger.debug(f"Couldn't load PyTorch UNet while {name} was paused: {e}")
+                self.fall_back(f"Couldn't run PyTorch while {name} was paused ({e})", _unexpected(e))
+        elif self._torch_partial and common.free(dev, at_least=act_room) < act_room:
+            common.make_room(act_room, dev, _loaded_entries(self.patcher))
+
+    @contextlib.contextmanager
+    def _park_tracker(self):
+        tracker = self.tracker
+        if tracker is None:
+            yield
+            return
+        dev = tracker.device
+        tracker._jumps.wait()
+        tracker._statuses.wait()
+        tracker._constants.clear()
+        moved = []
+
+        def park(obj, attr):
+            t = getattr(obj, attr, None)
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                setattr(obj, attr, t.cpu())
+                moved.append((obj, attr))
+
+        park(tracker, "tables")
+        for entry in (*tracker.history, tracker.current):
+            if entry is not None:
+                for attr in ("x", "sigma", "denoised", "uncond", "uncond_rows", "removed", "reason"):
+                    park(entry, attr)
+        last_keys = []
+        for k, t in list(tracker._last.items()):
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                tracker._last[k] = t.cpu()
+                last_keys.append(k)
+        ok = False
+        try:
+            yield
+            ok = True
+        finally:
+            if ok and self.tracker is tracker:
+                for obj, attr in moved:
+                    t = getattr(obj, attr, None)
+                    if isinstance(t, torch.Tensor):
+                        setattr(obj, attr, t.to(dev))
+                for k in last_keys:
+                    if k in tracker._last and isinstance(tracker._last[k], torch.Tensor):
+                        tracker._last[k] = tracker._last[k].to(dev)
+
+    def _resume_from_torch_mode(self, record, x, padded: int):
+        self._torch_mode = False
+        self._torch_joint_key = None
+        self._torch_stable_evals = 0
+        self._torch_resumes += 1
+        self._anchor = None
+        self._last_anchor_eval = -1
+        self._evicts_anchor.clear()
+        self._engine_eval.clear()
+        logger.info(f"Resuming TensorRT on the {record.arch.name} {record.label}.")
+        try:
+            with self._park_tracker():
+                self._unload_torch_weights()
+                target = model_for(record)
+                _fits(target, self, x, unet_batch=padded)
+                self.use(record, (padded, x.shape[2], x.shape[3]))
+                _make_room_for_activations(self.model, self.patcher, x, unet_batch=padded)
+        except Exception as e:
+            failed = _models.get(record.key)
+            if failed is not None and failed.opened and not failed.loaded:
+                _unload(failed, keep=False)
+            self.fall_back(f"Couldn't resume the {record.arch.name} {record.label} ({e})", _unexpected(e))
 
     def use(self, record, call_shape=None):
         global _use_tick
@@ -757,6 +1529,8 @@ class Pass:
         want_shallow = bool(self.schedule is not None and model.hacks is not None and not model.shallow_failed)
         if model is not self.model or not model.loaded:
             was_loaded = model.loaded
+            if not was_loaded:
+                self._synced.pop(record.key, None)
             self._hold()
             for other in list(_models.values()):
                 if other is not model and other.opened and not other.loaded:
@@ -765,10 +1539,36 @@ class Pass:
                 (other for other in _models.values() if other is not model and other.loaded),
                 key=lambda m: _use_order.get(m.record.key, 0),
             )
-            if others:
-                need = self._need_for(model, want_shallow, call_shape)
-                while others and common.obtainable(model.load_device, keep=[model], engines=False) - common.reserve() < need:
+            base_need = self._need_for(model, want_shallow, call_shape) if (others or was_loaded) else 0
+            can_reuse_arena = was_loaded and not (want_shallow and not model.shallow_loaded) and model.engine is not None
+
+            def _cur_need() -> int:
+                if not can_reuse_arena:
+                    return base_need
+                arena = model.engine.arena.memory
+                return max(0, base_need - (arena.numel() if arena is not None else 0))
+
+            need = _cur_need()
+            need_room = need > 0 and (not was_loaded or common.free(model.load_device, at_least=need) < need)
+            if need_room and others:
+                res = common.reserve()
+                while others:
+                    need = _cur_need()
+                    if need <= 0 or common.obtainable(model.load_device, keep=[model, self.patcher], engines=False, at_least=need + res) - res >= need:
+                        break
                     _unload(others.pop(0))
+            need = _cur_need()
+            if was_loaded and need_room and need > 0 and common.free(model.load_device, at_least=need) < need:
+                keep_non_evict = [
+                    lm for lm in common.mm().current_loaded_models
+                    if lm.model is not None and (
+                        lm.model is model
+                        or lm.model is self.patcher
+                        or self.patcher.is_clone(lm.model)
+                        or getattr(lm.model, "evicted_last", False)
+                    )
+                ]
+                common.make_room(need, model.load_device, keep_non_evict)
             model.weights = self.weights
             model.want_shallow = want_shallow
             with torch.inference_mode(), _keeping(self.patcher):
@@ -780,7 +1580,11 @@ class Pass:
         _last_used[self.arch_id] = record.key
         _use_tick += 1
         _use_order[record.key] = _use_tick
-        model.sync()
+        uuid = getattr(self.patcher, "patches_uuid", None)
+        if uuid is None or self._synced.get(record.key) != (uuid, model.shallow_loaded) or not model.applied.get("unet"):
+            model.sync()
+            if uuid is not None:
+                self._synced[record.key] = (uuid, model.shallow_loaded)
         if self.schedule is not None and model.hacks and not model.shallow_loaded and not model.shallow_failed:
             model.want_shallow = True
             try:
@@ -788,6 +1592,9 @@ class Pass:
                     model.load_shallow()
             except Exception as e:
                 notify(f"Couldn't load the Speed Hacks part of the {model.name}, so it runs without Speed Hacks: {e}")
+            else:
+                if uuid is not None and model.shallow_loaded:
+                    self._synced[record.key] = (uuid, True)
         return model
 
     def preferred(self) -> set:
@@ -874,29 +1681,50 @@ class Pass:
             if hasattr(current, "_trt_before"):
                 self._put_apply_model(self.patcher.model, current._trt_before)
         self._hold()
+        self._torch_partial = False
+        self._torch_fast_loaded = False
+        self._no_coexist = False
+        self._torch_snap = None
+        self._torch_mode = False
+        self._torch_joint_key = None
         if self.model is not None and self.model.loaded:
             self.model.engine.release_activations()
+        else:
+            _release_unet_arena(common.device())
         if self.schedule is not None:
             self.schedule.release()
         if self.tracker is not None:
             self.tracker.release()
         self.schedule = self.tracker = None
+        for model in _models.values():
+            if model.weights is self.weights:
+                model.weights = None  # don't keep this checkpoint alive
+        if self.weights is not None:
+            self.weights.params.clear()
 
     def _hint_batching(self):
         # reForge decides how many conds to batch into one UNet call from the UNet's memory_required(). Overridden for
-        # the pass: 0 for any batch some profile runs (the engine's memory is already allocated), infinite otherwise,
-        # which makes reForge split the batch.
+        # the pass: 0 for any batch some profile runs while TensorRT is active (the engine's memory is already
+        # allocated), the model's real estimate while paused in _torch_mode, and infinite whenever no profile covers
+        # the combined batch/context so reForge splits it into profile-compatible calls (allowing TensorRT to resume).
         shapes = self.shapes
+        model = self.patcher.model
+        base_fn = getattr(type(model), "memory_required", None)
 
         def memory_required(input_shape, cond_shapes={}):
             b, _, h, w = input_shape[:4]
             lengths = [s[1] for s in cond_shapes.get("c_crossattn", ()) if len(s) > 1]
             context = math.lcm(*lengths) if lengths else profiles.CONTEXT_PER_CHUNK
-            return 0 if profiles.select(shapes, b, h, w, context) is not None else float("inf")
+            if profiles.select(shapes, b, h, w, context) is None:
+                return float("inf")
+            if self._torch_mode and callable(base_fn):
+                return base_fn(model, input_shape, cond_shapes)
+            return 0
 
-        self.patcher.model.memory_required = memory_required
+        model.memory_required = memory_required
 
     def end(self):
+        self._unload_torch_weights()
         self._restore()
         common.memory("after the sampling pass")
         from .engine import profile_report
@@ -908,13 +1736,12 @@ class Pass:
             if hacks.checks:
                 logger.debug("Speed Hacks checks (call, age, error): " + ", ".join(f"{i} {a} {e:.4f}" for i, a, e in hacks.checks))
             _note_speed_hacks(hacks)
-        for model in _models.values():
-            if model.weights is self.weights:
-                model.weights = None  # don't keep this checkpoint alive
 
     def fall_back(self, reason: str, error: Exception = None):
         self.fallback = reason
         notify(f"{reason}, so the rest of this pass runs on PyTorch.", error)
+        if self._torch_fast_loaded:
+            self._unload_torch_weights()
         self._restore()
         _load_torch_unet(self.patcher, self.shape)
         raise Fallback(reason)
@@ -923,15 +1750,140 @@ class Pass:
         b, c, h, w = x.shape
         if c != self.channels or context.shape[2] != self.context_dim:
             self.fall_back(f"The UNet was given {c} input channels and {context.shape[2]}-wide prompts, but the engine takes {self.channels} and {self.context_dim}")
-        choice = profiles.select(self.shapes, b, h, w, context.shape[1], prefer=self.preferred())
+        ctx_len = context.shape[1]
+        cur_shape = (b, h, w, ctx_len)
+        if self._deferred:
+            cand = (max(b, self._x_shape[0] * 2), c, h, w) if (h, w) == self._x_shape[2:] else tuple(x.shape)
+            if not self._deferred_seen or cand[0] * cand[2] * cand[3] >= self.shape[0] * self.shape[2] * self.shape[3]:
+                self.shape = cand
+                self._deferred_seen = True
+        resumed_choice = None
+        if self._torch_mode:
+            if self._eval_id != self._torch_eval_id:
+                prev_shapes = self._torch_eval_shapes
+                self._torch_eval_id = self._eval_id
+                self._torch_eval_shapes = [cur_shape]
+                joint = self._joint_record(prev_shapes)
+                if joint is not None:
+                    if joint.key == self._torch_joint_key:
+                        self._torch_stable_evals += 1
+                    else:
+                        self._torch_joint_key = joint.key
+                        self._torch_stable_evals = 1
+                    multi = len({(sh, sw) for _, sh, sw, _ in prev_shapes}) > 1
+                    if self._remaining_steps is None:
+                        enough_left = True
+                    elif multi:
+                        enough_left = self._remaining_steps >= 5
+                    elif self.schedule is not None:
+                        enough_left = self._remaining_steps >= 6
+                    else:
+                        enough_left = self._remaining_steps * self._evals_per_step >= 16
+                    if self._torch_resumes < 2 and enough_left and (multi or self._torch_stable_evals >= 2):
+                        fit_cur = profiles.select(joint.profile_shapes, b, h, w, ctx_len)
+                        if fit_cur is not None:
+                            self._resume_from_torch_mode(joint, x, fit_cur[1])
+                            slot_idx = next(i for i, (r, j) in enumerate(self.slots) if r.key == joint.key and j == fit_cur[0])
+                            resumed_choice = (slot_idx, fit_cur[1], fit_cur[2])
+                        else:
+                            self._torch_joint_key = None
+                            self._torch_stable_evals = 0
+                            raise _CallTorch()
+                    else:
+                        raise _CallTorch()
+                else:
+                    self._torch_joint_key = None
+                    self._torch_stable_evals = 0
+                    raise _CallTorch()
+            else:
+                if cur_shape not in self._torch_eval_shapes:
+                    self._torch_eval_shapes.append(cur_shape)
+                raise _CallTorch()
+        if self._eval_id != self._cur_eval_id:
+            self._cur_eval_id = self._eval_id
+            self._cur_eval_shapes = []
+        if cur_shape not in self._cur_eval_shapes:
+            self._cur_eval_shapes.append(cur_shape)
+        choice = resumed_choice if resumed_choice is not None else self._select(b, h, w, ctx_len)
+        anchor_recent = (
+            self.model is not None
+            and self.model.loaded
+            and self._anchor is not None
+            and (self._eval_id - self._last_anchor_eval) <= 2
+        )
         if choice is None:
-            tokens = context.shape[1] // profiles.CONTEXT_PER_CHUNK * profiles.TOKENS_PER_CHUNK
+            if anchor_recent and (h, w) != self._anchor[1:3]:
+                self._call_torch(f"no profile runs {w * 8}x{h * 8}", cur_shape)
+            tokens = ctx_len // profiles.CONTEXT_PER_CHUNK * profiles.TOKENS_PER_CHUNK
             self.fall_back(
                 f"No profile runs {w * 8}x{h * 8} with a UNet batch of {b} and {tokens}-token prompts "
                 "(reForge pads the prompt and negative prompt to the same length)"
             )
         index, padded, repeats = choice
         record, profile = self.slots[index]
+        prev_model = self.model
+        if prev_model is None or prev_model.record.key != record.key or not prev_model.loaded:
+            target = model_for(record)
+            want_shallow = bool(self.schedule is not None and target.hacks is not None and not target.shallow_failed)
+            upgraded = False
+            was_anchor_recent = anchor_recent
+            returning_to_anchor = prev_model is not None and self._covers_anchor(record) and not self._covers_anchor(prev_model.record)
+            stay = None
+            if (
+                anchor_recent
+                and not target.loaded
+                and not returning_to_anchor
+                and self._would_evict_current(target, want_shallow, (padded, h, w))
+            ):
+                stay = profiles.select(prev_model.record.profile_shapes, b, h, w, ctx_len)
+                if stay is not None:
+                    record = prev_model.record
+                    profile, padded, repeats = stay
+                elif b * h * w <= self._anchor[4] or record.key in self._evicts_anchor:
+                    self._call_torch(f"{w * 8}x{h * 8} would evict it", cur_shape)
+                else:
+                    upgraded = True
+                    self._evicts_anchor.add(prev_model.record.key)
+                    self._anchor = None
+            if stay is None:
+                need_load = not target.loaded or (want_shallow and not target.shallow_loaded)
+                active_before = {
+                    m.record.key: m for m in _models.values()
+                    if m.loaded and (m is prev_model or (self._eval_id - self._engine_eval.get(m.record.key, -99)) <= 2)
+                }
+                try:
+                    if need_load and prev_model is not None and prev_model.loaded:
+                        prev_model.engine.release_activations()
+                    if need_load:
+                        self._unload_torch_weights()
+                    elif self._torch_partial:
+                        need_t = self._need_for(target, want_shallow, (padded, h, w))
+                        arena_t = target.engine.arena.memory if target.engine is not None else None
+                        if arena_t is not None:
+                            need_t = max(0, need_t - arena_t.numel())
+                        res_t = common.reserve()
+                        if common.obtainable(target.load_device, keep=[target, self.patcher], engines=False, at_least=need_t + res_t) - res_t < need_t:
+                            self._no_coexist = True
+                            self._unload_torch_weights()
+                    if prev_model is None:
+                        _fits(target, self, x, unet_batch=padded)
+                    self.use(record, (padded, h, w))
+                    if prev_model is None:
+                        _make_room_for_activations(self.model, self.patcher, x, unet_batch=padded)
+                except Exception as e:
+                    failed = _models.get(record.key)
+                    if failed is not None and failed.opened and not failed.loaded:
+                        _unload(failed, keep=False)
+                    self.fall_back(f"Couldn't load the {record.arch.name} {record.label} ({e})", _unexpected(e))
+                evicted = [k for k, m in active_before.items() if k != record.key and not m.loaded]
+                if not upgraded and evicted and was_anchor_recent and self._anchor is not None:
+                    if self._covers_anchor(record) or b * h * w > self._anchor[4]:
+                        self._evicts_anchor.update(evicted)
+                    else:
+                        self._evicts_anchor.add(record.key)
+                if not anchor_recent and prev_model is not None and prev_model is not self.model:
+                    self._anchor = None
+                    self._evicts_anchor.clear()
         timesteps = timesteps.reshape(-1)
         feed = {
             "sample": x,
@@ -942,16 +1894,6 @@ class Pass:
             feed["y"] = y
         if padded > b:
             feed = {k: v.repeat(-(-padded // b), *([1] * (v.dim() - 1)))[:padded] for k, v in feed.items()}
-        if self.model is None or self.model.record.key != record.key or not self.model.loaded:
-            try:
-                if self.model is not None and self.model.loaded:
-                    self.model.engine.release_activations()
-                self.use(record, (padded, h, w))
-            except Exception as e:
-                failed = _models.get(record.key)
-                if failed is not None and failed.opened and not failed.loaded:
-                    _unload(failed, keep=False)
-                self.fall_back(f"Couldn't load the {record.arch.name} {record.label} ({e})", _unexpected(e))
         stream = torch.cuda.current_stream(self.model.load_device).cuda_stream
         hack = None
         if self.schedule is not None and not self.schedule.idle and self.model.shallow_loaded:
@@ -986,47 +1928,82 @@ class Pass:
                     hack = [slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b]
                 if hack is None and planned_shallow and self.started is not None:
                     self.started.ran_full()
-        out = self._infer_with_room(feed, profile, stream, hack)
+        vol = b * h * w
+        out = self._infer_with_room(feed, profile, stream, hack, vol=vol)
         # A shallow call whose Speed Hacks failed ran on the full engine instead
         shallow = bool(hack) and hack[2] is not None and self.schedule is not None
-        if not shallow and not self.checked:
-            self.checked = True
+        engine_key = self.model.record.key
+        if not shallow and engine_key not in self.checked:
+            self.checked.add(engine_key)
             if not torch.isfinite(out).all():
                 self.fall_back("The engine produced NaN/Inf values")
-        if shallow and not self.shallow_checked:
-            self.shallow_checked = True
+        if shallow and engine_key not in self.shallow_checked:
+            self.shallow_checked.add(engine_key)
             if not torch.isfinite(out).all():
                 if self.started is not None:
                     self.started.ran_full()
                 self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
-                out = self._infer_with_room(feed, profile, stream)
+                out = self._infer_with_room(feed, profile, stream, vol=vol)
+        self._engine_eval[engine_key] = self._eval_id
+        expired = self._anchor is not None and (self._eval_id - self._last_anchor_eval) > 2
+        if (
+            self._anchor is None
+            or expired
+            or vol > self._anchor[4]
+            or (vol == self._anchor[4] and (h, w) == self._anchor[1:3])
+        ):
+            if expired:
+                self._evicts_anchor.clear()
+            self._anchor = (b, h, w, ctx_len, vol)
+            self._last_anchor_eval = self._eval_id
+        elif (h, w) == self._anchor[1:3]:
+            self._last_anchor_eval = self._eval_id
         return out[:b].to(x.dtype)
 
-    def _infer_with_room(self, feed, profile, stream, hack=None):
-        def clear(error):
-            stack, seen = [error], set()
-            while stack:
-                cur = stack.pop()
-                if id(cur) in seen:
-                    continue
-                seen.add(id(cur))
-                for linked in (cur.__cause__, cur.__context__):
-                    if linked is not None:
-                        stack.append(linked)
-                cur.__traceback__ = cur.__cause__ = cur.__context__ = None
-
+    def _infer_with_room(self, feed, profile, stream, hack=None, vol: int = 0):
         try:
             return self._infer(feed, profile, stream, hack)
         except torch.cuda.OutOfMemoryError as e:
-            clear(e)
+            _clear_traceback(e)
+            dev = self.model.load_device
+            before_free = common.free(dev)
             self.model.engine.release_activations()
+            unloaded_torch = self._torch_partial
+            if self._torch_partial and not self._torch_mode:
+                self._no_coexist = True
+            self._unload_torch_weights()
+            active_other = [
+                m for m in _models.values()
+                if m is not self.model and m.loaded and (self._eval_id - self._engine_eval.get(m.record.key, -99)) <= 2
+            ]
+            # Stage 1: evict non-engine models (CLIP/VAE) and stale engines while keeping active engines of this pass
+            # resident; only touch active engines in Stage 2 if retrying after freeing everything else still OOMs.
+            if active_other:
+                with _evictable():
+                    freed = common.inference_mode(common.mm().free_memory)(
+                        sys.maxsize // 2, dev, keep_loaded=_loaded_entries(self.model, self.patcher, *active_other)
+                    )
+                common.mm().soft_empty_cache(force=True)
+                if unloaded_torch or freed or common.free(dev) > before_free:
+                    try:
+                        return self._infer(feed, profile, stream, hack, retry=False)
+                    except torch.cuda.OutOfMemoryError as e1:
+                        _clear_traceback(e1)
+                        self.model.engine.release_activations()
+            active_before = {m.record.key: m for m in active_other if m.loaded}
             with _evictable():
-                common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, self.model.load_device, keep_loaded=_loaded_entries(self.model, self.patcher))
+                common.inference_mode(common.mm().free_memory)(sys.maxsize // 2, dev, keep_loaded=_loaded_entries(self.model, self.patcher))
             common.mm().soft_empty_cache(force=True)
+            evicted = [k for k, m in active_before.items() if not m.loaded]
+            if evicted and self._anchor is not None and (self._eval_id - self._last_anchor_eval) <= 2:
+                if self._covers_anchor(self.model.record) or vol > self._anchor[4]:
+                    self._evicts_anchor.update(evicted)
+                else:
+                    self._evicts_anchor.add(self.model.record.key)
             try:
                 return self._infer(feed, profile, stream, hack, retry=True)
             except torch.cuda.OutOfMemoryError as e:
-                clear(e)
+                _clear_traceback(e)
                 if hack and hack[2] is not None and self.schedule is not None and self.started is not None:
                     self.started.ran_full()
                 if hack:
@@ -1085,6 +2062,19 @@ class Pass:
             self.fall_back(f"The engine failed ({e})", _unexpected(e))
 
 
+def _clear_traceback(error):
+    stack, seen = [error], set()
+    while stack:
+        cur = stack.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        for linked in (cur.__cause__, cur.__context__):
+            if linked is not None:
+                stack.append(linked)
+        cur.__traceback__ = cur.__cause__ = cur.__context__ = None
+
+
 def _engine_records(patcher, x):
     chosen = setting()
     if chosen not in (AUTOMATIC, SPEED_HACKS):
@@ -1102,7 +2092,7 @@ def _engine_records(patcher, x):
         notify(f"TensorRT engines can't apply {reason}, so this pass runs on PyTorch.")
         return None, False
     b, _, h, w = x.shape
-    if not profiles.covers_size([s for r in records for s in r.profile_shapes], h, w, b):
+    if not _wraps_unet(patcher) and not profiles.covers_size([s for r in records for s in r.profile_shapes], h, w, b):
         notify(f"No {arch.name} profile covers {w * 8}x{h * 8} at batch size {b}, so this pass runs on PyTorch. Add one in the TensorRT tab.")
         return None, False
     stale_graph = sum(r.stale_graph for r in records)
@@ -1134,6 +2124,11 @@ def _begin(records, hacks, patcher, x, prepare):
             _no_free -= 1
             mm.vram_state = prev_state
         p = Pass(records, patcher, x, hacks)
+        if p._deferred:
+            # Wrappers such as MultiDiffusion rewrite x into smaller tiles before the UNet runs: wait for the first
+            # actual UNet call so we load the tile engine directly instead of loading and immediately evicting the canvas one.
+            p._hold(patcher)
+            return p
         record = None
         try:
             b, _, h, w = x.shape
@@ -1165,16 +2160,18 @@ def _unexpected(error):  # the error, for its traceback, unless a RuntimeError: 
     return None if isinstance(error, RuntimeError) else error
 
 
-def _fits(model: TrtModel, p: Pass, x):
+def _fits(model: TrtModel, p: Pass, x, unet_batch: int = None):
     shallow = bool(model.hacks and p.schedule is not None and not model.shallow_failed)
-    calls = max(call_bytes(model, p.patcher, x), model.took.get(tuple(x.shape[i] for i in (0, 2, 3)), 0))
+    key = _took_key(model, x, unet_batch=unet_batch)
+    calls = max(call_bytes(model, p.patcher, x, unet_batch=unet_batch), model.took.get(key, 0))
     held = model.loaded_size()
     if model.loaded:
         engine = held + (model._serialized_size("shallow") if shallow and not model.shallow_loaded else 0)
     else:
         engine = model.full(shallow, model._kept(p.weights))
-    room = common.obtainable(model.load_device, keep=[model]) - common.reserve() + held
     need = held + common.padded(engine - held + calls)  # margin only on what isn't in VRAM yet
+    res = common.reserve()
+    room = common.obtainable(model.load_device, keep=[model], at_least=max(0, need - held + res)) - res + held
     logger.info(
         f"The {model.name} at {_sizes(x)} needs {common.gib(need)} of VRAM ({common.gib(engine)} for the engine, {common.gib(calls)} "
         f"to run it, {common.gib(need - engine - calls)} margin); {common.gib(room)} can be freed."
@@ -1183,15 +2180,15 @@ def _fits(model: TrtModel, p: Pass, x):
         raise DoesNotFit(f"it needs {common.gib(need)} of VRAM at {_sizes(x)}, and at most {common.gib(room)} can be freed")
 
 
-def _make_room_for_activations(model: TrtModel, patcher, x):
+def _make_room_for_activations(model: TrtModel, patcher, x, unet_batch: int = None):
     try:
-        takes = _call_bytes(model, x)
+        takes = _call_bytes(model, x, unet_batch=unet_batch)
     except Exception as e:
         logger.debug(f"Couldn't ask TensorRT what running the {model.name} takes: {e}")
         return
     if not takes:
         return
-    counted = call_bytes(model, patcher, x)
+    counted = call_bytes(model, patcher, x, unet_batch=unet_batch)
     if takes > counted:
         most = " (the most for any size its profile takes: it gave no figure for this one)" if model.engine.size_is_most else ""
         logger.debug(f"TensorRT takes {common.gib(takes)} to run the {model.name} at {_sizes(x)}{most}, more than the {common.gib(counted)} estimated.")
@@ -1202,14 +2199,17 @@ def _make_room_for_activations(model: TrtModel, patcher, x):
         with _evictable():
             free = common.make_room(need, model.load_device, keep)
     if free < need:
-        model.took[tuple(x.shape[i] for i in (0, 2, 3))] = takes  # so _fits rejects these sizes before loading next time
+        model.took[_took_key(model, x, unet_batch=unet_batch)] = takes  # so _fits rejects these sizes before loading next time
         raise RuntimeError(f"running it at {_sizes(x)} needs {common.gib(need)} of VRAM besides the engine, and only {common.gib(free)} could be freed")
 
 
-def _call_shapes(model: TrtModel, x):
+def _call_shapes(model: TrtModel, x, unet_batch: int = None):
     b, c, h, w = x.shape
     held = model.record.profile_shapes
-    choice = profiles.select(held, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select(held, b, h, w, profiles.CONTEXT_PER_CHUNK)
+    if unet_batch is not None:
+        choice = profiles.select(held, unet_batch, h, w, profiles.CONTEXT_PER_CHUNK)
+    else:
+        choice = profiles.select(held, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select(held, b, h, w, profiles.CONTEXT_PER_CHUNK)
     if choice is None:
         return None
     profile, padded, _ = choice
@@ -1224,14 +2224,22 @@ def _call_shapes(model: TrtModel, x):
     return profile, shapes
 
 
-def _call_bytes(model: TrtModel, x) -> int:
-    found = _call_shapes(model, x)
+def _call_bytes(model: TrtModel, x, unet_batch: int = None) -> int:
+    found = _call_shapes(model, x, unet_batch=unet_batch)
     if found is None:
         return 0
     profile, shapes = found
     act = model.engine.estimate_activation_bytes(profile, shapes, torch.cuda.current_stream(model.load_device).cuda_stream)
     io = model.engine.io_bytes()
     return act + sum(io.values())
+
+
+def _note_torch_call(p: Pass, x, out, cond_or_uncond):
+    if p.tracker is not None and p.tracker.current is not None and p.schedule is not None and not p.schedule.done:
+        with p._speed_hacks():
+            entry = p.tracker.call(x, x.shape[0])
+            if entry is not None:
+                p.tracker.after_call(entry, out[:x.shape[0]], cond_or_uncond)
 
 
 def _wrap_forward(original):
@@ -1246,6 +2254,28 @@ def _wrap_forward(original):
                 if (transformer_options.get("wrappers") or {}).get("diffusion_model"):
                     p.fall_back("TensorRT engines can't apply UNet wrappers")
                 return p.run(x, timesteps, context, y, transformer_options.get("cond_or_uncond"))
+            except _CallTorch:
+                cond_or_uncond = transformer_options.get("cond_or_uncond")
+                try:
+                    out = original(self, x, timesteps, context, y, control, transformer_options, **kwargs)
+                    _note_torch_call(p, x, out, cond_or_uncond)
+                    return out
+                except torch.cuda.OutOfMemoryError as e:
+                    _clear_traceback(e)
+                    if p._torch_partial:
+                        if not p._torch_mode:
+                            p._no_coexist = True
+                        p._unload_torch_weights()
+                        try:
+                            out = original(self, x, timesteps, context, y, control, transformer_options, **kwargs)
+                            _note_torch_call(p, x, out, cond_or_uncond)
+                            return out
+                        except torch.cuda.OutOfMemoryError as e2:
+                            _clear_traceback(e2)
+                    try:
+                        p.fall_back("Running a side call on PyTorch ran out of VRAM")
+                    except Fallback:
+                        pass
             except Fallback:
                 pass
         return original(self, x, timesteps, context, y, control, transformer_options, **kwargs)
@@ -1282,11 +2312,15 @@ def _wrap_prepare(original):
             with _evictable():
                 return original(unet, x, *args, **kwargs)
         _pass = _begin(records, hacks, unet, x, lambda u, v: original(u, v, *args, **kwargs))
-        if _pass is not None and _pass.schedule is not None and _denoiser_state is not None:
-            # Refiner switch mid-denoiser: get_sigmas doesn't run again, and the switch step is already in flight.
-            if _latest_sigmas is not None:
-                _pass.schedule.sigmas = list(_latest_sigmas)
-            _begin_step(_pass, *_denoiser_state)
+        if _pass is not None and _denoiser_state is not None:
+            _pass._eval_id = 1
+            if _denoiser_state[2]:
+                _pass._remaining_steps = max(0, int(_denoiser_state[2]) - int(_denoiser_state[3]))
+            if _pass.schedule is not None:
+                # Refiner switch mid-denoiser: get_sigmas doesn't run again, and the switch step is already in flight.
+                if _latest_sigmas is not None:
+                    _pass.schedule.sigmas = list(_latest_sigmas)
+                _begin_step(_pass, *_denoiser_state)
 
     sampling_prepare._trt_original = original
     return sampling_prepare
@@ -1316,6 +2350,8 @@ def _wrap_denoiser(original):
     def forward(self, x, sigma, *args, **kwargs):
         global _denoiser_state
         p = _pass
+        if p is not None and p.fallback is None:
+            p._eval_id += 1
         current_state = None
         if setting() in (AUTOMATIC, SPEED_HACKS):
             try:
@@ -1323,6 +2359,16 @@ def _wrap_denoiser(original):
 
                 state = shared.state
                 current_state = (int(self.step), self.total_steps, state.sampling_steps, state.sampling_step, x, sigma)
+                if p is not None and p.fallback is None and state.sampling_steps:
+                    step_now = int(state.sampling_step)
+                    p._remaining_steps = max(0, int(state.sampling_steps) - step_now)
+                    if p._last_step is None:
+                        p._last_step, p._step_evals = step_now, 1
+                    elif step_now == p._last_step:
+                        p._step_evals += 1
+                    else:
+                        p._evals_per_step = max(1, p._step_evals)
+                        p._last_step, p._step_evals = step_now, 1
             except Exception as e:
                 if p is not None and p.schedule is not None and p.fallback is None:
                     p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)

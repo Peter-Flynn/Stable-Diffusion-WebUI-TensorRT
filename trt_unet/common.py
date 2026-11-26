@@ -200,27 +200,34 @@ def reserve() -> int:
         return 0
 
 
-def _free_now(device, trim_cache: bool = True) -> int:
+def _free_now(device, trim_cache: bool = True, at_least: int = None) -> int:
     try:
         if torch.device(device).type == "cuda":
-            cached = 0
             if pooled():
-                if trim_cache:
-                    trim()
-            else:
-                stats = torch.cuda.memory_stats(device)
-                cached = stats.get("reserved_bytes.all.current", 0) - stats.get("active_bytes.all.current", 0)
-            return torch.cuda.mem_get_info(device)[0] + max(0, cached)
+                if at_least is not None or not trim_cache:
+                    driver = int(torch.cuda.mem_get_info(device)[0])
+                    if not trim_cache or driver >= at_least:
+                        return driver
+                trim()
+                return int(torch.cuda.mem_get_info(device)[0])
+            driver = int(torch.cuda.mem_get_info(device)[0])
+            if at_least is not None and driver >= at_least:
+                return driver
+            stats = torch.cuda.memory_stats(device)
+            cached = stats.get("reserved_bytes.all.current", 0) - stats.get("active_bytes.all.current", 0)
+            return driver + max(0, cached)
     except Exception:
         pass
     return mm().get_free_memory(device)
 
 
-def free(device) -> int:
-    return _free_now(device) - reserve()
+def free(device, trim: bool = True, at_least: int = None) -> int:
+    res = reserve()
+    want = None if at_least is None else at_least + res
+    return _free_now(device, trim_cache=trim, at_least=want) - res
 
 
-def obtainable(device, keep=(), engines: bool = True, trim: bool = True) -> int:
+def obtainable(device, keep=(), engines: bool = True, trim: bool = True, at_least: int = None) -> int:
     m = mm()
     held = sum(
         lm.model_loaded_memory()
@@ -228,7 +235,8 @@ def obtainable(device, keep=(), engines: bool = True, trim: bool = True) -> int:
         if lm.device == device and lm.model is not None and not any(lm.model is k for k in keep)
         and (engines or not getattr(lm.model, "evicted_last", False))
     )
-    return _free_now(device, trim) + held
+    want = None if at_least is None else max(0, at_least - held)
+    return _free_now(device, trim_cache=trim, at_least=want) + held
 
 
 def register(model):
@@ -238,6 +246,10 @@ def register(model):
     entry = next((lm for lm in m.current_loaded_models if lm.model is model), None)
     if entry is not None:
         m.current_loaded_models.remove(entry)
+        if getattr(model, "loaded", False) and getattr(entry, "model_finalizer", None) is not None and getattr(entry, "real_model", None) is not None and entry.real_model() is getattr(model, "model", None):
+            entry.currently_used = True
+            m.current_loaded_models.insert(0, entry)
+            return
         if entry.model_finalizer is not None:
             entry.model_finalizer.detach()  # model_load() creates a new one
             entry.model_finalizer = None
@@ -250,7 +262,7 @@ def register(model):
 
 def make_room(nbytes: int, device, keep_loaded=()) -> int:
     m = mm()
-    had = free(device)
+    had = free(device, at_least=nbytes)
     for _ in range(16):
         if had >= nbytes:
             break
@@ -258,7 +270,7 @@ def make_room(nbytes: int, device, keep_loaded=()) -> int:
         # own count of free memory, which can be lower than free().
         with torch.inference_mode():
             m.free_memory(m.get_free_memory(device) + nbytes - had, device, keep_loaded=list(keep_loaded))
-        now = free(device)
+        now = free(device, at_least=nbytes)
         if now <= had:
             break
         had = now

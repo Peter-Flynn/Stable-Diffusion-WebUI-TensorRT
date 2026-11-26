@@ -38,11 +38,8 @@ class _Side:
         self.key = None
         self.engines = {}
         self.names = {}
-        # Extra execution contexts on the same engines: for strips' shorter last strip, and for asking TensorRT activation
-        # sizes without changing the shapes set on the context that runs
+        # Extra execution contexts on strip engines for their shorter last strip so alternating full/last strips don't thrash shapes
         self.lasts = {}
-        self.probes = {}
-        self.part_probes = {}
         self.applied = {}
         self.sizes = {}
         self.activations = {}
@@ -67,13 +64,7 @@ class _Side:
         return self._get(part, record.plan(part), None, listed)
 
     def part_probe(self, part: str):
-        e = self.engine(part)
-        probe = self.part_probes.get(part)
-        if probe is None or probe.engine is not e.engine:
-            if probe is not None:
-                probe.unload()
-            probe = self.part_probes[part] = e.twin()
-        return probe
+        return self.engine(part)
 
     def stage(self, stage) -> tuple:
         record, kind = self.model.record, stage.kind.name
@@ -84,9 +75,7 @@ class _Side:
         return e, self.lasts[stage.identity]
 
     def probe(self, stage):
-        if stage.kind.name not in self.probes:
-            self.probes[stage.kind.name] = self.stage(stage)[0].twin()
-        return self.probes[stage.kind.name]
+        return self.stage(stage)[0]
 
     def runner_for(self, stage):
         return strips.EngineRunner(lambda: self.stage(stage), lambda: self.probe(stage), self.kinds[stage.kind.name]["shapes"], stage.kind)
@@ -182,13 +171,10 @@ class _Side:
 
     def drop(self, keep=()):
         if self.strips_key not in keep:  # contexts go before the engines they belong to
-            for e in list(self.probes.values()) + list(self.lasts.values()):
+            for e in list(self.lasts.values()):
                 e.unload()
-            self.probes, self.lasts = {}, {}
+            self.lasts = {}
         for which in [w for w in self.engines if not self._kept(w, keep)]:
-            probe = self.part_probes.pop(which, None)
-            if probe is not None:
-                probe.unload()
             self.engines.pop(which).unload()
             gpu.unloaded(self.model.owner, self.sizes.get(which, 0))
             for d in (self.names, self.applied, self.sizes):
@@ -289,12 +275,14 @@ class VaeModel:
         for part in parts if load else ():
             side.engine(part)
 
-    def obtainable(self, engines: bool = True, trim: bool = True) -> int:
+    def obtainable(self, engines: bool = True, trim: bool = True, at_least: int = None) -> int:
         spare = self.decoder.spare(self.using) + self.encoder.spare(self.using)
-        return common.obtainable(self.load_device, keep=[self], engines=engines, trim=trim) - common.reserve() + spare
+        res = common.reserve()
+        want = None if at_least is None else max(0, at_least + res - spare)
+        return common.obtainable(self.load_device, keep=[self], engines=engines, trim=trim, at_least=want) - res + spare
 
     def make_room(self, nbytes: int) -> int:
-        if common.free(self.load_device) < nbytes:
+        if common.free(self.load_device, at_least=nbytes) < nbytes:
             self.decoder.drop(self.using)
             self.encoder.drop(self.using)
         keep = _own(self)
@@ -438,9 +426,14 @@ def _fit(model: VaeModel, top: int, need_for, engines: bool, load) -> tuple:
         return common.padded(need_for(n)[0])
 
     for loaded in (False, True):
-        can = model.obtainable(engines)
+        can = model.obtainable(engines, trim=False)
         beside = can if not engines else model.obtainable(engines=False, trim=False)
         n = next((n for n in range(top, 0, -1) if room_for(n) <= beside), 0) or (1 if room_for(1) <= can else 0)
+        if n < top and common.pooled():
+            common.trim()
+            can = model.obtainable(engines, trim=False)
+            beside = can if not engines else model.obtainable(engines=False, trim=False)
+            n = next((n for n in range(top, 0, -1) if room_for(n) <= beside), 0) or (1 if room_for(1) <= can else 0)
         if not n:
             return 0, *need_for(1), can
         if not loaded:
@@ -475,12 +468,30 @@ def _settled(planner, h: int, w: int, budget, ram: bool = True):
     return None
 
 
+def _settled_lazy(model: VaeModel, planner, h: int, w: int, beside: int, engines: bool, use_free: bool = False, target=None):
+    budget = (
+        (lambda: common.usable(common.free(model.load_device, trim=False)) - beside)
+        if use_free
+        else (lambda: common.usable(model.obtainable(engines, trim=False)) - beside)
+    )
+    plan = _settled(planner, h, w, budget, ram=engines)
+    if not common.pooled():
+        return plan
+    if plan is not None and (
+        plan.optimal
+        or (target is not None and plan.modes == target.modes and plan.rows == target.rows and plan.host == target.host)
+    ):
+        return plan
+    common.trim()
+    return _settled(planner, h, w, budget, ram=engines)
+
+
 def _plan_strips(model: VaeModel, planner, h: int, w: int, beside: int, engines: bool):
-    best = _settled(planner, h, w, lambda: common.usable(model.obtainable(engines)) - beside, engines)
+    best = _settled_lazy(model, planner, h, w, beside, engines)
     if best is None:
         return None
     model.make_room(common.padded(best.vram + beside))
-    return _settled(planner, h, w, lambda: common.usable(common.free(model.load_device)) - beside, engines)
+    return _settled_lazy(model, planner, h, w, beside, engines, use_free=True, target=best)
 
 
 class _Peak:
@@ -1067,7 +1078,7 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
     before = model.need(1, h, w, whole=False)[0]
     held = 2 * cfg["mid_channels"] * h * w * dtype.itemsize  # alive while slab allocates, freed once copied in
     before = common.padded(before)
-    if before > model.obtainable(engines) or _settled(decoder, h, w, lambda: common.usable(model.obtainable(engines)) - beside - held, engines) is None:
+    if before > model.obtainable(engines, at_least=before) or _settled_lazy(model, decoder, h, w, beside + held, engines) is None:
         return _NO_ROOM
     pixels = plan = None
     report = ""
@@ -1077,7 +1088,8 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
                 return _NO_ROOM
         else:
             model.release()
-            common.trim()
+            if common.pooled() and common.free(device, trim=False) < before:
+                common.trim()
         z = vae._to_vae_latent(samples_in[i:i + 1])
         z = (z.to(device=device, dtype=torch.float32) * wscale).to(dtype) if wscale != 1.0 else z.to(device=device, dtype=dtype)
         mid = side.engine(PRE).infer({"latent": z}, 0, stream)
@@ -1089,11 +1101,12 @@ def _run_strips(model: VaeModel, vae, samples_in, found: list, out_gpu: bool, en
             notify(f"The VAE decoder's pre engine produced NaN/Inf values in {_whole_label(record)}, so this decode runs on PyTorch.")
             return None, ""
         model.release()
-        common.trim()
         if plan is None:
             plan = _plan_strips(model, decoder, h, w, beside, engines)
             if plan is None:
                 return _NO_ROOM
+        elif common.pooled() and common.free(device, trim=False) < common.padded(plan.vram + beside):
+            common.trim()
         x_factor = side.scale / wscale
         if x_factor != 1.0:  # scaled in FP32, before the strips convert to FP16
             x = x.float() * x_factor
@@ -1320,9 +1333,9 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
     image_bytes = c * h * w * (4 + sdtype.itemsize)
     beside = cfg["mid_channels"] * mh * mw * sdtype.itemsize
     after = model.need_after_strips(mh, mw)
-    can = model.obtainable(engines)
     image_room, after = common.padded(image_bytes), common.padded(after)
-    if max(image_room, after + beside) > can or _settled(encoder, mh, mw, lambda: common.usable(model.obtainable(engines)) - beside - image_bytes, engines) is None:
+    can = model.obtainable(engines, at_least=max(image_room, after + beside))
+    if max(image_room, after + beside) > can or _settled_lazy(model, encoder, mh, mw, beside + image_bytes, engines) is None:
         return _NO_ROOM
     norm = strips.norms_of(fsm, [strips.ATTENTION_NORM], device)[strips.ATTENTION_NORM]
     a = fsm.encoder.mid.attn_1
@@ -1335,12 +1348,15 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
                 return _NO_ROOM
         else:
             model.release()
-            common.trim()
+            if common.pooled() and common.free(device, trim=False) < image_room:
+                common.trim()
         image = vae.process_input(pixels[i:i + 1]).to(device=device, dtype=sdtype)
         if plan is None:
             plan = _plan_strips(model, encoder, mh, mw, beside, engines)
             if plan is None:
                 return _NO_ROOM
+        elif common.pooled() and common.free(device, trim=False) < common.padded(plan.vram + beside):
+            common.trim()
         inputs = [image]
         del image
         with _Peak() as peak:
@@ -1351,7 +1367,7 @@ def _encode_strips(model: VaeModel, vae, pixels, found: list, engines: bool):
         if i == 0:
             if model.make_room(after) < after and model.beside:
                 return _NO_ROOM
-        else:
+        elif common.pooled() and common.free(device, trim=False) < after:
             common.trim()
         center, factor, shift = stats.affine(norm, side.scale)
         normed = ((x.float() - center) * factor + shift).to(dtype)

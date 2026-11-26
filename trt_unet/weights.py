@@ -148,12 +148,15 @@ class EffectiveWeights:
         return items
 
     @staticmethod
-    def apply_fast_lora(gpu_base: torch.Tensor, gpu_items: list, dtype=torch.float16) -> torch.Tensor:
+    def apply_fast_lora(gpu_base: torch.Tensor, gpu_items: list, dtype=torch.float16, out: torch.Tensor = None) -> torch.Tensor:
         weight = gpu_base.to(torch.float32, copy=True, memory_format=torch.contiguous_format)
         flat = weight.reshape(weight.shape[0], -1)
         for up, down, scale in gpu_items:
             if scale != 0.0:
                 flat.addmm_(up.to(torch.float32).flatten(start_dim=1), down.to(torch.float32).flatten(start_dim=1), alpha=scale)
+        if out is not None:
+            out.copy_(weight)
+            return out
         return weight.to(dtype)
 
     def apply_on_gpu(self, name: str, gpu_base: torch.Tensor, dtype=torch.float16) -> torch.Tensor:

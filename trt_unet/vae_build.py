@@ -291,7 +291,7 @@ def build(arch, profiles: list, work: str, optimization_level=None, progress=Non
             progress(0.0, "exporting the graphs")
         graphs, seen_warnings = {}, set()
         whole_exp = EXPONENT if scaled(dtype) else 0
-        small_fp32_gn = lambda span: dtype in (torch.float16, torch.bfloat16) and (span[0][2:] != span[2][2:]) and max(span[2][2:]) <= 49
+        small_fp32_gn = lambda span: (span[0][2:] != span[2][2:]) and (span[2][2] * span[2][3] <= 49 * 49)
         if PRE in todo or POST in todo:
             graphs.update(export_onnx(vae, work, dtype, device, seen_warnings, fp32_gn=small_fp32_gn(asked[PRE]["latent"]), scale_exponent=whole_exp))
         if ENCODE_PRE in todo:

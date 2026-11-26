@@ -19,7 +19,7 @@ from .profiles import Profile
 PER_PROFILE, MERGED = "per_profile", "merged"
 SHALLOW = ".shallow.plan"
 MODES = (PER_PROFILE, MERGED)
-GRAPH_VERSION = 2  # bumped when the exported UNet ONNX graph changes (2: FP32 GroupNorm for TRT 11 Myelin bug)
+GRAPH_VERSION = 3  # 2: FP32 GroupNorm; 3: decomposed FP32 GroupNorm (avoids TRT 11 __myl_Gnor on small dynamic profiles)
 
 
 def root() -> str:
@@ -129,7 +129,22 @@ class Record:
 
     @property
     def stale_graph(self) -> bool:
-        return self.meta.get("graph", 1) != GRAPH_VERSION
+        g = self.meta.get("graph", 1)
+        if isinstance(g, bool) or not isinstance(g, int) or g < 2 or g > GRAPH_VERSION:
+            return True
+        if g == GRAPH_VERSION:
+            return False
+        # Graph v2 used ONNX GroupNorm in FP32, which still hits TensorRT 11's broken __myl_Gnor kernel when a
+        # spatially dynamic profile is small enough for a group to fit in __myl_Gnor's tile (~24,576 elements:
+        # C=640 at stride 32px, e.g. SDXL *-1024 and SD 1.5 *-768; C=1280 at stride 64px, e.g. SD 1.5 *-1536).
+        d = self.arch.multiple
+        for p in self.profiles:
+            if p.width[0] == p.width[2] and p.height[0] == p.height[2]:
+                continue
+            w, h = p.width[2], p.height[2]
+            if (w // 32) * (h // 32) <= 1300 or (d >= 64 and (w // d) * (h // d) <= 650):
+                return True
+        return False
 
     @property
     def stale_speed_hacks(self) -> bool:  # built with another fresh.SIGNATURE: a different shallow graph

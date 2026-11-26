@@ -720,6 +720,7 @@ class Plan:
     in_place: dict
     io: list
     act: int
+    optimal: bool = False
 
     @property
     def vram(self) -> int:
@@ -869,6 +870,7 @@ class Decode:
         # tall as the engines take (down to 1/8 of that); then repeatedly switching the block whose held tensor is
         # largest at peak usage to RECOMPUTE or FUSED; then (if `ram`) moving the largest tensors held at peak to RAM.
         modes = {b: ways[0] for b, ways in enumerate(self.ways)}
+        initial = True
         while True:
             result = None
             for div in (1, 2, 4, 8):
@@ -876,7 +878,10 @@ class Decode:
                 if result is None:
                     return None
                 if result[0].vram <= budget:
+                    if initial and div == 1:
+                        result[0].optimal = True
                     return result[0]
+            initial = False
             plan, at, sizes = result
             better = []
             for key in self._live_at(plan, at):
