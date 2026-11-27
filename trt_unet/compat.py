@@ -106,6 +106,24 @@ def unet_class():
         return IntegratedUNet2DConditionModel
 
 
+def anima_class():
+    try:
+        from backend.nn.anima import Anima
+
+        return Anima
+    except ImportError:
+        return None
+
+
+def moss_class():
+    try:
+        from backend.nn.moss_image import MOSSImage
+
+        return MOSSImage
+    except ImportError:
+        return None
+
+
 def fresh_unet(config: dict, device, dtype=torch.float16):
     try:
         import ldm_patched.modules.ops as ops
@@ -121,6 +139,24 @@ def fresh_unet(config: dict, device, dtype=torch.float16):
         if torch.device(device).type != "meta":
             unet = unet.to_empty(device=device)
         return unet.eval()
+
+
+def fresh_dit(kind: str, config: dict, device, dtype=torch.bfloat16):
+    cfg = {k: v for k, v in config.items() if k != "image_model"}
+    if kind == "anima":
+        cls = anima_class()
+    elif kind == "moss_image":
+        cls = moss_class()
+    else:
+        raise ValueError(f"Unsupported DiT kind {kind!r}")
+    if cls is None:
+        raise RuntimeError(f"Could not import Forge Neo's {kind} model class")
+    with torch.device("meta"):
+        model = cls(**cfg)
+    model = model.to(dtype=dtype)
+    if torch.device(device).type != "meta":
+        model = model.to_empty(device=device)
+    return model.eval()
 
 
 def timestep_embedding(timesteps, dim, repeat_only: bool = False):
@@ -151,8 +187,15 @@ def patch_attention(fn):
         import backend.attention as attention
         import backend.nn.unet as neo_unet
 
-        # backend/nn/unet.py binds `from backend.attention import attention_function` at import time, so patch both.
+        # Forge Neo modules bind `from backend.attention import attention_function` at import time, so patch each.
         swaps = [(attention, "attention_function", fn), (neo_unet, "attention_function", fn)]
+        for mod_name in ("backend.nn.anima", "backend.nn.moss_image"):
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                with contextlib.suppress(ImportError):
+                    mod = importlib.import_module(mod_name)
+            if mod is not None and hasattr(mod, "attention_function"):
+                swaps.append((mod, "attention_function", fn))
     originals = [(owner, name, getattr(owner, name)) for owner, name, _ in swaps]
     for owner, name, replacement in swaps:
         setattr(owner, name, replacement)
@@ -360,7 +403,25 @@ def dequantize_weight(t, converter=None) -> torch.Tensor:
             gguf_cls.bake(t)
         return dequantize_tensor(t).to(torch.float32, copy=True)
     if is_quantized_weight(t):
-        # Neo's QuantizedTensor (MixedPrecisionOps) must be dequantized before casting to FP32.
+        # Neo's QuantizedTensor (MixedPrecisionOps) must be dequantized before casting to FP32. Ensure any extra
+        # layout parameter tensors (e.g. block_scale, s_channel, codebook) live on the same device as _qdata.
+        qdata = getattr(t, "_qdata", None)
+        params = getattr(t, "_params", None)
+        if isinstance(qdata, torch.Tensor) and params is not None:
+            qdev = qdata.device
+            pdict = getattr(params, "__dict__", None)
+            if pdict and any(isinstance(v, torch.Tensor) and v.device != qdev for v in pdict.values()):
+                if callable(getattr(params, "to_device", None)):
+                    params = params.to_device(qdev)
+                    pdict = getattr(params, "__dict__", None)
+                if pdict and any(isinstance(v, torch.Tensor) and v.device != qdev for v in pdict.values()):
+                    import copy as _copy
+
+                    params = _copy.copy(params)
+                    for k, v in vars(params).items():
+                        if isinstance(v, torch.Tensor) and v.device != qdev:
+                            setattr(params, k, v.to(qdev))
+                t = type(t)(qdata, t._layout_cls, params)
         out = converter(t, inplace=True) if converter is not None else t.dequantize()
         return out.to(torch.float32, copy=True)
     raw = t.data if isinstance(t, torch.nn.Parameter) else t

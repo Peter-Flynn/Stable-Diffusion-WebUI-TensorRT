@@ -20,7 +20,7 @@ import torch
 from modules import sd_unet
 
 from . import arch as arch_mod
-from . import common, compat, fresh, gpu, profiles, refits, speed, store, strips, working
+from . import common, compat, dit, dit_speed, fresh, gpu, profiles, quant, refits, speed, store, strips, working
 from . import vae_run
 from .common import inference_mode, logger, notify
 from .weights import EffectiveWeights
@@ -32,6 +32,7 @@ _use_tick = 0
 _pass = None
 _unet_arenas = {}  # (device.type, device.index) -> shared Arena across co-resident UNet TrtModels
 _BackupWeight = collections.namedtuple("Dimension", ["weight", "inplace_update"])
+_NO_BATCH_REPEAT = {"rope", "rope_img", "rope_txt"}
 
 
 def _unet_arena(dev):
@@ -79,15 +80,27 @@ class _Shape:
         self.shape = shape
 
 
+def _padded_hw(arch, h: int, w: int) -> tuple:
+    if arch.kind == "anima":
+        return h + (h & 1), w + (w & 1)
+    return h, w
+
+
 def _took_key(model, x, unet_batch: int = None) -> tuple:
+    arch = model.record.arch
+    b, _, h, w = arch.spatial(x.shape)
+    h, w = _padded_hw(arch, h, w)
     found = _call_shapes(model, x, unet_batch=unet_batch)
-    batch = found[1]["sample"][0] if found is not None else (unet_batch if unet_batch is not None else 2 * x.shape[0])
-    return (batch, x.shape[2], x.shape[3])
+    batch = found[1]["sample"][0] if found is not None else (unet_batch if unet_batch is not None else 2 * b)
+    return (batch, h, w)
 
 
 def call_bytes(model, patcher, x, unet_batch: int = None) -> int:
+    arch = model.record.arch
     batch, h, w = _took_key(model, x, unet_batch=unet_batch)
-    return working.call_bytes(model.record.arch, patcher, batch, w * 8, h * 8)
+    if arch.is_dit:
+        return working.call_bytes(arch, patcher, batch, w * arch.downscale, h * arch.downscale, precision=model.record.precision)
+    return working.call_bytes(arch, patcher, batch, w * arch.downscale, h * arch.downscale)
 
 
 class DoesNotFit(RuntimeError):
@@ -162,7 +175,7 @@ class TrtModel:
         return self.current_loaded_device()
 
     def model_dtype(self):
-        return torch.float16
+        return quant.compute_dtype(self.record.precision) if self.record.arch.is_dit else torch.float16
 
     def model_patches_to(self, *args):
         pass
@@ -620,7 +633,7 @@ _EXTRA_TRANSFORMER_OPTIONS = (
 )
 
 
-def _unsupported(patcher) -> str:
+def _unsupported(patcher, arch=None) -> str:
     if getattr(patcher, "controlnet_linked_list", None) is not None:
         return "ControlNet"
     if getattr(patcher, "extra_concat_condition", None) is not None:
@@ -628,6 +641,14 @@ def _unsupported(patcher) -> str:
     kmodel = getattr(patcher, "model", None)
     if getattr(kmodel, "_torch_compile_config", None) or getattr(getattr(kmodel, "apply_model", None), "_torch_compile_wrapper", False):
         return "torch.compile"
+    if patcher.model_options.get("sampler_calc_cond_batch_function") is not None:
+        return "Skip Layer Guidance"
+    if arch is not None and arch.is_dit and compat.is_neo():
+        with contextlib.suppress(Exception):
+            from backend.args import dynamic_args
+
+            if getattr(dynamic_args, "ref_latents", None):
+                return "reference images (Edit mode)"
     module = getattr(kmodel, "diffusion_model", None)
     if module is not None:
         paddings = {m.padding_mode for m in module.modules() if isinstance(m, torch.nn.Conv2d) and m.padding_mode != "zeros"}
@@ -800,21 +821,27 @@ class Pass:
     def __init__(self, records: list, patcher, x, hacks: bool = False):
         self.patcher = patcher
         model = patcher.model
-        self.schedule = self.tracker = None
+        arch = records[0].arch
+        self.arch = arch
+        self.arch_id = arch.id
+        self.schedule = self.tracker = self.dit_speed = None
+        self._rope_cache = {}
+        self._apply_sigma = None
         if hacks:
             try:
-                self.tracker = fresh.Tracker(compat.model_sampling(model), common.device(), model.diffusion_model.out_channels)
-                self.schedule = speed.Schedule(*speed_settings())
+                if arch.is_dit:
+                    self.dit_speed = dit_speed.DiTSchedule(compat.model_sampling(model), *speed_settings())
+                else:
+                    self.tracker = fresh.Tracker(compat.model_sampling(model), common.device(), model.diffusion_model.out_channels)
+                    self.schedule = speed.Schedule(*speed_settings())
             except Exception as e:
                 notify(f"Speed Hacks failed ({e}), so this pass runs without them.", e)
-                self.tracker, hacks = None, False
+                self.tracker = self.schedule = self.dit_speed = None
+                hacks = False
         self.slots = store.slots(records)
         self.model = None
         self.weights = EffectiveWeights(patcher)
         self.module = patcher.model.diffusion_model
-        arch = records[0].arch
-        self.arch = arch
-        self.arch_id = arch.id
         self.shapes, self.takes_y = [r.profile_shapes[j] for r, j in self.slots], bool(arch.adm_channels)
         self.channels, self.context_dim = arch.in_channels, arch.context_dim
         self._x_shape = tuple(x.shape)
@@ -851,7 +878,7 @@ class Pass:
         self._torch_logged = False
         if not options.get("tiled_diffusion"):
             self._hint_batching()
-        self.started = self.schedule  # for end()'s report once Speed Hacks turn off mid-pass
+        self.started = self.dit_speed if arch.is_dit else self.schedule  # for end()'s report once Speed Hacks turn off mid-pass
         self._watching = False
         if hacks:
             self._watch_apply_model(model)
@@ -863,10 +890,13 @@ class Pass:
             load_need = model.full(want_shallow, model._kept(self.weights))
         if call_shape is not None:
             padded, h, w = call_shape
-            calls = max(
-                working.call_bytes(model.record.arch, self.patcher, padded, w * 8, h * 8),
-                model.took.get((padded, h, w), 0),
+            ds = self.arch.downscale
+            cb = (
+                working.call_bytes(model.record.arch, self.patcher, padded, w * ds, h * ds, precision=model.record.precision)
+                if self.arch.is_dit
+                else working.call_bytes(model.record.arch, self.patcher, padded, w * ds, h * ds)
             )
+            calls = max(cb, model.took.get((padded, h, w), 0))
         else:
             shape = _Shape(self._x_shape)
             calls = max(call_bytes(model, self.patcher, shape), model.took.get(_took_key(model, shape), 0))
@@ -1309,7 +1339,8 @@ class Pass:
             common.mm().soft_empty_cache(force=True)
 
     def _select(self, b: int, h: int, w: int, context: int):
-        choice = profiles.select(self.shapes, b, h, w, context, prefer=self.preferred())
+        allow = self.arch.allow_context_repeat
+        choice = profiles.select(self.shapes, b, h, w, context, prefer=self.preferred(), allow_context_repeat=allow)
         if choice is None:
             return None
         if self.model is None or not self.model.loaded or self.slots[choice[0]][0].key == self.model.record.key:
@@ -1317,7 +1348,7 @@ class Pass:
         # Prefer another engine already resident in VRAM over loading an unloaded one from RAM or disk.
         loaded = {i for i, (r, _) in enumerate(self.slots) if (m := _models.get(r.key)) is not None and m.loaded}
         if loaded:
-            alt = profiles.select(self.shapes, b, h, w, context, prefer=loaded)
+            alt = profiles.select(self.shapes, b, h, w, context, prefer=loaded, allow_context_repeat=allow)
             if alt is not None and alt[0] in loaded:
                 return alt
         return choice
@@ -1325,35 +1356,38 @@ class Pass:
     def _joint_record(self, shapes: list):
         if not shapes:
             return None
+        allow = self.arch.allow_context_repeat
         valid = sorted(
             i for i, (r, _) in enumerate(self.slots)
-            if all(any(profiles.fit(s, b, h, w, ctx) is not None for s in r.profile_shapes) for b, h, w, ctx in shapes)
+            if all(any(profiles.fit(s, b, h, w, ctx, allow_context_repeat=allow) is not None for s in r.profile_shapes) for b, h, w, ctx in shapes)
         )
         if not valid:
             return None
         hb, hh, hw, hctx = max(shapes, key=lambda t: t[0] * t[1] * t[2])
         subset = [self.shapes[i] for i in valid]
         pref = {k for k, i in enumerate(valid) if (m := _models.get(self.slots[i][0].key)) is not None and m.loaded}
-        choice = profiles.select(subset, hb, hh, hw, hctx, prefer=pref)
+        choice = profiles.select(subset, hb, hh, hw, hctx, prefer=pref, allow_context_repeat=allow)
         return self.slots[valid[choice[0]]][0] if choice is not None else None
 
     def _covers_anchor(self, record) -> bool:
         if self._anchor is None:
             return False
         ab, ah, aw, actx, _ = self._anchor
-        return any(profiles.fit(s, ab, ah, aw, actx) is not None for s in record.profile_shapes)
+        allow = self.arch.allow_context_repeat
+        return any(profiles.fit(s, ab, ah, aw, actx, allow_context_repeat=allow) is not None for s in record.profile_shapes)
 
     def _anchor_act_bytes(self) -> int:
         if self._anchor is not None and self.model is not None:
             ab, ah, aw, _, _ = self._anchor
-            anchor_x = _Shape((ab, self.channels, ah, aw))
+            anchor_x = _Shape(self.arch.latent_shape(ab, ah, aw, self.channels))
             if self.model.loaded and self._covers_anchor(self.model.record):
                 anchor_model = self.model
             else:
+                slot_keys = {r.key for r, _ in self.slots}
                 anchor_model = next(
                     (
                         m for m in _models.values()
-                        if m.loaded and m.record.arch.id == self.arch_id and self._covers_anchor(m.record)
+                        if m.loaded and m.record.key in slot_keys and self._covers_anchor(m.record)
                     ),
                     self.model,
                 )
@@ -1386,16 +1420,24 @@ class Pass:
 
     def _torch_act_bytes(self, shape: tuple) -> int:
         sb, sh, sw, _ = shape
-        est = working.call_bytes(self.arch, self.patcher, sb, sw * 8, sh * 8)
+        ds = self.arch.downscale
+        if self.arch.is_dit:
+            est = working.call_bytes(
+                self.arch, self.patcher, sb, sw * ds, sh * ds,
+                precision=self.model.record.precision if self.model is not None else None,
+            )
+        else:
+            est = working.call_bytes(self.arch, self.patcher, sb, sw * ds, sh * ds)
+        full_shape = list(self.arch.latent_shape(sb, sh, sw, self.channels))
         try:
             model = self.patcher.model
             fn = getattr(type(model), "memory_required", None)
             if callable(fn):
-                pt = fn(model, [sb, self.channels, sh, sw])
+                pt = fn(model, full_shape)
             else:
                 saved = model.__dict__.pop("memory_required", _MISSING)
                 try:
-                    pt = self.patcher.memory_required([sb, self.channels, sh, sw])
+                    pt = self.patcher.memory_required(full_shape)
                 finally:
                     if saved is not _MISSING:
                         model.__dict__["memory_required"] = saved
@@ -1479,6 +1521,8 @@ class Pass:
         if self.schedule is not None:
             self.schedule.deep.clear()
             self.schedule._missed.clear()
+        if self.dit_speed is not None:
+            self.dit_speed.branches.clear()
         self._hold(self.patcher)
         for m in list(_models.values()):
             if m.loaded or m.opened:
@@ -1494,8 +1538,9 @@ class Pass:
         self._torch_stable_evals = 0
         dev = common.device()
         missing = max(0, self.patcher.model_size() - self.patcher.loaded_size())
+        sb, _, sh, sw = self.arch.spatial(self.shape)
         need_act = max(
-            self._torch_act_bytes((self.shape[0], self.shape[2], self.shape[3], 0)),
+            self._torch_act_bytes((sb, sh, sw, 0)),
             self._torch_act_bytes(shape),
         )
         act_room = common.padded(need_act)
@@ -1580,12 +1625,14 @@ class Pass:
         self._evicts_anchor.clear()
         self._engine_eval.clear()
         logger.info(f"Resuming TensorRT on the {record.arch.name} {record.label}.")
+        _, _, xh, xw = self.arch.spatial(x.shape)
+        xh, xw = _padded_hw(self.arch, xh, xw)
         try:
             with self._park_tracker():
                 self._unload_torch_weights()
                 target = model_for(record)
                 _fits(target, self, x, unet_batch=padded)
-                self.use(record, (padded, x.shape[2], x.shape[3]))
+                self.use(record, (padded, xh, xw))
                 _make_room_for_activations(self.model, self.patcher, x, unet_batch=padded)
         except Exception as e:
             failed = _models.get(record.key)
@@ -1593,10 +1640,14 @@ class Pass:
                 _unload(failed, keep=False)
             self.fall_back(f"Couldn't resume the {record.arch.name} {record.label} ({e})", _unexpected(e))
 
+    def _wants_shallow(self, model: TrtModel) -> bool:
+        active = self.schedule is not None or (self.dit_speed is not None and dit_speed.USES_SHALLOW_ENGINE)
+        return bool(active and model.hacks is not None and not model.shallow_failed)
+
     def use(self, record, call_shape=None):
         global _use_tick
         model = model_for(record)
-        want_shallow = bool(self.schedule is not None and model.hacks is not None and not model.shallow_failed)
+        want_shallow = self._wants_shallow(model)
         if model is not self.model or not model.loaded:
             was_loaded = model.loaded
             if not was_loaded:
@@ -1655,7 +1706,7 @@ class Pass:
             model.sync()
             if uuid is not None:
                 self._synced[record.key] = (uuid, model.shallow_loaded)
-        if self.schedule is not None and model.hacks and not model.shallow_loaded and not model.shallow_failed:
+        if self._wants_shallow(model) and not model.shallow_loaded:
             model.want_shallow = True
             try:
                 with torch.inference_mode():
@@ -1687,8 +1738,8 @@ class Pass:
             _kept.append(self._keep)
 
     def _watch_apply_model(self, model):
-        # fresh.Tracker takes x and sigma from apply_model: in FP32, and as the UNet gets them. A wrapper left by a pass
-        # that didn't end is removed first, so wrappers don't pile up.
+        # fresh.Tracker takes x and sigma from apply_model: in FP32, and as the UNet gets them. For DiTs, captures
+        # sigma directly for DiTSchedule. A wrapper left by a pass that didn't end is removed first.
         stale = model.__dict__.get("apply_model")
         if hasattr(stale, "_trt_before"):
             self._put_apply_model(model, stale._trt_before)
@@ -1696,12 +1747,18 @@ class Pass:
         original = model.apply_model
 
         def apply_model(*args, **kwargs):
+            prev_sigma = self._apply_sigma
+            if self.dit_speed is not None and not self.dit_speed.idle and not self.dit_speed.done:
+                self._apply_sigma = args[1] if len(args) > 1 else kwargs.get("t")
             if self.schedule is not None and self.tracker is not None and not self.schedule.idle and not self.schedule.done:
                 with self._speed_hacks():
                     x = args[0] if args else kwargs.get("x")
                     t = args[1] if len(args) > 1 else kwargs.get("t")
                     self.tracker.see(x, t)
-            return original(*args, **kwargs)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self._apply_sigma = prev_sigma
 
         apply_model._trt_before = before
         model.apply_model = apply_model
@@ -1716,6 +1773,8 @@ class Pass:
         failures = gpu.failures()
         try:
             yield
+        except Fallback:
+            raise
         except torch.cuda.OutOfMemoryError:
             if rethrow_oom:
                 raise
@@ -1734,7 +1793,9 @@ class Pass:
             self.schedule.release()
         if self.tracker is not None:
             self.tracker.release()
-        self.schedule = self.tracker = None
+        if self.dit_speed is not None:
+            self.dit_speed.release()
+        self.schedule = self.tracker = self.dit_speed = None
 
     @staticmethod
     def _put_apply_model(model, value):
@@ -1757,6 +1818,8 @@ class Pass:
         self._torch_snap = None
         self._torch_mode = False
         self._torch_joint_key = None
+        self._rope_cache.clear()
+        self._apply_sigma = None
         if self.model is not None and self.model.loaded:
             self.model.engine.release_activations()
         else:
@@ -1765,7 +1828,9 @@ class Pass:
             self.schedule.release()
         if self.tracker is not None:
             self.tracker.release()
-        self.schedule = self.tracker = None
+        if self.dit_speed is not None:
+            self.dit_speed.release()
+        self.schedule = self.tracker = self.dit_speed = None
         for model in _models.values():
             if model.weights is self.weights:
                 model.weights = None  # don't keep this checkpoint alive
@@ -1778,6 +1843,7 @@ class Pass:
         # allocated), the model's real estimate while paused in _torch_mode, and infinite whenever no profile covers
         # the combined batch/context so the sampler splits it into profile-compatible calls (allowing TensorRT to resume).
         shapes = self.shapes
+        arch = self.arch
         model = self.patcher.model
         base_fn = getattr(type(model), "memory_required", None)
         base_takes_cond = False
@@ -1791,10 +1857,11 @@ class Pass:
                 base_takes_cond = False
 
         def memory_required(input_shape, cond_shapes={}):
-            b, _, h, w = input_shape[:4]
-            lengths = [s[1] for s in cond_shapes.get("c_crossattn", ()) if len(s) > 1]
-            context = math.lcm(*lengths) if lengths else profiles.CONTEXT_PER_CHUNK
-            if profiles.select(shapes, b, h, w, context) is None:
+            b, _, h, w = arch.spatial(input_shape)
+            h, w = _padded_hw(arch, h, w)
+            lengths = [math.prod(s[1:-1]) for s in cond_shapes.get("c_crossattn", ()) if len(s) >= 3]
+            context = math.lcm(*lengths) if lengths else None
+            if profiles.select(shapes, b, h, w, context, allow_context_repeat=arch.allow_context_repeat) is None:
                 return float("inf")
             if self._torch_mode and callable(base_fn):
                 return base_fn(model, input_shape, cond_shapes) if base_takes_cond else base_fn(model, input_shape)
@@ -1810,7 +1877,15 @@ class Pass:
 
         profile_report("sampling pass")
         hacks = self.started
-        if hacks is not None and hacks.shallow_calls:
+        if isinstance(hacks, dit_speed.DiTSchedule):
+            if hacks.shallow_calls or hacks.tier1_calls:
+                total = hacks.shallow_calls + hacks.full_calls
+                tier1_note = f" and {hacks.tier1_calls} CFG-split calls" if hacks.tier1_calls else ""
+                logger.info(f"Speed Hacks skipped {hacks.shallow_calls} full calls{tier1_note} of {total} {self.arch.name} calls.")
+                if hacks.checks:
+                    logger.debug("Speed Hacks checks (call, age, error): " + ", ".join(f"{i} {a} {e:.4f}" for i, a, e in hacks.checks))
+                _note_speed_hacks(hacks)
+        elif hacks is not None and hacks.shallow_calls:
             logger.info(f"Speed Hacks ran {hacks.shallow_calls} of {hacks.shallow_calls + hacks.full_calls} UNet calls on the shallow engine.")
             if hacks.checks:
                 logger.debug("Speed Hacks checks (call, age, error): " + ", ".join(f"{i} {a} {e:.4f}" for i, a, e in hacks.checks))
@@ -1825,15 +1900,69 @@ class Pass:
         _load_torch_unet(self.patcher, self.shape)
         raise Fallback(reason)
 
+    def _dit_feed_rope(self, feed: dict, h: int, w: int):
+        if self.arch.kind == "anima":
+            feed["rope"] = dit.anima_rope(self.module, h, w, self.model.load_device, self._rope_cache)
+        elif self.arch.kind == "moss_image":
+            rope_img, rope_txt = dit.moss_rope(self.module, h, w, feed["encoder_hidden_states"].shape[1], self.model.load_device, self._rope_cache)
+            feed["rope_img"] = rope_img
+            feed["rope_txt"] = rope_txt
+
+    def _dit_sigma_for(self, timesteps: torch.Tensor, b: int) -> torch.Tensor:
+        s = self._apply_sigma
+        if s is not None:
+            st = torch.as_tensor(s, device=timesteps.device, dtype=torch.float32).reshape(-1)
+            if st.numel() == b:
+                return st
+            if st.numel() == 1:
+                return st.expand(b)
+        sig = dit_speed.sigma_from_timesteps(self.dit_speed.predictor, timesteps).reshape(-1)
+        if sig.numel() == b:
+            return sig
+        if sig.numel() == 1:
+            return sig.expand(b)
+        return sig[:b] if sig.numel() > b else sig[-1:].expand(b)
+
+    def _build_feed(self, x, timesteps, context, y, b: int, h: int, w: int, padded: int, repeats: int) -> dict:
+        t = timesteps.reshape(-1)
+        feed = {
+            "sample": x,
+            "timesteps": t if t.shape[0] == b else t.expand(b),
+            "encoder_hidden_states": context.repeat(1, repeats, 1) if repeats > 1 else context,
+        }
+        if y is not None and self.takes_y:
+            feed["y"] = y
+        if self.arch.is_dit:
+            self._dit_feed_rope(feed, h, w)
+        if padded > b:
+            feed = {
+                k: v if k in _NO_BATCH_REPEAT else v.repeat(-(-padded // b), *([1] * (v.dim() - 1)))[:padded]
+                for k, v in feed.items()
+            }
+        return feed
+
     def run(self, x, timesteps, context, y, cond_or_uncond=None):
-        b, c, h, w = x.shape
+        orig_spatial = None
+        if self.arch.kind == "anima":
+            if context.ndim > 3:
+                context = context.reshape(context.shape[0], -1, context.shape[-1])
+            orig_t, orig_h, orig_w = x.shape[2], x.shape[3], x.shape[4]
+            pad_h, pad_w = orig_h & 1, orig_w & 1
+            if pad_h or pad_w:
+                orig_spatial = (orig_t, orig_h, orig_w)
+                x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h, 0, 0), mode="circular")
+        b, c, h, w = self.arch.spatial(x.shape)
+        ds = self.arch.downscale
         if c != self.channels or context.shape[2] != self.context_dim:
-            self.fall_back(f"The UNet was given {c} input channels and {context.shape[2]}-wide prompts, but the engine takes {self.channels} and {self.context_dim}")
+            self.fall_back(f"The model was given {c} input channels and {context.shape[2]}-wide prompts, but the engine takes {self.channels} and {self.context_dim}")
         ctx_len = context.shape[1]
         cur_shape = (b, h, w, ctx_len)
         if self._deferred:
-            cand = (max(b, self._x_shape[0] * 2), c, h, w) if (h, w) == self._x_shape[2:] else tuple(x.shape)
-            if not self._deferred_seen or cand[0] * cand[2] * cand[3] >= self.shape[0] * self.shape[2] * self.shape[3]:
+            xb, _, xh, xw = self.arch.spatial(self._x_shape)
+            cand = self.arch.latent_shape(max(b, xb * 2), h, w, c) if (h, w) == (xh, xw) else tuple(x.shape)
+            sb, _, sh, sw = self.arch.spatial(self.shape)
+            cb, _, ch, cw = self.arch.spatial(cand)
+            if not self._deferred_seen or cb * ch * cw >= sb * sh * sw:
                 self.shape = cand
                 self._deferred_seen = True
         resumed_choice = None
@@ -1854,12 +1983,14 @@ class Pass:
                         enough_left = True
                     elif multi:
                         enough_left = self._remaining_steps >= 5
-                    elif self.schedule is not None:
+                    elif self.schedule is not None or self.dit_speed is not None:
                         enough_left = self._remaining_steps >= 6
                     else:
                         enough_left = self._remaining_steps * self._evals_per_step >= 16
                     if self._torch_resumes < 2 and enough_left and (multi or self._torch_stable_evals >= 2):
-                        fit_cur = profiles.select(joint.profile_shapes, b, h, w, ctx_len)
+                        fit_cur = profiles.select(
+                            joint.profile_shapes, b, h, w, ctx_len, allow_context_repeat=self.arch.allow_context_repeat
+                        )
                         if fit_cur is not None:
                             self._resume_from_torch_mode(joint, x, fit_cur[1])
                             slot_idx = next(i for i, (r, j) in enumerate(self.slots) if r.key == joint.key and j == fit_cur[0])
@@ -1892,10 +2023,14 @@ class Pass:
         )
         if choice is None:
             if anchor_recent and (h, w) != self._anchor[1:3]:
-                self._call_torch(f"no profile runs {w * 8}x{h * 8}", cur_shape)
+                self._call_torch(f"no profile runs {w * ds}x{h * ds}", cur_shape)
+            if self.arch.is_dit:
+                self.fall_back(
+                    f"No profile runs {w * ds}x{h * ds} with a batch of {b} and {ctx_len}-token prompts"
+                )
             tokens = ctx_len // profiles.CONTEXT_PER_CHUNK * profiles.TOKENS_PER_CHUNK
             self.fall_back(
-                f"No profile runs {w * 8}x{h * 8} with a UNet batch of {b} and {tokens}-token prompts "
+                f"No profile runs {w * ds}x{h * ds} with a UNet batch of {b} and {tokens}-token prompts "
                 "(reForge pads the prompt and negative prompt to the same length)"
             )
         index, padded, repeats = choice
@@ -1903,7 +2038,7 @@ class Pass:
         prev_model = self.model
         if prev_model is None or prev_model.record.key != record.key or not prev_model.loaded:
             target = model_for(record)
-            want_shallow = bool(self.schedule is not None and target.hacks is not None and not target.shallow_failed)
+            want_shallow = self._wants_shallow(target)
             upgraded = False
             was_anchor_recent = anchor_recent
             returning_to_anchor = prev_model is not None and self._covers_anchor(record) and not self._covers_anchor(prev_model.record)
@@ -1914,12 +2049,14 @@ class Pass:
                 and not returning_to_anchor
                 and self._would_evict_current(target, want_shallow, (padded, h, w))
             ):
-                stay = profiles.select(prev_model.record.profile_shapes, b, h, w, ctx_len)
+                stay = profiles.select(
+                    prev_model.record.profile_shapes, b, h, w, ctx_len, allow_context_repeat=self.arch.allow_context_repeat
+                )
                 if stay is not None:
                     record = prev_model.record
                     profile, padded, repeats = stay
                 elif b * h * w <= self._anchor[4] or record.key in self._evicts_anchor:
-                    self._call_torch(f"{w * 8}x{h * 8} would evict it", cur_shape)
+                    self._call_torch(f"{w * ds}x{h * ds} would evict it", cur_shape)
                 else:
                     upgraded = True
                     self._evicts_anchor.add(prev_model.record.key)
@@ -1963,18 +2100,108 @@ class Pass:
                 if not anchor_recent and prev_model is not None and prev_model is not self.model:
                     self._anchor = None
                     self._evicts_anchor.clear()
-        timesteps = timesteps.reshape(-1)
-        feed = {
-            "sample": x,
-            "timesteps": timesteps if timesteps.shape[0] == b else timesteps.expand(b),
-            "encoder_hidden_states": context.repeat(1, repeats, 1) if repeats > 1 else context,
-        }
-        if y is not None and self.takes_y:
-            feed["y"] = y
-        if padded > b:
-            feed = {k: v.repeat(-(-padded // b), *([1] * (v.dim() - 1)))[:padded] for k, v in feed.items()}
+
+        def _finish(out_tensor):
+            res = out_tensor[:b].to(x.dtype)
+            if orig_spatial is not None:
+                ot, oh, ow = orig_spatial
+                res = res[:, :, :ot, :oh, :ow]
+            return res
+
+        def _touch_anchor(engine_key):
+            vol = b * h * w
+            self._engine_eval[engine_key] = self._eval_id
+            expired = self._anchor is not None and (self._eval_id - self._last_anchor_eval) > 2
+            if (
+                self._anchor is None
+                or expired
+                or vol > self._anchor[4]
+                or (vol == self._anchor[4] and (h, w) == self._anchor[1:3])
+            ):
+                if expired:
+                    self._evicts_anchor.clear()
+                self._anchor = (b, h, w, ctx_len, vol)
+                self._last_anchor_eval = self._eval_id
+            elif (h, w) == self._anchor[1:3]:
+                self._last_anchor_eval = self._eval_id
+
         stream = torch.cuda.current_stream(self.model.load_device).cuda_stream
+        engine_key = self.model.record.key
+        vol = b * h * w
+
+        # DiT Speed Hacks (Candidate A x0-space forecasting + CFG Tier 1/2, or Candidate B shallow engine)
+        dit_plan = None
+        dit_sigma = None
+        split_sub = None
+        if (
+            self.arch.is_dit
+            and self.dit_speed is not None
+            and not self.dit_speed.idle
+            and (not dit_speed.USES_SHALLOW_ENGINE or self.model.shallow_loaded)
+        ):
+            if self.dit_speed.done:
+                self.dit_speed.full_calls += 1
+            else:
+                with self._speed_hacks():
+                    dit_sigma = self._dit_sigma_for(timesteps, b)
+                    dit_plan = self.dit_speed.plan_call(x, dit_sigma, context, cond_or_uncond, tuple(_prompts))
+                    if dit_plan["mode"] == "skip_all" and not dit_speed.USES_SHALLOW_ENGINE:
+                        parts = [
+                            self.dit_speed.forecast_slice(bkey, x[slc], dit_sigma[slc], dit_plan["u"])
+                            for slc, bkey, _, _ in dit_plan["groups"]
+                        ]
+                        out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+                        if torch.isfinite(out).all():
+                            self.dit_speed.note_counts("skip_all")
+                            _touch_anchor(engine_key)
+                            return _finish(out)
+                        self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
+                        dit_plan = None
+                    elif dit_plan["mode"] == "split_cfg" and not dit_speed.USES_SHALLOW_ENGINE:
+                        run_groups = [(gi, slc, bkey) for gi, (slc, bkey, _, can_skip) in enumerate(dit_plan["groups"]) if not can_skip]
+                        skip_groups = [(gi, slc, bkey) for gi, (slc, bkey, _, can_skip) in enumerate(dit_plan["groups"]) if can_skip]
+                        x_sub = torch.cat([x[slc] for _, slc, _ in run_groups], dim=0)
+                        b_sub = x_sub.shape[0]
+                        sub_choice = profiles.select(
+                            record.profile_shapes, b_sub, h, w, ctx_len, allow_context_repeat=self.arch.allow_context_repeat
+                        )
+                        if sub_choice is not None and sub_choice[1] < padded:
+                            sub_profile, sub_padded, sub_repeats = sub_choice
+                            t_flat = timesteps.reshape(-1)
+                            t_full = t_flat if t_flat.shape[0] == b else t_flat.expand(b)
+                            t_sub = torch.cat([t_full[slc] for _, slc, _ in run_groups], dim=0)
+                            ctx_sub = torch.cat([context[slc] for _, slc, _ in run_groups], dim=0)
+                            feed_sub = self._build_feed(x_sub, t_sub, ctx_sub, None, b_sub, h, w, sub_padded, sub_repeats)
+                            split_sub = (run_groups, skip_groups, b_sub, sub_profile, feed_sub)
+                if split_sub is not None and self.dit_speed is not None:
+                    run_groups, skip_groups, b_sub, sub_profile, feed_sub = split_sub
+                    out_sub = self._infer_with_room(feed_sub, sub_profile, stream, vol=b_sub * h * w)[:b_sub]
+                    if engine_key not in self.checked:
+                        self.checked.add(engine_key)
+                        if not torch.isfinite(out_sub).all():
+                            self.fall_back("The engine produced NaN/Inf values")
+                    with self._speed_hacks():
+                        assembled = [None] * len(dit_plan["groups"])
+                        off = 0
+                        for gi, slc, bkey in run_groups:
+                            n_rows = slc.stop - slc.start
+                            o_slc = out_sub[off : off + n_rows]
+                            off += n_rows
+                            assembled[gi] = o_slc.to(x.dtype)
+                            self.dit_speed.record_full(bkey, x[slc], dit_sigma[slc], o_slc, context[slc], dit_plan["u"])
+                        for gi, slc, bkey in skip_groups:
+                            assembled[gi] = self.dit_speed.forecast_slice(bkey, x[slc], dit_sigma[slc], dit_plan["u"])
+                        out = torch.cat(assembled, dim=0)
+                        if torch.isfinite(out).all():
+                            self.dit_speed.note_counts("split_cfg")
+                            _touch_anchor(engine_key)
+                            return _finish(out)
+                        self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
+                        dit_plan = None
+
+        feed = self._build_feed(x, timesteps, context, y, b, h, w, padded, repeats)
         hack = None
+        dit_delta = None
         if self.schedule is not None and not self.schedule.idle and self.model.shallow_loaded:
             if self.schedule.done:
                 self.schedule.full_calls += 1
@@ -2007,11 +2234,26 @@ class Pass:
                     hack = [slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b]
                 if hack is None and planned_shallow and self.started is not None:
                     self.started.ran_full()
-        vol = b * h * w
-        out = self._infer_with_room(feed, profile, stream, hack, vol=vol)
+        elif (
+            dit_plan is not None
+            and dit_speed.USES_SHALLOW_ENGINE
+            and self.dit_speed is not None
+            and self.model.shallow_loaded
+            and dit_plan["mode"] == "skip_all"
+        ):
+            with self._speed_hacks():
+                dt = self.model.model_dtype()
+                deltas = [self.dit_speed.forecast_feature(bkey, dit_plan["u"], dt) for _, bkey, _, _ in dit_plan["groups"]]
+                delta_cat = deltas[0] if len(deltas) == 1 else torch.cat(deltas, dim=0)
+                if padded > b:
+                    delta_cat = delta_cat.repeat(-(-padded // b), 1, 1)[:padded]
+                dit_delta = [delta_cat]
+
+        self._last_trunk_delta = None
+        out = self._infer_with_room(feed, profile, stream, hack, vol=vol, dit_delta=dit_delta)
         # A shallow call whose Speed Hacks failed ran on the full engine instead
-        shallow = bool(hack) and hack[2] is not None and self.schedule is not None
-        engine_key = self.model.record.key
+        dit_shallow = bool(dit_delta) and self.dit_speed is not None
+        shallow = (bool(hack) and hack[2] is not None and self.schedule is not None) or dit_shallow
         if not shallow and engine_key not in self.checked:
             self.checked.add(engine_key)
             if not torch.isfinite(out).all():
@@ -2019,29 +2261,32 @@ class Pass:
         if shallow and engine_key not in self.shallow_checked:
             self.shallow_checked.add(engine_key)
             if not torch.isfinite(out).all():
-                if self.started is not None:
+                if self.started is not None and not dit_shallow:
                     self.started.ran_full()
                 self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
+                dit_shallow = False
+                dit_plan = None
                 out = self._infer_with_room(feed, profile, stream, vol=vol)
-        self._engine_eval[engine_key] = self._eval_id
-        expired = self._anchor is not None and (self._eval_id - self._last_anchor_eval) > 2
-        if (
-            self._anchor is None
-            or expired
-            or vol > self._anchor[4]
-            or (vol == self._anchor[4] and (h, w) == self._anchor[1:3])
-        ):
-            if expired:
-                self._evicts_anchor.clear()
-            self._anchor = (b, h, w, ctx_len, vol)
-            self._last_anchor_eval = self._eval_id
-        elif (h, w) == self._anchor[1:3]:
-            self._last_anchor_eval = self._eval_id
-        return out[:b].to(x.dtype)
+        if dit_shallow:
+            self.dit_speed.note_counts("skip_all")
+            self._last_trunk_delta = None
+            _touch_anchor(engine_key)
+            return _finish(out)
+        if dit_plan is not None and self.dit_speed is not None and not self.dit_speed.done:
+            with self._speed_hacks():
+                delta_full = self._last_trunk_delta if dit_speed.USES_SHALLOW_ENGINE else None
+                if not dit_speed.USES_SHALLOW_ENGINE or delta_full is not None:
+                    for slc, bkey, _, _ in dit_plan["groups"]:
+                        feat_slc = delta_full[slc] if delta_full is not None else None
+                        self.dit_speed.record_full(bkey, x[slc], dit_sigma[slc], out[slc], context[slc], dit_plan["u"], feature_slice=feat_slc)
+                    self.dit_speed.note_counts("full")
+        self._last_trunk_delta = None
+        _touch_anchor(engine_key)
+        return _finish(out)
 
-    def _infer_with_room(self, feed, profile, stream, hack=None, vol: int = 0):
+    def _infer_with_room(self, feed, profile, stream, hack=None, vol: int = 0, dit_delta=None):
         try:
-            return self._infer(feed, profile, stream, hack)
+            return self._infer(feed, profile, stream, hack, dit_delta=dit_delta)
         except torch.cuda.OutOfMemoryError as e:
             _clear_traceback(e)
             dev = self.model.load_device
@@ -2065,7 +2310,7 @@ class Pass:
                 common.mm().soft_empty_cache(force=True)
                 if unloaded_torch or freed or common.free(dev) > before_free:
                     try:
-                        return self._infer(feed, profile, stream, hack, retry=False)
+                        return self._infer(feed, profile, stream, hack, retry=False, dit_delta=dit_delta)
                     except torch.cuda.OutOfMemoryError as e1:
                         _clear_traceback(e1)
                         self.model.engine.release_activations()
@@ -2080,16 +2325,18 @@ class Pass:
                 else:
                     self._evicts_anchor.add(self.model.record.key)
             try:
-                return self._infer(feed, profile, stream, hack, retry=True)
+                return self._infer(feed, profile, stream, hack, retry=True, dit_delta=dit_delta)
             except torch.cuda.OutOfMemoryError as e:
                 _clear_traceback(e)
                 if hack and hack[2] is not None and self.schedule is not None and self.started is not None:
                     self.started.ran_full()
                 if hack:
                     hack.clear()
+                if dit_delta:
+                    dit_delta.clear()
                 self.fall_back("The engine ran out of VRAM")
 
-    def _infer(self, feed, profile, stream, hack=None, retry: bool = False):
+    def _infer(self, feed, profile, stream, hack=None, retry: bool = False, dit_delta=None):
         from . import engine as engine_mod
 
         # hack: [slot, Schedule key, deep feature or None, index of the call that computed it, (deep feature, index) to
@@ -2099,6 +2346,14 @@ class Pass:
         engine_mod.LOGGER.clear()
         failures = gpu.failures()
         try:
+            if dit_delta and self.dit_speed is not None and self.model.shallow_loaded:
+                # A shallow call that fails runs in full below
+                with self._speed_hacks(rethrow_oom=not retry):
+                    return self.model.shallow.infer({**feed, "trunk_delta": dit_delta[0]}, profile, stream)["latent"]
+                dit_delta.clear()
+                if retry:
+                    self.model.engine.release_activations()
+                    common.mm().soft_empty_cache(force=True)
             if deep is not None and self.schedule is not None:
                 # A shallow call that fails runs in full below
                 with self._speed_hacks(rethrow_oom=not retry):
@@ -2119,6 +2374,8 @@ class Pass:
             failures = gpu.failures()
             outputs = self.model.engine.infer(feed, profile, stream)
             out = outputs["latent"]
+            if "trunk_delta" in outputs:
+                self._last_trunk_delta = outputs["trunk_delta"]
             if slot is not None and "deep" in outputs and self.schedule is not None:
                 with self._speed_hacks():
                     self.schedule.keep(slot, key, outputs["deep"], (feed["encoder_hidden_states"], feed.get("y")))
@@ -2154,32 +2411,70 @@ def _clear_traceback(error):
         cur.__traceback__ = cur.__cause__ = cur.__context__ = None
 
 
+def _has_ref_latents() -> bool:
+    if not compat.is_neo():
+        return False
+    try:
+        from backend.args import dynamic_args
+
+        return bool(getattr(dynamic_args, "ref_latents", None))
+    except Exception:
+        return False
+
+
 def _engine_records(patcher, x):
     chosen = setting()
     if chosen not in (AUTOMATIC, SPEED_HACKS):
         return None, False
     arch = arch_mod.detect(patcher)
-    records = store.engines(arch.id) if arch is not None else []
+    records = []
+    prec_note = ""
+    if arch is not None:
+        if arch.is_dit:
+            saved = store.saved_precision(arch.id)
+            prec = store.active_precision(arch, patcher, requested=saved)
+            records = store.engines(arch.id, precision=prec)
+            if not records and saved == quant.AUTO:
+                # Auto-selected precision isn't built yet; fall back to highest-priority built loadable precision.
+                all_built = store.engines(arch.id)
+                if all_built:
+                    by_prec = {}
+                    for r in all_built:
+                        by_prec.setdefault(r.precision, []).append(r)
+                    for cand in quant.supported_precisions():
+                        if cand in by_prec:
+                            records = by_prec[cand]
+                            break
+            elif not records and saved != quant.AUTO:
+                prec_note = f" ({quant.LABELS.get(prec, prec)})"
+        else:
+            records = store.engines(arch.id)
     if not records:  # with "Automatic" that's normal (e.g. a refiner of another architecture), so no warning
         if chosen == SPEED_HACKS and arch is None:
             notify("TensorRT engines can't run this model, so it runs on PyTorch.")
-        elif chosen == SPEED_HACKS:
-            notify(f"There are no {arch.name} engines yet, so it runs on PyTorch. Build them in the TensorRT tab.")
+        elif chosen == SPEED_HACKS or prec_note:
+            notify(f"There are no {arch.name}{prec_note} engines yet, so it runs on PyTorch. Build them in the TensorRT tab.")
         return None, False
-    reason = _unsupported(patcher)
+    reason = _unsupported(patcher, arch)
     if reason:
         notify(f"TensorRT engines can't apply {reason}, so this pass runs on PyTorch.")
         return None, False
-    b, _, h, w = x.shape
-    if not _wraps_unet(patcher) and not profiles.covers_size([s for r in records for s in r.profile_shapes], h, w, b):
-        notify(f"No {arch.name} profile covers {w * 8}x{h * 8} at batch size {b}, so this pass runs on PyTorch. Add one in the TensorRT tab.")
+    if arch.kind == "anima" and (x.ndim != 5 or x.shape[2] != 1):
+        notify("TensorRT engines only support single-frame Anima latents, so this pass runs on PyTorch.")
+        return None, False
+    b, _, h, w = arch.spatial(x.shape)
+    ph, pw = _padded_hw(arch, h, w)
+    ds = arch.downscale
+    if not _wraps_unet(patcher) and not profiles.covers_size([s for r in records for s in r.profile_shapes], ph, pw, b):
+        notify(f"No {arch.name} profile covers {w * ds}x{h * ds} at batch size {b}, so this pass runs on PyTorch. Add one in the TensorRT tab.")
         return None, False
     stale_graph = sum(r.stale_graph for r in records)
     if stale_graph:
-        notify(f"{stale_graph} of the {arch.name} engines were built with an older UNet graph that can produce artifacts on TensorRT 11. Build again in the TensorRT tab to update them.")
-    hacks = chosen == SPEED_HACKS and any(r.speed_hacks for r in records)
+        detail = "an older graph" if arch.is_dit else "an older UNet graph that can produce artifacts on TensorRT 11"
+        notify(f"{stale_graph} of the {arch.name} engines were built with {detail}. Build again in the TensorRT tab to update them.")
+    hacks = chosen == SPEED_HACKS and any(r.supports_speed_hacks for r in records)
     stale = sum(r.stale_speed_hacks for r in records) if chosen == SPEED_HACKS else 0
-    failed = sum(not r.speed_hacks for r in records) - stale if chosen == SPEED_HACKS else 0
+    failed = sum(not r.supports_speed_hacks for r in records) - stale if chosen == SPEED_HACKS else 0
     if stale:
         notify(f"{stale} of the {arch.name} engines have a Speed Hacks part from another version of this extension, so they run without Speed Hacks until they're built again in the TensorRT tab.")
     if failed:
@@ -2210,10 +2505,17 @@ def _begin(records, hacks, patcher, x, prepare):
             return p
         record = None
         try:
-            b, _, h, w = x.shape
+            arch = p.arch
+            b, _, h, w = arch.spatial(x.shape)
+            h, w = _padded_hw(arch, h, w)
+            ctx = None
+            rep = arch.allow_context_repeat
             prefer = p.preferred()
-            # Load the engine for the likeliest first call: cond and uncond batched, shortest prompts
-            choice = profiles.select(p.shapes, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK, prefer) or profiles.select(p.shapes, b, h, w, profiles.CONTEXT_PER_CHUNK, prefer)
+            # Load the engine for the likeliest first call: cond and uncond batched (or unbatched for MOSS-Image), any prompt length
+            choice = (
+                profiles.select(p.shapes, 2 * b, h, w, ctx, prefer, allow_context_repeat=rep)
+                or profiles.select(p.shapes, b, h, w, ctx, prefer, allow_context_repeat=rep)
+            )
             index = choice[0] if choice else next(i for i, s in enumerate(p.shapes) if profiles.covers_size([s], h, w, b))
             record = p.slots[index][0]
             _fits(model_for(record), p, x)
@@ -2231,8 +2533,13 @@ def _begin(records, hacks, patcher, x, prepare):
     return p
 
 
-def _sizes(x) -> str:
-    return f"{x.shape[3] * 8}x{x.shape[2] * 8}" + (f", batch size {x.shape[0]}" if x.shape[0] > 1 else "")
+def _sizes(x, arch=None) -> str:
+    if arch is not None:
+        b, _, h, w = arch.spatial(x.shape)
+        ds = arch.downscale
+    else:
+        b, h, w, ds = x.shape[0], x.shape[-2], x.shape[-1], 8
+    return f"{w * ds}x{h * ds}" + (f", batch size {b}" if b > 1 else "")
 
 
 def _unexpected(error):  # the error, for its traceback, unless a RuntimeError: those messages are complete on their own
@@ -2240,7 +2547,8 @@ def _unexpected(error):  # the error, for its traceback, unless a RuntimeError: 
 
 
 def _fits(model: TrtModel, p: Pass, x, unet_batch: int = None):
-    shallow = bool(model.hacks and p.schedule is not None and not model.shallow_failed)
+    arch = model.record.arch
+    shallow = p._wants_shallow(model)
     key = _took_key(model, x, unet_batch=unet_batch)
     calls = max(call_bytes(model, p.patcher, x, unet_batch=unet_batch), model.took.get(key, 0))
     held = model.loaded_size()
@@ -2252,14 +2560,15 @@ def _fits(model: TrtModel, p: Pass, x, unet_batch: int = None):
     res = common.reserve()
     room = common.obtainable(model.load_device, keep=[model], at_least=max(0, need - held + res)) - res + held
     logger.info(
-        f"The {model.name} at {_sizes(x)} needs {common.gib(need)} of VRAM ({common.gib(engine)} for the engine, {common.gib(calls)} "
+        f"The {model.name} at {_sizes(x, arch)} needs {common.gib(need)} of VRAM ({common.gib(engine)} for the engine, {common.gib(calls)} "
         f"to run it, {common.gib(need - engine - calls)} margin); {common.gib(room)} can be freed."
     )
     if need > room:
-        raise DoesNotFit(f"it needs {common.gib(need)} of VRAM at {_sizes(x)}, and at most {common.gib(room)} can be freed")
+        raise DoesNotFit(f"it needs {common.gib(need)} of VRAM at {_sizes(x, arch)}, and at most {common.gib(room)} can be freed")
 
 
 def _make_room_for_activations(model: TrtModel, patcher, x, unet_batch: int = None):
+    arch = model.record.arch
     try:
         takes = _call_bytes(model, x, unet_batch=unet_batch)
     except Exception as e:
@@ -2270,7 +2579,7 @@ def _make_room_for_activations(model: TrtModel, patcher, x, unet_batch: int = No
     counted = call_bytes(model, patcher, x, unet_batch=unet_batch)
     if takes > counted:
         most = " (the most for any size its profile takes: it gave no figure for this one)" if model.engine.size_is_most else ""
-        logger.debug(f"TensorRT takes {common.gib(takes)} to run the {model.name} at {_sizes(x)}{most}, more than the {common.gib(counted)} estimated.")
+        logger.debug(f"TensorRT takes {common.gib(takes)} to run the {model.name} at {_sizes(x, arch)}{most}, more than the {common.gib(counted)} estimated.")
     need = common.padded(max(takes, counted))
     keep = _loaded_entries(model, patcher)
     free = common.make_room(need, model.load_device, keep)
@@ -2279,27 +2588,41 @@ def _make_room_for_activations(model: TrtModel, patcher, x, unet_batch: int = No
             free = common.make_room(need, model.load_device, keep)
     if free < need:
         model.took[_took_key(model, x, unet_batch=unet_batch)] = takes  # so _fits rejects these sizes before loading next time
-        raise RuntimeError(f"running it at {_sizes(x)} needs {common.gib(need)} of VRAM besides the engine, and only {common.gib(free)} could be freed")
+        raise RuntimeError(f"running it at {_sizes(x, arch)} needs {common.gib(need)} of VRAM besides the engine, and only {common.gib(free)} could be freed")
 
 
 def _call_shapes(model: TrtModel, x, unet_batch: int = None):
-    b, c, h, w = x.shape
+    arch = model.record.arch
+    b, c, h, w = arch.spatial(x.shape)
+    h, w = _padded_hw(arch, h, w)
     held = model.record.profile_shapes
+    ctx = None
+    rep = arch.allow_context_repeat
     if unet_batch is not None:
-        choice = profiles.select(held, unet_batch, h, w, profiles.CONTEXT_PER_CHUNK)
+        choice = profiles.select(held, unet_batch, h, w, ctx, allow_context_repeat=rep)
     else:
-        choice = profiles.select(held, 2 * b, h, w, profiles.CONTEXT_PER_CHUNK) or profiles.select(held, b, h, w, profiles.CONTEXT_PER_CHUNK)
+        choice = (
+            profiles.select(held, 2 * b, h, w, ctx, allow_context_repeat=rep)
+            or profiles.select(held, b, h, w, ctx, allow_context_repeat=rep)
+        )
     if choice is None:
         return None
     profile, padded, _ = choice
     s = held[profile]
+    ctx_opt = s["encoder_hidden_states"][1][1]
     shapes = {
-        "sample": (padded, c, h, w),
+        "sample": arch.latent_shape(padded, h, w, c),
         "timesteps": (padded,),
-        "encoder_hidden_states": (padded, s["encoder_hidden_states"][1][1], s["encoder_hidden_states"][0][2]),
+        "encoder_hidden_states": (padded, ctx_opt, s["encoder_hidden_states"][0][2]),
     }
     if "y" in s:
         shapes["y"] = (padded, s["y"][0][1])
+    if "rope" in s:
+        shapes["rope"] = (1, h // 2, w // 2, 1, s["rope"][0][4], 2)
+    if "rope_img" in s:
+        shapes["rope_img"] = (1, h, w, 1, s["rope_img"][0][4], 2)
+    if "rope_txt" in s:
+        shapes["rope_txt"] = (1, ctx_opt, 1, s["rope_txt"][0][3], 2)
     return profile, shapes
 
 
@@ -2321,6 +2644,39 @@ def _note_torch_call(p: Pass, x, out, cond_or_uncond):
                 p.tracker.after_call(entry, out[:x.shape[0]], cond_or_uncond)
 
 
+def _check_transformer_options(p: Pass, transformer_options: dict):
+    if any(v for g in ("patches", "patches_replace") for v in transformer_options.get(g, {}).values()):
+        p.fall_back("TensorRT engines can't apply model patches")
+    if any(transformer_options.get(k) for k in _EXTRA_TRANSFORMER_OPTIONS):
+        p.fall_back("TensorRT engines can't apply model patches")
+    if (transformer_options.get("wrappers") or {}).get("diffusion_model"):
+        p.fall_back("TensorRT engines can't apply model wrappers")
+
+
+def _run_torch_side_call(p: Pass, call, x, cond_or_uncond):
+    try:
+        out = call()
+        _note_torch_call(p, x, out, cond_or_uncond)
+        return out
+    except torch.cuda.OutOfMemoryError as e:
+        _clear_traceback(e)
+        if p._torch_partial:
+            if not p._torch_mode:
+                p._no_coexist = True
+            p._unload_torch_weights()
+            try:
+                out = call()
+                _note_torch_call(p, x, out, cond_or_uncond)
+                return out
+            except torch.cuda.OutOfMemoryError as e2:
+                _clear_traceback(e2)
+        try:
+            p.fall_back("Running a side call on PyTorch ran out of VRAM")
+        except Fallback:
+            pass
+    return None
+
+
 def _wrap_forward(original):
     def forward(self, x, timesteps=None, context=None, y=None, control=None, transformer_options={}, **kwargs):
         p = _pass
@@ -2336,30 +2692,71 @@ def _wrap_forward(original):
                     p.fall_back("TensorRT engines can't apply UNet wrappers")
                 return p.run(x, timesteps, context, y, transformer_options.get("cond_or_uncond"))
             except _CallTorch:
-                cond_or_uncond = transformer_options.get("cond_or_uncond")
-                try:
-                    out = original(self, x, timesteps, context, y, control, transformer_options, **kwargs)
-                    _note_torch_call(p, x, out, cond_or_uncond)
-                    return out
-                except torch.cuda.OutOfMemoryError as e:
-                    _clear_traceback(e)
-                    if p._torch_partial:
-                        if not p._torch_mode:
-                            p._no_coexist = True
-                        p._unload_torch_weights()
-                        try:
-                            out = original(self, x, timesteps, context, y, control, transformer_options, **kwargs)
-                            _note_torch_call(p, x, out, cond_or_uncond)
-                            return out
-                        except torch.cuda.OutOfMemoryError as e2:
-                            _clear_traceback(e2)
-                    try:
-                        p.fall_back("Running a side call on PyTorch ran out of VRAM")
-                    except Fallback:
-                        pass
+                res = _run_torch_side_call(
+                    p, lambda: original(self, x, timesteps, context, y, control, transformer_options, **kwargs),
+                    x, transformer_options.get("cond_or_uncond"),
+                )
+                if res is not None:
+                    return res
             except Fallback:
                 pass
         return original(self, x, timesteps, context, y, control, transformer_options, **kwargs)
+
+    forward._trt_original = original
+    return forward
+
+
+def _wrap_anima_forward(original):
+    def forward(self, x, timesteps, context, padding_mask=None, **kwargs):
+        p = _pass
+        if p is not None and p.fallback is None and self is p.module:
+            transformer_options = kwargs.get("transformer_options") or {}
+            try:
+                if _has_ref_latents():
+                    p.fall_back("TensorRT engines can't apply reference latents")
+                if x.ndim != 5 or x.shape[2] != 1:
+                    p.fall_back("TensorRT engines only support single-frame Anima latents")
+                if padding_mask is not None:
+                    p.fall_back("TensorRT engines can't apply a padding mask")
+                _check_transformer_options(p, transformer_options)
+                return p.run(x, timesteps, context, None, transformer_options.get("cond_or_uncond"))
+            except _CallTorch:
+                res = _run_torch_side_call(
+                    p, lambda: original(self, x, timesteps, context, padding_mask=padding_mask, **kwargs),
+                    x, transformer_options.get("cond_or_uncond"),
+                )
+                if res is not None:
+                    return res
+            except Fallback:
+                pass
+        return original(self, x, timesteps, context, padding_mask=padding_mask, **kwargs)
+
+    forward._trt_original = original
+    return forward
+
+
+def _wrap_moss_forward(original):
+    def forward(self, x, timestep, context, transformer_options={}, **kwargs):
+        p = _pass
+        if p is not None and p.fallback is None and self is p.module:
+            opts = transformer_options or {}
+            try:
+                if _has_ref_latents():
+                    p.fall_back("TensorRT engines can't apply reference latents")
+                if x.ndim != 4:
+                    p.fall_back("TensorRT engines expect 4D MOSS-Image latents")
+                _check_transformer_options(p, opts)
+                return p.run(x, timestep, context, None, opts.get("cond_or_uncond"))
+            except _CallTorch:
+                res = _run_torch_side_call(
+                    p, lambda: original(self, x, timestep, context, transformer_options, **kwargs),
+                    x, opts.get("cond_or_uncond"),
+                )
+                if res is not None:
+                    return res
+            except Fallback:
+                pass
+        return original(self, x, timestep, context, transformer_options, **kwargs)
 
     forward._trt_original = original
     return forward
@@ -2371,12 +2768,16 @@ _denoiser_state = None  # active CFGDenoiser.forward call, so a refiner switch i
 
 def _begin_step(p: Pass, index: int, total, steps, step, x, sigma):
     try:
-        p.schedule.begin(index, total, steps, step, sigma)
-        _prompts.clear()
-        if p.schedule.done:
-            p.tracker.release()
-        elif not p.schedule.idle:
-            p.tracker.begin(index, x)
+        if p.schedule is not None:
+            p.schedule.begin(index, total, steps, step, sigma)
+            _prompts.clear()
+            if p.schedule.done:
+                p.tracker.release()
+            elif not p.schedule.idle:
+                p.tracker.begin(index, x)
+        elif p.dit_speed is not None:
+            p.dit_speed.begin(index, total, steps, step, sigma)
+            _prompts.clear()
     except Exception as e:
         p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
 
@@ -2397,10 +2798,13 @@ def _wrap_prepare(original):
             _pass._eval_id = 1
             if _denoiser_state[2]:
                 _pass._remaining_steps = max(0, int(_denoiser_state[2]) - int(_denoiser_state[3]))
-            if _pass.schedule is not None:
+            if _pass.schedule is not None or _pass.dit_speed is not None:
                 # Refiner switch mid-denoiser: get_sigmas doesn't run again, and the switch step is already in flight.
                 if _latest_sigmas is not None:
-                    _pass.schedule.sigmas = list(_latest_sigmas)
+                    if _pass.schedule is not None:
+                        _pass.schedule.sigmas = list(_latest_sigmas)
+                    if _pass.dit_speed is not None:
+                        _pass.dit_speed.sigmas = list(_latest_sigmas)
                 _begin_step(_pass, *_denoiser_state)
 
     sampling_prepare._trt_original = original
@@ -2451,10 +2855,10 @@ def _wrap_denoiser(original):
                         p._evals_per_step = max(1, p._step_evals)
                         p._last_step, p._step_evals = step_now, 1
             except Exception as e:
-                if p is not None and p.schedule is not None and p.fallback is None:
+                if p is not None and (p.schedule is not None or p.dit_speed is not None) and p.fallback is None:
                     p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
             else:
-                if p is not None and p.schedule is not None and p.fallback is None:
+                if p is not None and (p.schedule is not None or p.dit_speed is not None) and p.fallback is None:
                     _begin_step(p, *current_state)
         prev_state, _denoiser_state = _denoiser_state, current_state
         try:
@@ -2490,12 +2894,18 @@ def _wrap_get_sigmas(original):
             values = [float(s) for s in sigmas.reshape(-1).tolist()]
         except Exception as e:
             _latest_sigmas = None
-            if _pass is not None and _pass.schedule is not None and _pass.schedule.index is None:
+            if _pass is not None and (
+                (_pass.schedule is not None and _pass.schedule.index is None)
+                or (_pass.dit_speed is not None and _pass.dit_speed.index is None)
+            ):
                 _pass.drop_speed_hacks(f"Speed Hacks failed ({e})", _unexpected(e))
             return sigmas
         _latest_sigmas = values
-        if _pass is not None and _pass.schedule is not None and _pass.schedule.index is None:
-            _pass.schedule.sigmas = values
+        if _pass is not None:
+            if _pass.schedule is not None and _pass.schedule.index is None:
+                _pass.schedule.sigmas = values
+            if _pass.dit_speed is not None and _pass.dit_speed.index is None:
+                _pass.dit_speed.sigmas = values
         return sigmas
 
     get_sigmas._trt_original = original
@@ -2629,7 +3039,10 @@ def _cond_key(schedule, step) -> int:
 
 def _note_prompts(schedules_of, step):
     # schedules_of() -> one list of ScheduledPromptConditioning per prompt
-    if _pass is None or _pass.schedule is None or _pass.schedule.idle or _pass.schedule.done or _pass.fallback is not None:
+    if _pass is None or _pass.fallback is not None:
+        return
+    sched = _pass.schedule if _pass.schedule is not None else _pass.dit_speed
+    if sched is None or sched.idle or sched.done:
         return
     try:
         _prompts.append(tuple(_cond_key(s, step) for s in schedules_of()))
@@ -2710,6 +3123,9 @@ def install_hooks():
 
     sampler_mod = compat.sampling_module()
     _hook(compat.unet_class(), "forward", _wrap_forward)
+    for dit_cls, wrap_fn in ((compat.anima_class(), _wrap_anima_forward), (compat.moss_class(), _wrap_moss_forward)):
+        if dit_cls is not None:
+            _hook(dit_cls, "forward", wrap_fn)
     _hook(processing.StableDiffusionProcessing, "close", _wrap_close)
     _rebind(sampler_mod, "sampling_prepare", _wrap_prepare)
     _rebind(sampler_mod, "sampling_cleanup", _wrap_cleanup)

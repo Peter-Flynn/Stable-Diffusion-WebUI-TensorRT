@@ -12,7 +12,7 @@ import os
 import shutil
 from dataclasses import dataclass, field
 
-from . import common, fresh
+from . import common, dit_speed, fresh, quant
 from .arch import Arch
 from .profiles import Profile
 
@@ -20,6 +20,7 @@ PER_PROFILE, MERGED = "per_profile", "merged"
 SHALLOW = ".shallow.plan"
 MODES = (PER_PROFILE, MERGED)
 GRAPH_VERSION = 3  # 2: FP32 GroupNorm; 3: decomposed FP32 GroupNorm (avoids TRT 11 __myl_Gnor on small dynamic profiles)
+DIT_GRAPH_VERSION = 1
 
 
 def root() -> str:
@@ -50,13 +51,26 @@ def _settings_path() -> str:
     return os.path.join(root(), "settings.json")
 
 
-def _saved_mode():
+def _read_settings() -> dict:
     try:
         with open(_settings_path(), encoding="utf-8") as f:
-            saved = json.load(f).get("mode")
-        return saved if saved in MODES else None
-    except (OSError, ValueError, AttributeError):
-        return None
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_settings(data: dict):
+    path = _settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def _saved_mode():
+    saved = _read_settings().get("mode")
+    return saved if saved in MODES else None
 
 
 def mode() -> str:
@@ -71,9 +85,48 @@ def set_mode(new: str):
         raise ValueError(f"Unknown engine mode {new!r}")
     if records():
         raise RuntimeError("The engine mode can only change while there are no engines: delete them all first.")
-    with open(_settings_path() + ".tmp", "w", encoding="utf-8") as f:
-        json.dump({"mode": new}, f)
-    os.replace(_settings_path() + ".tmp", _settings_path())
+    data = _read_settings()
+    data["mode"] = new
+    _write_settings(data)
+
+
+def keep_precisions() -> bool:
+    val = _read_settings().get("keep_precisions", True)
+    return bool(val) if isinstance(val, bool) else True
+
+
+def set_keep_precisions(keep: bool):
+    data = _read_settings()
+    data["keep_precisions"] = bool(keep)
+    _write_settings(data)
+
+
+def saved_precision(arch_id: str) -> str:
+    prefs = _read_settings().get("precision")
+    if isinstance(prefs, dict):
+        saved = prefs.get(arch_id)
+        if saved in quant.ALL_PRECISIONS:
+            return saved
+    return quant.AUTO
+
+
+def set_precision(arch_id: str, precision: str):
+    if precision not in quant.ALL_PRECISIONS:
+        raise ValueError(f"Unknown engine precision {precision!r}")
+    data = _read_settings()
+    prefs = data.get("precision")
+    if not isinstance(prefs, dict):
+        prefs = {}
+    prefs[arch_id] = precision
+    data["precision"] = prefs
+    _write_settings(data)
+
+
+def active_precision(arch: Arch, patcher=None, requested: str = None) -> str:
+    if arch is None or not arch.is_dit:
+        return quant.FP16
+    req = requested if requested is not None else saved_precision(arch.id)
+    return quant.resolve_precision(arch, patcher, requested=req)
 
 
 def _prefix(arch_id: str) -> str:
@@ -98,6 +151,13 @@ class Record:
         return self.mode == MERGED
 
     @property
+    def precision(self) -> str:
+        p = self.meta.get("precision")
+        if p in quant.EXPLICIT_PRECISIONS:
+            return p
+        return quant.BF16 if self.arch.is_dit else quant.FP16
+
+    @property
     def profiles(self) -> list:
         return [Profile.from_dict(d) for d in (self.meta["profiles"] if self.merged else [self.meta["profile"]])]
 
@@ -115,7 +175,8 @@ class Record:
 
     @property
     def engine_key(self) -> str:
-        return merged_key(self.profiles) if self.merged else profile_key(self.profiles[0])
+        base = merged_key(self.profiles) if self.merged else profile_key(self.profiles[0])
+        return f"{self.precision}-{base}" if self.arch.is_dit else base
 
     @property
     def shallow_plan(self):
@@ -125,10 +186,23 @@ class Record:
     @property
     def speed_hacks(self):
         hacks = self.meta.get("speed_hacks")
+        if self.arch.is_dit:
+            if not dit_speed.USES_SHALLOW_ENGINE:
+                return None
+            return hacks if hacks and hacks.get("dit_speed") == dit_speed.SHALLOW_SIGNATURE else None
         return hacks if hacks and hacks.get("fresh") == fresh.SIGNATURE else None
 
     @property
+    def supports_speed_hacks(self) -> bool:
+        if self.arch.is_dit and not dit_speed.USES_SHALLOW_ENGINE:
+            return True
+        return self.speed_hacks is not None
+
+    @property
     def stale_graph(self) -> bool:
+        if self.arch.is_dit:
+            g = self.meta.get("graph", 0)
+            return isinstance(g, bool) or not isinstance(g, int) or g != DIT_GRAPH_VERSION
         g = self.meta.get("graph", 1)
         if isinstance(g, bool) or not isinstance(g, int) or g < 2 or g > GRAPH_VERSION:
             return True
@@ -148,16 +222,25 @@ class Record:
 
     @property
     def stale_speed_hacks(self) -> bool:  # built with another fresh.SIGNATURE: a different shallow graph
+        if self.arch.is_dit and not dit_speed.USES_SHALLOW_ENGINE:
+            return False
         return self.speed_hacks is None and "speed_hacks" in self.meta
 
     @property
     def retry_speed_hacks(self) -> bool:
+        if self.arch.is_dit and not dit_speed.USES_SHALLOW_ENGINE:
+            return False
         return self.speed_hacks is None and (self.stale_speed_hacks or not self.meta.get("speed_hacks_retried"))
 
     @property
     def label(self) -> str:
         n = len(self.indexes)
-        return f"merged engine ({n} profile{'' if n == 1 else 's'})" if self.merged else f"engine for profile {self.indexes[0] + 1}"
+        prec = f" [{quant.LABELS.get(self.precision, self.precision)}]" if self.arch.is_dit else ""
+        return (
+            f"merged engine ({n} profile{'' if n == 1 else 's'}){prec}"
+            if self.merged
+            else f"engine for profile {self.indexes[0] + 1}{prec}"
+        )
 
     def renumbered(self, indexes: list) -> dict:
         return {**self.meta, "indexes": list(indexes)} if self.merged else {**self.meta, "index": indexes[0]}
@@ -176,7 +259,8 @@ class Record:
 
     @property
     def group(self) -> tuple:
-        return self.meta["arch"]["id"], self.meta["gpu"], common.trt_tag(self.meta["trt"])
+        base = (self.meta["arch"]["id"], self.meta["gpu"], common.trt_tag(self.meta["trt"]))
+        return (*base, self.precision) if self.arch.is_dit else base
 
     @property
     def loadable(self) -> bool:
@@ -202,10 +286,14 @@ def _safe_tag(s) -> bool:
     return _plain_name(s) and not any(c in s for c in "*?[")
 
 
-def _valid_shapes(shapes) -> bool:
+def _valid_shapes(shapes, arch: Arch = None) -> bool:
     if not isinstance(shapes, dict):
         return False
-    checks = (("sample", 4), ("encoder_hidden_states", 3)) + ((("y", 2),) if "y" in shapes else ())
+    sample_dims = arch.latent_ndim if arch is not None else 4
+    checks = [("sample", sample_dims), ("encoder_hidden_states", 3)]
+    for opt_name, opt_dims in (("y", 2), ("rope", 6), ("rope_img", 6), ("rope_txt", 5)):
+        if opt_name in shapes:
+            checks.append((opt_name, opt_dims))
     for name, dims in checks:
         bounds = shapes.get(name)
         if not isinstance(bounds, list) or len(bounds) != 3:
@@ -232,6 +320,8 @@ def _read(meta_path: str):
                 raise ValueError(f"unknown engine mode {record.mode!r}")
             if not _safe_tag(record.meta["gpu"]) or not _safe_tag(record.meta["trt"]):
                 raise ValueError("invalid gpu or trt metadata")
+            if "precision" in record.meta and record.meta["precision"] not in quant.EXPLICIT_PRECISIONS:
+                raise ValueError(f"invalid precision metadata {record.meta['precision']!r}")
             arch = record.arch
             if arch.id != os.path.basename(os.path.dirname(meta_path)):
                 raise ValueError("arch id does not match engine folder")
@@ -241,7 +331,7 @@ def _read(meta_path: str):
             profs, shapes, indexes = record.profiles, record.profile_shapes, record.indexes
             if not isinstance(shapes, list) or not profs or len(indexes) != len(profs) or len(shapes) != len(profs):
                 raise ValueError("mismatched profiles, indexes, or shapes")
-            if not all(_valid_shapes(s) for s in shapes):
+            if not all(_valid_shapes(s, arch) for s in shapes):
                 raise ValueError("invalid profile shapes")
             if record.speed_hacks is not None:
                 if record.shallow_plan is None:
@@ -260,8 +350,8 @@ def records() -> list:
     return sorted(found, key=lambda r: (r.group, r.index))
 
 
-def engines(arch_id: str) -> list:
-    return [r for r in records() if r.meta["arch"]["id"] == arch_id and r.loadable]
+def engines(arch_id: str, precision: str = None) -> list:
+    return [r for r in records() if r.meta["arch"]["id"] == arch_id and r.loadable and (precision is None or r.precision == precision)]
 
 
 def slots(records: list) -> list:
@@ -294,25 +384,31 @@ def save(arch: Arch, plan_tmp: str, meta: dict, shallow_tmp: str = None) -> Reco
     return Record(base + ".plan", record.meta)
 
 
-def wanted_keys(profiles: list, mode_: str) -> set:
-    return {merged_key(profiles)} if mode_ == MERGED else {profile_key(p) for p in profiles}
+def wanted_keys(profiles: list, mode_: str, precision: str = None) -> set:
+    base = {merged_key(profiles)} if mode_ == MERGED else {profile_key(p) for p in profiles}
+    return {f"{precision}-{k}" for k in base} if precision else base
 
 
-def keep_only(arch_id: str, profiles: list, mode_: str) -> int:
+def keep_only(arch_id: str, profiles: list, mode_: str, *, precision: str = None, keep_other_precisions: bool = None) -> int:
     position = {profile_key(p): i for i, p in enumerate(profiles)}
-    wanted = wanted_keys(profiles, mode_)
+    wanted = wanted_keys(profiles, mode_, precision=precision)
+    keep_others = keep_precisions() if keep_other_precisions is None else bool(keep_other_precisions)
+    prec_prefix = f"{precision}-" if precision else None
     prefix = _prefix(arch_id)
     deleted = 0
     for path in glob.glob(glob.escape(prefix) + "-*.plan"):
         if path.endswith(SHALLOW):
             continue
         base = path[: -len(".plan")]
-        if base[len(prefix) + 1:] in wanted:
+        key = base[len(prefix) + 1 :]
+        if key in wanted:
             record = _read(base + ".json")
             if record is not None:
                 indexes = [position[profile_key(p)] for p in record.profiles]
                 if indexes != record.indexes:
                     _write_meta(base, record.renumbered(indexes))
+            continue
+        if prec_prefix is not None and keep_others and not key.startswith(prec_prefix):
             continue
         for stale in (path, base + ".json", base + SHALLOW):
             with contextlib.suppress(FileNotFoundError):

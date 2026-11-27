@@ -3,7 +3,7 @@ import weakref
 
 import torch
 
-from . import common, compat
+from . import common, compat, quant
 
 PREFIX = "diffusion_model."
 
@@ -65,11 +65,14 @@ def _head_bytes(t: torch.Tensor, limit: int) -> torch.Tensor:
 def _fingerprint_head(t) -> torch.Tensor:
     qdata = getattr(t, "_qdata", None)
     if isinstance(qdata, torch.Tensor):
-        head = _head_bytes(qdata, 16)
-        scale = getattr(getattr(t, "_params", None), "scale", None)
-        if isinstance(scale, torch.Tensor):
-            return torch.cat([head, _head_bytes(scale, 4)])
-        return head
+        parts = [_head_bytes(qdata, 16)]
+        params = getattr(t, "_params", None)
+        if params is not None:
+            for attr in ("scale", "block_scale", "s_channel", "codebook", "correction"):
+                val = getattr(params, attr, None)
+                if isinstance(val, torch.Tensor):
+                    parts.append(_head_bytes(val, 4))
+        return torch.cat(parts) if len(parts) > 1 else parts[0]
     return _head_bytes(t.data, 16)
 
 
@@ -98,7 +101,8 @@ class EffectiveWeights:
         self.wrappers = getattr(self.patcher, "weight_wrapper_patches", {}) or {}
 
     def _patches_for(self, name: str):
-        full = PREFIX + name
+        base_name = quant.base_weight_name(name)
+        full = PREFIX + base_name
         baked = self.patches.get(full)
         wrappers = self.wrappers.get(full)
         if not wrappers:
@@ -109,15 +113,17 @@ class EffectiveWeights:
         return (list(baked) if baked else []) + online
 
     def has(self, name: str) -> bool:
-        return name in self.params or PREFIX + name in self.backup
+        base_name = quant.base_weight_name(name)
+        return base_name in self.params or PREFIX + base_name in self.backup
 
     def base(self, name: str) -> torch.Tensor:
-        backup = self.backup.get(PREFIX + name)
-        if backup is None and name not in self.params:
-            raise RuntimeError(f"The engine has a weight this UNet doesn't ({name}); rebuild the engine")
+        base_name = quant.base_weight_name(name)
+        backup = self.backup.get(PREFIX + base_name)
+        if backup is None and base_name not in self.params:
+            raise RuntimeError(f"The engine has a weight this model doesn't ({base_name}); rebuild the engine")
         # reForge/Neo keeps the original of a weight it patched in place in `backup`. Keep QuantizedTensor/ParameterGGUF
         # wrappers intact so dequantization sees their metadata; use `.data` on plain Parameters for inference-mode safety.
-        src = getattr(backup, "weight", backup) if backup is not None else self.params[name]
+        src = getattr(backup, "weight", backup) if backup is not None else self.params[base_name]
         if compat.is_quantized_weight(src):
             return src
         return src.data
@@ -127,27 +133,50 @@ class EffectiveWeights:
         return hashlib.sha256(torch.cat(heads).numpy().tobytes()).hexdigest() if heads else ""
 
     def is_patched(self, name: str) -> bool:
+        if quant.is_any_scale_weight(name):
+            return False
         return bool(self._patches_for(name))
 
     def signature(self, name: str):
+        if quant.is_act_scale_weight(name):
+            return self.base_version, "act_scale"
         patches = self._patches_for(name)
         return self.base_version, _identity(patches) if patches else None
 
     _LORA_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
     def needs_gpu(self, name: str) -> bool:
-        return bool(self._patches_for(name) or self.converters.get(name) is not None or compat.is_quantized_weight(self.base(name)))
+        if quant.is_act_scale_weight(name):
+            return False
+        if quant.is_scale_weight(name):
+            return True
+        base_name = quant.base_weight_name(name)
+        return bool(self._patches_for(base_name) or self.converters.get(base_name) is not None or compat.is_quantized_weight(self.base(base_name)))
+
+    def act_scale(self, name: str, dtype: torch.dtype) -> torch.Tensor:
+        if not hasattr(self, "_int8_act_scales"):
+            from . import arch as arch_mod
+
+            arch = arch_mod.detect(self.patcher)
+            self._int8_act_scales = quant.calibrate_int8_scales(arch, self)
+        base_name = quant.base_weight_name(name)
+        val = self._int8_act_scales.get(base_name)
+        if val is None or not (val > 0.0):
+            val = quant.fallback_int8_act_scale(base_name)
+        min_scale = 1e-4 if dtype == torch.float16 else 1e-12
+        return torch.tensor(max(min_scale, float(val)), dtype=dtype)
 
     def fast_lora(self, name: str):
         # Standard LoRA weights (up @ down) can be staged alongside base in pinned memory and merged via in-place FP32
         # addmm_, avoiding per-weight synchronous H2D copies and intermediate lora_diff allocations. Anything unusual
         # (converters, quantized weights, DoRA, LoCon mid weights, offsets, custom functions, strength_model != 1, LoHa/LoKr) returns None.
-        if self.converters.get(name) is not None:
+        base_name = quant.base_weight_name(name)
+        if self.converters.get(base_name) is not None:
             return None
-        patches = self._patches_for(name)
+        patches = self._patches_for(base_name)
         if not patches:
             return None
-        base = self.base(name)
+        base = self.base(base_name)
         if type(base) is not torch.Tensor or base.ndim < 2 or base.shape[0] <= 0:
             return None
         rows, total = base.shape[0], base.numel()
@@ -193,20 +222,42 @@ class EffectiveWeights:
         if out is not None:
             out.copy_(weight)
             return out
-        return weight.to(dtype)
+        return weight if dtype == torch.float32 else weight.to(dtype)
+
+    def apply_fp32_on_gpu(self, name: str, gpu_base: torch.Tensor, gpu_lora: list = None) -> torch.Tensor:
+        base_name = quant.base_weight_name(name)
+        if gpu_lora is not None:
+            return self.apply_fast_lora(gpu_base, gpu_lora, torch.float32)
+        items = self.fast_lora(base_name)
+        if items is not None:
+            dev = gpu_base.device
+            return self.apply_fast_lora(gpu_base, [(u.to(dev), d.to(dev), s) for u, d, s in items], torch.float32)
+        weight = compat.dequantize_weight(gpu_base, self.converters.get(base_name))
+        patches = self._patches_for(base_name)
+        if patches:
+            weight = compat.merge_weight(patches, weight, PREFIX + base_name)
+        return weight if weight.dtype == torch.float32 else weight.float()
+
+    def quantize_on_gpu(self, name: str, gpu_base: torch.Tensor, quant_kind: str, scale_dtype: torch.dtype, gpu_lora: list = None) -> tuple:
+        w_fp32 = self.apply_fp32_on_gpu(name, gpu_base, gpu_lora=gpu_lora)
+        return quant.quantize_for_refit(w_fp32, quant_kind, scale_dtype, transposed=quant.is_transposed_weight(name))
 
     def apply_on_gpu(self, name: str, gpu_base: torch.Tensor, dtype=torch.float16) -> torch.Tensor:
-        items = self.fast_lora(name)
+        base_name = quant.base_weight_name(name)
+        items = self.fast_lora(base_name)
         if items is not None:
             dev = gpu_base.device
             return self.apply_fast_lora(gpu_base, [(u.to(dev), d.to(dev), s) for u, d, s in items], dtype)
-        weight = compat.dequantize_weight(gpu_base, self.converters.get(name))
-        patches = self._patches_for(name)
+        weight = compat.dequantize_weight(gpu_base, self.converters.get(base_name))
+        patches = self._patches_for(base_name)
         if patches:
-            weight = compat.merge_weight(patches, weight, PREFIX + name)
+            weight = compat.merge_weight(patches, weight, PREFIX + base_name)
         return weight.to(dtype)
 
     def tensor(self, name: str, device="cpu", dtype=torch.float16) -> torch.Tensor:
+        if quant.is_act_scale_weight(name):
+            t = self.act_scale(name, dtype)
+            return t if device is None else t.to(device)
         base = self.base(name)
         if not self.needs_gpu(name):
             return base if device is None else base.to(device)

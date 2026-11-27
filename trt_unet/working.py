@@ -62,6 +62,9 @@ class _Alive(TorchDispatchMode):
 
 
 def _attention(q, k, v, heads, *args, **kwargs):  # stand-in: just the output's memory, like TensorRT's fused attention
+    if kwargs.get("skip_reshape") and not kwargs.get("skip_output_reshape"):
+        b, h, l, d = q.shape
+        return torch.empty((b, l, h * d), dtype=q.dtype, device=q.device)
     return torch.empty(q.shape, dtype=q.dtype, device=q.device)
 
 
@@ -82,22 +85,59 @@ def measure(config: dict, in_channels: int, context_dim: int, adm_channels: int,
     return alive.most / (side * 8 * side * 8)
 
 
-def per_pixel(arch, patcher) -> float:
+def measure_dit(arch, config: dict, dtype=torch.bfloat16, fp32_residual: bool = False) -> float:
+    from . import compat, dit
+
+    model = compat.fresh_dit(arch.kind, config, "meta", dtype)
+    alive = _Alive()
+    if arch.kind == "anima":
+        side = 64  # 512x512 pixels (32x32 patches)
+        head_dim = int(model.blocks[0].self_attn.head_dim)
+        x = torch.empty(1, arch.in_channels, 1, side, side, dtype=dtype, device="meta")
+        t = torch.empty(1, dtype=torch.float32, device="meta")
+        ctx = torch.empty(1, 512, arch.context_dim, dtype=dtype, device="meta")
+        rope = torch.empty(1, side // 2, side // 2, 1, head_dim // 2, 2, dtype=torch.float32, device="meta")
+        with torch.no_grad(), alive:
+            dit.anima_traceable_forward(model, x, t, ctx, rope, fp32_residual=fp32_residual, attn_fn=_attention)
+        return alive.most / (side * arch.downscale * side * arch.downscale)
+    if arch.kind == "moss_image":
+        side = 32  # 512x512 pixels (32x32 latent grid)
+        head_dim = int(model.layers[0].q_norm.weight.shape[0])
+        x = torch.empty(1, arch.in_channels, side, side, dtype=dtype, device="meta")
+        t = torch.empty(1, dtype=torch.float32, device="meta")
+        ctx = torch.empty(1, 256, arch.context_dim, dtype=dtype, device="meta")
+        r_img = torch.empty(1, side, side, 1, head_dim // 2, 2, dtype=torch.float32, device="meta")
+        r_txt = torch.empty(1, 256, 1, head_dim // 2, 2, dtype=torch.float32, device="meta")
+        with torch.no_grad(), alive:
+            dit.moss_traceable_forward(model, x, t, ctx, r_img, r_txt, fp32_residual=fp32_residual, attn_fn=_attention)
+        return alive.most / (side * arch.downscale * side * arch.downscale)
+    raise ValueError(f"Unsupported DiT kind {arch.kind!r}")
+
+
+def per_pixel(arch, patcher, precision: str = None) -> float:
+    from . import quant
+
+    key = (arch.id, precision) if getattr(arch, "is_dit", False) else arch.id
     with _lock:
-        if arch.id not in _figures:
+        if key not in _figures:
             from .arch import unet_config
 
             try:
-                _figures[arch.id] = measure(unet_config(patcher), arch.in_channels, arch.context_dim, arch.adm_channels)
-                logger.debug(f"A {arch.name} UNet call takes {_figures[arch.id]:.1f} bytes of VRAM per pixel of each image.")
+                if getattr(arch, "is_dit", False):
+                    prec = precision or quant.BF16
+                    dt = quant.compute_dtype(prec)
+                    _figures[key] = measure_dit(arch, unet_config(patcher), dtype=dt, fp32_residual=quant.uses_fp32_residual(prec))
+                else:
+                    _figures[key] = measure(unet_config(patcher), arch.in_channels, arch.context_dim, arch.adm_channels)
+                logger.debug(f"A {arch.name} call takes {_figures[key]:.1f} bytes of VRAM per pixel of each image.")
             except Exception as e:
-                _figures[arch.id] = FALLBACK
+                _figures[key] = FALLBACK
                 logger.warning(
-                    f"Couldn't work out how much VRAM a {arch.name} UNet call takes ({type(e).__name__}: {e}), so it's assumed to be "
+                    f"Couldn't work out how much VRAM a {arch.name} call takes ({type(e).__name__}: {e}), so it's assumed to be "
                     f"{FALLBACK} bytes per pixel, the most of any known architecture. Some passes that would fit may run on PyTorch."
                 )
-        return _figures[arch.id]
+        return _figures[key]
 
 
-def call_bytes(arch, patcher, batch: int, width: int, height: int) -> int:
-    return int(batch * width * height * per_pixel(arch, patcher) * CALL_FACTOR)
+def call_bytes(arch, patcher, batch: int, width: int, height: int, precision: str = None) -> int:
+    return int(batch * width * height * per_pixel(arch, patcher, precision=precision) * CALL_FACTOR)

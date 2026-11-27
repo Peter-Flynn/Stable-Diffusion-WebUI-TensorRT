@@ -10,7 +10,7 @@ from collections import deque
 import tensorrt as trt
 import torch
 
-from . import common, gpu
+from . import common, gpu, quant
 from .common import gib, logger
 
 # The refitter prepares host weights on one CPU thread by default, and scans every weight for NaN/Inf. The weights are
@@ -22,6 +22,9 @@ _unsettable = set()
 PROFILE = os.environ.get("TRT_EXTENSION_PROFILE", "").lower() in ("1", "true", "yes")
 _layer_times = {}
 
+_TRT_INT8 = getattr(trt.DataType, "INT8", None)
+_TRT_FP8 = getattr(trt.DataType, "FP8", None)
+_TRT_INT4 = getattr(trt.DataType, "INT4", None)
 
 _DTYPES = {
     trt.DataType.FLOAT: torch.float32,
@@ -31,12 +34,32 @@ _DTYPES = {
     trt.DataType.INT64: torch.int64,
     trt.DataType.BOOL: torch.bool,
 }
+if _TRT_INT8 is not None:
+    _DTYPES[_TRT_INT8] = torch.int8
+if _TRT_FP8 is not None and hasattr(torch, "float8_e4m3fn"):
+    _DTYPES[_TRT_FP8] = torch.float8_e4m3fn
 
 
 def torch_dtype(dtype):
     if dtype not in _DTYPES:
         raise TypeError(f"Unsupported TensorRT dtype {dtype}")
     return _DTYPES[dtype]
+
+
+def _quant_kind(trt_dtype):
+    if _TRT_FP8 is not None and trt_dtype == _TRT_FP8:
+        return quant.FP8
+    if _TRT_INT8 is not None and trt_dtype == _TRT_INT8:
+        return quant.INT8
+    if _TRT_INT4 is not None and trt_dtype == _TRT_INT4:
+        return quant.INT4
+    return None
+
+
+def _proto_nbytes(proto) -> int:
+    if _TRT_INT4 is not None and proto.dtype == _TRT_INT4:
+        return (int(proto.size) + 1) // 2
+    return int(proto.size) * torch_dtype(proto.dtype).itemsize
 
 
 class Logger(trt.ILogger):
@@ -400,13 +423,18 @@ class Engine:
                 and callable(getattr(source, "fast_lora", None))
                 and callable(getattr(source, "apply_fast_lora", None))
             )
+            has_quant_api = can_pipe and callable(getattr(source, "quantize_on_gpu", None))
+            weight_set = set(self.weight_names)
+            quant_bases = {quant.weight_name_of_scale(n) for n in self.weight_names if quant.is_scale_weight(n)}
             fast_map = {}
             align16 = lambda n: (n + 15) & ~15
             if can_pipe:
                 gpu_stage_sizes = []
                 pin_stage_sizes = []
                 for n in names:
-                    if source.needs_gpu(n):
+                    if quant.is_any_scale_weight(n):
+                        continue
+                    if source.needs_gpu(n) or (has_quant_api and n in quant_bases):
                         items = source.fast_lora(n) if has_fast_lora else None
                         if items is not None:
                             fast_map[n] = items
@@ -435,9 +463,11 @@ class Engine:
                             if pin_nb > 0:
                                 pin_stage_sizes.append(pin_nb)
                 if len(gpu_stage_sizes) >= 2:
-                    gpu_buf_size = min(32 << 20, max(gpu_stage_sizes))
-                    pin_size = min(32 << 20, max(pin_stage_sizes)) if pin_stage_sizes else 0
-                    if 2 * gpu_buf_size <= max(0, free_b - (256 << 20)) // 4:
+                    vram_cap = max(0, free_b - (256 << 20)) // 8
+                    max_cap = 112 << 20 if quant_bases else (32 << 20)
+                    gpu_buf_size = min(max_cap, max(gpu_stage_sizes), vram_cap)
+                    pin_size = min(gpu_buf_size, max(pin_stage_sizes)) if pin_stage_sizes else 0
+                    if gpu_buf_size >= (4 << 20):
                         try:
                             if pin_size > 0:
                                 pins = [torch.empty(pin_size, dtype=torch.uint8, pin_memory=True) for _ in range(2)]
@@ -476,6 +506,20 @@ class Engine:
 
                             def bind(name, proto, t, loc):
                                 nonlocal device_bytes, has_device
+                                if _TRT_INT4 is not None and proto.dtype == _TRT_INT4:
+                                    expected = (int(proto.size) + 1) // 2
+                                    if t.dtype != torch.uint8 or t.numel() != expected:
+                                        raise RuntimeError(
+                                            f"Packed INT4 weight {name} has {t.numel()} bytes ({t.dtype}), "
+                                            f"expected {expected} uint8 bytes for {proto.size} elements"
+                                        )
+                                    keep.append(t)
+                                    if not refitter.set_named_weights(name, trt.Weights(proto.dtype, t.data_ptr(), int(proto.size)), loc):
+                                        raise RuntimeError(f"TensorRT rejected weight {name}")
+                                    if loc == trt.TensorLocation.DEVICE:
+                                        device_bytes += t.numel()
+                                        has_device = True
+                                    return
                                 if t.numel() != proto.size:
                                     raise RuntimeError(f"Weight {name} has {t.numel()} values, the engine expects {proto.size}")
                                 keep.append(t)
@@ -506,9 +550,56 @@ class Engine:
                                 else:
                                     bind(name, proto, t, trt.TensorLocation.HOST)
 
-                            def put(name, proto=None, dt=None):
+                            def put_quant(w_name, w_proto, qkind, scale_info, bind_w: bool = True, bind_s: bool = True):
+                                if not has_quant_api:
+                                    raise RuntimeError(f"Quantized weight {w_name} requires EffectiveWeights")
+                                gpu_base = source.base(w_name).to(dev)
+                                scale_dt = scale_info[2] if scale_info is not None else torch.float32
+                                q_w, scale = source.quantize_on_gpu(w_name, gpu_base, qkind, scale_dt)
+                                if bind_w:
+                                    bind_tensor(w_name, w_proto, q_w)
+                                if bind_s and scale_info is not None:
+                                    bind_tensor(scale_info[0], scale_info[1], scale)
+
+                            def put(name, proto=None, dt=None, missing_set=None):
+                                if quant.is_act_scale_weight(name):
+                                    if proto is None:
+                                        proto = refitter.get_weights_prototype(name)
+                                    if dt is None:
+                                        dt = torch_dtype(proto.dtype)
+                                    raw = source.act_scale(name, dt) if (can_pipe and callable(getattr(source, "act_scale", None))) else tensor_for(name, None)
+                                    t = raw.to(device="cpu", dtype=dt).contiguous()
+                                    bind(name, proto, t, trt.TensorLocation.HOST)
+                                    return
+                                if quant.is_scale_weight(name):
+                                    s_proto = proto if proto is not None else refitter.get_weights_prototype(name)
+                                    s_dt = dt if dt is not None else torch_dtype(s_proto.dtype)
+                                    w_name = quant.weight_name_of_scale(name)
+                                    w_proto = refitter.get_weights_prototype(w_name)
+                                    qkind = _quant_kind(w_proto.dtype)
+                                    if qkind is None:
+                                        raise RuntimeError(f"Scale {name} has non-quantized base weight {w_name}")
+                                    put_quant(w_name, w_proto, qkind, (name, s_proto, s_dt), bind_w=False, bind_s=True)
+                                    return
                                 if proto is None:
                                     proto = refitter.get_weights_prototype(name)
+                                qkind = _quant_kind(proto.dtype)
+                                if qkind is not None:
+                                    s_name = quant.scale_weight_name(name)
+                                    s_info = None
+                                    if s_name in weight_set:
+                                        s_proto = refitter.get_weights_prototype(s_name)
+                                        s_info = (s_name, s_proto, torch_dtype(s_proto.dtype))
+                                    bind_s = (
+                                        s_info is not None
+                                        and s_name not in seen_in_chunk
+                                        and (s_name not in done or (missing_set is not None and s_name in missing_set))
+                                    )
+                                    put_quant(name, proto, qkind, s_info, bind_w=True, bind_s=bind_s)
+                                    if bind_s:
+                                        seen_in_chunk.add(s_name)
+                                    return
+                                if dt is None:
                                     dt = torch_dtype(proto.dtype)
                                 raw = source.tensor(name, None, dt) if can_pipe else tensor_for(name, None)
                                 t = raw.to(dtype=dt).contiguous()
@@ -523,7 +614,53 @@ class Engine:
                                 if name in done or name in seen_in_chunk:
                                     pos += 1
                                     continue
+                                if quant.is_act_scale_weight(name):
+                                    s_proto = refitter.get_weights_prototype(name)
+                                    host_items.append((name, s_proto, torch_dtype(s_proto.dtype)))
+                                    seen_in_chunk.add(name)
+                                    pos += 1
+                                    continue
+                                if quant.is_scale_weight(name):
+                                    w_name = quant.weight_name_of_scale(name)
+                                    if w_name in weight_set and w_name not in done and w_name not in seen_in_chunk:
+                                        name = w_name  # process quantized weight + scale together as one pair
+                                    else:
+                                        s_proto = refitter.get_weights_prototype(name)
+                                        s_dt = torch_dtype(s_proto.dtype)
+                                        nb = _proto_nbytes(s_proto)
+                                        if use_device and est_device > 0 and est_device + nb > device_budget:
+                                            break
+                                        if use_device:
+                                            est_device += nb
+                                        gpu_items.append((name, s_proto, s_dt, None, None))
+                                        seen_in_chunk.add(name)
+                                        pos += 1
+                                        continue
                                 proto = refitter.get_weights_prototype(name)
+                                qkind = _quant_kind(proto.dtype)
+                                if qkind is not None:
+                                    s_name = quant.scale_weight_name(name)
+                                    s_info = None
+                                    nb = _proto_nbytes(proto)
+                                    if s_name in weight_set and s_name not in done and s_name not in seen_in_chunk:
+                                        s_proto = refitter.get_weights_prototype(s_name)
+                                        s_dt = torch_dtype(s_proto.dtype)
+                                        s_info = (s_name, s_proto, s_dt)
+                                        nb += _proto_nbytes(s_proto)
+                                    elif s_name in weight_set:
+                                        s_proto = refitter.get_weights_prototype(s_name)
+                                        s_info = (s_name, s_proto, torch_dtype(s_proto.dtype))
+                                    if use_device and est_device > 0 and est_device + nb > device_budget:
+                                        break
+                                    if use_device:
+                                        est_device += nb
+                                    bind_scale = s_info is not None and s_info[0] not in done and s_info[0] not in seen_in_chunk
+                                    gpu_items.append((name, proto, None, qkind, (s_info, bind_scale)))
+                                    seen_in_chunk.add(name)
+                                    if bind_scale:
+                                        seen_in_chunk.add(s_info[0])
+                                    pos += 1
+                                    continue
                                 dt = torch_dtype(proto.dtype)
                                 if can_pipe and source.needs_gpu(name):
                                     nb = proto.size * dt.itemsize
@@ -531,7 +668,7 @@ class Engine:
                                         break
                                     if use_device:
                                         est_device += nb
-                                    gpu_items.append((name, proto, dt))
+                                    gpu_items.append((name, proto, dt, None, None))
                                 else:
                                     host_items.append((name, proto, dt))
                                 seen_in_chunk.add(name)
@@ -542,6 +679,8 @@ class Engine:
                             if gpu_items:
 
                                 def stage(idx, name):
+                                    if quant.is_any_scale_weight(name):
+                                        return None, None, None
                                     base = source.base(name)
                                     if type(base) is not torch.Tensor:
                                         return None, None, None
@@ -679,10 +818,25 @@ class Engine:
                                     return slot, gviews[0], g_items
 
                                 staged = stage(0, gpu_items[0][0])
-                                for idx, (name, proto, dt) in enumerate(gpu_items):
+                                for idx, (name, proto, dt, qkind, qpair) in enumerate(gpu_items):
                                     slot, gpu_base, gpu_lora = staged
                                     if idx + 1 < len(gpu_items):
                                         staged = stage(idx + 1, gpu_items[idx + 1][0])
+                                    if qkind is not None:
+                                        s_info, bind_scale = qpair
+                                        if gpu_base is None:
+                                            put_quant(name, proto, qkind, s_info, bind_w=True, bind_s=bind_scale)
+                                            continue
+                                        if slot is not None:
+                                            compute_stream.wait_event(ev_copy[slot])
+                                        scale_dt = s_info[2] if s_info is not None else torch.float32
+                                        q_w, scale = source.quantize_on_gpu(name, gpu_base, qkind, scale_dt, gpu_lora=gpu_lora)
+                                        if slot is not None:
+                                            ev_use[slot].record(compute_stream)
+                                        bind_tensor(name, proto, q_w)
+                                        if bind_scale and s_info is not None:
+                                            bind_tensor(s_info[0], s_info[1], scale)
+                                        continue
                                     if gpu_base is None:
                                         put(name, proto, dt)
                                         continue
@@ -703,8 +857,17 @@ class Engine:
                                 missing = [n for n in refitter.get_missing_weights() if n not in seen_in_chunk]
                                 if not missing:
                                     break
+                                missing_set = set(missing)
                                 for name in missing:
-                                    put(name)
+                                    if name in seen_in_chunk:
+                                        continue
+                                    if quant.is_scale_weight(name):
+                                        w_name = quant.weight_name_of_scale(name)
+                                        if w_name in missing_set and w_name not in seen_in_chunk:
+                                            put(w_name, missing_set=missing_set)
+                                            seen_in_chunk.add(w_name)
+                                            continue
+                                    put(name, missing_set=missing_set)
                                     seen_in_chunk.add(name)
                                 flush()
                             done.update(seen_in_chunk)

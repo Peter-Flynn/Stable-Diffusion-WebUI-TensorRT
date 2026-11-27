@@ -19,7 +19,7 @@ import warnings
 import torch
 import torch.nn.functional as F
 
-from . import common, fresh, speed, store
+from . import common, dit, dit_speed, fresh, quant, speed, store
 from .arch import Arch, unet_config
 from .common import duration, gib, logger
 
@@ -178,7 +178,32 @@ def _fresh_unet(config: dict, device, dtype=torch.float16):
     return unet
 
 
-def _weightless_graph(onnx_path: str, input_names, agree_with, quiet: bool = False) -> dict:
+def _fresh_dit(kind: str, config: dict, device, dtype=torch.bfloat16):
+    from . import compat
+
+    model = compat.fresh_dit(kind, config, device, dtype)
+    is_cuda = torch.device(device).type == "cuda"
+    for idx, t in enumerate(model.state_dict(keep_vars=True).values()):
+        if t.is_floating_point():
+            if is_cuda:
+                t.normal_(0, 0.02)
+            else:
+                # Distinct finite non-zero fill avoids multi-second CPU PRNG on 5B-parameter models while keeping
+                # weight identities distinct during TorchScript tracing.
+                t.fill_(0.01 + (idx % 997) * 1e-4)
+    return model
+
+
+def _weightless_graph(
+    onnx_path: str,
+    input_names,
+    agree_with,
+    quiet: bool = False,
+    *,
+    quantize_precision: str = None,
+    act_dtype: torch.dtype = None,
+    weight_bytes_out: list = None,
+) -> dict:
     # Turns the weight inputs into initializers backed by one small sparse file of zeros: TensorRT needs only their
     # shapes, and refitting supplies the values. The parser maps that file once and TensorRT identifies weights by
     # their address, so each starts PLACEHOLDER_STRIDE bytes after the previous; their ranges overlap, which keeps the
@@ -215,25 +240,73 @@ def _weightless_graph(onnx_path: str, input_names, agree_with, quiet: bool = Fal
         graph.input.remove(value)
         del shapes[value.name]
 
-    sizes = {onnx.TensorProto.FLOAT16: 2, onnx.TensorProto.BFLOAT16: 2, onnx.TensorProto.FLOAT: 4, onnx.TensorProto.INT64: 8}
+    if quantize_precision and quant.is_quantized_precision(quantize_precision):
+        quant.quantize_onnx_graph(model, quantize_precision, act_dtype or torch.bfloat16, shapes=shapes)
+
     data_name = os.path.basename(onnx_path) + ".zeros"
     end = 0
-    for index, value in enumerate([i for i in graph.input if i.name in shapes]):
+    total_bytes = 0
+    weight_inputs = [i for i in graph.input if i.name in shapes]
+    regular_inputs = [v for v in weight_inputs if not quant.is_any_scale_weight(v.name)]
+    scale_inputs = [v for v in weight_inputs if quant.is_any_scale_weight(v.name)]
+
+    def _add_external_init(value, offset: int, nbytes: int, dims: list):
         graph.input.remove(value)
-        t = value.type.tensor_type
-        dims = [d.dim_value for d in t.shape.dim]  # the graph's shape, which can differ from the checkpoint's (see graph._unsqueezed_weights)
-        nbytes = math.prod(dims) * sizes[t.elem_type]
-        offset = index * PLACEHOLDER_STRIDE
-        end = max(end, offset + nbytes)
         init = graph.initializer.add()
-        init.name, init.data_type, init.data_location = value.name, t.elem_type, onnx.TensorProto.EXTERNAL
+        init.name, init.data_type, init.data_location = value.name, value.type.tensor_type.elem_type, onnx.TensorProto.EXTERNAL
         init.dims.extend(dims)
         for key, val in (("location", data_name), ("offset", str(offset)), ("length", str(nbytes))):
             entry = init.external_data.add()
             entry.key, entry.value = key, val
+
+    for index, value in enumerate(regular_inputs):
+        t = value.type.tensor_type
+        dims = [d.dim_value for d in t.shape.dim]  # the graph's shape, which can differ from the checkpoint's (see graph._unsqueezed_weights)
+        nbytes = quant.onnx_tensor_nbytes(t.elem_type, dims)
+        total_bytes += nbytes
+        offset = index * PLACEHOLDER_STRIDE
+        end = max(end, offset + nbytes)
+        _add_external_init(value, offset, nbytes, dims)
+
+    # TensorRT's ONNX parser validates that DequantizeLinear scale initializers are strictly positive at parse time;
+    # place each scale in a non-overlapping tail slice filled with distinct positive dummy values so TRT parses
+    # cleanly and never merges/deduplicates refittable scale tensors by value.
+    _elem_to_torch = {
+        onnx.TensorProto.FLOAT: torch.float32,
+        onnx.TensorProto.FLOAT16: torch.float16,
+        onnx.TensorProto.BFLOAT16: torch.bfloat16,
+    }
+    scale_writes = []
+    for s_idx, value in enumerate(scale_inputs):
+        t = value.type.tensor_type
+        dims = [d.dim_value for d in t.shape.dim]
+        nbytes = quant.onnx_tensor_nbytes(t.elem_type, dims)
+        total_bytes += nbytes
+        offset = (end + 15) & ~15
+        end = offset + nbytes
+        _add_external_init(value, offset, nbytes, dims)
+        dt = _elem_to_torch[t.elem_type]
+        if dt == torch.bfloat16:
+            v = torch.tensor(0x3F80 + (s_idx % 1024) + 1, dtype=torch.uint16).view(torch.bfloat16)
+        elif dt == torch.float16:
+            v = torch.tensor(0x3C00 + (s_idx % 1024) + 1, dtype=torch.uint16).view(torch.float16)
+        else:
+            v = torch.tensor(1.0 + (s_idx + 1) * 1e-4, dtype=torch.float32)
+        buf = torch.ones(dims, dtype=dt).reshape(-1)
+        if buf.numel() >= 1:
+            buf[0] = v
+        if buf.numel() >= 2:
+            buf[1] = 1.0 + ((s_idx // 1024) + 1) * 0.015625
+        scale_writes.append((offset, buf.contiguous().view(torch.uint8).numpy().tobytes()))
+
     with open(os.path.join(os.path.dirname(onnx_path), data_name), "wb") as f:
         f.truncate(end)
+        for offset, raw in scale_writes:
+            f.seek(offset)
+            f.write(raw)
     onnx.save(model, onnx_path)
+    if weight_bytes_out is not None:
+        weight_bytes_out.append(total_bytes)
     return shapes
 
 
@@ -247,9 +320,146 @@ def _as_shallow(unet, x, timesteps, context, *rest):
     return fresh.shallow(lambda sample, t: speed.shallow_forward(unet, sample, t, context, y, deep), x, timesteps, tracked)
 
 
+def _dit_trace_device(patcher, requested_device):
+    dev = torch.device(requested_device)
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return dev
+    dm = getattr(getattr(patcher, "model", None), "diffusion_model", None)
+    est_w16 = quant.param_count(dm) * 2
+    try:
+        free_vram = int(torch.cuda.mem_get_info(dev)[0])
+    except Exception:
+        free_vram = 0
+    # 5B BF16 models (~10 GiB) exceed 8-12 GB GPUs during tracing; tracing on CPU uses RAM and takes ~2-4s on tiny shapes.
+    if est_w16 and free_vram < est_w16 + (3 << 30):
+        logger.debug(f"Tracing DiT ONNX on CPU ({gib(est_w16)} weights vs {gib(free_vram)} free VRAM).")
+        return torch.device("cpu")
+    return dev
+
+
+def _export_dit_onnx(arch: Arch, patcher, folder: str, device, precision: str) -> dict:
+    act_dtype = quant.compute_dtype(precision)
+    fp32_res = quant.uses_fp32_residual(precision)
+    trace_dev = _dit_trace_device(patcher, device)
+    model = _fresh_dit(arch.kind, unet_config(patcher), trace_dev, act_dtype)
+    paths = {"unet": os.path.join(folder, "unet.onnx"), "shallow": os.path.join(folder, "shallow.onnx")}
+    use_shallow = bool(dit_speed.USES_SHALLOW_ENGINE)
+
+    if arch.kind == "anima":
+        head_dim = int(model.blocks[0].self_attn.head_dim)
+        h_p, w_p = 4, 4
+        names = ["sample", "timesteps", "encoder_hidden_states", "rope"]
+        inputs = (
+            torch.randn(2, arch.in_channels, 1, h_p * 2, w_p * 2, dtype=act_dtype, device=trace_dev),
+            torch.rand(2, device=trace_dev, dtype=torch.float32),
+            torch.randn(2, 8, arch.context_dim, dtype=act_dtype, device=trace_dev),
+            torch.randn(1, h_p, w_p, 1, head_dim // 2, 2, dtype=torch.float32, device=trace_dev),
+        )
+        axes = {
+            "sample": {0: "batch", 3: "height", 4: "width"},
+            "timesteps": {0: "batch"},
+            "encoder_hidden_states": {0: "batch", 1: "context"},
+            "rope": {1: "patch_h", 2: "patch_w"},
+            "latent": {0: "batch", 3: "height", 4: "width"},
+        }
+        full_fn = lambda m, x, t, c, r: dit.anima_traceable_forward(
+            m, x, t, c, r, fp32_residual=fp32_res, return_trunk_delta=use_shallow, attn_fn=_optimized_attention
+        )
+        shallow_fn = lambda m, x, t, c, r, d: dit.anima_shallow_forward(
+            m, x, t, c, r, d, fp32_residual=fp32_res, attn_fn=_optimized_attention
+        )
+        delta_dim = int(model.final_layer.hidden_size)
+    elif arch.kind == "moss_image":
+        head_dim = int(model.layers[0].q_norm.weight.shape[0])
+        h_lat, w_lat, s_txt = 4, 4, 6
+        names = ["sample", "timesteps", "encoder_hidden_states", "rope_img", "rope_txt"]
+        inputs = (
+            torch.randn(2, arch.in_channels, h_lat, w_lat, dtype=act_dtype, device=trace_dev),
+            torch.rand(2, device=trace_dev, dtype=torch.float32),
+            torch.randn(2, s_txt, arch.context_dim, dtype=act_dtype, device=trace_dev),
+            torch.randn(1, h_lat, w_lat, 1, head_dim // 2, 2, dtype=torch.float32, device=trace_dev),
+            torch.randn(1, s_txt, 1, head_dim // 2, 2, dtype=torch.float32, device=trace_dev),
+        )
+        axes = {
+            "sample": {0: "batch", 2: "height", 3: "width"},
+            "timesteps": {0: "batch"},
+            "encoder_hidden_states": {0: "batch", 1: "context"},
+            "rope_img": {1: "height", 2: "width"},
+            "rope_txt": {1: "context"},
+            "latent": {0: "batch", 2: "height", 3: "width"},
+        }
+        full_fn = lambda m, x, t, c, ri, rt: dit.moss_traceable_forward(
+            m, x, t, c, ri, rt, fp32_residual=fp32_res, return_trunk_delta=use_shallow, attn_fn=_optimized_attention
+        )
+        shallow_fn = lambda m, x, t, c, ri, rt, d: dit.moss_shallow_forward(
+            m, x, t, c, ri, rt, d, fp32_residual=fp32_res, attn_fn=_optimized_attention
+        )
+        delta_dim = int(model.final_norm_video.weight.shape[0])
+    else:
+        raise ValueError(f"Unsupported DiT kind {arch.kind!r}")
+
+    logger.info(f"Exporting the {arch.name} DiT to ONNX ({quant.LABELS.get(precision, precision)}).")
+    shallow_exported = False
+    delta_example = None
+    out_names = ["latent", "trunk_delta"] if use_shallow else ["latent"]
+    if use_shallow:
+        axes["trunk_delta"] = {0: "batch", 1: "img_tokens"}
+    with _traceable_attention(), fast_weightless_export(), quiet_warnings():
+        try:
+            model.forward = types.MethodType(full_fn, model)
+            if use_shallow:
+                delta_example = full_fn(model, *inputs)[1]
+            torch.onnx.export(model, inputs, paths["unet"], input_names=names, output_names=out_names, dynamic_axes=axes, **ONNX_KWARGS)
+            if use_shallow and delta_example is not None:
+                model.forward = types.MethodType(shallow_fn, model)
+                torch.onnx.export(
+                    model,
+                    (*inputs, delta_example),
+                    paths["shallow"],
+                    input_names=names + ["trunk_delta"],
+                    output_names=["latent"],
+                    dynamic_axes={k: v for k, v in axes.items()},
+                    **ONNX_KWARGS,
+                )
+                shallow_exported = True
+        finally:
+            with contextlib.suppress(AttributeError):
+                del model.forward
+
+    exported = {k: list(v.shape) for k, v in model.state_dict(keep_vars=True).items()}
+    del model, inputs, delta_example
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    dm = patcher.model.diffusion_model
+    loaded = {k: list(v.shape) for k, v in {**dm.state_dict(keep_vars=True), **dict(dm.named_parameters())}.items()}
+    wb_full = []
+    full_shapes = _weightless_graph(
+        paths["unet"], names, (exported, loaded), quantize_precision=precision, act_dtype=act_dtype, weight_bytes_out=wb_full
+    )
+    shallow_shapes = None
+    wb_shallow = []
+    if shallow_exported:
+        shallow_shapes = _weightless_graph(
+            paths["shallow"], names + ["trunk_delta"], (exported, loaded), quantize_precision=precision, act_dtype=act_dtype, weight_bytes_out=wb_shallow
+        )
+    return {
+        "unet": full_shapes,
+        "shallow": shallow_shapes,
+        "deep": {"delta_dim": delta_dim} if shallow_exported else None,
+        "weight_bytes": wb_full[0] if wb_full else sum(math.prod(s) * 2 for s in full_shapes.values()),
+        "shallow_weight_bytes": wb_shallow[0] if wb_shallow else 0,
+        "precision": precision,
+    }
+
+
 @common.inference_mode
-def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float16) -> dict:
+def export_onnx(arch: Arch, patcher, folder: str, device=None, dtype=torch.float16, precision: str = None) -> dict:
     device = device or common.device()
+    if arch.is_dit:
+        prec = precision or store.active_precision(arch, patcher)
+        return _export_dit_onnx(arch, patcher, folder, device, prec)
     unet = _fresh_unet(unet_config(patcher), device, dtype)
     names = [n for n in INPUTS if n != "y" or arch.adm_channels]
     inputs = [
@@ -458,7 +668,15 @@ def _build_batch(batch_job: dict, folder: str, step) -> dict:
 SHALLOW_SHARE = 0.15
 
 
-def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=None, mode=store.PER_PROFILE, profiles=None) -> dict:
+def _dit_shallow_shapes(shapes: dict, delta_dim: int, kind: str) -> dict:
+    if kind == "anima":
+        delta = [[b, (h // 2) * (w // 2), delta_dim] for b, _, _, h, w in shapes["sample"]]
+    else:
+        delta = [[b, h * w, delta_dim] for b, _, h, w in shapes["sample"]]
+    return {**shapes, "trunk_delta": delta}
+
+
+def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=None, mode=store.PER_PROFILE, profiles=None, precision: str = None) -> dict:
     from . import runtime
     from . import vae as vae_mod
     from . import vae_build
@@ -472,33 +690,37 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
     folder = store.work_dir(arch)
     shutil.rmtree(folder, ignore_errors=True)
     os.makedirs(folder, exist_ok=True)
+    prec = (precision or store.active_precision(arch, patcher)) if arch.is_dit else None
     records, result, memory_warnings, hack_errors = [], {"ok": True}, 0, []
-    before = {r.engine_key: r for r in store.engines(arch.id)}
+    before = {r.engine_key: r for r in store.engines(arch.id, precision=prec)}
     vae_part = vae_mod.needs_build(arch, profiles) if profiles else ""
     merged = mode == store.MERGED
     groups = ([todo] if todo else []) if merged else [[item] for item in todo]
     total = len(groups) + (1 if vae_part else 0)
     vae_record = vae_error = None
+    module = getattr(getattr(patcher, "model", None), "diffusion_model", None)
+    expect_shallow = dit_speed.USES_SHALLOW_ENGINE if arch.is_dit else True
     try:
         graphs = shapes = None
         if groups:
             if progress:
-                progress(0.0, "Exporting the UNet graphs")
-            graphs = export_onnx(arch, patcher, folder)
+                progress(0.0, f"Exporting the {arch.name} graphs" if arch.is_dit else "Exporting the UNet graphs")
+            graphs = export_onnx(arch, patcher, folder, precision=prec)
             shapes = graphs["unet"]
         for n, group in enumerate(groups):
             if CANCEL.is_set():
                 result = {"ok": False, "error": "cancelled"}
                 break
             start = time.time()
-            what = f"merged {arch.name} engine" if merged else f"{arch.name} engine for profile {group[0][0] + 1}"
+            prec_note = f" [{quant.LABELS.get(prec, prec)}]" if arch.is_dit else ""
+            what = f"merged {arch.name} engine{prec_note}" if merged else f"{arch.name} engine for profile {group[0][0] + 1}{prec_note}"
             step = shallow_step = None
             if progress:
                 title = (f"Merged engine, {len(group)} profiles" if merged else f"Profile {group[0][0] + 1} ({n + 1} of {len(groups)} to build)")
                 share = 1 - SHALLOW_SHARE if graphs["shallow"] is not None else 1
                 step = lambda f, t, n=n, title=title, share=share: progress((n + share * f) / total, f"{title}: {t}")
                 shallow_step = lambda f, t, n=n, title=title: progress((n + 1 - SHALLOW_SHARE + SHALLOW_SHARE * f) / total, f"{title}, Speed Hacks part: {t}")
-            unet_shapes = [p.unet_shapes(arch.in_channels, arch.context_dim, arch.adm_channels) for _, p in group]
+            unet_shapes = [p.engine_shapes(arch, module) for _, p in group]
             job = {
                 "onnx": os.path.join(folder, "unet.onnx"),
                 "plan": os.path.join(folder, "engine.plan"),
@@ -518,57 +740,76 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                     logger.error(f"Couldn't build the {what}: {result.get('error')}")
                 break
             hacks = shallow_plan = hack_error = None
-            if graphs["shallow"] is not None:
-                shallow_job = {
-                    **job,
-                    "onnx": os.path.join(folder, "shallow.onnx"),
-                    "plan": os.path.join(folder, "shallow.plan"),
-                    "weights": sorted(graphs["shallow"]),
-                    "profiles": [{**speed.shallow_shapes(s, graphs["deep"]), **fresh.input_shapes(s, graphs["deep"]["latent_channels"])} for s in unet_shapes],
-                    "exact_fp32": True,
-                }
-                logger.info(f"Building the {what}'s Speed Hacks part.")
-                shallow = _build_plan(shallow_job, folder, shallow_step)
-                memory_warnings += shallow.get("memory_warnings") or 0
-                if shallow.get("error") == "cancelled" or CANCEL.is_set():
-                    result = {"ok": False, "error": "cancelled"}
-                    break
-                if shallow["ok"]:
-                    shallow_plan = shallow_job["plan"]
-                    hacks = {
-                        "deep": graphs["deep"],
-                        "shapes": shallow_job["profiles"],
-                        "weights": shallow_job["weights"],
-                        "weight_bytes": sum(math.prod(graphs["shallow"][w]) * 2 for w in shallow_job["weights"]),
-                        "stripped": shallow["stripped"],
-                        "fresh": fresh.SIGNATURE,
+            if expect_shallow:
+                if graphs["shallow"] is not None:
+                    if arch.is_dit:
+                        shallow_profiles = [_dit_shallow_shapes(s, graphs["deep"]["delta_dim"], arch.kind) for s in unet_shapes]
+                    else:
+                        shallow_profiles = [{**speed.shallow_shapes(s, graphs["deep"]), **fresh.input_shapes(s, graphs["deep"]["latent_channels"])} for s in unet_shapes]
+                    shallow_job = {
+                        **job,
+                        "onnx": os.path.join(folder, "shallow.onnx"),
+                        "plan": os.path.join(folder, "shallow.plan"),
+                        "weights": sorted(graphs["shallow"]),
+                        "profiles": shallow_profiles,
+                        "exact_fp32": not arch.is_dit,
                     }
+                    logger.info(f"Building the {what}'s Speed Hacks part.")
+                    shallow = _build_plan(shallow_job, folder, shallow_step)
+                    memory_warnings += shallow.get("memory_warnings") or 0
+                    if shallow.get("error") == "cancelled" or CANCEL.is_set():
+                        result = {"ok": False, "error": "cancelled"}
+                        break
+                    if shallow["ok"]:
+                        shallow_plan = shallow_job["plan"]
+                        if arch.is_dit:
+                            hacks = {
+                                "deep": graphs["deep"],
+                                "shapes": shallow_job["profiles"],
+                                "weights": shallow_job["weights"],
+                                "weight_bytes": int(graphs.get("shallow_weight_bytes") or 0),
+                                "stripped": shallow["stripped"],
+                                "dit_speed": dit_speed.SHALLOW_SIGNATURE,
+                            }
+                        else:
+                            hacks = {
+                                "deep": graphs["deep"],
+                                "shapes": shallow_job["profiles"],
+                                "weights": shallow_job["weights"],
+                                "weight_bytes": sum(math.prod(graphs["shallow"][w]) * 2 for w in shallow_job["weights"]),
+                                "stripped": shallow["stripped"],
+                                "fresh": fresh.SIGNATURE,
+                            }
+                    else:
+                        hack_error = str(shallow.get("error"))
+                        logger.warning(f"Couldn't build the {what}'s Speed Hacks part, so it runs without Speed Hacks: {hack_error}")
                 else:
-                    hack_error = str(shallow.get("error"))
-                    logger.warning(f"Couldn't build the {what}'s Speed Hacks part, so it runs without Speed Hacks: {hack_error}")
-            else:
-                hack_error = "the shallow UNet graph couldn't be exported"
-            if hack_error:
-                hack_errors.append(hack_error)
+                    hack_error = "the shallow graph couldn't be exported"
+                if hack_error:
+                    hack_errors.append(hack_error)
             if merged:
                 meta = {"mode": store.MERGED, "profiles": [p.to_dict() for _, p in group], "indexes": [i for i, _ in group], "shapes": unet_shapes}
             else:
                 meta = {"mode": store.PER_PROFILE, "profile": group[0][1].to_dict(), "index": group[0][0], "shapes": unet_shapes[0]}
+            weight_bytes = int(graphs["weight_bytes"]) if arch.is_dit else sum(math.prod(s) * 2 for s in shapes.values())
             meta.update({
                 "weights": job["weights"],
-                "weight_bytes": sum(math.prod(s) * 2 for s in shapes.values()),
+                "weight_bytes": weight_bytes,
                 "stripped": result["stripped"],
-                "graph": store.GRAPH_VERSION,
+                "graph": store.DIT_GRAPH_VERSION if arch.is_dit else store.GRAPH_VERSION,
                 "trt": common.trt_version(),
                 "gpu": common.gpu_tag(),
                 "gpu_name": torch.cuda.get_device_name(common.device()),
                 "created": time.strftime("%Y-%m-%d %H:%M"),
             })
+            if arch.is_dit:
+                meta["precision"] = prec
             if hacks:
                 meta["speed_hacks"] = hacks
-            else:
+            elif expect_shallow:
                 meta["speed_hacks_error"] = hack_error
-                replaced = before.get(store.merged_key([p for _, p in group]) if merged else store.profile_key(group[0][1]))
+                base_k = store.merged_key([p for _, p in group]) if merged else store.profile_key(group[0][1])
+                replaced = before.get(f"{prec}-{base_k}" if arch.is_dit else base_k)
                 meta["speed_hacks_retried"] = replaced is not None and "speed_hacks_error" in replaced.meta
             records.append(store.save(arch, job["plan"], meta, shallow_plan))
             logger.info(f"Built the {what} in {duration(time.time() - start)} ({gib(records[-1].disk_bytes)}).")
