@@ -220,7 +220,7 @@ def _eligible_weight(name: str, dims: list, precision: str) -> bool:
     if "adaln" in name or "norm" in name:
         return False
     # Uniform INT8 activations clip severely after unbounded / extreme-dynamic-range FFN activations
-    # (MOSS-Image SiTU in [-100, 100] -> ffn_down, Anima ReLU^2 -> mlp.layer2); FP8's exponent and
+    # (MOSS-Image SiTU in [-100, 100] -> ffn_down, Anima GELU up to ~170 -> mlp.layer2); FP8's exponent and
     # INT4's unquantized W4A16 activations handle them cleanly.
     if precision == INT8 and ("ffn_down" in name or "mlp.layer2" in name):
         return False
@@ -307,6 +307,16 @@ def _is_2d_transpose(node) -> bool:
     return perm is None or perm == [1, 0]
 
 
+def _get_fp8_scale_init(graph, fp8_scale_inits: dict, s_val: float, act_dtype: torch.dtype) -> str:
+    s_name = fp8_scale_inits.get(s_val)
+    if s_name is None:
+        tag = f"{s_val:.8g}".replace(".", "p").replace("-", "m")
+        s_name = f"__trt_fp8_act_scale_{tag}"
+        graph.initializer.append(_make_scalar_initializer(s_name, s_val, act_dtype))
+        fp8_scale_inits[s_val] = s_name
+    return s_name
+
+
 def quantize_onnx_graph(
     model,
     precision: str,
@@ -318,7 +328,7 @@ def quantize_onnx_graph(
     """Rewrites eligible 2D DiT Linear weights in an ONNX model for true low-VRAM TensorRT execution:
 
     - FP8 (sm89+): explicit W8A8 (`QuantizeLinear -> DequantizeLinear` on activations with floating-point E4M3 scale,
-      per-channel FP8 weights) -> true 1-byte weight storage in VRAM + native SM89 FP8 Tensor Core GEMMs (~1.5-1.65x).
+      per-channel FP8 weights) -> true 1-byte weight storage in VRAM + native SM89 FP8 Tensor Core GEMMs (~1.65-1.95x).
     - INT8 (sm75+): explicit W8A8 with refittable per-site activation scales (`<w>.__trt_act_scale__`, auto-calibrated
       per checkpoint) + per-channel INT8 weights -> true 1-byte weight storage + native INT8 Tensor Core GEMMs (~1.4-1.55x).
     - INT4 (sm75+): block-64 W4A16 with `Transpose(1, 0)` folded into `<w>.__trt_t__` (`(K, N)` layout, FP32 block scale
@@ -462,13 +472,7 @@ def quantize_onnx_graph(
                 orig_w = dq_weight_origin[node.input[1]]
                 act_in = node.input[0]
                 if precision == FP8:
-                    s_val = _fp8_act_scale_for(orig_w)
-                    s_name = fp8_scale_inits.get(s_val)
-                    if s_name is None:
-                        tag = str(s_val).replace(".", "p")
-                        s_name = f"__trt_fp8_act_scale_{tag}"
-                        graph.initializer.append(_make_scalar_initializer(s_name, s_val, act_dtype))
-                        fp8_scale_inits[s_val] = s_name
+                    s_name = _get_fp8_scale_init(graph, fp8_scale_inits, _fp8_act_scale_for(orig_w), act_dtype)
                     cache_key = (act_in, s_name)
                 else:
                     # INT8: deduplicate by activation tensor (shared Q/K/V share one refittable scalar scale).
@@ -516,7 +520,8 @@ def pack_int4(q_int8: torch.Tensor) -> torch.Tensor:
     n = flat.numel()
     if n & 1:
         flat = torch.cat([flat, flat.new_zeros(1)])
-    pairs = flat.view(-1, 2).to(torch.uint8)
+    u = flat.view(torch.uint8) if flat.dtype == torch.int8 else flat.to(torch.uint8)
+    pairs = u.view(-1, 2)
     packed = (pairs[:, 0] & 0x0F) | ((pairs[:, 1] & 0x0F) << 4)
     return packed.contiguous()
 
@@ -532,92 +537,184 @@ def unpack_int4(packed: torch.Tensor, numel: int) -> torch.Tensor:
     return torch.stack([lo, hi], dim=1).reshape(-1)[:numel]
 
 
-def quantize_for_refit(weight_fp32: torch.Tensor, kind: str, scale_dtype: torch.dtype, *, transposed: bool = False) -> tuple:
+def quantize_for_refit(
+    weight_fp32: torch.Tensor,
+    kind: str,
+    scale_dtype: torch.dtype,
+    *,
+    transposed: bool = False,
+    in_place: bool = False,
+) -> tuple:
     """Quantizes a 2D FP32 weight on its current device into `(quantized_weight, scale)` for TRT refit.
 
     `kind` is one of `FP8`, `INT8`, `INT4`. If `transposed=True`, transposes `(N, K) -> (K, N)` before quantizing
     along the K (dim=0) / N (dim=1) axes to match `Transpose`-folded ONNX graphs. Scales are strictly positive.
+    When `in_place=True` (or `weight_fp32` is already converted/transposed into a fresh buffer), quantizes in place
+    to avoid allocating 3-4 full-weight FP32 temporaries per Linear during GPU refit.
     """
     if weight_fp32.ndim != 2:
         raise ValueError(f"Expected 2D weight for {kind} quantization, got shape {tuple(weight_fp32.shape)}")
     w = weight_fp32 if weight_fp32.dtype == torch.float32 else weight_fp32.float()
-    min_scale = 1e-4 if scale_dtype == torch.float16 else 1e-12
     if transposed:
-        wt = w.t().contiguous()
-        k_in, n_out = wt.shape
-        if kind == FP8:
-            amax = wt.abs().amax(dim=0)
-            scale = (amax / 448.0).clamp_min(min_scale).to(scale_dtype).contiguous()
-            q = (wt / scale.float().unsqueeze(0)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
-            return q, scale
-        if kind == INT8:
-            amax = wt.abs().amax(dim=0)
-            scale = (amax / 127.0).clamp_min(min_scale).to(scale_dtype).contiguous()
-            q = (wt / scale.float().unsqueeze(0)).round().clamp(-127.0, 127.0).to(torch.int8).contiguous()
-            return q, scale
-        if kind == INT4:
-            if k_in % INT4_BLOCK_SIZE != 0:
-                raise ValueError(f"Weight width {k_in} is not divisible by INT4 block size {INT4_BLOCK_SIZE}")
-            blocks = wt.reshape(k_in // INT4_BLOCK_SIZE, INT4_BLOCK_SIZE, n_out)
-            amax = blocks.abs().amax(dim=1)  # (K // B, N)
-            scale = (amax / 7.0).clamp_min(min_scale).to(scale_dtype).contiguous()
-            q_i8 = (blocks / scale.float().unsqueeze(1)).round().clamp(-8.0, 7.0).to(torch.int8).reshape(k_in, n_out)
-            return pack_int4(q_i8), scale
-        raise ValueError(f"Unsupported quantization kind {kind!r}")
-
+        w = w.t().contiguous()
+    # Guard against views aliasing caller storage (e.g. an already-transposed view whose .t().contiguous() is zero-copy).
+    fresh_storage = w.untyped_storage().data_ptr() != weight_fp32.untyped_storage().data_ptr()
+    owned = (in_place and w.is_contiguous()) or fresh_storage
+    min_scale = 1e-4 if scale_dtype == torch.float16 else 1e-12
+    reduce_dim = 0 if transposed else 1
     if kind == FP8:
-        amax = w.abs().amax(dim=1)
+        amax = torch.maximum(w.amax(dim=reduce_dim), -w.amin(dim=reduce_dim))
         scale = (amax / 448.0).clamp_min(min_scale).to(scale_dtype).contiguous()
-        q = (w / scale.float().unsqueeze(1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
-        return q, scale
+        inv = scale.float().unsqueeze(reduce_dim)
+        q_f = w.div_(inv).clamp_(-448.0, 448.0) if owned else (w / inv).clamp(-448.0, 448.0)
+        return q_f.to(torch.float8_e4m3fn).contiguous(), scale
     if kind == INT8:
-        amax = w.abs().amax(dim=1)
+        amax = torch.maximum(w.amax(dim=reduce_dim), -w.amin(dim=reduce_dim))
         scale = (amax / 127.0).clamp_min(min_scale).to(scale_dtype).contiguous()
-        q = (w / scale.float().unsqueeze(1)).round().clamp(-127.0, 127.0).to(torch.int8).contiguous()
-        return q, scale
+        inv = scale.float().unsqueeze(reduce_dim)
+        q_f = w.div_(inv).round_().clamp_(-127.0, 127.0) if owned else (w / inv).round().clamp(-127.0, 127.0)
+        return q_f.to(torch.int8).contiguous(), scale
     if kind == INT4:
-        n, k = w.shape
-        if k % INT4_BLOCK_SIZE != 0:
-            raise ValueError(f"Weight width {k} is not divisible by INT4 block size {INT4_BLOCK_SIZE}")
-        blocks = w.reshape(n, k // INT4_BLOCK_SIZE, INT4_BLOCK_SIZE)
-        amax = blocks.abs().amax(dim=-1)
-        scale = (amax / 7.0).clamp_min(min_scale).to(scale_dtype).contiguous()
-        q_i8 = (blocks / scale.float().unsqueeze(-1)).round().clamp(-8.0, 7.0).to(torch.int8)
+        k_dim = w.shape[0] if transposed else w.shape[1]
+        if k_dim % INT4_BLOCK_SIZE != 0:
+            raise ValueError(f"Weight width {k_dim} is not divisible by INT4 block size {INT4_BLOCK_SIZE}")
+        if transposed:
+            k_in, n_out = w.shape
+            blocks = w.reshape(k_in // INT4_BLOCK_SIZE, INT4_BLOCK_SIZE, n_out)
+            amax = torch.maximum(blocks.amax(dim=1), -blocks.amin(dim=1))
+            scale = (amax / 7.0).clamp_min(min_scale).to(scale_dtype).contiguous()
+            inv = scale.float().unsqueeze(1)
+            q_f = blocks.div_(inv).round_().clamp_(-8.0, 7.0) if owned else (blocks / inv).round().clamp(-8.0, 7.0)
+            q_i8 = q_f.to(torch.int8).reshape(k_in, n_out)
+        else:
+            n_out, k_in = w.shape
+            blocks = w.reshape(n_out, k_in // INT4_BLOCK_SIZE, INT4_BLOCK_SIZE)
+            amax = torch.maximum(blocks.amax(dim=-1), -blocks.amin(dim=-1))
+            scale = (amax / 7.0).clamp_min(min_scale).to(scale_dtype).contiguous()
+            inv = scale.float().unsqueeze(-1)
+            q_f = blocks.div_(inv).round_().clamp_(-8.0, 7.0) if owned else (blocks / inv).round().clamp(-8.0, 7.0)
+            q_i8 = q_f.to(torch.int8)
         return pack_int4(q_i8), scale
     raise ValueError(f"Unsupported quantization kind {kind!r}")
+
+
+class _CalibStaging:
+    """Double-buffered pinned-host + single reusable GPU buffer for streaming CPU weights during INT8 calibration."""
+
+    def __init__(self, source, device):
+        self.dev = torch.device(device)
+        self.buf_nb = 0
+        self.pins = None
+        self.gpu_buf = None
+        self.ev_dma = None
+        self.slot_used = [False, False]
+        self.slot = 0
+        if self.dev.type != "cuda":
+            return
+        max_cpu = max_unpinned = 0
+        for name in source.params:
+            raw = source.base(name)
+            if type(raw) is torch.Tensor and not raw.is_cuda and raw.is_contiguous():
+                nb = raw.numel() * raw.element_size()
+                if nb > max_cpu:
+                    max_cpu = nb
+                if not raw.is_pinned() and nb > max_unpinned:
+                    max_unpinned = nb
+        if max_cpu < (1 << 20):
+            return
+        try:
+            free_b = int(torch.cuda.mem_get_info(self.dev)[0])
+        except Exception:
+            free_b = 0
+        cap = min(max_cpu, 160 << 20, max(0, free_b // 4)) if free_b else min(max_cpu, 160 << 20)
+        if cap < (1 << 20):
+            return
+        try:
+            with common.on_device(self.dev):
+                self.gpu_buf = torch.empty(cap, dtype=torch.uint8, device=self.dev)
+                if max_unpinned > 0:
+                    pin_cap = min(cap, max_unpinned)
+                    self.pins = [torch.empty(pin_cap, dtype=torch.uint8, pin_memory=True) for _ in range(2)]
+                    self.ev_dma = [torch.cuda.Event() for _ in range(2)]
+            self.buf_nb = cap
+        except RuntimeError:
+            self.pins = self.gpu_buf = self.ev_dma = None
+            self.buf_nb = 0
+
+    def stage(self, t):
+        if type(t) is not torch.Tensor:
+            return t.to(self.dev)
+        if t.is_cuda and t.device == self.dev:
+            return t
+        if t.is_cuda or not t.is_contiguous() or self.gpu_buf is None:
+            return t.to(self.dev)
+        nb = t.numel() * t.element_size()
+        if nb == 0 or nb > self.buf_nb:
+            return t.to(self.dev)
+        gv = self.gpu_buf[:nb].view(t.dtype).view(t.shape)
+        if t.is_pinned():
+            gv.copy_(t, non_blocking=True)
+            return gv
+        if self.pins is None or nb > self.pins[0].numel():
+            return t.to(self.dev)
+        s = self.slot
+        self.slot = s ^ 1
+        if self.slot_used[s]:
+            self.ev_dma[s].synchronize()
+        pv = self.pins[s][:nb].view(t.dtype).view(t.shape)
+        pv.copy_(t)
+        gv.copy_(pv, non_blocking=True)
+        self.ev_dma[s].record(torch.cuda.current_stream(self.dev))
+        self.slot_used[s] = True
+        return gv
+
+    def release(self):
+        if self.dev.type == "cuda" and (self.gpu_buf is not None or self.pins is not None):
+            try:
+                torch.cuda.current_stream(self.dev).synchronize()
+            except Exception:
+                pass
+        self.pins = self.gpu_buf = self.ev_dma = None
+        self.buf_nb = 0
 
 
 class _CalibProxy:
     """Non-mutating layer-streaming proxy around a DiT module for 1-shot INT8 activation calibration.
 
     Materializes one Linear weight at a time on `device` via `EffectiveWeights.apply_on_gpu()` (supporting BF16, FP8,
-    INT8-ConvRot, NVFP4, GGUF, and LoRA checkpoints with <150 MB peak VRAM) and records max(|x|) per eligible Linear.
+    INT8-ConvRot, NVFP4, GGUF, and LoRA checkpoints with <150 MB peak VRAM) and records max(|x|) asynchronously per
+    eligible Linear without per-layer CUDA stream synchronization stalls.
     """
 
-    def __init__(self, mod, prefix: str, source, device, dtype: torch.dtype, stats: dict):
+    def __init__(self, mod, prefix: str, source, device, dtype: torch.dtype, stats: dict, staging: _CalibStaging = None):
         object.__setattr__(self, "_mod", mod)
         object.__setattr__(self, "_prefix", prefix)
         object.__setattr__(self, "_source", source)
         object.__setattr__(self, "_device", device)
         object.__setattr__(self, "_dtype", dtype)
         object.__setattr__(self, "_stats", stats)
+        object.__setattr__(self, "_staging", staging)
 
     def _child_prefix(self, key) -> str:
         p = object.__getattribute__(self, "_prefix")
         return f"{p}.{key}" if p else str(key)
 
+    def _wrap(self, child, key):
+        return type(self)(
+            child,
+            self._child_prefix(key),
+            object.__getattribute__(self, "_source"),
+            object.__getattribute__(self, "_device"),
+            object.__getattribute__(self, "_dtype"),
+            object.__getattribute__(self, "_stats"),
+            object.__getattribute__(self, "_staging"),
+        )
+
     def __getattr__(self, attr: str):
         mod = object.__getattribute__(self, "_mod")
         val = getattr(mod, attr)
         if isinstance(val, torch.nn.Module):
-            return _CalibProxy(
-                val,
-                self._child_prefix(attr),
-                object.__getattribute__(self, "_source"),
-                object.__getattribute__(self, "_device"),
-                object.__getattribute__(self, "_dtype"),
-                object.__getattribute__(self, "_stats"),
-            )
+            return self._wrap(val, attr)
         if isinstance(val, torch.Tensor):
             dev = object.__getattribute__(self, "_device")
             if attr in ("weight", "bias"):
@@ -631,34 +728,14 @@ class _CalibProxy:
         return val
 
     def __getitem__(self, key):
-        mod = object.__getattribute__(self, "_mod")
-        val = mod[key]
+        val = object.__getattribute__(self, "_mod")[key]
         if isinstance(val, torch.nn.Module):
-            idx_key = key if isinstance(key, str) else str(key)
-            return _CalibProxy(
-                val,
-                self._child_prefix(idx_key),
-                object.__getattribute__(self, "_source"),
-                object.__getattribute__(self, "_device"),
-                object.__getattribute__(self, "_dtype"),
-                object.__getattribute__(self, "_stats"),
-            )
+            return self._wrap(val, key if isinstance(key, str) else str(key))
         return val
 
     def __iter__(self):
-        mod = object.__getattribute__(self, "_mod")
-        for i, child in enumerate(mod):
-            if isinstance(child, torch.nn.Module):
-                yield _CalibProxy(
-                    child,
-                    self._child_prefix(i),
-                    object.__getattribute__(self, "_source"),
-                    object.__getattribute__(self, "_device"),
-                    object.__getattribute__(self, "_dtype"),
-                    object.__getattribute__(self, "_stats"),
-                )
-            else:
-                yield child
+        for i, child in enumerate(object.__getattribute__(self, "_mod")):
+            yield self._wrap(child, i) if isinstance(child, torch.nn.Module) else child
 
     def __len__(self):
         return len(object.__getattribute__(self, "_mod"))
@@ -675,13 +752,19 @@ class _CalibProxy:
             dev = object.__getattribute__(self, "_device")
             dtype = object.__getattribute__(self, "_dtype")
             stats = object.__getattribute__(self, "_stats")
+            staging = object.__getattribute__(self, "_staging")
             w_name = f"{prefix}.weight"
             if x.is_floating_point():
-                mx = float(x.detach().float().abs().max().item())
-                if math.isfinite(mx) and mx > stats.get(w_name, 0.0):
-                    stats[w_name] = mx
+                xf = x.detach()
+                mx = torch.maximum(xf.amax(), -xf.amin()).float()
+                mx = torch.where(torch.isfinite(mx), mx, mx.new_zeros(()))
+                prev = stats.get(w_name)
+                stats[w_name] = mx if prev is None else torch.maximum(prev, mx)
             base_w = source.base(w_name)
-            w_dev = base_w if (isinstance(base_w, torch.Tensor) and base_w.device == dev) else base_w.to(dev)
+            if staging is not None:
+                w_dev = staging.stage(base_w)
+            else:
+                w_dev = base_w if (isinstance(base_w, torch.Tensor) and base_w.device == dev) else base_w.to(dev)
             w = source.apply_on_gpu(w_name, w_dev, dtype) if source.needs_gpu(w_name) else w_dev.to(dtype)
             b_name = f"{prefix}.bias"
             b = None
@@ -701,9 +784,11 @@ class _CalibProxy:
 
 
 def calibrate_int8_scales(arch, source, device=None) -> dict:
-    """Computes per-Linear INT8 activation scales via 3 tiny 128x128 streaming forward passes (~0.4s, <150 MB VRAM).
+    """Computes per-Linear INT8 activation scales via one batched B=3 128x128 streaming pass (<150 MB VRAM).
 
-    Cached per `(arch.id, source.base_version, dtype)` so refitting LoRAs or switching profiles reuses cached scales instantly.
+    Batching all three noise levels into a single B=3 forward streams model weights over PCIe once instead of 3x,
+    uses double-buffered pinned H2D staging, and reads back all per-Linear maxima in one batched D2H transfer.
+    Cached per `(arch.id, source.base_version, dtype)` so refitting LoRAs or switching profiles reuses cached scales.
     """
     from . import dit
 
@@ -715,34 +800,46 @@ def calibrate_int8_scales(arch, source, device=None) -> dict:
     if cached is not None:
         return cached
 
-    dev = device if device is not None else common.device()
+    dev = torch.device(device) if device is not None else common.device()
     fp32_res = uses_fp32_residual(INT8)
     dm = source.module
     stats = {}
-    proxy = _CalibProxy(dm, "", source, dev, dtype, stats)
-    gen = torch.Generator(device=dev)
-    gen.manual_seed(0)
-
-    try:
-        with torch.inference_mode():
-            for sig, x_std in ((0.95, 1.0), (0.50, 0.85), (0.08, 0.70)):
-                t = torch.tensor([sig], device=dev, dtype=torch.float32)
+    sigmas = (0.95, 0.50, 0.08)
+    x_stds = (1.0, 0.85, 0.70)
+    with common.on_device(dev):
+        staging = _CalibStaging(source, dev)
+        proxy = _CalibProxy(dm, "", source, dev, dtype, stats, staging=staging)
+        gen = torch.Generator(device=dev)
+        gen.manual_seed(0)
+        try:
+            with torch.inference_mode():
+                t = torch.tensor(sigmas, device=dev, dtype=torch.float32)
                 if arch.kind == "anima":
-                    x = torch.randn((1, arch.in_channels, 1, 16, 16), generator=gen, device=dev, dtype=dtype) * x_std
-                    ctx = torch.randn((1, 16, arch.context_dim), generator=gen, device=dev, dtype=dtype) * 0.25
+                    x = torch.cat(
+                        [torch.randn((1, arch.in_channels, 1, 16, 16), generator=gen, device=dev, dtype=dtype) * s for s in x_stds],
+                        dim=0,
+                    )
+                    ctx = torch.randn((len(sigmas), 16, arch.context_dim), generator=gen, device=dev, dtype=dtype) * 0.25
                     rope = dit.anima_rope(dm, 16, 16, dev)
                     dit.anima_traceable_forward(proxy, x, t, ctx, rope, fp32_residual=fp32_res)
                 elif arch.kind == "moss_image":
-                    x = torch.randn((1, arch.in_channels, 8, 8), generator=gen, device=dev, dtype=dtype) * x_std
-                    ctx = torch.randn((1, 32, arch.context_dim), generator=gen, device=dev, dtype=dtype) * 2.0
+                    x = torch.cat(
+                        [torch.randn((1, arch.in_channels, 8, 8), generator=gen, device=dev, dtype=dtype) * s for s in x_stds],
+                        dim=0,
+                    )
+                    ctx = torch.randn((len(sigmas), 32, arch.context_dim), generator=gen, device=dev, dtype=dtype) * 2.0
                     ri, rt = dit.moss_rope(dm, 8, 8, 32, dev)
                     dit.moss_traceable_forward(proxy, x, t, ctx, ri, rt, fp32_residual=fp32_res)
-    except Exception as e:
-        common.logger.debug(f"INT8 activation calibration fell back to role defaults: {e}")
-        return {}
+                keys = list(stats.keys())
+                vals = torch.stack([stats[k] for k in keys]).cpu().tolist() if keys else []
+        except Exception as e:
+            common.logger.debug(f"INT8 activation calibration fell back to role defaults: {e}")
+            return {}
+        finally:
+            staging.release()
 
     # Apply 1.25x headroom over measured max(|x|) so real prompts/LoRAs don't clip while keeping high INT8 resolution.
-    scales = {w_name: max(1e-4, mx * 1.25 / 127.0) for w_name, mx in stats.items() if mx > 0.0}
+    scales = {w_name: max(1e-4, float(mx) * 1.25 / 127.0) for w_name, mx in zip(keys, vals) if math.isfinite(mx) and mx > 0.0}
     if scales:
         if len(_act_scale_cache) >= 4:
             _act_scale_cache.pop(next(iter(_act_scale_cache)))

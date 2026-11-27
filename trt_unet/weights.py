@@ -240,7 +240,16 @@ class EffectiveWeights:
 
     def quantize_on_gpu(self, name: str, gpu_base: torch.Tensor, quant_kind: str, scale_dtype: torch.dtype, gpu_lora: list = None) -> tuple:
         w_fp32 = self.apply_fp32_on_gpu(name, gpu_base, gpu_lora=gpu_lora)
-        return quant.quantize_for_refit(w_fp32, quant_kind, scale_dtype, transposed=quant.is_transposed_weight(name))
+        can_inplace = w_fp32 is not gpu_base and (
+            type(gpu_base) is not torch.Tensor or w_fp32.untyped_storage().data_ptr() != gpu_base.untyped_storage().data_ptr()
+        )
+        return quant.quantize_for_refit(
+            w_fp32,
+            quant_kind,
+            scale_dtype,
+            transposed=quant.is_transposed_weight(name),
+            in_place=can_inplace,
+        )
 
     def apply_on_gpu(self, name: str, gpu_base: torch.Tensor, dtype=torch.float16) -> torch.Tensor:
         base_name = quant.base_weight_name(name)

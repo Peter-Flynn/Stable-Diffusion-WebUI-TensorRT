@@ -10,7 +10,7 @@ from modules.ui_common import refresh_symbol
 from modules.ui_components import ToolButton
 
 from . import arch as arch_mod
-from . import common, compat, dit_speed, quant, store
+from . import common, compat, quant, store
 from . import vae as vae_mod
 from .profiles import FIELDS, PRESETS, Profile, default_profiles, presets_for
 

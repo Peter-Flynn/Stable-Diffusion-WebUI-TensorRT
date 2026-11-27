@@ -463,8 +463,8 @@ class Engine:
                             if pin_nb > 0:
                                 pin_stage_sizes.append(pin_nb)
                 if len(gpu_stage_sizes) >= 2:
-                    vram_cap = max(0, free_b - (256 << 20)) // 8
-                    max_cap = 112 << 20 if quant_bases else (32 << 20)
+                    vram_cap = max(0, free_b - (256 << 20)) // (6 if quant_bases else 8)
+                    max_cap = 160 << 20 if quant_bases else (32 << 20)
                     gpu_buf_size = min(max_cap, max(gpu_stage_sizes), vram_cap)
                     pin_size = min(gpu_buf_size, max(pin_stage_sizes)) if pin_stage_sizes else 0
                     if gpu_buf_size >= (4 << 20):

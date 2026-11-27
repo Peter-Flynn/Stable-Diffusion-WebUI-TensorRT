@@ -12,7 +12,7 @@ import os
 import shutil
 from dataclasses import dataclass, field
 
-from . import common, dit_speed, fresh, quant
+from . import common, fresh, quant
 from .arch import Arch
 from .profiles import Profile
 
@@ -20,7 +20,7 @@ PER_PROFILE, MERGED = "per_profile", "merged"
 SHALLOW = ".shallow.plan"
 MODES = (PER_PROFILE, MERGED)
 GRAPH_VERSION = 3  # 2: FP32 GroupNorm; 3: decomposed FP32 GroupNorm (avoids TRT 11 __myl_Gnor on small dynamic profiles)
-DIT_GRAPH_VERSION = 1
+DIT_GRAPH_VERSION = 2  # 2: FP32-fused Q/K RMSNorm->RoPE (eliminates per-block FP32->BF16->FP32 casts)
 
 
 def root() -> str:
@@ -185,18 +185,14 @@ class Record:
 
     @property
     def speed_hacks(self):
-        hacks = self.meta.get("speed_hacks")
         if self.arch.is_dit:
-            if not dit_speed.USES_SHALLOW_ENGINE:
-                return None
-            return hacks if hacks and hacks.get("dit_speed") == dit_speed.SHALLOW_SIGNATURE else None
+            return None
+        hacks = self.meta.get("speed_hacks")
         return hacks if hacks and hacks.get("fresh") == fresh.SIGNATURE else None
 
     @property
     def supports_speed_hacks(self) -> bool:
-        if self.arch.is_dit and not dit_speed.USES_SHALLOW_ENGINE:
-            return True
-        return self.speed_hacks is not None
+        return True if self.arch.is_dit else self.speed_hacks is not None
 
     @property
     def stale_graph(self) -> bool:
@@ -222,13 +218,11 @@ class Record:
 
     @property
     def stale_speed_hacks(self) -> bool:  # built with another fresh.SIGNATURE: a different shallow graph
-        if self.arch.is_dit and not dit_speed.USES_SHALLOW_ENGINE:
-            return False
-        return self.speed_hacks is None and "speed_hacks" in self.meta
+        return False if self.arch.is_dit else (self.speed_hacks is None and "speed_hacks" in self.meta)
 
     @property
     def retry_speed_hacks(self) -> bool:
-        if self.arch.is_dit and not dit_speed.USES_SHALLOW_ENGINE:
+        if self.arch.is_dit:
             return False
         return self.speed_hacks is None and (self.stale_speed_hacks or not self.meta.get("speed_hacks_retried"))
 

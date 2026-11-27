@@ -1,5 +1,5 @@
-# DiT-native Speed Hacks: closed-loop x0-space trajectory forecasting + CFG two-tier skipping (Candidate A),
-# plus optional ONNX/TRT engine-bundled First-Block Residual forecasting (Candidate B) for Anima & MOSS-Image.
+# DiT-native Speed Hacks: closed-loop x0-space trajectory forecasting (damped Hermite / Taylor / Chebyshev)
+# for Anima & MOSS-Image with zero extra engine or VRAM overhead.
 #
 # Forecasting in clean-image x0-space (x0 = predictor.calculate_denoised(sigma, v, x)) and inverting back to velocity
 # (v_pred = (x_t - x0_pred) / sigma) makes skips automatically fresh-noise-safe on ancestral and SDE samplers (Euler a,
@@ -13,12 +13,6 @@ import torch
 
 from . import speed
 from .common import Readback
-
-# Empirically locked by live L4 Phase B benchmark on Anima 2B + MOSS-Image 5B:
-# Zero-extra-engine x0-space Hermite forecasting decisively outperformed ONNX-bundled First-Block Residual
-# (.shallow.plan) in both speedup and quality across deterministic and SDE samplers with 0 extra VRAM/disk.
-USES_SHALLOW_ENGINE = False
-SHALLOW_SIGNATURE = "dit-fbr-v1"
 
 DEFAULT_METHOD = "hermite"  # "constant" | "taylor" | "hermite" | "chebyshev"
 HISTORY_LEN = 5
@@ -522,27 +516,15 @@ class DiTSchedule:
         st.consec_skips += 1
         return v_pred.to(x_slice.dtype)
 
-    def forecast_feature(self, bkey: tuple, u_now: float, out_dtype: torch.dtype) -> torch.Tensor:
-        """Forecasts a cached feature tensor (e.g. Candidate B trunk_delta) at u_now."""
-        st = self.branches[bkey]
-        weights = forecast_weights(st.us, u_now, method=self.method, order=self.order)
-        feat = eval_linear_combination(st.ys, weights)
-        du = max(1e-7, (st.last_full_u or u_now) - u_now)
-        if st.last_err is not None and st.last_err_du and st.last_err_du > 1e-8:
-            ratio = max(0.25, du / st.last_err_du)
-            st.accum_err += st.last_err * (ratio ** 1.5)
-        st.consec_skips += 1
-        return feat.to(out_dtype)
-
-    def record_full(self, bkey: tuple, x_slice: torch.Tensor, sigma_slice: torch.Tensor, out_slice: torch.Tensor, context_slice: torch.Tensor, u_now: float, feature_slice: torch.Tensor = None):
-        """Records a full evaluation in x0-space (or feature space if feature_slice is given) and measures free check error."""
+    def record_full(self, bkey: tuple, x_slice: torch.Tensor, sigma_slice: torch.Tensor, out_slice: torch.Tensor, context_slice: torch.Tensor, u_now: float):
+        """Records a full evaluation in x0-space and measures free closed-loop forecast error."""
         if bkey in self.volatile:
             return
         st = self.branches.get(bkey)
         if st is None:
             st = self.branches[bkey] = _BranchState()
 
-        target = feature_slice.float() if feature_slice is not None else to_x0(self.predictor, sigma_slice, out_slice, x_slice)
+        target = to_x0(self.predictor, sigma_slice, out_slice, x_slice)
 
         # Free closed-loop accuracy check: compare what forecasting WOULD have predicted at u_now against true target.
         if len(st.ys) >= 2 and st.last_full_u is not None and (st.last_full_u - u_now) > 1e-7:

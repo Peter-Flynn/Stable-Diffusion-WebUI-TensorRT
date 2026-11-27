@@ -19,7 +19,7 @@ import warnings
 import torch
 import torch.nn.functional as F
 
-from . import common, dit, dit_speed, fresh, quant, speed, store
+from . import common, dit, fresh, quant, speed, store
 from .arch import Arch, unet_config
 from .common import duration, gib, logger
 
@@ -342,8 +342,7 @@ def _export_dit_onnx(arch: Arch, patcher, folder: str, device, precision: str) -
     fp32_res = quant.uses_fp32_residual(precision)
     trace_dev = _dit_trace_device(patcher, device)
     model = _fresh_dit(arch.kind, unet_config(patcher), trace_dev, act_dtype)
-    paths = {"unet": os.path.join(folder, "unet.onnx"), "shallow": os.path.join(folder, "shallow.onnx")}
-    use_shallow = bool(dit_speed.USES_SHALLOW_ENGINE)
+    onnx_path = os.path.join(folder, "unet.onnx")
 
     if arch.kind == "anima":
         head_dim = int(model.blocks[0].self_attn.head_dim)
@@ -363,12 +362,8 @@ def _export_dit_onnx(arch: Arch, patcher, folder: str, device, precision: str) -
             "latent": {0: "batch", 3: "height", 4: "width"},
         }
         full_fn = lambda m, x, t, c, r: dit.anima_traceable_forward(
-            m, x, t, c, r, fp32_residual=fp32_res, return_trunk_delta=use_shallow, attn_fn=_optimized_attention
+            m, x, t, c, r, fp32_residual=fp32_res, attn_fn=_optimized_attention
         )
-        shallow_fn = lambda m, x, t, c, r, d: dit.anima_shallow_forward(
-            m, x, t, c, r, d, fp32_residual=fp32_res, attn_fn=_optimized_attention
-        )
-        delta_dim = int(model.final_layer.hidden_size)
     elif arch.kind == "moss_image":
         head_dim = int(model.layers[0].q_norm.weight.shape[0])
         h_lat, w_lat, s_txt = 4, 4, 6
@@ -389,45 +384,22 @@ def _export_dit_onnx(arch: Arch, patcher, folder: str, device, precision: str) -
             "latent": {0: "batch", 2: "height", 3: "width"},
         }
         full_fn = lambda m, x, t, c, ri, rt: dit.moss_traceable_forward(
-            m, x, t, c, ri, rt, fp32_residual=fp32_res, return_trunk_delta=use_shallow, attn_fn=_optimized_attention
+            m, x, t, c, ri, rt, fp32_residual=fp32_res, attn_fn=_optimized_attention
         )
-        shallow_fn = lambda m, x, t, c, ri, rt, d: dit.moss_shallow_forward(
-            m, x, t, c, ri, rt, d, fp32_residual=fp32_res, attn_fn=_optimized_attention
-        )
-        delta_dim = int(model.final_norm_video.weight.shape[0])
     else:
         raise ValueError(f"Unsupported DiT kind {arch.kind!r}")
 
     logger.info(f"Exporting the {arch.name} DiT to ONNX ({quant.LABELS.get(precision, precision)}).")
-    shallow_exported = False
-    delta_example = None
-    out_names = ["latent", "trunk_delta"] if use_shallow else ["latent"]
-    if use_shallow:
-        axes["trunk_delta"] = {0: "batch", 1: "img_tokens"}
     with _traceable_attention(), fast_weightless_export(), quiet_warnings():
         try:
             model.forward = types.MethodType(full_fn, model)
-            if use_shallow:
-                delta_example = full_fn(model, *inputs)[1]
-            torch.onnx.export(model, inputs, paths["unet"], input_names=names, output_names=out_names, dynamic_axes=axes, **ONNX_KWARGS)
-            if use_shallow and delta_example is not None:
-                model.forward = types.MethodType(shallow_fn, model)
-                torch.onnx.export(
-                    model,
-                    (*inputs, delta_example),
-                    paths["shallow"],
-                    input_names=names + ["trunk_delta"],
-                    output_names=["latent"],
-                    dynamic_axes={k: v for k, v in axes.items()},
-                    **ONNX_KWARGS,
-                )
-                shallow_exported = True
+            torch.onnx.export(model, inputs, onnx_path, input_names=names, output_names=["latent"], dynamic_axes=axes, **ONNX_KWARGS)
         finally:
             with contextlib.suppress(AttributeError):
                 del model.forward
 
     exported = {k: list(v.shape) for k, v in model.state_dict(keep_vars=True).items()}
-    del model, inputs, delta_example
+    del model, inputs
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -436,20 +408,13 @@ def _export_dit_onnx(arch: Arch, patcher, folder: str, device, precision: str) -
     loaded = {k: list(v.shape) for k, v in {**dm.state_dict(keep_vars=True), **dict(dm.named_parameters())}.items()}
     wb_full = []
     full_shapes = _weightless_graph(
-        paths["unet"], names, (exported, loaded), quantize_precision=precision, act_dtype=act_dtype, weight_bytes_out=wb_full
+        onnx_path, names, (exported, loaded), quantize_precision=precision, act_dtype=act_dtype, weight_bytes_out=wb_full
     )
-    shallow_shapes = None
-    wb_shallow = []
-    if shallow_exported:
-        shallow_shapes = _weightless_graph(
-            paths["shallow"], names + ["trunk_delta"], (exported, loaded), quantize_precision=precision, act_dtype=act_dtype, weight_bytes_out=wb_shallow
-        )
     return {
         "unet": full_shapes,
-        "shallow": shallow_shapes,
-        "deep": {"delta_dim": delta_dim} if shallow_exported else None,
+        "shallow": None,
+        "deep": None,
         "weight_bytes": wb_full[0] if wb_full else sum(math.prod(s) * 2 for s in full_shapes.values()),
-        "shallow_weight_bytes": wb_shallow[0] if wb_shallow else 0,
         "precision": precision,
     }
 
@@ -668,14 +633,6 @@ def _build_batch(batch_job: dict, folder: str, step) -> dict:
 SHALLOW_SHARE = 0.15
 
 
-def _dit_shallow_shapes(shapes: dict, delta_dim: int, kind: str) -> dict:
-    if kind == "anima":
-        delta = [[b, (h // 2) * (w // 2), delta_dim] for b, _, _, h, w in shapes["sample"]]
-    else:
-        delta = [[b, h * w, delta_dim] for b, _, h, w in shapes["sample"]]
-    return {**shapes, "trunk_delta": delta}
-
-
 def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=None, mode=store.PER_PROFILE, profiles=None, precision: str = None) -> dict:
     from . import runtime
     from . import vae as vae_mod
@@ -699,12 +656,12 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
     total = len(groups) + (1 if vae_part else 0)
     vae_record = vae_error = None
     module = getattr(getattr(patcher, "model", None), "diffusion_model", None)
-    expect_shallow = dit_speed.USES_SHALLOW_ENGINE if arch.is_dit else True
+    expect_shallow = not arch.is_dit
     try:
         graphs = shapes = None
         if groups:
             if progress:
-                progress(0.0, f"Exporting the {arch.name} graphs" if arch.is_dit else "Exporting the UNet graphs")
+                progress(0.0, f"Exporting the {arch.name} graph" if arch.is_dit else "Exporting the UNet graphs")
             graphs = export_onnx(arch, patcher, folder, precision=prec)
             shapes = graphs["unet"]
         for n, group in enumerate(groups):
@@ -742,17 +699,14 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             hacks = shallow_plan = hack_error = None
             if expect_shallow:
                 if graphs["shallow"] is not None:
-                    if arch.is_dit:
-                        shallow_profiles = [_dit_shallow_shapes(s, graphs["deep"]["delta_dim"], arch.kind) for s in unet_shapes]
-                    else:
-                        shallow_profiles = [{**speed.shallow_shapes(s, graphs["deep"]), **fresh.input_shapes(s, graphs["deep"]["latent_channels"])} for s in unet_shapes]
+                    shallow_profiles = [{**speed.shallow_shapes(s, graphs["deep"]), **fresh.input_shapes(s, graphs["deep"]["latent_channels"])} for s in unet_shapes]
                     shallow_job = {
                         **job,
                         "onnx": os.path.join(folder, "shallow.onnx"),
                         "plan": os.path.join(folder, "shallow.plan"),
                         "weights": sorted(graphs["shallow"]),
                         "profiles": shallow_profiles,
-                        "exact_fp32": not arch.is_dit,
+                        "exact_fp32": True,
                     }
                     logger.info(f"Building the {what}'s Speed Hacks part.")
                     shallow = _build_plan(shallow_job, folder, shallow_step)
@@ -762,24 +716,14 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
                         break
                     if shallow["ok"]:
                         shallow_plan = shallow_job["plan"]
-                        if arch.is_dit:
-                            hacks = {
-                                "deep": graphs["deep"],
-                                "shapes": shallow_job["profiles"],
-                                "weights": shallow_job["weights"],
-                                "weight_bytes": int(graphs.get("shallow_weight_bytes") or 0),
-                                "stripped": shallow["stripped"],
-                                "dit_speed": dit_speed.SHALLOW_SIGNATURE,
-                            }
-                        else:
-                            hacks = {
-                                "deep": graphs["deep"],
-                                "shapes": shallow_job["profiles"],
-                                "weights": shallow_job["weights"],
-                                "weight_bytes": sum(math.prod(graphs["shallow"][w]) * 2 for w in shallow_job["weights"]),
-                                "stripped": shallow["stripped"],
-                                "fresh": fresh.SIGNATURE,
-                            }
+                        hacks = {
+                            "deep": graphs["deep"],
+                            "shapes": shallow_job["profiles"],
+                            "weights": shallow_job["weights"],
+                            "weight_bytes": sum(math.prod(graphs["shallow"][w]) * 2 for w in shallow_job["weights"]),
+                            "stripped": shallow["stripped"],
+                            "fresh": fresh.SIGNATURE,
+                        }
                     else:
                         hack_error = str(shallow.get("error"))
                         logger.warning(f"Couldn't build the {what}'s Speed Hacks part, so it runs without Speed Hacks: {hack_error}")
@@ -809,7 +753,7 @@ def build(arch: Arch, patcher, todo: list, optimization_level=None, progress=Non
             elif expect_shallow:
                 meta["speed_hacks_error"] = hack_error
                 base_k = store.merged_key([p for _, p in group]) if merged else store.profile_key(group[0][1])
-                replaced = before.get(f"{prec}-{base_k}" if arch.is_dit else base_k)
+                replaced = before.get(base_k)
                 meta["speed_hacks_retried"] = replaced is not None and "speed_hacks_error" in replaced.meta
             records.append(store.save(arch, job["plan"], meta, shallow_plan))
             logger.info(f"Built the {what} in {duration(time.time() - start)} ({gib(records[-1].disk_bytes)}).")

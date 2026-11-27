@@ -7,6 +7,8 @@ import torch.nn.functional as F
 
 
 def _to_dtype(y: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if y.dtype == dtype:
+        return y
     if dtype == torch.float16:
         # Clamp finite values beyond FP16 range without masking NaN (CUDA fminf(NaN, 65504) would hide NaN as 65504).
         y = torch.where(y.abs() > 65504.0, torch.sign(y) * 65504.0, y)
@@ -53,11 +55,11 @@ def _modulated_rms_norm_fp32(
     return _to_dtype(y, x.dtype if out_dtype is None else out_dtype)
 
 
-def _apply_rope_split_half(x: torch.Tensor, rope_cs: torch.Tensor) -> torch.Tensor:
+def _apply_rope_split_half(x: torch.Tensor, rope_cs: torch.Tensor, out_dtype: torch.dtype = None) -> torch.Tensor:
     # Matches comfy_kitchen.backends.eager.rope.apply_rope_split_half1:
     # x: (B, L, H, D), rope_cs: (1, L, 1, D//2, 2) FP32 where [..., 0]=cos, [..., 1]=sin.
-    orig_dtype = x.dtype
-    xf = x.float()
+    target = x.dtype if out_dtype is None else out_dtype
+    xf = x if x.dtype == torch.float32 else x.float()
     half = xf.shape[-1] // 2
     x1 = xf[..., :half]
     x2 = xf[..., half:]
@@ -66,7 +68,7 @@ def _apply_rope_split_half(x: torch.Tensor, rope_cs: torch.Tensor) -> torch.Tens
     out1 = x1 * cos - x2 * sin
     out2 = x2 * cos + x1 * sin
     out = torch.cat([out1, out2], dim=-1)
-    return _to_dtype(out, orig_dtype)
+    return _to_dtype(out, target)
 
 
 def _situ_fp32(hidden: torch.Tensor, gate: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -137,12 +139,14 @@ def _anima_block(block, x_res: torch.Tensor, t_emb: torch.Tensor, adaln_lora: to
     sa = block.self_attn
     h = _adaln_layer_norm_fp32(x_res, scale_sa, shift_sa, 1e-6, compute_dtype)
     q = _apply_rope_split_half(
-        _rms_norm_fp32(sa.q_proj(h).reshape(b, -1, sa.n_heads, sa.head_dim), sa.q_norm.weight, sa.q_norm.eps, out_dtype=compute_dtype),
+        _rms_norm_fp32(sa.q_proj(h).reshape(b, -1, sa.n_heads, sa.head_dim), sa.q_norm.weight, sa.q_norm.eps, out_dtype=torch.float32),
         rope_seq,
+        out_dtype=compute_dtype,
     ).transpose(1, 2)
     k = _apply_rope_split_half(
-        _rms_norm_fp32(sa.k_proj(h).reshape(b, -1, sa.n_heads, sa.head_dim), sa.k_norm.weight, sa.k_norm.eps, out_dtype=compute_dtype),
+        _rms_norm_fp32(sa.k_proj(h).reshape(b, -1, sa.n_heads, sa.head_dim), sa.k_norm.weight, sa.k_norm.eps, out_dtype=torch.float32),
         rope_seq,
+        out_dtype=compute_dtype,
     ).transpose(1, 2)
     v = sa.v_proj(h).reshape(b, -1, sa.n_heads, sa.head_dim).transpose(1, 2)
     res_sa = sa.output_proj(_attn_bhsd(q, k, v, attn_fn))
@@ -183,42 +187,13 @@ def anima_traceable_forward(
     rope: torch.Tensor,
     *,
     fp32_residual: bool = False,
-    return_trunk_delta: bool = False,
     attn_fn=None,
 ):
     compute_dtype = x.dtype
     x_seq, t_emb, adaln_lora, rope_seq, h_p, w_p = _anima_embed(module, x, timesteps, rope, compute_dtype)
     x_res = x_seq.float() if (fp32_residual or compute_dtype == torch.float16) else x_seq
-    h0 = None
-    for i, block in enumerate(module.blocks):
+    for block in module.blocks:
         x_res = _anima_block(block, x_res, t_emb, adaln_lora, context, rope_seq, compute_dtype, attn_fn=attn_fn)
-        if return_trunk_delta and i == 0:
-            h0 = x_res
-    latent = _anima_final(module, x_res, t_emb, adaln_lora, h_p, w_p, compute_dtype)
-    if return_trunk_delta:
-        delta = (x_res - h0) if h0 is not None else torch.zeros_like(x_res)
-        if compute_dtype == torch.float16:
-            delta = delta.clamp(-65504.0, 65504.0)
-        return latent, delta.to(compute_dtype)
-    return latent
-
-
-def anima_shallow_forward(
-    module,
-    x: torch.Tensor,
-    timesteps: torch.Tensor,
-    context: torch.Tensor,
-    rope: torch.Tensor,
-    trunk_delta: torch.Tensor,
-    *,
-    fp32_residual: bool = False,
-    attn_fn=None,
-):
-    compute_dtype = x.dtype
-    x_seq, t_emb, adaln_lora, rope_seq, h_p, w_p = _anima_embed(module, x, timesteps, rope, compute_dtype)
-    x_res = x_seq.float() if (fp32_residual or compute_dtype == torch.float16) else x_seq
-    x_res = _anima_block(module.blocks[0], x_res, t_emb, adaln_lora, context, rope_seq, compute_dtype, attn_fn=attn_fn)
-    x_res = x_res + trunk_delta.to(x_res.dtype)
     return _anima_final(module, x_res, t_emb, adaln_lora, h_p, w_p, compute_dtype)
 
 
@@ -244,12 +219,14 @@ def _moss_embed(module, x: torch.Tensor, timesteps: torch.Tensor, context: torch
         h1 = _rms_norm_fp32(txt_res, tb.norm1.weight, tb.norm1.eps, out_dtype=compute_dtype)
         q, k, v = tb.qkv(h1).chunk(3, dim=-1)
         q = _apply_rope_split_half(
-            _rms_norm_fp32(q.reshape(b, -1, tb.num_heads, head_dim), tb.q_norm.weight, tb.q_norm.eps, out_dtype=compute_dtype),
+            _rms_norm_fp32(q.reshape(b, -1, tb.num_heads, head_dim), tb.q_norm.weight, tb.q_norm.eps, out_dtype=torch.float32),
             rope_txt,
+            out_dtype=compute_dtype,
         ).transpose(1, 2)
         k = _apply_rope_split_half(
-            _rms_norm_fp32(k.reshape(b, -1, tb.num_heads, head_dim), tb.k_norm.weight, tb.k_norm.eps, out_dtype=compute_dtype),
+            _rms_norm_fp32(k.reshape(b, -1, tb.num_heads, head_dim), tb.k_norm.weight, tb.k_norm.eps, out_dtype=torch.float32),
             rope_txt,
+            out_dtype=compute_dtype,
         ).transpose(1, 2)
         v = v.reshape(b, -1, tb.num_heads, head_dim).transpose(1, 2)
         txt_res = txt_res + tb.proj(_attn_bhsd(q, k, v, attn_fn)).to(res_dtype)
@@ -272,12 +249,14 @@ def _moss_block(block, x_res: torch.Tensor, mod: tuple, rope_all: torch.Tensor, 
     else:
         q, k, v = block.proj["q"](y), block.proj["k"](y), block.proj["v"](y)
     q = _apply_rope_split_half(
-        _rms_norm_fp32(q.reshape(b, -1, block.num_heads, head_dim), block.q_norm.weight, block.q_norm.eps, out_dtype=compute_dtype),
+        _rms_norm_fp32(q.reshape(b, -1, block.num_heads, head_dim), block.q_norm.weight, block.q_norm.eps, out_dtype=torch.float32),
         rope_all,
+        out_dtype=compute_dtype,
     ).transpose(1, 2)
     k = _apply_rope_split_half(
-        _rms_norm_fp32(k.reshape(b, -1, block.num_heads, head_dim), block.k_norm.weight, block.k_norm.eps, out_dtype=compute_dtype),
+        _rms_norm_fp32(k.reshape(b, -1, block.num_heads, head_dim), block.k_norm.weight, block.k_norm.eps, out_dtype=torch.float32),
         rope_all,
+        out_dtype=compute_dtype,
     ).transpose(1, 2)
     v = v.reshape(b, -1, block.num_heads, head_dim).transpose(1, 2)
     attn_out = _attn_bhsd(q, k, v, attn_fn)
@@ -307,7 +286,6 @@ def moss_traceable_forward(
     rope_txt: torch.Tensor,
     *,
     fp32_residual: bool = False,
-    return_trunk_delta: bool = False,
     attn_fn=None,
 ):
     b = x.shape[0]
@@ -315,42 +293,9 @@ def moss_traceable_forward(
     x_res, mod, head_shift, head_scale, rope_all, head_dim, h, w = _moss_embed(
         module, x, timesteps, context, rope_img, rope_txt, fp32_residual, attn_fn=attn_fn
     )
-    h0 = None
-    for i, block in enumerate(module.layers):
+    for block in module.layers:
         x_res = _moss_block(block, x_res, mod, rope_all, head_dim, compute_dtype, attn_fn=attn_fn)
-        if return_trunk_delta and i == 0:
-            h0 = x_res
-    n_img = h * w
-    x_vid = x_res[:, :n_img]
-    latent = _moss_final(module, x_vid, head_scale, head_shift, b, h, w, compute_dtype)
-    if return_trunk_delta:
-        delta = (x_vid - h0[:, :n_img]) if h0 is not None else torch.zeros_like(x_vid)
-        if compute_dtype == torch.float16:
-            delta = delta.clamp(-65504.0, 65504.0)
-        return latent, delta.to(compute_dtype)
-    return latent
-
-
-def moss_shallow_forward(
-    module,
-    x: torch.Tensor,
-    timesteps: torch.Tensor,
-    context: torch.Tensor,
-    rope_img: torch.Tensor,
-    rope_txt: torch.Tensor,
-    trunk_delta: torch.Tensor,
-    *,
-    fp32_residual: bool = False,
-    attn_fn=None,
-):
-    b = x.shape[0]
-    compute_dtype = x.dtype
-    x_res, mod, head_shift, head_scale, rope_all, head_dim, h, w = _moss_embed(
-        module, x, timesteps, context, rope_img, rope_txt, fp32_residual, attn_fn=attn_fn
-    )
-    x_res = _moss_block(module.layers[0], x_res, mod, rope_all, head_dim, compute_dtype, attn_fn=attn_fn)
-    x_vid = x_res[:, : h * w] + trunk_delta.to(x_res.dtype)
-    return _moss_final(module, x_vid, head_scale, head_shift, b, h, w, compute_dtype)
+    return _moss_final(module, x_res[:, : h * w], head_scale, head_shift, b, h, w, compute_dtype)
 
 
 def anima_rope(module, h_lat: int, w_lat: int, device, cache: dict = None) -> torch.Tensor:

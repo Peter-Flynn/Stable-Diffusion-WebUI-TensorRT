@@ -1641,8 +1641,7 @@ class Pass:
             self.fall_back(f"Couldn't resume the {record.arch.name} {record.label} ({e})", _unexpected(e))
 
     def _wants_shallow(self, model: TrtModel) -> bool:
-        active = self.schedule is not None or (self.dit_speed is not None and dit_speed.USES_SHALLOW_ENGINE)
-        return bool(active and model.hacks is not None and not model.shallow_failed)
+        return bool(self.schedule is not None and model.hacks is not None and not model.shallow_failed)
 
     def use(self, record, call_shape=None):
         global _use_tick
@@ -2129,23 +2128,18 @@ class Pass:
         engine_key = self.model.record.key
         vol = b * h * w
 
-        # DiT Speed Hacks (Candidate A x0-space forecasting + CFG Tier 1/2, or Candidate B shallow engine)
+        # DiT Speed Hacks (closed-loop x0-space trajectory forecasting)
         dit_plan = None
         dit_sigma = None
         split_sub = None
-        if (
-            self.arch.is_dit
-            and self.dit_speed is not None
-            and not self.dit_speed.idle
-            and (not dit_speed.USES_SHALLOW_ENGINE or self.model.shallow_loaded)
-        ):
+        if self.arch.is_dit and self.dit_speed is not None and not self.dit_speed.idle:
             if self.dit_speed.done:
                 self.dit_speed.full_calls += 1
             else:
                 with self._speed_hacks():
                     dit_sigma = self._dit_sigma_for(timesteps, b)
                     dit_plan = self.dit_speed.plan_call(x, dit_sigma, context, cond_or_uncond, tuple(_prompts))
-                    if dit_plan["mode"] == "skip_all" and not dit_speed.USES_SHALLOW_ENGINE:
+                    if dit_plan["mode"] == "skip_all":
                         parts = [
                             self.dit_speed.forecast_slice(bkey, x[slc], dit_sigma[slc], dit_plan["u"])
                             for slc, bkey, _, _ in dit_plan["groups"]
@@ -2157,7 +2151,7 @@ class Pass:
                             return _finish(out)
                         self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
                         dit_plan = None
-                    elif dit_plan["mode"] == "split_cfg" and not dit_speed.USES_SHALLOW_ENGINE:
+                    elif dit_plan["mode"] == "split_cfg":
                         run_groups = [(gi, slc, bkey) for gi, (slc, bkey, _, can_skip) in enumerate(dit_plan["groups"]) if not can_skip]
                         skip_groups = [(gi, slc, bkey) for gi, (slc, bkey, _, can_skip) in enumerate(dit_plan["groups"]) if can_skip]
                         x_sub = torch.cat([x[slc] for _, slc, _ in run_groups], dim=0)
@@ -2201,7 +2195,6 @@ class Pass:
 
         feed = self._build_feed(x, timesteps, context, y, b, h, w, padded, repeats)
         hack = None
-        dit_delta = None
         if self.schedule is not None and not self.schedule.idle and self.model.shallow_loaded:
             if self.schedule.done:
                 self.schedule.full_calls += 1
@@ -2234,26 +2227,10 @@ class Pass:
                     hack = [slot, key, deep, origin, stale, kind, entry, cond_or_uncond, b]
                 if hack is None and planned_shallow and self.started is not None:
                     self.started.ran_full()
-        elif (
-            dit_plan is not None
-            and dit_speed.USES_SHALLOW_ENGINE
-            and self.dit_speed is not None
-            and self.model.shallow_loaded
-            and dit_plan["mode"] == "skip_all"
-        ):
-            with self._speed_hacks():
-                dt = self.model.model_dtype()
-                deltas = [self.dit_speed.forecast_feature(bkey, dit_plan["u"], dt) for _, bkey, _, _ in dit_plan["groups"]]
-                delta_cat = deltas[0] if len(deltas) == 1 else torch.cat(deltas, dim=0)
-                if padded > b:
-                    delta_cat = delta_cat.repeat(-(-padded // b), 1, 1)[:padded]
-                dit_delta = [delta_cat]
 
-        self._last_trunk_delta = None
-        out = self._infer_with_room(feed, profile, stream, hack, vol=vol, dit_delta=dit_delta)
+        out = self._infer_with_room(feed, profile, stream, hack, vol=vol)
         # A shallow call whose Speed Hacks failed ran on the full engine instead
-        dit_shallow = bool(dit_delta) and self.dit_speed is not None
-        shallow = (bool(hack) and hack[2] is not None and self.schedule is not None) or dit_shallow
+        shallow = bool(hack) and hack[2] is not None and self.schedule is not None
         if not shallow and engine_key not in self.checked:
             self.checked.add(engine_key)
             if not torch.isfinite(out).all():
@@ -2261,32 +2238,21 @@ class Pass:
         if shallow and engine_key not in self.shallow_checked:
             self.shallow_checked.add(engine_key)
             if not torch.isfinite(out).all():
-                if self.started is not None and not dit_shallow:
+                if self.started is not None:
                     self.started.ran_full()
                 self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
-                dit_shallow = False
-                dit_plan = None
                 out = self._infer_with_room(feed, profile, stream, vol=vol)
-        if dit_shallow:
-            self.dit_speed.note_counts("skip_all")
-            self._last_trunk_delta = None
-            _touch_anchor(engine_key)
-            return _finish(out)
         if dit_plan is not None and self.dit_speed is not None and not self.dit_speed.done:
             with self._speed_hacks():
-                delta_full = self._last_trunk_delta if dit_speed.USES_SHALLOW_ENGINE else None
-                if not dit_speed.USES_SHALLOW_ENGINE or delta_full is not None:
-                    for slc, bkey, _, _ in dit_plan["groups"]:
-                        feat_slc = delta_full[slc] if delta_full is not None else None
-                        self.dit_speed.record_full(bkey, x[slc], dit_sigma[slc], out[slc], context[slc], dit_plan["u"], feature_slice=feat_slc)
-                    self.dit_speed.note_counts("full")
-        self._last_trunk_delta = None
+                for slc, bkey, _, _ in dit_plan["groups"]:
+                    self.dit_speed.record_full(bkey, x[slc], dit_sigma[slc], out[slc], context[slc], dit_plan["u"])
+                self.dit_speed.note_counts("full")
         _touch_anchor(engine_key)
         return _finish(out)
 
-    def _infer_with_room(self, feed, profile, stream, hack=None, vol: int = 0, dit_delta=None):
+    def _infer_with_room(self, feed, profile, stream, hack=None, vol: int = 0):
         try:
-            return self._infer(feed, profile, stream, hack, dit_delta=dit_delta)
+            return self._infer(feed, profile, stream, hack)
         except torch.cuda.OutOfMemoryError as e:
             _clear_traceback(e)
             dev = self.model.load_device
@@ -2310,7 +2276,7 @@ class Pass:
                 common.mm().soft_empty_cache(force=True)
                 if unloaded_torch or freed or common.free(dev) > before_free:
                     try:
-                        return self._infer(feed, profile, stream, hack, retry=False, dit_delta=dit_delta)
+                        return self._infer(feed, profile, stream, hack, retry=False)
                     except torch.cuda.OutOfMemoryError as e1:
                         _clear_traceback(e1)
                         self.model.engine.release_activations()
@@ -2325,18 +2291,16 @@ class Pass:
                 else:
                     self._evicts_anchor.add(self.model.record.key)
             try:
-                return self._infer(feed, profile, stream, hack, retry=True, dit_delta=dit_delta)
+                return self._infer(feed, profile, stream, hack, retry=True)
             except torch.cuda.OutOfMemoryError as e:
                 _clear_traceback(e)
                 if hack and hack[2] is not None and self.schedule is not None and self.started is not None:
                     self.started.ran_full()
                 if hack:
                     hack.clear()
-                if dit_delta:
-                    dit_delta.clear()
                 self.fall_back("The engine ran out of VRAM")
 
-    def _infer(self, feed, profile, stream, hack=None, retry: bool = False, dit_delta=None):
+    def _infer(self, feed, profile, stream, hack=None, retry: bool = False):
         from . import engine as engine_mod
 
         # hack: [slot, Schedule key, deep feature or None, index of the call that computed it, (deep feature, index) to
@@ -2346,14 +2310,6 @@ class Pass:
         engine_mod.LOGGER.clear()
         failures = gpu.failures()
         try:
-            if dit_delta and self.dit_speed is not None and self.model.shallow_loaded:
-                # A shallow call that fails runs in full below
-                with self._speed_hacks(rethrow_oom=not retry):
-                    return self.model.shallow.infer({**feed, "trunk_delta": dit_delta[0]}, profile, stream)["latent"]
-                dit_delta.clear()
-                if retry:
-                    self.model.engine.release_activations()
-                    common.mm().soft_empty_cache(force=True)
             if deep is not None and self.schedule is not None:
                 # A shallow call that fails runs in full below
                 with self._speed_hacks(rethrow_oom=not retry):
@@ -2374,8 +2330,6 @@ class Pass:
             failures = gpu.failures()
             outputs = self.model.engine.infer(feed, profile, stream)
             out = outputs["latent"]
-            if "trunk_delta" in outputs:
-                self._last_trunk_delta = outputs["trunk_delta"]
             if slot is not None and "deep" in outputs and self.schedule is not None:
                 with self._speed_hacks():
                     self.schedule.keep(slot, key, outputs["deep"], (feed["encoder_hidden_states"], feed.get("y")))
