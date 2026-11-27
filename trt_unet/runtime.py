@@ -1522,7 +1522,7 @@ class Pass:
             self.schedule.deep.clear()
             self.schedule._missed.clear()
         if self.dit_speed is not None:
-            self.dit_speed.branches.clear()
+            self.dit_speed.release()
         self._hold(self.patcher)
         for m in list(_models.values()):
             if m.loaded or m.opened:
@@ -1747,7 +1747,7 @@ class Pass:
 
         def apply_model(*args, **kwargs):
             prev_sigma = self._apply_sigma
-            if self.dit_speed is not None and not self.dit_speed.idle and not self.dit_speed.done:
+            if self.dit_speed is not None and not self.dit_speed.idle and (not self.dit_speed.done or self.dit_speed.tail_cfg_active()):
                 self._apply_sigma = args[1] if len(args) > 1 else kwargs.get("t")
             if self.schedule is not None and self.tracker is not None and not self.schedule.idle and not self.schedule.done:
                 with self._speed_hacks():
@@ -1878,9 +1878,15 @@ class Pass:
         hacks = self.started
         if isinstance(hacks, dit_speed.DiTSchedule):
             if hacks.shallow_calls or hacks.tier1_calls:
-                total = hacks.shallow_calls + hacks.full_calls
-                tier1_note = f" and {hacks.tier1_calls} CFG-split calls" if hacks.tier1_calls else ""
-                logger.info(f"Speed Hacks skipped {hacks.shallow_calls} full calls{tier1_note} of {total} {self.arch.name} calls.")
+                total = hacks.shallow_calls + hacks.full_calls + hacks.cfg_unbatched_calls
+                parts = []
+                if hacks.shallow_calls:
+                    parts.append(f"skipped {hacks.shallow_calls} full")
+                if hacks.cfg_unbatched_calls:
+                    parts.append(f"saved {hacks.cfg_unbatched_calls} CFG-uncond")
+                if hacks.cfg_batched_calls:
+                    parts.append(f"halved {hacks.cfg_batched_calls} batched-CFG")
+                logger.info(f"Speed Hacks {', '.join(parts)} of {total} {self.arch.name} calls.")
                 if hacks.checks:
                     logger.debug("Speed Hacks checks (call, age, error): " + ", ".join(f"{i} {a} {e:.4f}" for i, a, e in hacks.checks))
                 _note_speed_hacks(hacks)
@@ -2128,47 +2134,55 @@ class Pass:
         engine_key = self.model.record.key
         vol = b * h * w
 
-        # DiT Speed Hacks (closed-loop x0-space trajectory forecasting)
+        # DiT Speed Hacks (quality-tiered dual VDE/FreqCa forecasting + orthogonal CFG acceleration)
         dit_plan = None
         dit_sigma = None
-        split_sub = None
+        batched_cfg = None
         if self.arch.is_dit and self.dit_speed is not None and not self.dit_speed.idle:
-            if self.dit_speed.done:
+            if self.dit_speed.done and not self.dit_speed.tail_cfg_active():
                 self.dit_speed.full_calls += 1
             else:
                 with self._speed_hacks():
                     dit_sigma = self._dit_sigma_for(timesteps, b)
                     dit_plan = self.dit_speed.plan_call(x, dit_sigma, context, cond_or_uncond, tuple(_prompts))
-                    if dit_plan["mode"] == "skip_all":
-                        parts = [
-                            self.dit_speed.forecast_slice(bkey, x[slc], dit_sigma[slc], dit_plan["u"])
-                            for slc, bkey, _, _ in dit_plan["groups"]
-                        ]
-                        out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+                    mode = dit_plan["mode"]
+                    if mode == "skip_all":
+                        out = self.dit_speed.forecast_step(dit_plan, x, dit_sigma)
                         if torch.isfinite(out).all():
                             self.dit_speed.note_counts("skip_all")
                             _touch_anchor(engine_key)
                             return _finish(out)
                         self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
                         dit_plan = None
-                    elif dit_plan["mode"] == "split_cfg":
-                        run_groups = [(gi, slc, bkey) for gi, (slc, bkey, _, can_skip) in enumerate(dit_plan["groups"]) if not can_skip]
-                        skip_groups = [(gi, slc, bkey) for gi, (slc, bkey, _, can_skip) in enumerate(dit_plan["groups"]) if can_skip]
-                        x_sub = torch.cat([x[slc] for _, slc, _ in run_groups], dim=0)
-                        b_sub = x_sub.shape[0]
-                        sub_choice = profiles.select(
-                            record.profile_shapes, b_sub, h, w, ctx_len, allow_context_repeat=self.arch.allow_context_repeat
-                        )
-                        if sub_choice is not None and sub_choice[1] < padded:
-                            sub_profile, sub_padded, sub_repeats = sub_choice
-                            t_flat = timesteps.reshape(-1)
-                            t_full = t_flat if t_flat.shape[0] == b else t_flat.expand(b)
-                            t_sub = torch.cat([t_full[slc] for _, slc, _ in run_groups], dim=0)
-                            ctx_sub = torch.cat([context[slc] for _, slc, _ in run_groups], dim=0)
-                            feed_sub = self._build_feed(x_sub, t_sub, ctx_sub, None, b_sub, h, w, sub_padded, sub_repeats)
-                            split_sub = (run_groups, skip_groups, b_sub, sub_profile, feed_sub)
-                if split_sub is not None and self.dit_speed is not None:
-                    run_groups, skip_groups, b_sub, sub_profile, feed_sub = split_sub
+                    elif mode in ("unbatched_cfg_drop", "unbatched_fastercache"):
+                        fc_entry = self.dit_speed._fresh_cond.get(dit_plan["skey"])
+                        if fc_entry is not None and fc_entry[0] == self.dit_speed.index and fc_entry[2]:
+                            out = self.dit_speed.synthesize_uncond(dit_plan["skey"], mode, fc_entry[1], x.dtype)
+                            if torch.isfinite(out).all():
+                                self.dit_speed.note_counts(mode)
+                                _touch_anchor(engine_key)
+                                return _finish(out)
+                            self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
+                            dit_plan = None
+                    elif mode in ("batched_cfg_drop", "batched_fastercache"):
+                        run_groups = [(gi, slc, bkey) for gi, (slc, bkey, is_u, _) in enumerate(dit_plan["groups"]) if not is_u]
+                        synth_groups = [(gi, slc, bkey) for gi, (slc, bkey, is_u, _) in enumerate(dit_plan["groups"]) if is_u]
+                        if run_groups and synth_groups:
+                            x_sub = torch.cat([x[slc] for _, slc, _ in run_groups], dim=0)
+                            b_sub = x_sub.shape[0]
+                            sub_choice = profiles.select(
+                                record.profile_shapes, b_sub, h, w, ctx_len, allow_context_repeat=self.arch.allow_context_repeat
+                            )
+                            if sub_choice is not None and sub_choice[1] < padded:
+                                sub_profile, sub_padded, sub_repeats = sub_choice
+                                t_flat = timesteps.reshape(-1)
+                                t_full = t_flat if t_flat.shape[0] == b else t_flat.expand(b)
+                                t_sub = torch.cat([t_full[slc] for _, slc, _ in run_groups], dim=0)
+                                ctx_sub = torch.cat([context[slc] for _, slc, _ in run_groups], dim=0)
+                                feed_sub = self._build_feed(x_sub, t_sub, ctx_sub, None, b_sub, h, w, sub_padded, sub_repeats)
+                                batched_cfg = (mode, run_groups, synth_groups, b_sub, sub_profile, feed_sub)
+                if batched_cfg is not None and self.dit_speed is not None:
+                    mode, run_groups, synth_groups, b_sub, sub_profile, feed_sub = batched_cfg
                     out_sub = self._infer_with_room(feed_sub, sub_profile, stream, vol=b_sub * h * w)[:b_sub]
                     if engine_key not in self.checked:
                         self.checked.add(engine_key)
@@ -2177,21 +2191,26 @@ class Pass:
                     with self._speed_hacks():
                         assembled = [None] * len(dit_plan["groups"])
                         off = 0
+                        cond_out = None
                         for gi, slc, bkey in run_groups:
                             n_rows = slc.stop - slc.start
                             o_slc = out_sub[off : off + n_rows]
                             off += n_rows
                             assembled[gi] = o_slc.to(x.dtype)
+                            cond_out = o_slc
                             self.dit_speed.record_full(bkey, x[slc], dit_sigma[slc], o_slc, context[slc], dit_plan["u"])
-                        for gi, slc, bkey in skip_groups:
-                            assembled[gi] = self.dit_speed.forecast_slice(bkey, x[slc], dit_sigma[slc], dit_plan["u"])
-                        out = torch.cat(assembled, dim=0)
-                        if torch.isfinite(out).all():
-                            self.dit_speed.note_counts("split_cfg")
-                            _touch_anchor(engine_key)
-                            return _finish(out)
-                        self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
-                        dit_plan = None
+                        if mode == "batched_fastercache" and dit_plan["skey"] not in self.dit_speed._cfg_delta:
+                            dit_plan = None
+                        else:
+                            for gi, slc, bkey in synth_groups:
+                                assembled[gi] = self.dit_speed.synthesize_uncond(dit_plan["skey"], mode, cond_out, x.dtype)
+                            out = torch.cat(assembled, dim=0)
+                            if torch.isfinite(out).all():
+                                self.dit_speed.note_counts(mode)
+                                _touch_anchor(engine_key)
+                                return _finish(out)
+                            self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
+                            dit_plan = None
 
         feed = self._build_feed(x, timesteps, context, y, b, h, w, padded, repeats)
         hack = None
@@ -2242,7 +2261,7 @@ class Pass:
                     self.started.ran_full()
                 self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
                 out = self._infer_with_room(feed, profile, stream, vol=vol)
-        if dit_plan is not None and self.dit_speed is not None and not self.dit_speed.done:
+        if dit_plan is not None and self.dit_speed is not None:
             with self._speed_hacks():
                 for slc, bkey, _, _ in dit_plan["groups"]:
                     self.dit_speed.record_full(bkey, x[slc], dit_sigma[slc], out[slc], context[slc], dit_plan["u"])
@@ -2596,6 +2615,9 @@ def _note_torch_call(p: Pass, x, out, cond_or_uncond):
             entry = p.tracker.call(x, x.shape[0])
             if entry is not None:
                 p.tracker.after_call(entry, out[:x.shape[0]], cond_or_uncond)
+    if p.dit_speed is not None and not p._torch_mode:
+        with p._speed_hacks():
+            p.dit_speed.note_side_call()
 
 
 def _check_transformer_options(p: Pass, transformer_options: dict):
@@ -2720,7 +2742,7 @@ _latest_sigmas = None
 _denoiser_state = None  # active CFGDenoiser.forward call, so a refiner switch inside it can start the new pass on that step
 
 
-def _begin_step(p: Pass, index: int, total, steps, step, x, sigma):
+def _begin_step(p: Pass, index: int, total, steps, step, x, sigma, cond_scale=None):
     try:
         if p.schedule is not None:
             p.schedule.begin(index, total, steps, step, sigma)
@@ -2730,7 +2752,7 @@ def _begin_step(p: Pass, index: int, total, steps, step, x, sigma):
             elif not p.schedule.idle:
                 p.tracker.begin(index, x)
         elif p.dit_speed is not None:
-            p.dit_speed.begin(index, total, steps, step, sigma)
+            p.dit_speed.begin(index, total, steps, step, sigma, cond_scale=cond_scale)
             _prompts.clear()
     except Exception as e:
         p.drop_speed_hacks(f"Speed Hacks failed ({e})", e)
@@ -2797,7 +2819,17 @@ def _wrap_denoiser(original):
                 from modules import shared
 
                 state = shared.state
-                current_state = (int(self.step), self.total_steps, state.sampling_steps, state.sampling_step, x, sigma)
+                cond_scale = kwargs.get("cond_scale") if "cond_scale" in kwargs else (args[2] if len(args) >= 3 else None)
+                proc = getattr(self, "p", None)
+                if proc is not None and getattr(proc, "is_hr_pass", False):
+                    hr_cfg = getattr(proc, "hr_cfg", None)
+                    if hr_cfg:
+                        cond_scale = hr_cfg
+                if getattr(self, "_refiner_pass", False) and proc is not None:
+                    ref_cfg = getattr(proc, "refiner_cfg", None)
+                    if ref_cfg:
+                        cond_scale = ref_cfg
+                current_state = (int(self.step), self.total_steps, state.sampling_steps, state.sampling_step, x, sigma, cond_scale)
                 if p is not None and p.fallback is None and state.sampling_steps:
                     step_now = int(state.sampling_step)
                     p._remaining_steps = max(0, int(state.sampling_steps) - step_now)
@@ -2996,7 +3028,7 @@ def _note_prompts(schedules_of, step):
     if _pass is None or _pass.fallback is not None:
         return
     sched = _pass.schedule if _pass.schedule is not None else _pass.dit_speed
-    if sched is None or sched.idle or sched.done:
+    if sched is None or sched.idle or (sched.done and not (isinstance(sched, dit_speed.DiTSchedule) and sched.tail_cfg_active())):
         return
     try:
         _prompts.append(tuple(_cond_key(s, step) for s in schedules_of()))
@@ -3016,6 +3048,12 @@ def _wrap_reconstruct_cond_batch(original):
 def _wrap_reconstruct_multicond_batch(original):
     def reconstruct_multicond_batch(c, current_step):
         _note_prompts(lambda: [prompt.schedules for prompts in c.batch for prompt in prompts], current_step)
+        if _pass is not None and _pass.fallback is None and _pass.dit_speed is not None:
+            try:
+                if any(len(prompts) > 1 for prompts in c.batch):
+                    _pass.dit_speed.note_multi_cond()
+            except Exception:
+                pass
         return original(c, current_step)
 
     reconstruct_multicond_batch._trt_original = original

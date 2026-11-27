@@ -45,7 +45,7 @@ Swapped-out engines are kept in RAM (with their weights) when there's room to sp
 
 **Speed Hacks** accelerate denoising steps with adaptive closed-loop error control:
 - On **UNets** (SD 1.x / SD 2.x / SDXL), they implement [DeepCache](https://github.com/horseee/DeepCache) – about half of the steps run on a small engine of the outermost blocks using cached deep features, with fresh noise separated out for ancestral/SDE samplers.
-- On **DiTs** (Anima / MOSS-Image), they use clean-image ($\\hat{x}_0$) damped Hermite trajectory forecasting with zero extra engine or VRAM overhead, keeping ancestral/SDE samplers fresh-noise safe and adapting independently to conditional and unconditional drift.
+- On **DiTs** (Anima / MOSS-Image), they combine quality-tiered trajectory forecasting (self-selecting between VDE and FreqCa in clean-image $\\hat{x}_0$-space with Wiener/guidance-aware error checks) and late/mid-pass CFG acceleration, with zero extra engine or VRAM overhead while keeping ancestral/SDE samplers fresh-noise safe.
 
 The first 15%, and last 5% of steps are always computed in full, as they determine composition, and fine detail. In between, **quality** sets how long a full step may wait while the measured error stays within tolerance. All three are adjustable in **Settings → Stable Diffusion → TensorRT**, and in the X/Y/Z plot script.
 """
