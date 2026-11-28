@@ -68,10 +68,15 @@ def _fingerprint_head(t) -> torch.Tensor:
         parts = [_head_bytes(qdata, 16)]
         params = getattr(t, "_params", None)
         if params is not None:
-            for attr in ("scale", "block_scale", "s_channel", "codebook", "correction"):
-                val = getattr(params, attr, None)
-                if isinstance(val, torch.Tensor):
+            p_tensors = compat.param_tensor_attrs(params)
+            if p_tensors is not None:
+                for _, val in p_tensors:
                     parts.append(_head_bytes(val, 4))
+            else:
+                for attr in ("scale", "block_scale", "s_channel", "codebook", "correction"):
+                    val = getattr(params, attr, None)
+                    if isinstance(val, torch.Tensor):
+                        parts.append(_head_bytes(val, 4))
         return torch.cat(parts) if len(parts) > 1 else parts[0]
     return _head_bytes(t.data, 16)
 
@@ -170,7 +175,10 @@ class EffectiveWeights:
         if quant.is_weight_scale_weight(name):
             return True
         base_name = quant.base_weight_name(name)
-        return bool(self._patches_for(base_name) or self.converters.get(base_name) is not None or compat.is_quantized_weight(self.base(base_name)))
+        if self._patches_for(base_name) or self.converters.get(base_name) is not None:
+            return True
+        raw = self.base(base_name)
+        return compat.is_quantized_weight(raw) or compat.is_plain_fp8_tensor(raw)
 
     def _native_act_scales(self, kind: str) -> dict:
         if kind not in (quant.FP8, quant.FP4):
@@ -178,19 +186,37 @@ class EffectiveWeights:
         cached = self._native_act_cache.get(kind)
         if cached is not None:
             return cached
-        raw_vals = []
-        scales = {}
+        raw_by_fmt = {}
+        entries = {}  # base_name -> (layer_fmt, raw_v, trt_v)
         for base_name, mod in self.weight_modules.items():
             if not base_name.endswith(".weight") or not self.has(base_name):
                 continue
-            found = compat.native_input_scale(mod, self.base(base_name), kind)
+            w = self.base(base_name)
+            found = compat.native_input_scale(mod, w, kind)
             if found is not None:
                 raw_v, trt_v = found
-                raw_vals.append(raw_v)
-                scales[base_name] = trt_v
-        # Reject uncalibrated checkpoints that store 1.0 as a placeholder input_scale on every layer.
-        if raw_vals and all(v == 1.0 for v in raw_vals):
-            scales = {}
+                layer_fmt, _ = compat.layer_quant_format(w, mod)
+                raw_by_fmt.setdefault(layer_fmt, []).append(raw_v)
+                entries[base_name] = (layer_fmt, raw_v, trt_v)
+        # Reject uncalibrated formats that store 1.0 as a placeholder input_scale on every layer of that format.
+        bad_fmts = {fmt for fmt, vals in raw_by_fmt.items() if vals and all(v == 1.0 for v in vals)}
+        per_layer = {k: (raw_v, trt_v) for k, (fmt, raw_v, trt_v) in entries.items() if fmt not in bad_fmts}
+        scales = {}
+        if per_layer:
+            # Share max(sibling_scales) across projections guaranteed to consume the same input activation
+            # (e.g. self_attn.{q,k,v}, cross_attn.{k,v}, ffn_up/ffn_gate) so hybrid checkpoints keeping one
+            # sibling in BF16 inherit calibrated scales and shared QDQ sites never clip any sibling.
+            # If any sibling in a group has a calibrated scale (raw_v != 1.0), drop default 1.0 placeholders in that group.
+            groups = {}
+            for base_name, pair in per_layer.items():
+                sibs = quant.shared_input_siblings(base_name)
+                groups.setdefault(sibs, []).append(pair)
+            for sibs, pairs in groups.items():
+                calibrated = [trt_v for raw_v, trt_v in pairs if raw_v != 1.0]
+                val = max(calibrated) if calibrated else max(trt_v for _, trt_v in pairs)
+                for sib in sibs:
+                    if self.has(sib):
+                        scales[sib] = val
         self._native_act_cache[kind] = scales
         return scales
 
@@ -325,8 +351,12 @@ class EffectiveWeights:
         if items is not None:
             dev = gpu_base.device
             return self.apply_fast_lora(gpu_base, [(u.to(dev), d.to(dev), s) for u, d, s in items], dtype)
-        weight = compat.dequantize_weight(gpu_base, self.converters.get(base_name))
+        conv = self.converters.get(base_name)
         patches = self._patches_for(base_name)
+        if conv is None and not patches and type(gpu_base) is torch.Tensor:
+            # Direct cast (e.g. plain FP8 -> BF16/FP16 upcast) avoids an FP32 intermediate; copy=True prevents aliasing gpu_bufs.
+            return gpu_base.to(dtype, copy=True, memory_format=torch.contiguous_format)
+        weight = compat.dequantize_weight(gpu_base, conv)
         if patches:
             weight = compat.merge_weight(patches, weight, PREFIX + base_name)
         return weight.to(dtype)

@@ -10,7 +10,7 @@ from collections import deque
 import tensorrt as trt
 import torch
 
-from . import common, gpu, quant
+from . import common, compat, gpu, quant
 from .common import gib, logger
 
 # The refitter prepares host weights on one CPU thread by default, and scans every weight for NaN/Inf. The weights are
@@ -26,6 +26,8 @@ _TRT_INT8 = getattr(trt.DataType, "INT8", None)
 _TRT_FP8 = getattr(trt.DataType, "FP8", None)
 _TRT_INT4 = getattr(trt.DataType, "INT4", None)
 _TRT_FP4 = getattr(trt.DataType, "FP4", None)
+_TRT_E8M0 = getattr(trt.DataType, "E8M0", None)
+_TRT_UINT8 = getattr(trt.DataType, "UINT8", None)
 
 _DTYPES = {
     trt.DataType.FLOAT: torch.float32,
@@ -39,6 +41,10 @@ if _TRT_INT8 is not None:
     _DTYPES[_TRT_INT8] = torch.int8
 if _TRT_FP8 is not None and hasattr(torch, "float8_e4m3fn"):
     _DTYPES[_TRT_FP8] = torch.float8_e4m3fn
+if _TRT_UINT8 is not None:
+    _DTYPES[_TRT_UINT8] = torch.uint8
+if _TRT_E8M0 is not None:
+    _DTYPES[_TRT_E8M0] = torch.uint8
 
 
 def torch_dtype(dtype):
@@ -51,8 +57,13 @@ def _is_packed_4bit(trt_dtype) -> bool:
     return (_TRT_INT4 is not None and trt_dtype == _TRT_INT4) or (_TRT_FP4 is not None and trt_dtype == _TRT_FP4)
 
 
-def _quant_kind(trt_dtype):
+def _quant_kind(trt_dtype, scale_dtype=None):
     if _TRT_FP8 is not None and trt_dtype == _TRT_FP8:
+        if scale_dtype is not None and (
+            (_TRT_E8M0 is not None and scale_dtype == _TRT_E8M0)
+            or (_TRT_UINT8 is not None and scale_dtype == _TRT_UINT8)
+        ):
+            return quant.MXFP8
         return quant.FP8
     if _TRT_INT8 is not None and trt_dtype == _TRT_INT8:
         return quant.INT8
@@ -446,15 +457,31 @@ class Engine:
                         items = source.fast_lora(n) if has_fast_lora else None
                         if items is not None:
                             fast_map[n] = items
-                        b = source.base(n)
-                        if type(b) is torch.Tensor:
+                        plan = compat.staging_plan(source.base(n))
+                        if plan is not None:
+                            raw_parts, _ = plan
                             gpu_nb = pin_nb = 0
-                            if not b.is_cuda and b.is_contiguous():
-                                b_nb = align16(b.numel() * b.element_size())
-                                gpu_nb += b_nb
-                                if not b.is_pinned():
-                                    pin_nb += b_nb
-                            if items is not None:
+                            ok_parts = True
+                            for pi, p in enumerate(raw_parts):
+                                if p.is_cuda:
+                                    if p.device != dev:
+                                        ok_parts = False
+                                        break
+                                    continue
+                                if pi == 0 and not p.is_contiguous():
+                                    ok_parts = False
+                                    break
+                                nb = p.numel() * p.element_size()
+                                if nb == 0:
+                                    ok_parts = False
+                                    break
+                                p_nb = align16(nb)
+                                gpu_nb += p_nb
+                                if not (p.is_contiguous() and p.is_pinned()):
+                                    pin_nb += p_nb
+                            if not ok_parts:
+                                gpu_nb = pin_nb = 0
+                            if items is not None and ok_parts:
                                 for up, down, _ in items:
                                     if not up.is_cuda:
                                         u_nb = align16(up.numel() * up.element_size())
@@ -472,10 +499,10 @@ class Engine:
                                 pin_stage_sizes.append(pin_nb)
                 if len(gpu_stage_sizes) >= 2:
                     vram_cap = max(0, free_b - (256 << 20)) // (6 if quant_bases else 8)
-                    max_cap = 160 << 20 if quant_bases else (32 << 20)
+                    max_cap = 160 << 20 if quant_bases else (128 << 20)
                     gpu_buf_size = min(max_cap, max(gpu_stage_sizes), vram_cap)
                     pin_size = min(gpu_buf_size, max(pin_stage_sizes)) if pin_stage_sizes else 0
-                    if gpu_buf_size >= (4 << 20):
+                    if vram_cap >= (4 << 20) and gpu_buf_size >= (256 << 10):
                         try:
                             if pin_size > 0:
                                 pins = [torch.empty(pin_size, dtype=torch.uint8, pin_memory=True) for _ in range(2)]
@@ -613,7 +640,11 @@ class Engine:
                                 if not has_quant_api:
                                     raise RuntimeError(f"Quantized weight {w_name} requires EffectiveWeights")
                                 gpu_base = source.base(w_name).to(dev)
-                                scale_dt = s_info[2] if s_info is not None else (torch.float8_e4m3fn if qkind == quant.FP4 else torch.float32)
+                                scale_dt = (
+                                    s_info[2]
+                                    if s_info is not None
+                                    else (torch.float8_e4m3fn if qkind == quant.FP4 else (torch.uint8 if qkind == quant.MXFP8 else torch.float32))
+                                )
                                 gs_dt = gs_info[2] if gs_info is not None else None
                                 res = source.quantize_on_gpu(w_name, gpu_base, qkind, scale_dt, gscale_dtype=gs_dt)
                                 bind_quant(w_name, w_proto, qkind, s_info, gs_info, res, bind_w, bind_s, bind_gs)
@@ -634,9 +665,6 @@ class Engine:
                                 if quant.is_weight_scale_weight(name):
                                     w_name = quant.weight_name_of_scale(name)
                                     w_proto = refitter.get_weights_prototype(w_name)
-                                    qkind = _quant_kind(w_proto.dtype)
-                                    if qkind is None:
-                                        raise RuntimeError(f"Scale {name} has non-quantized base weight {w_name}")
                                     s_name = quant.scale_weight_name(w_name)
                                     s_info = None
                                     if s_name == name:
@@ -645,6 +673,9 @@ class Engine:
                                     elif s_name in weight_set:
                                         s_proto = refitter.get_weights_prototype(s_name)
                                         s_info = (s_name, s_proto, torch_dtype(s_proto.dtype))
+                                    qkind = _quant_kind(w_proto.dtype, s_info[1].dtype if s_info is not None else None)
+                                    if qkind is None:
+                                        raise RuntimeError(f"Scale {name} has non-quantized base weight {w_name}")
                                     gs_info = _gscale_info(w_name, qkind)
                                     if gs_info is not None and gs_info[0] == name and proto is not None:
                                         gs_info = (name, proto, dt if dt is not None else torch_dtype(proto.dtype))
@@ -671,6 +702,7 @@ class Engine:
                                     if s_name in weight_set:
                                         s_proto = refitter.get_weights_prototype(s_name)
                                         s_info = (s_name, s_proto, torch_dtype(s_proto.dtype))
+                                        qkind = _quant_kind(proto.dtype, s_proto.dtype)
                                     gs_info = _gscale_info(name, qkind)
                                     bind_s = (
                                         s_info is not None
@@ -734,6 +766,7 @@ class Engine:
                                     if s_name in weight_set:
                                         s_proto = refitter.get_weights_prototype(s_name)
                                         s_info = (s_name, s_proto, torch_dtype(s_proto.dtype))
+                                        qkind = _quant_kind(proto.dtype, s_proto.dtype)
                                         if s_name not in done and s_name not in seen_in_chunk:
                                             nb += _proto_nbytes(s_proto)
                                     gs_info = _gscale_info(name, qkind)
@@ -772,56 +805,22 @@ class Engine:
                                     if quant.is_any_scale_weight(name):
                                         return None, None, None
                                     base = source.base(name)
-                                    if type(base) is not torch.Tensor:
+                                    plan = compat.staging_plan(base)
+                                    if plan is None:
                                         return None, None, None
+                                    base_parts, rebuild_base = plan
                                     items = fast_map.get(name)
-                                    base_on_dev = base.is_cuda and base.device == dev
-                                    if items is None:
-                                        if base_on_dev:
-                                            return None, base, None
-                                        nb = base.numel() * base.element_size()
-                                        base_pinned = not base.is_cuda and base.is_contiguous() and base.is_pinned()
-                                        if (
-                                            gpu_bufs is None
-                                            or base.is_cuda
-                                            or not base.is_contiguous()
-                                            or nb == 0
-                                            or nb > gpu_buf_size
-                                            or (not base_pinned and (pins is None or nb > pin_size))
-                                        ):
-                                            return None, base.to(dev), None
-                                        slot = idx & 1
-                                        gv = gpu_bufs[slot][:nb].view(base.dtype).view(base.shape)
-                                        if base_pinned:
-                                            keep_pinned.append(base)
-                                            with torch.cuda.stream(copy_stream):
-                                                if slot_used[slot]:
-                                                    copy_stream.wait_event(ev_use[slot])
-                                                gv.copy_(base, non_blocking=True)
-                                                ev_copy[slot].record(copy_stream)
-                                        else:
-                                            if slot_used[slot]:
-                                                ev_copy[slot].synchronize()
-                                            pv = pins[slot][:nb].view(base.dtype).view(base.shape)
-                                            pv.copy_(base)
-                                            with torch.cuda.stream(copy_stream):
-                                                if slot_used[slot]:
-                                                    copy_stream.wait_event(ev_use[slot])
-                                                gv.copy_(pv, non_blocking=True)
-                                                ev_copy[slot].record(copy_stream)
-                                        slot_used[slot] = True
-                                        return slot, gv, None
-
-                                    tensors = [base]
+                                    n_base = len(base_parts)
+                                    tensors = list(base_parts)
                                     scales = []
-                                    for up, down, sc in items:
-                                        tensors.append(up)
-                                        tensors.append(down)
-                                        scales.append(sc)
+                                    if items is not None:
+                                        for up, down, sc in items:
+                                            tensors.append(up)
+                                            tensors.append(down)
+                                            scales.append(sc)
                                     if all(t.is_cuda and t.device == dev for t in tensors):
                                         return None, base, items
-                                    can_pack = gpu_bufs is not None and (base_on_dev or (not base.is_cuda and base.is_contiguous()))
-                                    base_pinned = can_pack and not base_on_dev and base.is_pinned()
+                                    can_pack = gpu_bufs is not None
                                     offsets = []
                                     total = 0
                                     pin_total = 0
@@ -833,21 +832,25 @@ class Engine:
                                                     break
                                                 offsets.append(None)
                                             else:
+                                                if ti == 0 and not t.is_contiguous():
+                                                    can_pack = False
+                                                    break
                                                 if ti > 0 and not t.is_contiguous():
                                                     t = tensors[ti] = t.contiguous()
                                                 nb = t.numel() * t.element_size()
                                                 if nb == 0:
                                                     can_pack = False
                                                     break
-                                                direct = (ti == 0 and base_pinned) or (ti > 0 and t.is_pinned())
-                                                if direct:
+                                                if t.is_pinned():
                                                     offsets.append((total, nb, t.dtype, t.shape, None))
                                                 else:
                                                     offsets.append((total, nb, t.dtype, t.shape, pin_total))
                                                     pin_total = align16(pin_total + nb)
                                                 total = align16(total + nb)
                                     if not can_pack or total == 0 or total > gpu_buf_size or (pin_total > 0 and (pins is None or pin_total > pin_size)):
-                                        g_base = base if base_on_dev else base.to(dev)
+                                        g_base = rebuild_base([p if (p.is_cuda and p.device == dev) else p.to(dev) for p in base_parts])
+                                        if items is None:
+                                            return None, g_base, None
                                         g_items = [
                                             (
                                                 u if (u.is_cuda and u.device == dev) else u.to(dev),
@@ -877,22 +880,15 @@ class Engine:
                                             gbuf[:total].copy_(pins[slot][:total], non_blocking=True)
                                         else:
                                             for t, spec in zip(tensors, offsets):
-                                                if spec is not None:
-                                                    goff, nb, tdt, sh, poff = spec
-                                                    if poff is None:
-                                                        gbuf[goff : goff + nb].view(tdt).view(sh).copy_(t, non_blocking=True)
+                                                if spec is not None and spec[4] is None:
+                                                    goff, nb, tdt, sh, _ = spec
+                                                    gbuf[goff : goff + nb].view(tdt).view(sh).copy_(t, non_blocking=True)
                                             if pin_total > 0:
-                                                # Packed unpinned tensors share contiguous trailing/interleaved offsets in pbuf;
-                                                # copy each into its GPU slot (or a single bulk DMA when base is the only pinned tensor).
                                                 pbuf = pins[slot]
-                                                contiguous_pin = all(
-                                                    spec[0] - (offsets[0][0] + align16(offsets[0][1]) if offsets[0] is not None and offsets[0][4] is None else 0) == spec[4]
-                                                    for spec in offsets[1:]
-                                                    if spec is not None and spec[4] is not None
-                                                ) and all(spec is None or spec[4] is not None for spec in offsets[1:])
-                                                if contiguous_pin and offsets[0] is not None and offsets[0][4] is None:
-                                                    base_end = align16(offsets[0][1])
-                                                    gbuf[base_end : base_end + pin_total].copy_(pbuf[:pin_total], non_blocking=True)
+                                                deltas = {spec[0] - spec[4] for spec in offsets if spec is not None and spec[4] is not None}
+                                                if len(deltas) == 1:
+                                                    base_off = next(iter(deltas))
+                                                    gbuf[base_off : base_off + pin_total].copy_(pbuf[:pin_total], non_blocking=True)
                                                 else:
                                                     for spec in offsets:
                                                         if spec is not None and spec[4] is not None:
@@ -904,8 +900,11 @@ class Engine:
                                         t if spec is None else gbuf[spec[0] : spec[0] + spec[1]].view(spec[2]).view(spec[3])
                                         for t, spec in zip(tensors, offsets)
                                     ]
-                                    g_items = [(gviews[1 + 2 * i], gviews[2 + 2 * i], scales[i]) for i in range(len(scales))]
-                                    return slot, gviews[0], g_items
+                                    g_base = rebuild_base(gviews[:n_base])
+                                    if items is None:
+                                        return slot, g_base, None
+                                    g_items = [(gviews[n_base + 2 * i], gviews[n_base + 2 * i + 1], scales[i]) for i in range(len(scales))]
+                                    return slot, g_base, g_items
 
                                 staged = stage(0, gpu_items[0][0])
                                 for idx, (name, proto, dt, qkind, qpair) in enumerate(gpu_items):
@@ -928,7 +927,11 @@ class Engine:
                                             continue
                                         if slot is not None:
                                             compute_stream.wait_event(ev_copy[slot])
-                                        scale_dt = s_info[2] if s_info is not None else (torch.float8_e4m3fn if qkind == quant.FP4 else torch.float32)
+                                        scale_dt = (
+                                            s_info[2]
+                                            if s_info is not None
+                                            else (torch.float8_e4m3fn if qkind == quant.FP4 else (torch.uint8 if qkind == quant.MXFP8 else torch.float32))
+                                        )
                                         gs_dt = gs_info[2] if gs_info is not None else None
                                         res = source.quantize_on_gpu(
                                             name,

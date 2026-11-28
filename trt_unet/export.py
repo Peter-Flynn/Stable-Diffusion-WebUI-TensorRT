@@ -203,6 +203,7 @@ def _weightless_graph(
     quantize_precision: str = None,
     act_dtype: torch.dtype = None,
     weight_bytes_out: list = None,
+    arch: Arch = None,
 ) -> dict:
     # Turns the weight inputs into initializers backed by one small sparse file of zeros: TensorRT needs only their
     # shapes, and refitting supplies the values. The parser maps that file once and TensorRT identifies weights by
@@ -241,7 +242,7 @@ def _weightless_graph(
         del shapes[value.name]
 
     if quantize_precision and quant.is_quantized_precision(quantize_precision):
-        quant.quantize_onnx_graph(model, quantize_precision, act_dtype or torch.bfloat16, shapes=shapes)
+        quant.quantize_onnx_graph(model, quantize_precision, act_dtype or torch.bfloat16, shapes=shapes, arch=arch)
 
     data_name = os.path.basename(onnx_path) + ".zeros"
     end = 0
@@ -275,6 +276,7 @@ def _weightless_graph(
         onnx.TensorProto.FLOAT: torch.float32,
         onnx.TensorProto.FLOAT16: torch.float16,
         onnx.TensorProto.BFLOAT16: torch.bfloat16,
+        onnx.TensorProto.UINT8: torch.uint8,
     }
     if hasattr(torch, "float8_e4m3fn"):
         _elem_to_torch[onnx.TensorProto.FLOAT8E4M3FN] = torch.float8_e4m3fn
@@ -288,24 +290,32 @@ def _weightless_graph(
         end = offset + nbytes
         _add_external_init(value, offset, nbytes, dims)
         dt = _elem_to_torch[t.elem_type]
-        if dt == torch.bfloat16:
-            # 2048 distinct strictly positive normal BF16 values in (0.03125, 2048.0] so scalar scales never collide.
-            v = torch.tensor(0x3D00 + (s_idx % 2048) + 1, dtype=torch.uint16).view(torch.bfloat16)
-        elif dt == torch.float16:
-            v = torch.tensor(0x3000 + (s_idx % 4096) + 1, dtype=torch.uint16).view(torch.float16)
-        elif hasattr(torch, "float8_e4m3fn") and dt == torch.float8_e4m3fn:
-            # 64 strictly positive normal FP8 E4M3 values in [0.125, 30.0] (4096 distinct pairs with buf[1]).
-            v = torch.tensor(0x20 + (s_idx % 64), dtype=torch.uint8).view(torch.float8_e4m3fn)
+        if dt == torch.uint8:
+            # Valid E8M0 scale bytes (127 = 2^0 = 1.0); 64x64 = 4096 distinct pairs in [96..159] prevent deduplication.
+            buf = torch.full(dims, 127, dtype=torch.uint8).reshape(-1)
+            if buf.numel() >= 1:
+                buf[0] = 96 + (s_idx % 64)
+            if buf.numel() >= 2:
+                buf[1] = 96 + ((s_idx // 64) % 64)
         else:
-            v = torch.tensor(1.0 + (s_idx + 1) * 1e-4, dtype=torch.float32)
-        buf = torch.ones(dims, dtype=dt).reshape(-1)
-        if buf.numel() >= 1:
-            buf[0] = v
-        if buf.numel() >= 2:
-            if hasattr(torch, "float8_e4m3fn") and dt == torch.float8_e4m3fn:
-                buf[1] = torch.tensor(0x20 + ((s_idx // 64) % 64), dtype=torch.uint8).view(torch.float8_e4m3fn)
+            if dt == torch.bfloat16:
+                # 2048 distinct strictly positive normal BF16 values in (0.03125, 2048.0] so scalar scales never collide.
+                v = torch.tensor(0x3D00 + (s_idx % 2048) + 1, dtype=torch.uint16).view(torch.bfloat16)
+            elif dt == torch.float16:
+                v = torch.tensor(0x3000 + (s_idx % 4096) + 1, dtype=torch.uint16).view(torch.float16)
+            elif hasattr(torch, "float8_e4m3fn") and dt == torch.float8_e4m3fn:
+                # 64 strictly positive normal FP8 E4M3 values in [0.125, 30.0] (4096 distinct pairs with buf[1]).
+                v = torch.tensor(0x20 + (s_idx % 64), dtype=torch.uint8).view(torch.float8_e4m3fn)
             else:
-                buf[1] = 1.0 + ((s_idx // 1024) + 1) * 0.015625
+                v = torch.tensor(1.0 + (s_idx + 1) * 1e-4, dtype=torch.float32)
+            buf = torch.ones(dims, dtype=dt).reshape(-1)
+            if buf.numel() >= 1:
+                buf[0] = v
+            if buf.numel() >= 2:
+                if hasattr(torch, "float8_e4m3fn") and dt == torch.float8_e4m3fn:
+                    buf[1] = torch.tensor(0x20 + ((s_idx // 64) % 64), dtype=torch.uint8).view(torch.float8_e4m3fn)
+                else:
+                    buf[1] = 1.0 + ((s_idx // 1024) + 1) * 0.015625
         scale_writes.append((offset, buf.contiguous().view(torch.uint8).numpy().tobytes()))
 
     with open(os.path.join(os.path.dirname(onnx_path), data_name), "wb") as f:
@@ -417,7 +427,7 @@ def _export_dit_onnx(arch: Arch, patcher, folder: str, device, precision: str) -
     loaded = {k: list(v.shape) for k, v in {**dm.state_dict(keep_vars=True), **dict(dm.named_parameters())}.items()}
     wb_full = []
     full_shapes = _weightless_graph(
-        onnx_path, names, (exported, loaded), quantize_precision=precision, act_dtype=act_dtype, weight_bytes_out=wb_full
+        onnx_path, names, (exported, loaded), quantize_precision=precision, act_dtype=act_dtype, weight_bytes_out=wb_full, arch=arch
     )
     return {
         "unet": full_shapes,

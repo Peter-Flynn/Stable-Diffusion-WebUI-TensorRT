@@ -64,6 +64,34 @@ class Arch:
             return 1
         return 77
 
+    @property
+    def quant_prefixes(self) -> tuple:
+        if self.kind == "anima":
+            return ("blocks.",)
+        if self.kind == "moss_image":
+            return ("layers.", "text_embedder.blocks.")
+        return ()
+
+    @property
+    def int8_skip_substrings(self) -> tuple:
+        # Uniform INT8 activations clip severely after unbounded / extreme-dynamic-range FFN activations
+        # (MOSS-Image SiTU in [-100, 100] -> ffn_down, Anima GELU up to ~170 -> mlp.layer2).
+        if self.kind == "anima":
+            return ("mlp.layer2",)
+        if self.kind == "moss_image":
+            return ("ffn_down",)
+        return ()
+
+    @property
+    def fp4_fp8_fallback_suffixes(self) -> tuple:
+        # Separate attention Value projections stay in FP8 inside NVFP4 engines (avoids NVIDIA/TensorRT#4879
+        # batched V-GEMM transpose corruption on SM100/SM120 and protects attention fidelity).
+        if self.kind == "anima":
+            return (".v_proj.weight",)
+        if self.kind == "moss_image":
+            return (".proj.v.weight",)
+        return ()
+
     def spatial(self, shape) -> tuple:
         if len(shape) == 5:
             return int(shape[0]), int(shape[1]), int(shape[3]), int(shape[4])

@@ -25,11 +25,11 @@ SETTLED = threading.Event()
 MODE_LABELS = {store.PER_PROFILE: "Per-profile engines", store.MERGED: "Merged engine"}
 MERGED_VRAM, MERGED_RAM = 24, 64
 HELP = """
-**Engines** are built per architecture, rather than per checkpoint. They hold no weights – those of the loaded checkpoint, and LoRAs are loaded into them, so every checkpoint of the same architecture (fine-tunes, merges, v-prediction models, and quantized checkpoints such as FP8, INT8, NVFP4, or GGUF) uses the same engines.
+**Engines** are built per architecture, rather than per checkpoint. They hold no weights – those of the loaded checkpoint, and LoRAs are loaded into them, so every checkpoint of the same architecture (fine-tunes, merges, v-prediction models, and quantized checkpoints such as FP8, MXFP8, INT8, NVFP4, or GGUF) uses the same engines.
 
 **Profiles** set the resolutions, batch sizes, and prompt lengths the engines are built for. Each is tuned for its optimal values, and accepts anything from min to max – narrower ranges build faster, and can run slightly faster. Anything unsupported by the engines (ControlNet, model patches like FreeU, reference-image edit modes, Skip Layer Guidance, or sizes outside every profile) is run on PyTorch instead, with a notice.
 
-**Engine precision** (in **Advanced**, for DiT models such as Anima and MOSS-Image) chooses the execution precision. `Auto` matches dedicated `NVFP4` (Blackwell) and `FP8` (Ada/Hopper/Blackwell) checkpoints natively for zero re-quantization loss, and otherwise picks the highest-quality precision supported by your GPU that fits VRAM (`BF16`, `FP8`, `NVFP4` on Blackwell, `INT8`, `INT4`, or `FP16` with an FP32 residual stream on Turing). Pre-quantized `NVFP4`, `GGUF NVFP4`, `FP8`, and standard `INT8` weights (and calibrated `input_scale`s) pass straight through into matching engines without re-quantizing; GPUs without hardware support for a checkpoint's format upcast automatically. **Keep engines for other precisions** retains previously built precisions on disk so you can switch between them without rebuilding; uncheck it to remove other precisions on the next build.
+**Engine precision** (in **Advanced**, for DiT models such as Anima and MOSS-Image) chooses the execution precision. `Auto` matches dedicated `NVFP4`, `MXFP8` (Blackwell), and `FP8` (Ada/Hopper/Blackwell) checkpoints natively for zero re-quantization loss, and otherwise picks the highest-quality precision supported by your GPU that fits VRAM (`BF16`, `MXFP8` / `NVFP4` on Blackwell, `FP8`, `INT8`, `INT4`, or `FP16` with an FP32 residual stream on Turing). Pre-quantized `NVFP4`, `GGUF NVFP4`, `MXFP8`, `FP8`, and standard `INT8` weights (and calibrated `input_scale`s) pass straight through into matching engines without re-quantizing; GPUs without hardware support for a checkpoint's format upcast automatically. **Keep engines for other precisions** retains previously built precisions on disk so you can switch between them without rebuilding; uncheck it to remove other precisions on the next build.
 
 **Engine modes** are chosen on first build, and can only be changed while no engines exist:
 - *Per-profile engines* – one engine per profile, loaded as needed. Only one is loaded at a time, using about as much VRAM as the checkpoint's model. Each batch starts on the engine that fits it best, and stays on it for any later pass (ex. Hires. fix) it covers.
@@ -240,7 +240,7 @@ def quant_warning_state(*, sm: tuple = None, total_vram: int = None) -> dict:
         records, saved, target, effective = store.resolve_runtime_engines(arch, patcher, sm=sm, total_vram=total_vram)
         if not records or effective not in (quant.INT4, quant.FP4):
             return hidden
-        ckpt_info = quant.checkpoint_quant_info(patcher)
+        ckpt_info = quant.checkpoint_quant_info(patcher, arch=arch)
         if ckpt_info.is_native_passthrough(effective):
             return hidden
         prec_label = quant.LABELS.get(effective, effective)
@@ -257,6 +257,19 @@ def quant_warning_state(*, sm: tuple = None, total_vram: int = None) -> dict:
                     tip = (
                         f"Your checkpoint uses {src_label}, which requires an RTX 50-series (Blackwell) GPU for native "
                         f"4-bit TensorRT pass-through, so {prec_label} is re-quantizing its weights and degrading quality. "
+                        f"Set SD Unet to None in Settings to run it on PyTorch, or build a higher-precision engine if VRAM allows."
+                    )
+            elif ckpt_info.is_native_passthrough(quant.MXFP8) or ckpt_info.dominant == quant.MXFP8:
+                if quant.MXFP8 in quant.supported_precisions(sm):
+                    tip = (
+                        f"Your checkpoint uses {src_label}, which supports lossless native MXFP8 pass-through on this GPU "
+                        f"when VRAM allows, but TensorRT is currently running {prec_label} engines and re-quantizing its weights onto 4-bit. "
+                        f"Open the TensorRT tab to build MXFP8 engines if VRAM allows, or set SD Unet to None in Settings to run it on PyTorch."
+                    )
+                else:
+                    tip = (
+                        f"Your checkpoint uses {src_label}, which requires an RTX 50-series (Blackwell) GPU for native "
+                        f"MXFP8 TensorRT pass-through, so {prec_label} is re-quantizing its weights onto 4-bit and degrading quality. "
                         f"Set SD Unet to None in Settings to run it on PyTorch, or build a higher-precision engine if VRAM allows."
                     )
             else:
@@ -341,7 +354,7 @@ def _status(sd_model, arch, records, precision=None, asking=False, patcher=None)
     if arch is None:
         base = f"`{name}` isn't a model TensorRT engines can run (SD 1.x, SD 2.x, SDXL, Anima, and MOSS-Image architectures are supported)."
         return f"{base}\n\n{pending_note}" if pending_note else base
-    ckpt_info = quant.checkpoint_quant_info(patcher) if (arch.is_dit and patcher is not None) else quant.CheckpointQuantInfo()
+    ckpt_info = quant.checkpoint_quant_info(patcher, arch=arch) if (arch.is_dit and patcher is not None) else quant.CheckpointQuantInfo()
     native_pt = bool(arch.is_dit and precision and ckpt_info.is_native_passthrough(precision))
     prec_label = quant.LABELS.get(precision, precision) if precision else ""
     prec_badge = f" · **Precision:** {prec_label}" + (" (native pass-through)" if native_pt else "") if arch.is_dit and precision else ""
@@ -387,6 +400,20 @@ def _status(sd_model, arch, records, precision=None, asking=False, patcher=None)
                             f"**Warning (Low-Quality 4-Bit Re-Quantization):** Your checkpoint uses `{src_label}`, which "
                             f"requires an RTX 50-series (Blackwell) GPU for native 4-bit TensorRT pass-through. Building "
                             f"`{prec_label}` engines will re-quantize its weights and degrade quality — consider running "
+                            f"on PyTorch (`SD Unet: None`) or a higher-precision engine if VRAM allows."
+                        )
+                elif ckpt_info.is_native_passthrough(quant.MXFP8) or ckpt_info.dominant == quant.MXFP8:
+                    if quant.MXFP8 in quant.supported_precisions():
+                        lines.append(
+                            f"**Warning (Low-Quality 4-Bit Re-Quantization):** Your checkpoint uses `{src_label}`, which "
+                            f"supports lossless native `MXFP8` pass-through on this GPU when VRAM allows — switch **Engine precision** "
+                            f"to `Auto` or `MXFP8` in **Advanced** if VRAM allows, or run on PyTorch (`SD Unet: None`)."
+                        )
+                    else:
+                        lines.append(
+                            f"**Warning (Low-Quality 4-Bit Re-Quantization):** Your checkpoint uses `{src_label}`, which "
+                            f"requires an RTX 50-series (Blackwell) GPU for native `MXFP8` TensorRT pass-through. Building "
+                            f"`{prec_label}` engines will re-quantize its weights onto 4-bit and degrade quality — consider running "
                             f"on PyTorch (`SD Unet: None`) or a higher-precision engine if VRAM allows."
                         )
                 else:
@@ -999,7 +1026,7 @@ def on_ui_tabs():
                         choices=["Auto"],
                         value="Auto",
                         visible=False,
-                        info="Auto matches native NVFP4/FP8 checkpoints on supported GPUs (zero re-quantization) and otherwise picks the highest-quality precision that fits VRAM.",
+                        info="Auto matches native NVFP4/MXFP8/FP8 checkpoints on supported GPUs (zero re-quantization) and otherwise picks the highest-quality precision that fits VRAM.",
                         elem_id="trt_precision",
                     )
                     keep_precisions_cb = gr.Checkbox(

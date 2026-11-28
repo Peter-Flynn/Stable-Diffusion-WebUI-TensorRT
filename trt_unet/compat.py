@@ -2,6 +2,8 @@
 # (Haoming02/sd-webui-forge-classic `neo` branch: backend.*). Every module in trt_unet talks to the host WebUI
 # through these helpers so both forks share one code path with zero reForge regressions.
 import contextlib
+import copy
+import dataclasses
 import importlib
 import importlib.util
 import math
@@ -381,6 +383,13 @@ def has_scheduled_lora() -> bool:
     return bool(getattr(_lora_control_cls, "mapping", None)) if _lora_control_cls is not None else False
 
 
+_PLAIN_FP8_DTYPES = tuple(dt for name in ("float8_e4m3fn", "float8_e5m2") if (dt := getattr(torch, name, None)) is not None)
+
+
+def is_plain_fp8_tensor(t) -> bool:
+    return bool(_PLAIN_FP8_DTYPES) and type(t) is torch.Tensor and t.dtype in _PLAIN_FP8_DTYPES
+
+
 def is_quantized_weight(t) -> bool:
     if hasattr(t, "gguf_cls"):
         return t.gguf_cls is not None
@@ -391,6 +400,73 @@ def is_quantized_weight(t) -> bool:
     return bool(getattr(t, "is_quantized", False)) or (
         type(t).__name__ == "QuantizedTensor" and callable(getattr(t, "dequantize", None))
     )
+
+
+def param_tensor_attrs(params, *, plain_only: bool = False):
+    """Returns sorted `(attr_name, tensor)` pairs for tensor fields on a QuantizedTensor `_params` object,
+    or `None` if `_params` cannot be safely introspected (or if `plain_only=True` and a field is a Tensor subclass).
+    """
+    if params is None:
+        return []
+    is_dc = dataclasses.is_dataclass(params)
+    pdict = getattr(params, "__dict__", None)
+    if not is_dc and not isinstance(pdict, dict):
+        return None
+    names = {f.name for f in dataclasses.fields(params)} if is_dc else set()
+    if isinstance(pdict, dict):
+        names.update(pdict.keys())
+    out = []
+    for k in sorted(names):
+        v = getattr(params, k, None)
+        if isinstance(v, torch.Tensor):
+            if plain_only and type(v) is not torch.Tensor:
+                return None
+            out.append((k, v))
+    return out
+
+
+def _first_part(parts):
+    return parts[0]
+
+
+def staging_plan(t):
+    """Unpacks a CPU/CUDA weight (`Tensor`, `ParameterGGUF`, or `QuantizedTensor`) for async pinned-H2D staging.
+
+    Returns `(raw_tensors, rebuild_fn)` where `raw_tensors` is a non-empty list of plain `torch.Tensor`s and
+    `rebuild_fn(staged_tensors)` reconstructs a view-backed weight wrapper on the target device without mutating `t`.
+    Returns `None` if `t` cannot be safely unpacked (caller falls back to `t.to(dev)`).
+    """
+    if type(t) is torch.Tensor:
+        return None if t.device.type == "meta" else ([t], _first_part)
+    if getattr(t, "gguf_cls", None) is not None and callable(getattr(t, "copy_with_data", None)):
+        raw = t.data
+        if type(raw) is torch.Tensor and raw.device.type != "meta":
+            return [raw], lambda parts, src=t: src.copy_with_data(parts[0])
+        return None
+    qdata = getattr(t, "_qdata", None)
+    layout = getattr(t, "_layout_cls", None)
+    params = getattr(t, "_params", None)
+    if type(qdata) is torch.Tensor and layout is not None and params is not None and callable(getattr(t, "dequantize", None)):
+        p_tensors = param_tensor_attrs(params, plain_only=True)
+        if p_tensors is None:
+            return None
+        raw_list = [qdata] + [v for _, v in p_tensors]
+        if any(p.device.type == "meta" for p in raw_list):
+            return None
+        attr_names = [k for k, _ in p_tensors]
+        cls = type(t)
+
+        def _rebuild(parts, _cls=cls, _layout=layout, _params=params, _attrs=attr_names):
+            if _attrs:
+                p_copy = copy.copy(_params)
+                for attr, tv in zip(_attrs, parts[1:]):
+                    object.__setattr__(p_copy, attr, tv)
+            else:
+                p_copy = _params
+            return _cls(parts[0], _layout, p_copy)
+
+        return raw_list, _rebuild
+    return None
 
 
 def dequantize_weight(t, converter=None) -> torch.Tensor:
@@ -410,18 +486,16 @@ def dequantize_weight(t, converter=None) -> torch.Tensor:
         params = getattr(t, "_params", None)
         if isinstance(qdata, torch.Tensor) and params is not None:
             qdev = qdata.device
-            pdict = getattr(params, "__dict__", None)
-            if pdict and any(isinstance(v, torch.Tensor) and v.device != qdev for v in pdict.values()):
+            p_tensors = param_tensor_attrs(params)
+            if p_tensors and any(v.device != qdev for _, v in p_tensors):
                 if callable(getattr(params, "to_device", None)):
                     params = params.to_device(qdev)
-                    pdict = getattr(params, "__dict__", None)
-                if pdict and any(isinstance(v, torch.Tensor) and v.device != qdev for v in pdict.values()):
-                    import copy as _copy
-
-                    params = _copy.copy(params)
-                    for k, v in vars(params).items():
-                        if isinstance(v, torch.Tensor) and v.device != qdev:
-                            setattr(params, k, v.to(qdev))
+                    p_tensors = param_tensor_attrs(params)
+                if p_tensors and any(v.device != qdev for _, v in p_tensors):
+                    params = copy.copy(params)
+                    for k, v in p_tensors:
+                        if v.device != qdev:
+                            object.__setattr__(params, k, v.to(qdev))
                 t = type(t)(qdata, t._layout_cls, params)
         out = converter(t, inplace=True) if converter is not None else t.dequantize()
         return out.to(torch.float32, copy=True)
@@ -430,6 +504,11 @@ def dequantize_weight(t, converter=None) -> torch.Tensor:
     if converter is not None:
         weight = converter(weight, inplace=True)
     return weight
+
+
+def _layout_name(layout) -> str:
+    # Forge Neo subclasses comfy_kitchen layouts with trailing underscores (e.g. TensorCoreNVFP4Layout_).
+    return (layout.__name__ if isinstance(layout, type) else str(layout)).rstrip("_")
 
 
 def layer_quant_format(weight, module=None) -> tuple:
@@ -448,7 +527,7 @@ def layer_quant_format(weight, module=None) -> tuple:
     qdata = getattr(weight, "_qdata", None)
     layout = getattr(weight, "_layout_cls", None)
     if isinstance(qdata, torch.Tensor) and layout is not None:
-        layout_s = layout.__name__ if isinstance(layout, type) else str(layout)
+        layout_s = _layout_name(layout)
         params = getattr(weight, "_params", None)
         if layout_s == "TensorCoreNVFP4Layout":
             return "fp4", "NVFP4"
@@ -526,10 +605,10 @@ def passthrough_quant(
 ):
     """Directly adapts a natively pre-quantized checkpoint weight to TRT refit tensors with zero re-quantization.
 
-    Supports Forge Neo `TensorCoreNVFP4Layout`, raw `ParameterGGUF` (`quants.NVFP4`), `TensorCoreFP8E4M3Layout` /
-    `TensorCoreFP8Layout`, non-ConvRot `TensorWiseINT8Layout`, reForge `scaled_fp8_op` / `fp8_ops`, and Forge Neo
-    plain `float8_e4m3fn` storage. Returns `None` on format mismatch or unsupported layouts so callers fall back
-    cleanly to dequantize -> quantize. Never mutates `gpu_base` or its parameter buffers.
+    Supports Forge Neo `TensorCoreNVFP4Layout`, raw `ParameterGGUF` (`quants.NVFP4`), `TensorCoreMXFP8Layout`,
+    `TensorCoreFP8E4M3Layout` / `TensorCoreFP8Layout`, non-ConvRot `TensorWiseINT8Layout`, reForge `scaled_fp8_op` /
+    `fp8_ops`, and Forge Neo plain `float8_e4m3fn` storage. Returns `None` on format mismatch or unsupported layouts so
+    callers fall back cleanly to dequantize -> quantize. Never mutates `gpu_base` or its parameter buffers.
     """
     from . import quant
 
@@ -549,7 +628,7 @@ def passthrough_quant(
     layout = getattr(gpu_base, "_layout_cls", None)
     params = getattr(gpu_base, "_params", None)
     if isinstance(qdata, torch.Tensor) and layout is not None and params is not None:
-        layout_s = layout.__name__ if isinstance(layout, type) else str(layout)
+        layout_s = _layout_name(layout)
         if getattr(params, "transposed", False):
             return None
         orig_shape = tuple(getattr(params, "orig_shape", ()) or getattr(gpu_base, "shape", ()))
@@ -582,6 +661,26 @@ def passthrough_quant(
                 return None
             q_trt = quant.swap_fp4_nibbles(qdata[:rows, : cols // 2])
             return quant.sanitize_fp4_block_scales(q_trt, w_sf, rows, cols, gscale, gscale_dtype=gscale_dtype)
+        if kind == quant.MXFP8 and layout_s == "TensorCoreMXFP8Layout":
+            if (
+                not hasattr(torch, "float8_e4m3fn")
+                or cols % quant.MXFP8_BLOCK_SIZE != 0
+                or qdata.ndim != 2
+                or qdata.dtype != torch.float8_e4m3fn
+                or qdata.shape[0] < rows
+                or qdata.shape[1] < cols
+            ):
+                return None
+            block_scale = getattr(params, "scale", None)
+            e8m0_dt = getattr(torch, "float8_e8m0fnu", None)
+            allowed_sdt = (e8m0_dt, torch.uint8) if e8m0_dt is not None else (torch.uint8,)
+            if not isinstance(block_scale, torch.Tensor) or block_scale.dtype not in allowed_sdt:
+                return None
+            bs_u8 = block_scale.to(device=qdata.device).contiguous().view(torch.uint8)
+            w_sf = quant.unswizzle_nvfp4_scales(bs_u8, rows, cols // quant.MXFP8_BLOCK_SIZE)
+            if w_sf is None:
+                return None
+            return quant.sanitize_mxfp8_block_scales(qdata[:rows, :cols], w_sf, rows, cols)
         if kind == quant.FP8 and layout_s in ("TensorCoreFP8E4M3Layout", "TensorCoreFP8Layout"):
             if (
                 not hasattr(torch, "float8_e4m3fn")
@@ -637,9 +736,11 @@ def native_input_scale(module, weight, target_kind: str):
         return raw_val, raw_val
     if layer_fmt == "fp4" and target_kind == "fp4":
         return raw_val, raw_val
-    # NVFP4 engines keep separate V projections in FP8: scale_fp8 = amax/448 = (amax/2688) * 6.
+    # NVFP4 engines keep separate V projections in FP8: scale_fp8 = amax/448 = (amax/2688) * 6, and vice versa.
     if layer_fmt == "fp4" and target_kind == "fp8":
         return raw_val, raw_val * 6.0
+    if layer_fmt == "fp8" and target_kind == "fp4":
+        return raw_val, raw_val / 6.0
     return None
 
 
