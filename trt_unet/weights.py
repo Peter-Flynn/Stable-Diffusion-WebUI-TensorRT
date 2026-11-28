@@ -99,6 +99,8 @@ class EffectiveWeights:
         self.backup = getattr(self.patcher, "backup", {}) or {}
         self.patches = getattr(self.patcher, "patches", {}) or {}
         self.wrappers = getattr(self.patcher, "weight_wrapper_patches", {}) or {}
+        self._all_patches_sig = None
+        self._act_scales = {}
 
     def _patches_for(self, name: str):
         base_name = quant.base_weight_name(name)
@@ -111,6 +113,16 @@ class EffectiveWeights:
         if not online:
             return baked
         return (list(baked) if baked else []) + online
+
+    def all_patches_signature(self):
+        if self._all_patches_sig is None:
+            items = []
+            for base_name in sorted(self.params):
+                patches = self._patches_for(base_name)
+                if patches:
+                    items.append((base_name, _identity(patches)))
+            self._all_patches_sig = tuple(items)
+        return self._all_patches_sig
 
     def has(self, name: str) -> bool:
         base_name = quant.base_weight_name(name)
@@ -139,7 +151,7 @@ class EffectiveWeights:
 
     def signature(self, name: str):
         if quant.is_act_scale_weight(name):
-            return self.base_version, "act_scale"
+            return self.base_version, "act_scale", self.all_patches_signature()
         patches = self._patches_for(name)
         return self.base_version, _identity(patches) if patches else None
 
@@ -148,21 +160,22 @@ class EffectiveWeights:
     def needs_gpu(self, name: str) -> bool:
         if quant.is_act_scale_weight(name):
             return False
-        if quant.is_scale_weight(name):
+        if quant.is_weight_scale_weight(name):
             return True
         base_name = quant.base_weight_name(name)
         return bool(self._patches_for(base_name) or self.converters.get(base_name) is not None or compat.is_quantized_weight(self.base(base_name)))
 
-    def act_scale(self, name: str, dtype: torch.dtype) -> torch.Tensor:
-        if not hasattr(self, "_int8_act_scales"):
+    def act_scale(self, name: str, dtype: torch.dtype, kind: str = quant.INT8) -> torch.Tensor:
+        scales = self._act_scales.get(kind)
+        if scales is None:
             from . import arch as arch_mod
 
             arch = arch_mod.detect(self.patcher)
-            self._int8_act_scales = quant.calibrate_int8_scales(arch, self)
+            scales = self._act_scales[kind] = quant.calibrate_act_scales(arch, self, kind=kind)
         base_name = quant.base_weight_name(name)
-        val = self._int8_act_scales.get(base_name)
+        val = scales.get(base_name)
         if val is None or not (val > 0.0):
-            val = quant.fallback_int8_act_scale(base_name)
+            val = quant.fallback_act_scale(base_name, kind=kind)
         min_scale = 1e-4 if dtype == torch.float16 else 1e-12
         return torch.tensor(max(min_scale, float(val)), dtype=dtype)
 
@@ -238,7 +251,16 @@ class EffectiveWeights:
             weight = compat.merge_weight(patches, weight, PREFIX + base_name)
         return weight if weight.dtype == torch.float32 else weight.float()
 
-    def quantize_on_gpu(self, name: str, gpu_base: torch.Tensor, quant_kind: str, scale_dtype: torch.dtype, gpu_lora: list = None) -> tuple:
+    def quantize_on_gpu(
+        self,
+        name: str,
+        gpu_base: torch.Tensor,
+        quant_kind: str,
+        scale_dtype: torch.dtype,
+        gpu_lora: list = None,
+        *,
+        gscale_dtype: torch.dtype = None,
+    ) -> tuple:
         w_fp32 = self.apply_fp32_on_gpu(name, gpu_base, gpu_lora=gpu_lora)
         can_inplace = w_fp32 is not gpu_base and (
             type(gpu_base) is not torch.Tensor or w_fp32.untyped_storage().data_ptr() != gpu_base.untyped_storage().data_ptr()
@@ -247,6 +269,7 @@ class EffectiveWeights:
             w_fp32,
             quant_kind,
             scale_dtype,
+            gscale_dtype=gscale_dtype,
             transposed=quant.is_transposed_weight(name),
             in_place=can_inplace,
         )

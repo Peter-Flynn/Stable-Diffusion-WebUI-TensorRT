@@ -16,371 +16,43 @@
 import bisect
 import math
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
 from . import speed
 from .common import Readback
-
-DEFAULT_METHOD = "auto"  # "auto" | "vde" | "freqca" | "hermite" | "taylor" | "chebyshev" | "constant"
-HISTORY_LEN = 5
-MIN_STEPS = 10
-STALE = 8
-MOVED = 0.01
-ORDER2_DAMP = 0.5
-# Canonical scaled physicist Hermite stability point: 2 * sigma^2 == 1.0 gives exact linear reproduction (0% lag)
-# and 0.5 * (s^2 - 1) == 0.0 at s == 1 (zero 2nd-difference noise amplification on single-step skips).
-HERMITE_SIGMA = 1.0 / math.sqrt(2.0)
-CHEB_RIDGE = 0.05
-FREQCA_CUTOFF = 0.20
-KALMAN_Q = 0.05
-KALMAN_R = 0.05
-MAX_CONSECUTIVE_CAP = 6
-
-# Per-(H, W, device) cached normalized radial frequency grid for 2D rfft2 (capped at 32 entries).
-_RADIAL_CACHE = {}
-
-
-def _radial_freq_grid(h: int, w: int, device) -> torch.Tensor:
-    key = (h, w, str(device))
-    grid = _RADIAL_CACHE.get(key)
-    if grid is None:
-        if len(_RADIAL_CACHE) >= 32:
-            _RADIAL_CACHE.clear()
-        fy = torch.fft.fftfreq(h, device=device, dtype=torch.float32) * 2.0
-        fx = torch.fft.rfftfreq(w, device=device, dtype=torch.float32) * 2.0
-        grid = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2).detach()
-        _RADIAL_CACHE[key] = grid
-    return grid
-
-
-def _lf_mask(h: int, w: int, cutoff: float, device) -> torch.Tensor:
-    r = _radial_freq_grid(h, w, device)
-    lo, hi = cutoff * 0.8, cutoff * 1.2
-    t = ((r - lo) / max(1e-6, hi - lo)).clamp(0.0, 1.0)
-    return 0.5 * (1.0 + torch.cos(math.pi * t))
-
-
-def wiener_filter_latent(x: torch.Tensor, sigma: float) -> torch.Tensor:
-    """SeaCache (CVPR 2026) zero-calibration 2D FFT Wiener filter isolating semantic drift from Gaussian noise."""
-    xf = x.float()
-    h, w = xf.shape[-2], xf.shape[-1]
-    if h < 4 or w < 4:
-        return xf
-    r = _radial_freq_grid(h, w, xf.device)
-    sx = 1.0 / (r * r + 0.04)
-    s_clamped = max(0.0, min(0.999, float(sigma)))
-    a = max(1e-3, 1.0 - s_clamped)
-    b = max(1e-3, s_clamped)
-    gain = (a * sx) / (a * a * sx + b * b)
-    gain = gain / gain.mean().clamp_min(1e-6)
-    return torch.fft.irfft2(torch.fft.rfft2(xf) * gain, s=(h, w))
-
-
-def to_x0(predictor, sigma: torch.Tensor, model_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Converts model output (flow velocity / eps / v_pred) to clean-image prediction x0 in FP32."""
-    xf = x.float()
-    vf = model_output.float()
-    sf = _broadcast_sigma(sigma, xf)
-    ptype = getattr(predictor, "prediction_type", "const")
-    if ptype == "v_prediction":
-        sd = float(getattr(predictor, "sigma_data", 1.0) or 1.0)
-        denom = sf * sf + sd * sd
-        return xf * (sd * sd / denom) - vf * (sf * sd / denom.sqrt())
-    # Both Flow Matching ("const") and "epsilon" use x0 = x - sigma * model_output.
-    return xf - vf * sf
-
-
-def from_x0(predictor, sigma: torch.Tensor, x0: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Inverts clean-image prediction x0 back to model output at current noisy x_t and sigma (fresh-noise safe)."""
-    xf = x.float()
-    x0f = x0.float()
-    sf = _broadcast_sigma(sigma, xf)
-    ptype = getattr(predictor, "prediction_type", "const")
-    if ptype == "v_prediction":
-        sd = float(getattr(predictor, "sigma_data", 1.0) or 1.0)
-        denom = sf * sf + sd * sd
-        return (xf * (sd * sd / denom) - x0f) * denom.sqrt() / (sf * sd).clamp_min(1e-6)
-    return (xf - x0f) / sf.clamp_min(1e-6)
-
-
-def _broadcast_sigma(sigma, ref: torch.Tensor) -> torch.Tensor:
-    s = torch.as_tensor(sigma, device=ref.device, dtype=torch.float32).reshape(-1)
-    if s.numel() == 1:
-        s = s.expand(ref.shape[0])
-    elif s.numel() != ref.shape[0]:
-        s = s[:1].expand(ref.shape[0])
-    return s.view(ref.shape[0], *([1] * (ref.ndim - 1)))
-
-
-def sigma_from_timesteps(predictor, timesteps: torch.Tensor) -> torch.Tensor:
-    t = timesteps.reshape(-1).float()
-    mult = float(getattr(predictor, "multiplier", 1.0) or 1.0)
-    return t / mult
-
-
-def vde_decompose(x: torch.Tensor, v: torch.Tensor) -> tuple:
-    """Orthogonal velocity decomposition v = alpha * x + beta * ||x|| * u_dir (VDE, arXiv:2605.23381)."""
-    xf = x.float()
-    vf = v.float()
-    dims = tuple(range(1, xf.ndim))
-    x_sq = (xf * xf).sum(dim=dims, keepdim=True).clamp_min(1e-12)
-    alpha = (vf * xf).sum(dim=dims, keepdim=True) / x_sq
-    orth = vf - alpha * xf
-    orth_norm = (orth * orth).sum(dim=dims, keepdim=True).sqrt().clamp_min(1e-8)
-    beta = orth_norm / x_sq.sqrt()
-    u_dir = orth / orth_norm
-    return alpha, beta, u_dir
-
-
-def vde_predict(vde_us: list, vde_alphas: list, vde_betas: list, vde_dir: torch.Tensor, x_now: torch.Tensor, u_now: float) -> torch.Tensor:
-    """Predicts model output at (x_now, u_now) via linearly extrapolated (alpha, beta) and reused unit direction."""
-    u2, u1 = float(vde_us[-1]), float(vde_us[-2])
-    du1 = u2 - u1
-    s = max(-3.0, min(3.0, (float(u_now) - u2) / du1)) if abs(du1) > 1e-8 else 0.0
-    a_last = vde_alphas[-1]
-    b_last = vde_betas[-1]
-    a_hat = a_last + s * (a_last - vde_alphas[-2])
-    b_hat = (b_last + s * (b_last - vde_betas[-2])).clamp_min(0.0).minimum((b_last * 2.5).clamp_min(1e-4))
-    xf = x_now.float()
-    dims = tuple(range(1, xf.ndim))
-    x_norm = (xf * xf).sum(dim=dims, keepdim=True).sqrt()
-    return a_hat * xf + b_hat * x_norm * vde_dir
-
-
-def forecast_weights(
-    us: list,
-    target_u: float,
-    method: str = "hermite",
-    *,
-    order: int = 2,
-    damp: float = ORDER2_DAMP,
-    hermite_sigma: float = HERMITE_SIGMA,
-    ridge: float = CHEB_RIDGE,
-) -> list:
-    """Computes affine scalar weights `[w_0, ..., w_{K-1}]` (sum == 1) to forecast y(target_u) from (us, ys)."""
-    k = len(us)
-    if k == 0:
-        raise ValueError("empty history")
-    if k == 1 or method == "constant":
-        return [0.0] * (k - 1) + [1.0]
-
-    u_last = float(us[-1])
-    u_prev = float(us[-2])
-    du_prev = u_last - u_prev
-    du = float(target_u) - u_last
-    if abs(du_prev) < 1e-8 or abs(du) < 1e-12:
-        return [0.0] * (k - 1) + [1.0]
-
-    # Cap extrapolation step ratio so abrupt schedule jumps cannot amplify noise.
-    step_ratio = du / du_prev
-    if abs(step_ratio) > 4.0:
-        step_ratio = math.copysign(4.0, step_ratio)
-        du = step_ratio * du_prev
-
-    if method == "taylor":
-        if k == 2 or order <= 1:
-            w = [0.0] * k
-            w[-1] = 1.0 + step_ratio
-            w[-2] = -step_ratio
-            return w
-        u_prev2 = float(us[-3])
-        du_prev2 = u_prev - u_prev2
-        du_span = u_last - u_prev2
-        if abs(du_prev2) < 1e-8 or abs(du_span) < 1e-8:
-            w = [0.0] * k
-            w[-1] = 1.0 + step_ratio
-            w[-2] = -step_ratio
-            return w
-        du1 = du_prev
-        du0 = du_prev2
-        c2 = damp * du * (du + du1) / du_span
-        max_c2 = 1.5 * abs(du1)
-        if abs(c2) > max_c2:
-            c2 = math.copysign(max_c2, c2)
-        c1 = du / du1
-        w = [0.0] * k
-        w[-1] = 1.0 + c1 + c2 / du1
-        w[-2] = -c1 - c2 * (1.0 / du1 + 1.0 / du0)
-        w[-3] = c2 / du0
-        return w
-
-    if method in ("hermite", "hicache", "freqca", "auto"):
-        # True scaled physicist Hermite basis (HiCache, ICLR 2026) on non-uniform sigma grids:
-        # H1_tilde(s) = 2 * sigma^2 * s,  H2_tilde(s) = (sigma^2 / 2) * (4 * sigma^2 * s^2 - 2) = 2 * sigma^4 * s^2 - sigma^2.
-        # At sigma = 1/sqrt(2): H1_tilde(s) = s (exact linear reproduction), H2_tilde(1) = 0 (zero 2nd-order noise at s=1).
-        s = step_ratio
-        s2 = hermite_sigma * hermite_sigma
-        c1 = 2.0 * s2 * s
-        w = [0.0] * k
-        if k == 2 or order <= 1:
-            w[-1] = 1.0 + c1
-            w[-2] = -c1
-            return w
-        u_prev2 = float(us[-3])
-        du0 = u_prev - u_prev2
-        if abs(du0) < 1e-8:
-            w[-1] = 1.0 + c1
-            w[-2] = -c1
-            return w
-        r = max(0.25, min(4.0, du_prev / du0))
-        c2_raw = 2.0 * (s2 * s2) * (s * s) - s2
-        c2 = max(-0.5, min(2.5, c2_raw)) * (2.0 / (1.0 + r))
-        # Delta_1 = y2 - y1, Delta_2 = (y2 - y1) - r * (y1 - y0) (identically 0 on any linear trajectory).
-        w[-1] = 1.0 + c1 + c2
-        w[-2] = -c1 - c2 * (1.0 + r)
-        w[-3] = c2 * r
-        return w
-
-    if method == "chebyshev":
-        u_arr = np.asarray(us, dtype=np.float64)
-        u_min, u_max = float(u_arr.min()), float(u_arr.max())
-        span = u_max - u_min
-        if span < 1e-8:
-            return [0.0] * (k - 1) + [1.0]
-        tau = 2.0 * (u_arr - u_min) / span - 1.0
-        t_tgt = 2.0 * (float(target_u) - u_min) / span - 1.0
-        t_tgt = max(-2.5, min(2.5, t_tgt))
-        deg = min(order, k - 1, 2)
-        A = np.zeros((k, deg + 1), dtype=np.float64)
-        phi = np.zeros(deg + 1, dtype=np.float64)
-        A[:, 0] = 1.0
-        phi[0] = 1.0
-        if deg >= 1:
-            A[:, 1] = tau
-            phi[1] = t_tgt
-        if deg >= 2:
-            A[:, 2] = 2.0 * tau * tau - 1.0
-            phi[2] = 2.0 * t_tgt * t_tgt - 1.0
-        pen = np.zeros((deg + 1, deg + 1), dtype=np.float64)
-        for j in range(1, deg + 1):
-            pen[j, j] = ridge * (j * j)
-        ata = A.T @ A + pen
-        try:
-            coeffs = np.linalg.solve(ata, A.T)
-            w = (phi @ coeffs).tolist()
-            s_w = sum(w)
-            if abs(s_w) > 1e-8:
-                w = [v / s_w for v in w]
-            return w
-        except np.linalg.LinAlgError:
-            return [0.0] * (k - 1) + [1.0]
-
-    raise ValueError(f"Unknown DiT forecast method {method!r}")
-
-
-def eval_linear_combination(tensors: list, weights: list) -> torch.Tensor:
-    """Evaluates sum_i w_i * tensors[i] in FP32 with minimal GPU kernel launches (single GEMV for K >= 2)."""
-    active = [(t, w) for t, w in zip(tensors, weights) if abs(w) > 1e-12]
-    if not active:
-        return tensors[-1].float()
-    if len(active) == 1:
-        t, w = active[0]
-        return t.float() if abs(w - 1.0) < 1e-7 else t.float() * w
-    shape = active[0][0].shape
-    dev = active[0][0].device
-    stack = torch.stack([t.float().reshape(-1) for t, _ in active], dim=0)
-    w_t = torch.tensor([w for _, w in active], device=dev, dtype=torch.float32)
-    return torch.matmul(w_t, stack).reshape(shape)
-
-
-def freqca_forecast(us: list, ys: list, target_u: float, *, order: int = 2, cutoff: float = FREQCA_CUTOFF) -> torch.Tensor:
-    """FreqCa (arXiv:2510.08669): directly reuses low spatial frequencies of x0 and forecasts high frequencies."""
-    y_last = ys[-1].float()
-    if len(ys) < 2:
-        return y_last
-    w = forecast_weights(us, target_u, method="hermite", order=order)
-    y_fc = eval_linear_combination(ys, w)
-    h, w_dim = y_last.shape[-2], y_last.shape[-1]
-    if h < 4 or w_dim < 4:
-        return y_fc
-    m_lf = _lf_mask(h, w_dim, cutoff, y_last.device)
-    f_last = torch.fft.rfft2(y_last)
-    f_fc = torch.fft.rfft2(y_fc)
-    return torch.fft.irfft2(m_lf * f_last + (1.0 - m_lf) * f_fc, s=(h, w_dim))
-
-
-def _lerp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * max(0.0, min(1.0, t))
-
-
-def tier_policy(quality: float) -> dict:
-    """Smooth continuous quality-tiered policy across quality in [0.0, 1.0], calibrated to real Flow DiTs.
-
-    - Tier 1 [0.85, 1.00]: Near-lossless dual VDE/FreqCa skips; conservative tail drop below q=0.98; no FasterCache.
-    - Tier 2 [0.65, 0.85): High Quality (default q=0.80); adds late Limited-Interval Guidance & guarded FasterCache.
-    - Tier 3 [0.40, 0.65): Fast / Balanced; widens Limited-Interval + FasterCache + Adaptive Guidance cosine cutoff.
-    - Tier 4 [0.00, 0.40): Draft / Turbo; pushes up to ~3.5-4.0x while keeping anchor refreshes (consec_cap <= 6) so
-      images stay sharp instead of collapsing into blur.
-    """
-    q = max(0.0, min(1.0, float(quality)))
-    if q >= 0.85:
-        t = (1.0 - q) / 0.15
-        return {
-            "tolerance": _lerp(0.06, 0.145, t),
-            "consec_cap": 1 if q >= 0.96 else 2,
-            "tail_uncond_drop": 0.0 if q >= 0.98 else _lerp(0.0, 0.12, t),
-            "fc_max_consec": 0,
-            "fc_start": 1.0,
-            "fc_tol": 0.0,
-            "adaptive_cos": 0.0,
-            "wiener_thresh": _lerp(0.20, 0.23, t),
-        }
-    if q >= 0.65:
-        t = (0.85 - q) / 0.20
-        return {
-            "tolerance": _lerp(0.145, 0.255, t),
-            "consec_cap": 3,
-            "tail_uncond_drop": _lerp(0.12, 0.28, t),
-            "fc_max_consec": 1,
-            "fc_start": _lerp(0.40, 0.28, t),
-            "fc_tol": _lerp(0.55, 0.82, t),
-            "adaptive_cos": 0.0,
-            "wiener_thresh": _lerp(0.23, 0.28, t),
-        }
-    if q >= 0.40:
-        t = (0.65 - q) / 0.25
-        return {
-            "tolerance": _lerp(0.255, 0.36, t),
-            "consec_cap": 4,
-            "tail_uncond_drop": _lerp(0.28, 0.36, t),
-            "fc_max_consec": 2,
-            "fc_start": _lerp(0.28, 0.22, t),
-            "fc_tol": _lerp(0.82, 1.08, t),
-            "adaptive_cos": _lerp(0.97, 0.95, t),
-            "wiener_thresh": _lerp(0.28, 0.38, t),
-        }
-    t = (0.40 - q) / 0.40
-    return {
-        "tolerance": math.inf if q <= 0.0 else _lerp(0.36, 0.62, t),
-        "consec_cap": 5 if q > 0.15 else MAX_CONSECUTIVE_CAP,
-        "tail_uncond_drop": _lerp(0.36, 0.45, t),
-        "fc_max_consec": 3,
-        "fc_start": _lerp(0.22, 0.15, t),
-        "fc_tol": math.inf if q <= 0.0 else _lerp(1.08, 1.75, t),
-        "adaptive_cos": _lerp(0.95, 0.92, t),
-        "wiener_thresh": math.inf if q <= 0.10 else _lerp(0.38, 0.55, t),
-    }
-
-
-def dit_tolerance(quality: float) -> float:
-    """Base closed-loop x0 forecast drift tolerance for quality in [0, 1] (modulated by propagation gain g(r))."""
-    return tier_policy(quality)["tolerance"]
-
-
-def propagation_gain(progress: float) -> float:
-    """RA-CFGCache / EpaCache analytic local-to-final error propagation gain g(r): tighter early, looser late."""
-    rem = max(0.05, 1.0 - max(0.0, min(1.0, float(progress))))
-    return 0.35 + 1.45 * (rem ** 1.2)
-
-
-def _kalman_update(prev_val, prev_var: float, obs: float) -> tuple:
-    if prev_val is None:
-        return obs, 0.10
-    p_pred = prev_var + KALMAN_Q
-    k = p_pred / (p_pred + KALMAN_R)
-    return (1.0 - k) * prev_val + k * obs, (1.0 - k) * p_pred
+from .dit_math import (  # noqa: F401 — re-exported for callers & compatibility
+    CHEB_RIDGE,
+    DEFAULT_METHOD,
+    FREQCA_CUTOFF,
+    HERMITE_SIGMA,
+    HISTORY_LEN,
+    KALMAN_Q,
+    KALMAN_R,
+    MAX_CONSECUTIVE_CAP,
+    MIN_STEPS,
+    MOVED,
+    ORDER2_DAMP,
+    STALE,
+    _RADIAL_CACHE,
+    _broadcast_sigma,
+    _kalman_update,
+    _lerp,
+    _lf_mask,
+    _radial_freq_grid,
+    dit_tolerance,
+    eval_linear_combination,
+    forecast_weights,
+    freqca_forecast,
+    from_x0,
+    propagation_gain,
+    sigma_from_timesteps,
+    tier_policy,
+    to_x0,
+    vde_decompose,
+    vde_predict,
+    wiener_filter_latent,
+)
 
 
 class _BranchState:
@@ -473,6 +145,117 @@ def _same_latent(a: torch.Tensor, b: torch.Tensor) -> bool:
     return bool(torch.equal(a, b))
 
 
+class _CfgCache:
+    """Encapsulates per-tile / per-image CFG-pairing state (FasterCache, Adaptive Guidance, GuideCache)."""
+
+    __slots__ = (
+        "fresh_cond",    # skey -> (step_index, out_tensor, is_real_full, x_tensor)
+        "last_uncond",   # skey -> (step_index, out_tensor, x_tensor)
+        "delta",         # skey -> u - c (FP32)
+        "delta_kf",      # skey -> (rate_est, variance)
+        "delta_consec",  # skey -> consecutive FasterCache reuses
+        "cos",           # skey -> cos(c, u)
+        "guide_weight",  # skey -> spatial guidance-share weight (mean ~ 1.0)
+        "boost_skeys",   # immutable per-step skeys eligible for boosted FasterCache
+    )
+
+    def __init__(self):
+        self.fresh_cond = {}
+        self.last_uncond = {}
+        self.delta = {}
+        self.delta_kf = {}
+        self.delta_consec = {}
+        self.cos = {}
+        self.guide_weight = {}
+        self.boost_skeys = set()
+
+    def clear_skey(self, skey):
+        # Intentionally preserves fresh_cond / last_uncond for same-step partition mismatch checks.
+        self.delta.pop(skey, None)
+        self.delta_kf.pop(skey, None)
+        self.delta_consec.pop(skey, None)
+        self.cos.pop(skey, None)
+        self.guide_weight.pop(skey, None)
+        self.boost_skeys.discard(skey)
+
+    def clear_all(self):
+        self.delta.clear()
+        self.delta_kf.clear()
+        self.delta_consec.clear()
+        self.cos.clear()
+        self.guide_weight.clear()
+        self.boost_skeys.clear()
+
+    def clear_step(self):
+        self.fresh_cond.clear()
+        self.last_uncond.clear()
+        self.boost_skeys.clear()
+        while len(self.delta) > 8:
+            self.clear_skey(next(iter(self.delta)))
+
+    def release(self):
+        self.fresh_cond.clear()
+        self.last_uncond.clear()
+        self.clear_all()
+
+    def fresh_cond_for(self, skey, step_index: int, require_real_full: bool = True, x_slice=None):
+        entry = self.fresh_cond.get(skey)
+        if entry is None or entry[0] != step_index:
+            return None
+        if require_real_full and not entry[2]:
+            return None
+        if x_slice is not None and not _same_latent(x_slice, entry[3]):
+            return None
+        return entry[1]
+
+    def update_pair(
+        self,
+        skey,
+        step_index: int,
+        progress: float,
+        cond_scale: float,
+        adaptive_cos: float,
+        readback,
+        weight_err_fn,
+    ) -> bool:
+        """Updates CFG delta / GuideCache / readbacks when both real COND & UNCOND ran on this step.
+
+        Returns False if COND and UNCOND latents mismatch (caller must latch asymmetric/mismatched state).
+        """
+        fc = self.fresh_cond.get(skey)
+        fu = self.last_uncond.get(skey)
+        if fc is None or fu is None or fc[0] != step_index or not fc[2] or fu[0] != step_index:
+            return True
+        if not _same_latent(fc[3], fu[2]):
+            return False
+        c_out = fc[1].float()
+        u_out = fu[1].float()
+        delta = u_out - c_out
+        prev_delta = self.delta.get(skey)
+        if prev_delta is not None and prev_delta.shape == delta.shape:
+            readback.send(("delta_err", skey, progress), weight_err_fn(prev_delta, delta, skey))
+        if adaptive_cos > 0.0 and progress >= 0.50:
+            cos_val = F.cosine_similarity(c_out.flatten(1), u_out.flatten(1), dim=1).min()
+            readback.send(("cfg_cos", skey, progress), cos_val)
+        if skey not in self.delta and len(self.delta) >= 8:
+            # Never evict a tile whose COND already ran on this step and whose UNCOND is still pending.
+            victim = next((k for k in self.delta if k not in self.fresh_cond or k in self.last_uncond), None)
+            if victim is not None:
+                self.clear_skey(victim)
+        self.delta[skey] = delta
+        self.delta_consec[skey] = 0
+        # GuideCache (arXiv:2611.25382): spatial guidance-share map boosts error weight on high-guidance text/faces.
+        if cond_scale > 1.01:
+            guided = u_out + cond_scale * (c_out - u_out)
+            cdim = tuple(range(1, c_out.ndim - 2))
+            g_mag = (cond_scale * (c_out - u_out)).pow(2).sum(dim=cdim, keepdim=True).sqrt()
+            v_mag = guided.pow(2).sum(dim=cdim, keepdim=True).sqrt().clamp_min(1e-4)
+            rho = g_mag / v_mag
+            rho = rho / rho.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+            self.guide_weight[skey] = 1.0 + 0.75 * (rho - 1.0).clamp_min(0.0)
+        return True
+
+
 class DiTSchedule:
     """Quality-tiered closed-loop DiT Speed Hacks scheduler (self-selecting VDE/FreqCa + orthogonal CFG stack)."""
 
@@ -535,15 +318,7 @@ class DiTSchedule:
         self._volatile_gkeys = set()
         self._moved = {}
         self._readback = Readback()
-
-        # Orthogonal CFG acceleration & GuideCache text-protection state
-        self._fresh_cond = {}  # skey -> (step_index, out_tensor, is_real_full, x_tensor)
-        self._last_uncond = {}  # skey -> (step_index, out_tensor, x_tensor)
-        self._cfg_delta = {}  # skey -> u - c (FP32)
-        self._cfg_delta_kf = {}  # skey -> (rate_est, variance)
-        self._cfg_delta_consec = {}  # skey -> consecutive FasterCache reuses
-        self._cfg_cos = {}  # skey -> cos(c, u)
-        self._guide_weight_map = {}  # skey -> spatial guidance-share weight (mean ~ 1.0)
+        self._cfg = _CfgCache()
 
         # Counters compatible with runtime.py's end() reporting & infotext
         self.full_calls = 0
@@ -553,8 +328,45 @@ class DiTSchedule:
         self.checks = []  # (index, age, rel_err)
 
     @property
+    def _fresh_cond(self):
+        return self._cfg.fresh_cond
+
+    @property
+    def _last_uncond(self):
+        return self._cfg.last_uncond
+
+    @property
+    def _cfg_delta(self):
+        return self._cfg.delta
+
+    @property
+    def _cfg_delta_kf(self):
+        return self._cfg.delta_kf
+
+    @property
+    def _cfg_delta_consec(self):
+        return self._cfg.delta_consec
+
+    @property
+    def _cfg_cos(self):
+        return self._cfg.cos
+
+    @property
+    def _guide_weight_map(self):
+        return self._cfg.guide_weight
+
+    @property
     def tier1_calls(self) -> int:
         return self.cfg_unbatched_calls + self.cfg_batched_calls
+
+    def fresh_cond_for(self, skey, require_real_full: bool = True, x_slice=None):
+        """Returns the current step's fresh COND output for `skey` if valid, else None."""
+        if self.index is None or skey is None:
+            return None
+        return self._cfg.fresh_cond_for(skey, self.index, require_real_full=require_real_full, x_slice=x_slice)
+
+    def has_cfg_delta(self, skey) -> bool:
+        return skey is not None and skey in self._cfg.delta
 
     def note_multi_cond(self):
         """Flags composable/multi-cond prompts (e.g. `A AND B`) so orthogonal CFG shortcuts stay disabled."""
@@ -603,8 +415,8 @@ class DiTSchedule:
                 if c_cnt != u_cnt:
                     self._asymmetric_cfg = True
                 elif not self._step_used_cfg_shortcut:
-                    real_cond = {k for k, v in self._fresh_cond.items() if v[2] and k not in self._volatile_skeys}
-                    real_uncond = {k for k in self._last_uncond if k not in self._volatile_skeys}
+                    real_cond = {k for k, v in self._cfg.fresh_cond.items() if v[2] and k not in self._volatile_skeys}
+                    real_uncond = {k for k in self._cfg.last_uncond if k not in self._volatile_skeys}
                     if real_cond and real_uncond and real_cond != real_uncond:
                         self._mismatched_latents = True
                         self._asymmetric_cfg = True
@@ -616,10 +428,7 @@ class DiTSchedule:
         self._step_u = None
         self._tag_counts.clear()
         self._step_skip.clear()
-        self._fresh_cond.clear()
-        self._last_uncond.clear()
-        while len(self._cfg_delta) > 8:
-            self._clear_skey_cfg(next(iter(self._cfg_delta)))
+        self._cfg.clear_step()
         self._step_multi_cond = False
         self._step_used_cfg_shortcut = False
         if cond_scale is not None:
@@ -694,20 +503,54 @@ class DiTSchedule:
             per = max(1, total // steps)
             start, end = round(self.warmup * total), total - max(per, round(self.tail * total))
             self.region = start <= self.index < end
+        self._refresh_fc_boost()
+
+    def _refresh_fc_boost(self):
+        """Computes immutable per-step FasterCache boost skeys once per step (before Call 1 & Call 2).
+
+        Closed-loop relaxation unlocks higher speed without weakening quality gates:
+        - Condition A: verified ultra-smooth CFG delta (`delta_err <= 0.45 * eff_fc_tol`, reclaiming unused headroom).
+        - Condition B: smooth CFG delta (`<= 0.75 * eff_fc_tol`) while trajectory skipping is Kalman-blocked
+          (e.g. stochastic `Euler a` / `DPM++ 2M SDE`, where common-mode noise cancels inside `u - c`).
+        """
+        self._cfg.boost_skeys.clear()
+        if (
+            not self.region
+            or self.done
+            or not self._cfg_shortcuts_allowed()
+            or self.fc_max_consec <= 0
+            or self.fc_tol >= math.inf
+        ):
+            return
+        eff_fc_tol = self._effective_tol(self.fc_tol)
+        eff_tol = self._effective_tol(self.tolerance)
+        for skey, (est, _) in self._cfg.delta_kf.items():
+            if est is None or skey in self._volatile_skeys or skey not in self._cfg.delta:
+                continue
+            if est <= eff_fc_tol * 0.45:
+                self._cfg.boost_skeys.add(skey)
+                continue
+            if est <= eff_fc_tol * 0.75 and eff_tol < math.inf:
+                blocked = False
+                for bkey, st in self.branches.items():
+                    if _skey_of(bkey) != skey or self.index - st.last_seen_index > STALE:
+                        continue
+                    rate = self._best_rate(st, bkey)
+                    if rate is not None and st.last_err_du is not None and st.last_err_du > 1e-8:
+                        if rate * st.last_err_du > eff_tol:
+                            blocked = True
+                            break
+                    elif st.last_err is not None and st.last_err > eff_tol:
+                        blocked = True
+                        break
+                if blocked:
+                    self._cfg.boost_skeys.add(skey)
 
     def _clear_skey_cfg(self, skey):
-        self._cfg_delta.pop(skey, None)
-        self._cfg_delta_kf.pop(skey, None)
-        self._cfg_delta_consec.pop(skey, None)
-        self._cfg_cos.pop(skey, None)
-        self._guide_weight_map.pop(skey, None)
+        self._cfg.clear_skey(skey)
 
     def _clear_all_cfg(self):
-        self._cfg_delta.clear()
-        self._cfg_delta_kf.clear()
-        self._cfg_delta_consec.clear()
-        self._cfg_cos.clear()
-        self._guide_weight_map.clear()
+        self._cfg.clear_all()
 
     def _collect(self):
         for tag, ((value,),) in self._readback.ready():
@@ -732,13 +575,13 @@ class DiTSchedule:
                 _, skey, prog = tag
                 # Ignore high-noise step-0/step-1 jumps so early transients never lock out mid-pass FasterCache.
                 if prog >= 0.15 and skey not in self._volatile_skeys:
-                    prev_est, prev_var = self._cfg_delta_kf.get(skey, (None, 0.25))
-                    self._cfg_delta_kf[skey] = _kalman_update(prev_est, prev_var, float(value))
+                    prev_est, prev_var = self._cfg.delta_kf.get(skey, (None, 0.25))
+                    self._cfg.delta_kf[skey] = _kalman_update(prev_est, prev_var, float(value))
             elif kind == "cfg_cos":
                 _, skey, prog = tag
                 # Ignore early high-noise cosine similarity (where shared noise makes cos(c, u) artificially high).
                 if prog >= 0.50 and skey not in self._volatile_skeys:
-                    self._cfg_cos[skey] = float(value)
+                    self._cfg.cos[skey] = float(value)
             elif kind == "move":
                 _, bkey, origin = tag
                 if value <= MOVED:
@@ -858,7 +701,7 @@ class DiTSchedule:
             or skey in self._volatile_skeys
         ):
             return False
-        c = self._cfg_cos.get(skey)
+        c = self._cfg.cos.get(skey)
         return c is not None and c >= self.adaptive_cos
 
     def _can_fastercache_uncond(self, skey) -> bool:
@@ -867,16 +710,19 @@ class DiTSchedule:
             or self.done
             or not self.region
             or self.fc_max_consec <= 0
-            or self._progress < self.fc_start - 1e-6
             or skey in self._volatile_skeys
+            or skey not in self._cfg.delta
         ):
             return False
-        if skey not in self._cfg_delta:
+        boosted = skey in self._cfg.boost_skeys
+        fc_max = min(4, self.fc_max_consec + 1) if boosted else self.fc_max_consec
+        fc_start = min(self.fc_start, max(self.warmup + 0.05, self.fc_start - 0.10)) if boosted else self.fc_start
+        if self._progress < fc_start - 1e-6:
             return False
-        if self._cfg_delta_consec.get(skey, 0) >= self.fc_max_consec:
+        if self._cfg.delta_consec.get(skey, 0) >= fc_max:
             return False
         if self.fc_tol < math.inf:
-            kf = self._cfg_delta_kf.get(skey)
+            kf = self._cfg.delta_kf.get(skey)
             if kf is not None and kf[0] is not None and kf[0] > self._effective_tol(self.fc_tol):
                 return False
         return True
@@ -938,7 +784,7 @@ class DiTSchedule:
         occ_match = len(set(occs)) == 1
         skey = (occs[0], chunk, spatial, prompt_ids) if occ_match else None
         if n_groups == 1 and groups[0][2] and skey is not None:
-            fc_chk = self._fresh_cond.get(skey)
+            fc_chk = self._cfg.fresh_cond.get(skey)
             if fc_chk is not None and fc_chk[0] == self.index and not _same_latent(x[0:chunk], fc_chk[3]):
                 # Cross-image partition mismatch (e.g. batch_size >= 3 variable-length prompts or area crops): disable pairing!
                 self._mismatched_latents = True
@@ -966,7 +812,7 @@ class DiTSchedule:
             if (can_skip or fc_ok) and st is not None:
                 if not self._check_prompt_move(bkey, st, context[slc]):
                     groups[gi] = (slc, bkey, is_u, False)
-        if fc_ok and skey not in self._cfg_delta:
+        if fc_ok and skey not in self._cfg.delta:
             fc_ok = False
 
         # Phase-lock full-skip per group key across ALL split calls (unbatched MOSS, multi-cond A AND B, Perp-Neg).
@@ -996,8 +842,7 @@ class DiTSchedule:
                 if not self._step_skip[gkey]:
                     groups[gi] = (slc, bkey, is_u, False)
                 elif n_groups == 1 and is_u and skey is not None and (tail_drop or fc_ok):
-                    fc = self._fresh_cond.get(skey)
-                    if fc is not None and fc[0] == self.index and _same_latent(x[slc], fc[3]):
+                    if self.fresh_cond_for(skey, require_real_full=False, x_slice=x[slc]) is not None:
                         groups[gi] = (slc, bkey, is_u, True)
 
         # 1. Full step skip (0 TRT calls), including Coupled FasterCache / tail_drop for 1:1 batched [COND, UNCOND].
@@ -1010,10 +855,9 @@ class DiTSchedule:
                     return {"mode": "skip_all", "groups": groups, "u": u_now, "b": b, "skey": skey, "tail_drop": tail_drop, "fc_ok": fc_ok}
 
         # 2. Orthogonal CFG Acceleration (Limited-Interval Guidance OR FasterCache CFG-Cache)
-        # Unbatched UNCOND (e.g. MOSS-Image): strictly requires REAL full COND from THIS exact step with IDENTICAL latent!
+        # Unbatched UNCOND (e.g. MOSS-Image / split Anima): strictly requires REAL full COND from THIS exact step!
         if n_groups == 1 and groups[0][2] and skey is not None:
-            fc = self._fresh_cond.get(skey)
-            if fc is not None and fc[0] == self.index and fc[2] and _same_latent(x[0:chunk], fc[3]):
+            if self.fresh_cond_for(skey, require_real_full=True, x_slice=x[0:chunk]) is not None:
                 if tail_drop:
                     self._step_used_cfg_shortcut = True
                     return {"mode": "unbatched_cfg_drop", "groups": groups, "u": u_now, "b": b, "skey": skey}
@@ -1037,8 +881,8 @@ class DiTSchedule:
         if mode in ("unbatched_cfg_drop", "batched_cfg_drop"):
             return cond_out.to(x_dtype)
         # Exact unboosted residual u_hat = c_t + (u_a - c_a) cancels common-mode scene drift inside CFG!
-        u_hat = cond_out.float() + self._cfg_delta[skey]
-        self._cfg_delta_consec[skey] = self._cfg_delta_consec.get(skey, 0) + 1
+        u_hat = cond_out.float() + self._cfg.delta[skey]
+        self._cfg.delta_consec[skey] = self._cfg.delta_consec.get(skey, 0) + 1
         return u_hat.to(x_dtype)
 
     def forecast_step(self, plan: dict, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -1063,19 +907,18 @@ class DiTSchedule:
                     c_hat = pred_out
                     c_x = x[slc]
                     # Mark is_real_full=False so record_full can NEVER mistake forecasted c_hat for a full eval!
-                    self._fresh_cond[skey] = (self.index, c_hat.detach(), False, c_x.detach())
+                    self._cfg.fresh_cond[skey] = (self.index, c_hat.detach(), False, c_x.detach())
         for gi, (slc, bkey, is_u, _) in enumerate(groups):
             if is_u:
-                fc_entry = self._fresh_cond.get(skey) if can_couple else None
                 if can_couple and c_hat is not None and _same_latent(x[slc], c_x):
                     c_ref = c_hat
-                elif fc_entry is not None and fc_entry[0] == self.index and _same_latent(x[slc], fc_entry[3]):
-                    c_ref = fc_entry[1]
+                elif can_couple:
+                    c_ref = self.fresh_cond_for(skey, require_real_full=False, x_slice=x[slc])
                 else:
                     c_ref = None
                 if c_ref is not None and tail_drop:
                     assembled[gi] = c_ref.to(x.dtype)
-                elif c_ref is not None and fc_ok and skey in self._cfg_delta:
+                elif c_ref is not None and fc_ok and skey in self._cfg.delta:
                     assembled[gi] = self.synthesize_uncond(skey, "unbatched_fastercache", c_ref, x.dtype)
                 else:
                     assembled[gi] = self.forecast_slice(bkey, x[slc], sigma[slc], u_now)
@@ -1102,7 +945,7 @@ class DiTSchedule:
         return v_pred.to(x_slice.dtype)
 
     def _weighted_rel_err(self, pred: torch.Tensor, target: torch.Tensor, skey) -> torch.Tensor:
-        wmap = self._guide_weight_map.get(skey)
+        wmap = self._cfg.guide_weight.get(skey)
         if wmap is not None and wmap.shape[-2:] == target.shape[-2:] and wmap.shape[0] == target.shape[0]:
             num = ((pred - target).pow(2) * wmap).sum().sqrt()
             den = (target.pow(2) * wmap).sum().sqrt().clamp_min(1e-6)
@@ -1116,9 +959,9 @@ class DiTSchedule:
         tag = bkey[0]
         skey = _skey_of(bkey)
         if tag == 0:
-            self._fresh_cond[skey] = (self.index, out_slice.detach(), True, x_slice.detach())
+            self._cfg.fresh_cond[skey] = (self.index, out_slice.detach(), True, x_slice.detach())
         elif tag == 1:
-            self._last_uncond[skey] = (self.index, out_slice.detach(), x_slice.detach())
+            self._cfg.last_uncond[skey] = (self.index, out_slice.detach(), x_slice.detach())
 
         # During tail (self.done), we only need fresh_cond recorded for unbatched tail CFG drop!
         if self.done:
@@ -1140,41 +983,12 @@ class DiTSchedule:
 
         # When BOTH COND (tag==0) and UNCOND (tag==1) ran REAL full evals on this step WITH IDENTICAL LATENT, update CFG state.
         if tag in (0, 1) and skey not in self._volatile_skeys and not self._asymmetric_cfg and not self._step_multi_cond and not self._mismatched_latents:
-            fc = self._fresh_cond.get(skey)
-            fu = self._last_uncond.get(skey)
-            if fc is not None and fu is not None and fc[0] == self.index and fc[2] and fu[0] == self.index:
-                if not _same_latent(fc[3], fu[2]):
-                    self._mismatched_latents = True
-                    self._asymmetric_cfg = True
-                    self._clear_all_cfg()
-                else:
-                    c_out = fc[1].float()
-                    u_out = fu[1].float()
-                    delta = u_out - c_out
-                    prev_delta = self._cfg_delta.get(skey)
-                    if prev_delta is not None and prev_delta.shape == delta.shape:
-                        d_err = self._weighted_rel_err(prev_delta, delta, skey)
-                        self._readback.send(("delta_err", skey, self._progress), d_err)
-                    if self.adaptive_cos > 0.0 and self._progress >= 0.50:
-                        cos_val = F.cosine_similarity(c_out.flatten(1), u_out.flatten(1), dim=1).min()
-                        self._readback.send(("cfg_cos", skey, self._progress), cos_val)
-                    if skey not in self._cfg_delta and len(self._cfg_delta) >= 8:
-                        # Never evict a tile whose COND already ran on this step and whose UNCOND is still pending.
-                        victim = next((k for k in self._cfg_delta if k not in self._fresh_cond or k in self._last_uncond), None)
-                        if victim is not None:
-                            self._clear_skey_cfg(victim)
-                    self._cfg_delta[skey] = delta
-                    self._cfg_delta_consec[skey] = 0
-                    # GuideCache (arXiv:2611.25382): spatial guidance-share map boosts error weight on high-guidance text/faces.
-                    if self._cond_scale > 1.01:
-                        w_cfg = self._cond_scale
-                        guided = u_out + w_cfg * (c_out - u_out)
-                        cdim = tuple(range(1, c_out.ndim - 2))
-                        g_mag = (w_cfg * (c_out - u_out)).pow(2).sum(dim=cdim, keepdim=True).sqrt()
-                        v_mag = guided.pow(2).sum(dim=cdim, keepdim=True).sqrt().clamp_min(1e-4)
-                        rho = g_mag / v_mag
-                        rho = rho / rho.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-                        self._guide_weight_map[skey] = 1.0 + 0.75 * (rho - 1.0).clamp_min(0.0)
+            if not self._cfg.update_pair(
+                skey, self.index, self._progress, self._cond_scale, self.adaptive_cos, self._readback, self._weighted_rel_err
+            ):
+                self._mismatched_latents = True
+                self._asymmetric_cfg = True
+                self._clear_all_cfg()
 
         target = to_x0(self.predictor, sigma_slice, out_slice, x_slice)
 
@@ -1257,8 +1071,6 @@ class DiTSchedule:
         self._tag_counts.clear()
         self._step_skip.clear()
         self._readback.clear()
-        self._fresh_cond.clear()
-        self._last_uncond.clear()
-        self._clear_all_cfg()
+        self._cfg.release()
         self._prev_u = None
         self._step_u = None

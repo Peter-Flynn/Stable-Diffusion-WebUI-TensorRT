@@ -12,33 +12,37 @@ AUTO = "auto"
 BF16 = "bf16"
 FP16 = "fp16"
 FP8 = "fp8"
+FP4 = "fp4"
 INT8 = "int8"
 INT4 = "int4"
 
-EXPLICIT_PRECISIONS = (BF16, FP8, INT8, INT4, FP16)
+EXPLICIT_PRECISIONS = (BF16, FP8, FP4, INT8, INT4, FP16)
 ALL_PRECISIONS = (AUTO, *EXPLICIT_PRECISIONS)
 LABELS = {
     AUTO: "Auto",
     BF16: "BF16",
     FP8: "FP8",
+    FP4: "NVFP4",
     INT8: "INT8",
     INT4: "INT4",
     FP16: "FP16",
 }
 SCALE_SUFFIX = ".__trt_scale__"
+GSCALE_SUFFIX = ".__trt_gscale__"
 ACT_SCALE_SUFFIX = ".__trt_act_scale__"
 TRANSPOSE_SUFFIX = ".__trt_t__"
 INT4_BLOCK_SIZE = 64
+FP4_BLOCK_SIZE = 16
+# Smallest strictly positive float8_e4m3fn subnormal (2^-9) so NVFP4 block scales never underflow to 0.
+_FP8_MIN_POS = 2.0**-9
 # Headroom left beyond engine weights for activations, CUDA context, and sampler state when auto-selecting precision.
 AUTO_HEADROOM = int(3.2 * 2**30)
 # Minimum weight matrix dimensions eligible for 8-bit/4-bit quantization (leaves embedders, norms, modulations exact).
 MIN_QUANT_DIM = 512
 
-# Role-based fallback activation scales calibrated on real Anima 2B & MOSS-Image 5B trajectories:
-# - FP8 E4M3 is floating-point (range [-448, 448] at scale=1.0), so 2-tier constants cover 16 orders of magnitude
-#   with zero calibration cost (0.25 -> [-112, 112] for small cross-attn/text outputs; 2.0 -> [-896, 896] for main blocks).
-# - INT8 uses refittable per-site activation scales auto-calibrated on the loaded checkpoint; these role defaults are
-#   used only as fallback if calibration is unavailable (e.g. unit tests without a full DiT module).
+# Role-based fallback activation scales calibrated on real Anima 2B & MOSS-Image 5B trajectories.
+# Both FP8, INT8, and NVFP4 use refittable per-site activation scales auto-calibrated on the loaded checkpoint
+# (+ active LoRAs); these role defaults are used only when calibration is unavailable (e.g. unit tests without a DiT).
 _FP8_SMALL_PATTERNS = ("cross_attn.k_proj", "cross_attn.v_proj", "cross_attn.output_proj", "text_embedder.")
 _INT8_ROLE_FALLBACKS = (
     ("cross_attn.output_proj", 0.01),
@@ -57,11 +61,20 @@ _INT8_ROLE_FALLBACKS = (
     ("mlp.layer1", 0.5),
     ("mlp.layer2", 1.0),
 )
-_act_scale_cache = {}  # (arch_id, base_version_key, kind) -> dict[base_weight_name, float]
+# Bounded LRU list of (cache_key, amax_dict) entries using exact == equality (supports weakref _Same patch keys).
+_act_amax_cache = []
 
 
 def is_scale_weight(name: str) -> bool:
     return name.endswith(SCALE_SUFFIX)
+
+
+def is_gscale_weight(name: str) -> bool:
+    return name.endswith(GSCALE_SUFFIX)
+
+
+def is_weight_scale_weight(name: str) -> bool:
+    return name.endswith((SCALE_SUFFIX, GSCALE_SUFFIX))
 
 
 def is_act_scale_weight(name: str) -> bool:
@@ -69,25 +82,31 @@ def is_act_scale_weight(name: str) -> bool:
 
 
 def is_any_scale_weight(name: str) -> bool:
-    return name.endswith(SCALE_SUFFIX) or name.endswith(ACT_SCALE_SUFFIX)
+    return name.endswith((SCALE_SUFFIX, GSCALE_SUFFIX, ACT_SCALE_SUFFIX))
 
 
 def weight_name_of_scale(name: str) -> str:
-    """Strips only SCALE_SUFFIX so an engine scale name maps back to its engine weight name (preserving TRANSPOSE_SUFFIX)."""
-    return name[: -len(SCALE_SUFFIX)] if name.endswith(SCALE_SUFFIX) else name
+    """Strips SCALE_SUFFIX or GSCALE_SUFFIX so an engine scale maps to its engine weight (preserving TRANSPOSE_SUFFIX)."""
+    if name.endswith(SCALE_SUFFIX):
+        return name[: -len(SCALE_SUFFIX)]
+    if name.endswith(GSCALE_SUFFIX):
+        return name[: -len(GSCALE_SUFFIX)]
+    return name
 
 
 def is_transposed_weight(name: str) -> bool:
-    core = name[: -len(SCALE_SUFFIX)] if name.endswith(SCALE_SUFFIX) else name
+    core = weight_name_of_scale(name)
     if core.endswith(ACT_SCALE_SUFFIX):
         core = core[: -len(ACT_SCALE_SUFFIX)]
     return core.endswith(TRANSPOSE_SUFFIX)
 
 
 def base_weight_name(name: str) -> str:
-    """Maps any quantized engine weight, weight-scale, or act-scale name back to the checkpoint's parameter name."""
+    """Maps any quantized engine weight, weight-scale, global-scale, or act-scale back to the checkpoint parameter."""
     if name.endswith(SCALE_SUFFIX):
         name = name[: -len(SCALE_SUFFIX)]
+    elif name.endswith(GSCALE_SUFFIX):
+        name = name[: -len(GSCALE_SUFFIX)]
     elif name.endswith(ACT_SCALE_SUFFIX):
         name = name[: -len(ACT_SCALE_SUFFIX)]
     if name.endswith(TRANSPOSE_SUFFIX):
@@ -97,6 +116,10 @@ def base_weight_name(name: str) -> str:
 
 def scale_weight_name(name: str) -> str:
     return name if name.endswith(SCALE_SUFFIX) else name + SCALE_SUFFIX
+
+
+def gscale_weight_name(name: str) -> str:
+    return name if name.endswith(GSCALE_SUFFIX) else name + GSCALE_SUFFIX
 
 
 def act_scale_weight_name(name: str) -> str:
@@ -124,9 +147,42 @@ def gpu_vram(dev=None) -> int:
         return 0
 
 
+_fp4_avail_cache = None
+
+
+def _fp4_available() -> bool:
+    """Checks runtime support for NVFP4 (torch FP8 block scales, TensorRT DataType.FP4, ONNX >= 1.18 FLOAT4E2M1)."""
+    global _fp4_avail_cache
+    if _fp4_avail_cache is not None:
+        return _fp4_avail_cache
+    if not hasattr(torch, "float8_e4m3fn"):
+        _fp4_avail_cache = False
+        return False
+    try:
+        import tensorrt as trt
+
+        if getattr(trt.DataType, "FP4", None) is None:
+            _fp4_avail_cache = False
+            return False
+    except ImportError:
+        pass
+    try:
+        import onnx
+
+        if getattr(onnx.TensorProto, "FLOAT4E2M1", None) is None:
+            _fp4_avail_cache = False
+            return False
+    except ImportError:
+        pass
+    _fp4_avail_cache = True
+    return True
+
+
 def supported_precisions(sm: tuple = None) -> tuple:
     sm = sm if sm is not None else gpu_sm()
-    if sm >= (8, 9):  # Ada, Hopper, Blackwell: native BF16 + FP8 W8A8 + INT8 W8A8 + INT4 WoQ + FP16
+    if sm >= (10, 0) and _fp4_available():  # Blackwell+: native BF16 + FP8 W8A8 + NVFP4 W4A4 + INT8 W8A8 + INT4 WoQ + FP16
+        return (BF16, FP8, FP4, INT8, INT4, FP16)
+    if sm >= (8, 9):  # Ada, Hopper (or Blackwell on onnx < 1.18): native BF16 + FP8 W8A8 + INT8 W8A8 + INT4 WoQ + FP16
         return (BF16, FP8, INT8, INT4, FP16)
     if sm >= (8, 0):  # Ampere: native BF16 + INT8 W8A8 + INT4 WoQ + FP16
         return (BF16, INT8, INT4, FP16)
@@ -153,6 +209,8 @@ def estimated_weight_bytes(params: int, precision: str) -> int:
         return params * 2
     if precision == FP8:
         return int(params * 1.05)  # 1 B/weight + ~5% unquantized embedders/norms/modulations
+    if precision == FP4:
+        return int(params * 0.60)  # 0.5 B/weight + FP8 block-16 scales + FP8 V-proj safety + ~5% unquantized layers
     if precision == INT8:
         return int(params * 1.25)  # 1 B/weight + ~20% native FFN down-projections + embedders/norms
     if precision == INT4:
@@ -174,6 +232,8 @@ def auto_precision(arch, params: int, sm: tuple = None, total_vram: int = None) 
     quant_8 = FP8 if FP8 in allowed else (INT8 if INT8 in allowed else None)
     if quant_8 is not None and estimated_weight_bytes(params, quant_8) + AUTO_HEADROOM <= vram:
         return quant_8
+    if FP4 in allowed:
+        return FP4
     if INT4 in allowed:
         return INT4
     return quant_8 or full_16
@@ -195,7 +255,7 @@ def resolve_precision(arch, patcher=None, requested: str = None, sm: tuple = Non
 
 def compute_dtype(precision: str, sm: tuple = None) -> torch.dtype:
     sm = sm if sm is not None else gpu_sm()
-    if precision in (BF16, FP8):
+    if precision in (BF16, FP8, FP4):
         return torch.bfloat16
     if precision == FP16:
         return torch.float16
@@ -207,7 +267,14 @@ def uses_fp32_residual(precision: str, sm: tuple = None) -> bool:
 
 
 def is_quantized_precision(precision: str) -> bool:
-    return precision in (FP8, INT8, INT4)
+    return precision in (FP8, FP4, INT8, INT4)
+
+
+def _fp4_uses_fp8_fallback(name: str) -> bool:
+    # Keep separate attention Value projections in FP8 inside NVFP4 engines:
+    # 1) Avoids NVIDIA/TensorRT#4879 (batched V-GEMM FP4 activation/scale transpose mismatch on SM100/SM120).
+    # 2) Protects the highest-sensitivity attention projection at minimal (~4%) VRAM overhead.
+    return name.endswith((".v_proj.weight", ".proj.v.weight"))
 
 
 def _eligible_weight(name: str, dims: list, precision: str) -> bool:
@@ -220,11 +287,13 @@ def _eligible_weight(name: str, dims: list, precision: str) -> bool:
     if "adaln" in name or "norm" in name:
         return False
     # Uniform INT8 activations clip severely after unbounded / extreme-dynamic-range FFN activations
-    # (MOSS-Image SiTU in [-100, 100] -> ffn_down, Anima GELU up to ~170 -> mlp.layer2); FP8's exponent and
-    # INT4's unquantized W4A16 activations handle them cleanly.
+    # (MOSS-Image SiTU in [-100, 100] -> ffn_down, Anima GELU up to ~170 -> mlp.layer2); FP8's exponent,
+    # NVFP4's dynamic block-16 FP8 scales, and INT4's unquantized W4A16 activations handle them cleanly.
     if precision == INT8 and ("ffn_down" in name or "mlp.layer2" in name):
         return False
     if precision == INT4 and dims[1] % INT4_BLOCK_SIZE != 0:
+        return False
+    if precision == FP4 and not _fp4_uses_fp8_fallback(name) and dims[1] % FP4_BLOCK_SIZE != 0:
         return False
     return True
 
@@ -256,12 +325,20 @@ def _fp8_act_scale_for(weight_name: str) -> float:
     return 0.25 if any(p in weight_name for p in _FP8_SMALL_PATTERNS) else 2.0
 
 
-def fallback_int8_act_scale(weight_name: str) -> float:
+def fallback_act_scale(weight_name: str, kind: str = INT8) -> float:
     base = base_weight_name(weight_name)
+    if kind == FP8:
+        return _fp8_act_scale_for(base)
+    if kind == FP4:
+        return max(1e-6, _fp8_act_scale_for(base) / 6.0)
     for pat, val in _INT8_ROLE_FALLBACKS:
         if pat in base:
             return val
     return 0.5
+
+
+def fallback_int8_act_scale(weight_name: str) -> float:
+    return fallback_act_scale(weight_name, INT8)
 
 
 _REDUCE_OPS_18 = frozenset({
@@ -307,16 +384,6 @@ def _is_2d_transpose(node) -> bool:
     return perm is None or perm == [1, 0]
 
 
-def _get_fp8_scale_init(graph, fp8_scale_inits: dict, s_val: float, act_dtype: torch.dtype) -> str:
-    s_name = fp8_scale_inits.get(s_val)
-    if s_name is None:
-        tag = f"{s_val:.8g}".replace(".", "p").replace("-", "m")
-        s_name = f"__trt_fp8_act_scale_{tag}"
-        graph.initializer.append(_make_scalar_initializer(s_name, s_val, act_dtype))
-        fp8_scale_inits[s_val] = s_name
-    return s_name
-
-
 def quantize_onnx_graph(
     model,
     precision: str,
@@ -327,12 +394,14 @@ def quantize_onnx_graph(
 ) -> dict:
     """Rewrites eligible 2D DiT Linear weights in an ONNX model for true low-VRAM TensorRT execution:
 
-    - FP8 (sm89+): explicit W8A8 (`QuantizeLinear -> DequantizeLinear` on activations with floating-point E4M3 scale,
-      per-channel FP8 weights) -> true 1-byte weight storage in VRAM + native SM89 FP8 Tensor Core GEMMs (~1.65-1.95x).
-    - INT8 (sm75+): explicit W8A8 with refittable per-site activation scales (`<w>.__trt_act_scale__`, auto-calibrated
-      per checkpoint) + per-channel INT8 weights -> true 1-byte weight storage + native INT8 Tensor Core GEMMs (~1.4-1.55x).
+    - FP8 (sm89+): explicit W8A8 with refittable per-site activation scales (`<w>.__trt_act_scale__`, auto-calibrated
+      per checkpoint + active LoRAs) + per-channel FP8 weights -> 1 B/weight + native SM89+ FP8 Tensor Core GEMMs.
+    - FP4 / NVFP4 (sm100+): native Blackwell block-16 W4A4 (`FLOAT4E2M1` weights + `FLOAT8E4M3FN` block scales +
+      scalar global weight/activation scales + `TRT_FP4DynamicQuantize`), keeping separate attention V projections
+      in FP8 to avoid TensorRT#4879 batched V-GEMM corruption and preserve attention fidelity.
+    - INT8 (sm75+): explicit W8A8 with refittable per-site activation scales + per-channel INT8 weights.
     - INT4 (sm75+): block-64 W4A16 with `Transpose(1, 0)` folded into `<w>.__trt_t__` (`(K, N)` layout, FP32 block scale
-      + Cast) -> true 0.5-byte weight storage in VRAM, 1.43x faster & -300 MB less activation workspace than untransposed.
+      + Cast) -> 0.5 B/weight in VRAM.
 
     If `shapes` is passed, updates it in-place (removing any transposed-weight old name and adding new weight/scale names).
     Returns a dict of newly added/updated `{name: [dims]}`.
@@ -343,15 +412,22 @@ def quantize_onnx_graph(
     import onnx
     from onnx import helper
 
+    elem_fp4 = getattr(onnx.TensorProto, "FLOAT4E2M1", None)
+    if precision == FP4 and elem_fp4 is None:
+        raise RuntimeError("NVFP4 quantization requires onnx >= 1.18 with TensorProto.FLOAT4E2M1")
+
     graph = model.graph
     act_elem = _onnx_dtype_for(act_dtype)
-    q_elem = {
+    q_elem_map = {
         FP8: onnx.TensorProto.FLOAT8E4M3FN,
         INT8: onnx.TensorProto.INT8,
         INT4: onnx.TensorProto.INT4,
-    }[precision]
-    min_opset = 21 if precision == INT4 else 19
-    min_ir = 10 if precision == INT4 else 9
+    }
+    if elem_fp4 is not None:
+        q_elem_map[FP4] = elem_fp4
+
+    min_opset = 23 if precision == FP4 else (21 if precision == INT4 else 19)
+    min_ir = 11 if precision == FP4 else (10 if precision == INT4 else 9)
     if model.ir_version < min_ir:
         model.ir_version = min_ir
     upgraded_from_17 = False
@@ -360,13 +436,15 @@ def quantize_onnx_graph(
             if imp.version < 18:
                 upgraded_from_17 = True
             imp.version = min_opset
+    if precision == FP4 and not any(imp.domain == "trt" for imp in model.opset_import):
+        model.opset_import.append(helper.make_opsetid("trt", 1))
     if upgraded_from_17:
         _upgrade_opset17_nodes(graph)
 
     # TRT 11.5's refittable INT4 WoQ requires FP32 scale + Cast (BF16 scale triggers CASK non-refittable assertion);
-    # FP8/INT8 W8A8 use native act_dtype scales so DQ outputs directly in compute dtype.
-    scale_elem = onnx.TensorProto.FLOAT if (precision == INT4 and fp32_scale_for_int4) else act_elem
-    needs_cast = scale_elem != act_elem
+    # FP8/INT8/NVFP4 use native act_dtype (global) scales so DQ outputs directly in compute dtype.
+    int4_scale_elem = onnx.TensorProto.FLOAT if fp32_scale_for_int4 else act_elem
+    int4_needs_cast = int4_scale_elem != act_elem
 
     consumers = {}
     for node in graph.node:
@@ -379,7 +457,8 @@ def quantize_onnx_graph(
     remove_node_ids = set()
     dq_nodes = []
     new_inputs = []
-    dq_weight_origin = {}  # tensor output name -> original checkpoint weight name
+    dq_weight_origin = {}  # tensor output name -> (original checkpoint weight name, w_kind)
+    used_w_kinds = set()
 
     for inp in list(graph.input):
         t = inp.type.tensor_type
@@ -387,11 +466,31 @@ def quantize_onnx_graph(
         if not _eligible_weight(inp.name, dims, precision):
             continue
         orig_name = inp.name
+        w_kind = FP8 if (precision == FP4 and _fp4_uses_fp8_fallback(orig_name)) else precision
+        used_w_kinds.add(w_kind)
         c_nodes = consumers.get(orig_name, [])
-        fold_transpose = precision == INT4 and len(c_nodes) == 1 and _is_2d_transpose(c_nodes[0])
+        fold_transpose = w_kind == INT4 and len(c_nodes) == 1 and _is_2d_transpose(c_nodes[0])
 
-        t.elem_type = q_elem
-        if fold_transpose:
+        t.elem_type = q_elem_map[w_kind]
+        if w_kind == FP4:
+            # Keep [N, K] unfolded with axis=-1, block_size=16 -> Transpose(1, 0) -> MatMul (native Blackwell FP4 pattern).
+            w_name = orig_name
+            s_name = scale_weight_name(w_name)
+            gs_name = gscale_weight_name(w_name)
+            sf_dims = [dims[0], dims[1] // FP4_BLOCK_SIZE]
+            scales_out = w_name + ".__trt_scales__"
+            dq_out = w_name + ".__trt_dq__"
+            new_inputs.append(helper.make_tensor_value_info(s_name, onnx.TensorProto.FLOAT8E4M3FN, sf_dims))
+            new_inputs.append(helper.make_tensor_value_info(gs_name, act_elem, []))
+            added_shapes[s_name] = sf_dims
+            added_shapes[gs_name] = []
+            dq_nodes.append(helper.make_node("DequantizeLinear", [s_name, gs_name], [scales_out], name=w_name + ".dq_s"))
+            dq_nodes.append(
+                helper.make_node("DequantizeLinear", [w_name, scales_out], [dq_out], name=w_name + ".dq", axis=-1, block_size=FP4_BLOCK_SIZE)
+            )
+            renames[w_name] = dq_out
+            dq_weight_origin[dq_out] = (orig_name, FP4)
+        elif fold_transpose:
             tr_node = c_nodes[0]
             w_name = transposed_weight_name(orig_name)
             n_out, k_in = dims[0], dims[1]
@@ -405,23 +504,25 @@ def quantize_onnx_graph(
             dq_attrs = {"axis": 0, "block_size": INT4_BLOCK_SIZE}
             s_name = scale_weight_name(w_name)
             dq_out = w_name + ".__trt_dq__"
-            final_out = w_name + ".__trt_dq_cast__" if needs_cast else dq_out
-            new_inputs.append(helper.make_tensor_value_info(s_name, scale_elem, scale_dims))
+            final_out = w_name + ".__trt_dq_cast__" if int4_needs_cast else dq_out
+            new_inputs.append(helper.make_tensor_value_info(s_name, int4_scale_elem, scale_dims))
             added_shapes[w_name] = [k_in, n_out]
             added_shapes[s_name] = scale_dims
             removed_names.add(orig_name)
             dq_nodes.append(helper.make_node("DequantizeLinear", [w_name, s_name], [dq_out], name=w_name + ".dq", **dq_attrs))
-            if needs_cast:
+            if int4_needs_cast:
                 dq_nodes.append(helper.make_node("Cast", [dq_out], [final_out], name=w_name + ".dq_cast", to=act_elem))
             renames[tr_node.output[0]] = final_out
             remove_node_ids.add(id(tr_node))
-            dq_weight_origin[final_out] = orig_name
+            dq_weight_origin[final_out] = (orig_name, INT4)
         else:
             w_name = orig_name
             s_name = scale_weight_name(w_name)
             dq_out = w_name + ".__trt_dq__"
+            scale_elem = int4_scale_elem if w_kind == INT4 else act_elem
+            needs_cast = w_kind == INT4 and int4_needs_cast
             final_out = w_name + ".__trt_dq_cast__" if needs_cast else dq_out
-            if precision == INT4:
+            if w_kind == INT4:
                 scale_dims = [dims[0], dims[1] // INT4_BLOCK_SIZE]
                 dq_attrs = {"axis": 1, "block_size": INT4_BLOCK_SIZE}
             else:
@@ -433,7 +534,7 @@ def quantize_onnx_graph(
             if needs_cast:
                 dq_nodes.append(helper.make_node("Cast", [dq_out], [final_out], name=w_name + ".dq_cast", to=act_elem))
             renames[w_name] = final_out
-            dq_weight_origin[final_out] = orig_name
+            dq_weight_origin[final_out] = (orig_name, w_kind)
 
     if not renames:
         return {}
@@ -447,9 +548,9 @@ def quantize_onnx_graph(
                 node.input[i] = renames[inp_name]
         kept_nodes.append(node)
 
-    # For FP8 and INT8, insert explicit static activation QuantizeLinear -> DequantizeLinear before MatMul/Gemm
-    # nodes consuming quantized weights so TensorRT keeps weights at 1 byte in VRAM and selects FP8/INT8 Tensor Cores.
-    if precision in (FP8, INT8):
+    # For FP8, INT8, and NVFP4, insert explicit activation quantization before MatMul/Gemm nodes consuming quantized
+    # weights so TensorRT keeps weights compressed in VRAM and selects FP8/INT8/FP4 Tensor Core kernels.
+    if precision in (FP8, INT8, FP4):
         changed = True
         while changed:
             changed = False
@@ -460,41 +561,67 @@ def quantize_onnx_graph(
                         dq_weight_origin[out_n] = dq_weight_origin[node.input[0]]
                         changed = True
 
-        zp_name = f"__trt_act_zp_{precision}"
-        zp_raw = b"\x00"
-        graph.initializer.append(helper.make_tensor(zp_name, q_elem, [], zp_raw, raw=True))
+        zp_names = {}
+        for zp_kind in (FP8, INT8):
+            if zp_kind in used_w_kinds:
+                zp_name = f"__trt_act_zp_{zp_kind}"
+                graph.initializer.append(helper.make_tensor(zp_name, q_elem_map[zp_kind], [], b"\x00", raw=True))
+                zp_names[zp_kind] = zp_name
 
-        fp8_scale_inits = {}
-        qdq_cache = {}  # (act_in, scale_key) -> dq_out
+        qdq_cache = {}  # (act_in, w_kind) -> dq_out
         final_nodes = []
         for node in kept_nodes:
             if node.op_type in ("MatMul", "Gemm") and len(node.input) >= 2 and node.input[1] in dq_weight_origin:
-                orig_w = dq_weight_origin[node.input[1]]
+                orig_w, w_kind = dq_weight_origin[node.input[1]]
                 act_in = node.input[0]
-                if precision == FP8:
-                    s_name = _get_fp8_scale_init(graph, fp8_scale_inits, _fp8_act_scale_for(orig_w), act_dtype)
-                    cache_key = (act_in, s_name)
-                else:
-                    # INT8: deduplicate by activation tensor (shared Q/K/V share one refittable scalar scale).
-                    cache_key = (act_in, None)
-                    s_name = None
-
+                cache_key = (act_in, w_kind)
                 dq_out = qdq_cache.get(cache_key)
                 if dq_out is None:
                     idx = len(qdq_cache)
-                    if precision == INT8:
-                        s_name = act_scale_weight_name(orig_w)
-                        if s_name not in added_shapes:
-                            new_inputs.append(helper.make_tensor_value_info(s_name, act_elem, []))
-                            added_shapes[s_name] = []
-                    q_out = f"__trt_act_q_{idx}"
-                    dq_out = f"__trt_act_dq_{idx}"
-                    final_nodes.append(
-                        helper.make_node("QuantizeLinear", [act_in, s_name, zp_name], [q_out], name=f"__trt_act_ql_{idx}")
-                    )
-                    final_nodes.append(
-                        helper.make_node("DequantizeLinear", [q_out, s_name, zp_name], [dq_out], name=f"__trt_act_dql_{idx}")
-                    )
+                    s_name = act_scale_weight_name(orig_w)
+                    if s_name not in added_shapes:
+                        new_inputs.append(helper.make_tensor_value_info(s_name, act_elem, []))
+                        added_shapes[s_name] = []
+                    if w_kind == FP4:
+                        f4_out = f"__trt_act_f4_{idx}"
+                        sf_out = f"__trt_act_sf_{idx}"
+                        sc_out = f"__trt_act_sc_{idx}"
+                        dq_out = f"__trt_act_dq_{idx}"
+                        final_nodes.append(
+                            helper.make_node(
+                                "TRT_FP4DynamicQuantize",
+                                [act_in, s_name],
+                                [f4_out, sf_out],
+                                name=f"__trt_act_fp4q_{idx}",
+                                domain="trt",
+                                axis=-1,
+                                block_size=FP4_BLOCK_SIZE,
+                                scale_type=onnx.TensorProto.FLOAT8E4M3FN,
+                            )
+                        )
+                        final_nodes.append(
+                            helper.make_node("DequantizeLinear", [sf_out, s_name], [sc_out], name=f"__trt_act_dqs_{idx}")
+                        )
+                        final_nodes.append(
+                            helper.make_node(
+                                "DequantizeLinear",
+                                [f4_out, sc_out],
+                                [dq_out],
+                                name=f"__trt_act_dql_{idx}",
+                                axis=-1,
+                                block_size=FP4_BLOCK_SIZE,
+                            )
+                        )
+                    else:
+                        zp_name = zp_names[w_kind]
+                        q_out = f"__trt_act_q_{idx}"
+                        dq_out = f"__trt_act_dq_{idx}"
+                        final_nodes.append(
+                            helper.make_node("QuantizeLinear", [act_in, s_name, zp_name], [q_out], name=f"__trt_act_ql_{idx}")
+                        )
+                        final_nodes.append(
+                            helper.make_node("DequantizeLinear", [q_out, s_name, zp_name], [dq_out], name=f"__trt_act_dql_{idx}")
+                        )
                     qdq_cache[cache_key] = dq_out
                 node.input[0] = dq_out
             final_nodes.append(node)
@@ -537,20 +664,56 @@ def unpack_int4(packed: torch.Tensor, numel: int) -> torch.Tensor:
     return torch.stack([lo, hi], dim=1).reshape(-1)[:numel]
 
 
+def pack_fp4(x_fp32: torch.Tensor) -> torch.Tensor:
+    """Quantizes values in [-6, 6] to NVIDIA FP4 E2M1 ({0, 0.5, 1, 1.5, 2, 3, 4, 6}, round-to-nearest-even),
+    packed two nibbles per uint8 (low nibble = even index, high nibble = odd index; bit 3 = sign).
+    """
+    flat = x_fp32.float().reshape(-1).contiguous()
+    if flat.numel() & 1:
+        flat = torch.cat([flat, flat.new_zeros(1)])
+    sign = (flat < 0).to(torch.uint8) << 3
+    a = flat.abs().clamp(max=6.0)
+    # Exact round-to-nearest-even midpoints for {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}:
+    # even-side ties (0.25->0, 1.25->2, 2.5->4, 5.0->6) use '>'; odd-side ties (0.75->2, 1.75->4, 3.5->6) use '>='.
+    code = torch.zeros_like(sign)
+    code = torch.where(a > 0.25, torch.full_like(code, 1), code)
+    code = torch.where(a >= 0.75, torch.full_like(code, 2), code)
+    code = torch.where(a > 1.25, torch.full_like(code, 3), code)
+    code = torch.where(a >= 1.75, torch.full_like(code, 4), code)
+    code = torch.where(a > 2.50, torch.full_like(code, 5), code)
+    code = torch.where(a >= 3.50, torch.full_like(code, 6), code)
+    code = torch.where(a > 5.00, torch.full_like(code, 7), code)
+    nib = sign | code
+    pairs = nib.view(-1, 2)
+    return (pairs[:, 0] | (pairs[:, 1] << 4)).contiguous()
+
+
+def unpack_fp4(packed: torch.Tensor, numel: int) -> torch.Tensor:
+    """Inverse of pack_fp4(): unpacks packed uint8 bytes back into FP32 E2M1 values in [-6.0, 6.0]."""
+    u = packed.reshape(-1).to(torch.uint8)
+    lo = u & 0x0F
+    hi = (u >> 4) & 0x0F
+    nibs = torch.stack([lo, hi], dim=1).reshape(-1)[:numel]
+    lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=u.device, dtype=torch.float32)
+    vals = lut[(nibs & 0x07).long()]
+    return torch.where((nibs & 0x08) != 0, -vals, vals)
+
+
 def quantize_for_refit(
     weight_fp32: torch.Tensor,
     kind: str,
     scale_dtype: torch.dtype,
     *,
+    gscale_dtype: torch.dtype = None,
     transposed: bool = False,
     in_place: bool = False,
 ) -> tuple:
-    """Quantizes a 2D FP32 weight on its current device into `(quantized_weight, scale)` for TRT refit.
+    """Quantizes a 2D FP32 weight on its current device for TRT refit.
 
-    `kind` is one of `FP8`, `INT8`, `INT4`. If `transposed=True`, transposes `(N, K) -> (K, N)` before quantizing
-    along the K (dim=0) / N (dim=1) axes to match `Transpose`-folded ONNX graphs. Scales are strictly positive.
-    When `in_place=True` (or `weight_fp32` is already converted/transposed into a fresh buffer), quantizes in place
-    to avoid allocating 3-4 full-weight FP32 temporaries per Linear during GPU refit.
+    - `FP8`, `INT8`, `INT4`: returns `(quantized_weight, scale)`.
+    - `FP4` (NVFP4): returns `(packed_fp4, fp8_block_scales, scalar_global_scale)`.
+    If `transposed=True`, transposes `(N, K) -> (K, N)` before quantizing along K/N to match `Transpose`-folded ONNX
+    graphs. All scales are strictly positive and computed asynchronously on the tensor's device with zero host syncs.
     """
     if weight_fp32.ndim != 2:
         raise ValueError(f"Expected 2D weight for {kind} quantization, got shape {tuple(weight_fp32.shape)}")
@@ -595,11 +758,33 @@ def quantize_for_refit(
             q_f = blocks.div_(inv).round_().clamp_(-8.0, 7.0) if owned else (blocks / inv).round().clamp(-8.0, 7.0)
             q_i8 = q_f.to(torch.int8)
         return pack_int4(q_i8), scale
+    if kind == FP4:
+        k_dim = w.shape[0] if transposed else w.shape[1]
+        if k_dim % FP4_BLOCK_SIZE != 0:
+            raise ValueError(f"Weight width {k_dim} is not divisible by FP4 block size {FP4_BLOCK_SIZE}")
+        gs_dt = gscale_dtype or torch.bfloat16
+        min_gs = 1e-4 if gs_dt == torch.float16 else 1e-12
+        w_amax = torch.maximum(w.amax(), -w.amin())
+        w_gs = (w_amax / 2688.0).clamp_min(min_gs).to(gs_dt).reshape(())
+        gs_f = w_gs.float()
+        if transposed:
+            k_in, n_out = w.shape
+            blocks = w.reshape(k_in // FP4_BLOCK_SIZE, FP4_BLOCK_SIZE, n_out)
+            blk_dim = 1
+        else:
+            n_out, k_in = w.shape
+            blocks = w.reshape(n_out, k_in // FP4_BLOCK_SIZE, FP4_BLOCK_SIZE)
+            blk_dim = -1
+        blk_amax = torch.maximum(blocks.amax(dim=blk_dim), -blocks.amin(dim=blk_dim))
+        w_sf = (blk_amax / (6.0 * gs_f)).clamp(_FP8_MIN_POS, 448.0).to(torch.float8_e4m3fn).contiguous()
+        eff = (w_sf.float() * gs_f).unsqueeze(blk_dim)
+        q_f = blocks.div_(eff).clamp_(-6.0, 6.0) if owned else (blocks / eff).clamp(-6.0, 6.0)
+        return pack_fp4(q_f), w_sf, w_gs
     raise ValueError(f"Unsupported quantization kind {kind!r}")
 
 
 class _CalibStaging:
-    """Double-buffered pinned-host + single reusable GPU buffer for streaming CPU weights during INT8 calibration."""
+    """Double-buffered pinned-host + single reusable GPU buffer for streaming CPU weights during activation calibration."""
 
     def __init__(self, source, device):
         self.dev = torch.device(device)
@@ -679,7 +864,7 @@ class _CalibStaging:
 
 
 class _CalibProxy:
-    """Non-mutating layer-streaming proxy around a DiT module for 1-shot INT8 activation calibration.
+    """Non-mutating layer-streaming proxy around a DiT module for 1-shot FP8/INT8/NVFP4 activation calibration.
 
     Materializes one Linear weight at a time on `device` via `EffectiveWeights.apply_on_gpu()` (supporting BF16, FP8,
     INT8-ConvRot, NVFP4, GGUF, and LoRA checkpoints with <150 MB peak VRAM) and records max(|x|) asynchronously per
@@ -783,25 +968,27 @@ class _CalibProxy:
         return type(mod).forward(self, *args, **kwargs)
 
 
-def calibrate_int8_scales(arch, source, device=None) -> dict:
-    """Computes per-Linear INT8 activation scales via one batched B=3 128x128 streaming pass (<150 MB VRAM).
+def _calibrate_act_amax(arch, source, kind: str = INT8, device=None) -> dict:
+    """Measures per-Linear activation max(|x|) via one batched B=3 128x128 streaming pass (<150 MB VRAM).
 
-    Batching all three noise levels into a single B=3 forward streams model weights over PCIe once instead of 3x,
-    uses double-buffered pinned H2D staging, and reads back all per-Linear maxima in one batched D2H transfer.
-    Cached per `(arch.id, source.base_version, dtype)` so refitting LoRAs or switching profiles reuses cached scales.
+    Cached by `(arch.id, source.base_version, active_patches_sig, dtype, fp32_res)` so FP8, INT8, and NVFP4
+    engines share one calibration pass per checkpoint + LoRA combination, while LoRA changes automatically
+    recalibrate activation ranges.
     """
     from . import dit
 
     if arch is None or not getattr(arch, "is_dit", False) or source is None:
         return {}
-    dtype = compute_dtype(INT8)
-    cache_key = (arch.id, source.base_version[1], str(dtype))
-    cached = _act_scale_cache.get(cache_key)
-    if cached is not None:
-        return cached
+    dtype = compute_dtype(kind)
+    fp32_res = uses_fp32_residual(kind)
+    patch_sig = source.all_patches_signature() if callable(getattr(source, "all_patches_signature", None)) else ()
+    cache_key = (arch.id, source.base_version, patch_sig, str(dtype), fp32_res)
+    for i, (k, val) in enumerate(_act_amax_cache):
+        if k == cache_key:
+            _act_amax_cache.append(_act_amax_cache.pop(i))
+            return val
 
     dev = torch.device(device) if device is not None else common.device()
-    fp32_res = uses_fp32_residual(INT8)
     dm = source.module
     stats = {}
     sigmas = (0.95, 0.50, 0.08)
@@ -833,25 +1020,48 @@ def calibrate_int8_scales(arch, source, device=None) -> dict:
                 keys = list(stats.keys())
                 vals = torch.stack([stats[k] for k in keys]).cpu().tolist() if keys else []
         except Exception as e:
-            common.logger.debug(f"INT8 activation calibration fell back to role defaults: {e}")
+            common.logger.debug(f"{kind.upper()} activation calibration fell back to role defaults: {e}")
             return {}
         finally:
             staging.release()
 
-    # Apply 1.25x headroom over measured max(|x|) so real prompts/LoRAs don't clip while keeping high INT8 resolution.
-    scales = {w_name: max(1e-4, float(mx) * 1.25 / 127.0) for w_name, mx in zip(keys, vals) if math.isfinite(mx) and mx > 0.0}
-    if scales:
-        if len(_act_scale_cache) >= 4:
-            _act_scale_cache.pop(next(iter(_act_scale_cache)))
-        _act_scale_cache[cache_key] = scales
-    return scales
+    amaxes = {w_name: float(mx) for w_name, mx in zip(keys, vals) if math.isfinite(mx) and mx > 0.0}
+    if amaxes:
+        if len(_act_amax_cache) >= 4:
+            _act_amax_cache.pop(0)
+        _act_amax_cache.append((cache_key, amaxes))
+    return amaxes
+
+
+# Floating-point activation headroom for FP8 E4M3FN and NVFP4 (which uses FP8 E4M3FN dynamic block-16 scales):
+# E4M3FN has a 28,672x normal dynamic range [2^-6, 448], so 48x headroom above synthetic 128x128 calibration amax
+# prevents hard-clipping 10-45x coherent-image outlier spikes (e.g. Anima blocks.12.mlp.layer2) while keeping
+# 597x full-mantissa normal precision below cal_amax (no subnormal underflow on tiny cross-attn projections).
+_FP_ACT_HEADROOM = 48.0
+
+
+def calibrate_act_scales(arch, source, kind: str = INT8, device=None) -> dict:
+    """Returns per-Linear activation scales for `INT8` (1.25x/127), `FP8` (48x/448), or `FP4` (48x/2688)."""
+    amaxes = _calibrate_act_amax(arch, source, kind=kind, device=device)
+    if not amaxes:
+        return {}
+    if kind == FP8:
+        return {w_name: max(1e-6, mx * _FP_ACT_HEADROOM / 448.0) for w_name, mx in amaxes.items()}
+    if kind == FP4:
+        return {w_name: max(1e-6, mx * _FP_ACT_HEADROOM / 2688.0) for w_name, mx in amaxes.items()}
+    return {w_name: max(1e-4, mx * 1.25 / 127.0) for w_name, mx in amaxes.items()}
+
+
+def calibrate_int8_scales(arch, source, device=None) -> dict:
+    return calibrate_act_scales(arch, source, kind=INT8, device=device)
 
 
 def onnx_tensor_nbytes(elem_type: int, dims: list) -> int:
     import onnx
 
     numel = math.prod(dims)
-    if elem_type == onnx.TensorProto.INT4:
+    elem_fp4 = getattr(onnx.TensorProto, "FLOAT4E2M1", None)
+    if elem_type == onnx.TensorProto.INT4 or (elem_fp4 is not None and elem_type == elem_fp4):
         return (numel + 1) // 2
     sizes = {
         onnx.TensorProto.FLOAT8E4M3FN: 1,

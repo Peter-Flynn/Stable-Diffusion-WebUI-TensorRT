@@ -2155,9 +2155,9 @@ class Pass:
                         self.drop_speed_hacks("Speed Hacks produced NaN/Inf values")
                         dit_plan = None
                     elif mode in ("unbatched_cfg_drop", "unbatched_fastercache"):
-                        fc_entry = self.dit_speed._fresh_cond.get(dit_plan["skey"])
-                        if fc_entry is not None and fc_entry[0] == self.dit_speed.index and fc_entry[2]:
-                            out = self.dit_speed.synthesize_uncond(dit_plan["skey"], mode, fc_entry[1], x.dtype)
+                        cond_out = self.dit_speed.fresh_cond_for(dit_plan["skey"])
+                        if cond_out is not None:
+                            out = self.dit_speed.synthesize_uncond(dit_plan["skey"], mode, cond_out, x.dtype)
                             if torch.isfinite(out).all():
                                 self.dit_speed.note_counts(mode)
                                 _touch_anchor(engine_key)
@@ -2199,7 +2199,7 @@ class Pass:
                             assembled[gi] = o_slc.to(x.dtype)
                             cond_out = o_slc
                             self.dit_speed.record_full(bkey, x[slc], dit_sigma[slc], o_slc, context[slc], dit_plan["u"])
-                        if mode == "batched_fastercache" and dit_plan["skey"] not in self.dit_speed._cfg_delta:
+                        if mode == "batched_fastercache" and not self.dit_speed.has_cfg_delta(dit_plan["skey"]):
                             dit_plan = None
                         else:
                             for gi, slc, bkey in synth_groups:
@@ -3104,6 +3104,50 @@ def _wrap_cast_bias_weight(original):
     return cast_bias_weight
 
 
+def _wrap_calc_cond_uncond_batch(original):
+    # Forge Neo reverses [COND, UNCOND] before popping when 2*B doesn't fit memory_required (e.g. Anima batch_size >= 2
+    # on a batch_max=2 profile, or VRAM-split passes), running UNCOND before COND and starving unbatched CFG shortcuts.
+    # Only reorder when Forge Neo would split into two calls anyway, never splitting what it would batch into one call.
+    def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
+        p = _pass
+        split_cond_first = False
+        opts = model_options or {}
+        if (
+            p is not None
+            and p.fallback is None
+            and not p._torch_mode
+            and p.dit_speed is not None
+            and model is p.patcher.model
+            and p.dit_speed._cfg_shortcuts_allowed()
+            and isinstance(cond, (list, tuple))
+            and isinstance(uncond, (list, tuple))
+            and len(cond) == 1
+            and len(uncond) == 1
+            and isinstance(cond[0], dict)
+            and isinstance(uncond[0], dict)
+            and not opts.get("model_function_wrapper")
+            and not opts.get("sampler_calc_cond_batch_function")
+            and not any(
+                item.get(k) is not None
+                for item in (cond[0], uncond[0])
+                for k in ("control", "batch_indices", "area", "mask", "hooks")
+            )
+        ):
+            try:
+                free_mem = common.mm().get_free_memory(x_in.device)
+                split_cond_first = model.memory_required([2 * x_in.shape[0], *x_in.shape[1:]]) >= free_mem
+            except Exception:
+                split_cond_first = False
+        if split_cond_first:
+            out_cond, _ = original(model, cond, None, x_in, timestep, model_options)
+            _, out_uncond = original(model, [], uncond, x_in, timestep, model_options)
+            return out_cond, out_uncond
+        return original(model, cond, uncond, x_in, timestep, model_options)
+
+    calc_cond_uncond_batch._trt_original = original
+    return calc_cond_uncond_batch
+
+
 def _hook_failed(message: str):
     if message not in _hook_failures:
         _hook_failures.add(message)
@@ -3124,7 +3168,15 @@ def install_hooks():
     _rebind(common.mm(), "free_memory", _wrap_free_memory)
     _rebind(common.mm(), "get_free_memory", _wrap_get_free_memory)
     _rebind(common.mm(), "unload_all_models", _wrap_unload_all)
-    if not compat.is_neo():
+    if compat.is_neo():
+        try:
+            from backend.sampling import sampling_function as neo_sf
+
+            if callable(getattr(neo_sf, "calc_cond_uncond_batch", None)):
+                _rebind(neo_sf, "calc_cond_uncond_batch", _wrap_calc_cond_uncond_batch)
+        except Exception as e:
+            logger.debug(f"Couldn't hook Forge Neo's calc_cond_uncond_batch for COND-first split ordering: {e}")
+    else:
         try:
             from ldm_patched.modules import ops as ldm_ops
 
