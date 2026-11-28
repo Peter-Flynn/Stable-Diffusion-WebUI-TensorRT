@@ -1,12 +1,13 @@
 # GPU precision capabilities, VRAM-aware auto-selection, ONNX weight/activation quantization, and on-the-fly GPU refit
 # quantization for DiT architectures (Anima, MOSS-Image). Keeps checkpoint quantization formats (BF16, FP8, MXFP8,
 # NVFP4, INT8-ConvRot, W4A4, W4A8, W6A8, GGUF + LoRA) completely orthogonal to engine execution precision.
+from dataclasses import dataclass, field
 import math
 
 import torch
 import torch.nn.functional as F
 
-from . import common
+from . import common, compat
 
 AUTO = "auto"
 BF16 = "bf16"
@@ -218,13 +219,133 @@ def estimated_weight_bytes(params: int, precision: str) -> int:
     return params * 2
 
 
-def auto_precision(arch, params: int, sm: tuple = None, total_vram: int = None) -> str:
+@dataclass
+class CheckpointQuantInfo:
+    """Model-agnostic summary of quantized Linear layers in a loaded checkpoint."""
+
+    total: int = 0
+    counts: dict = field(default_factory=dict)
+    labels: dict = field(default_factory=dict)
+    fp4_native: int = 0
+    fp4_total: int = 0
+    int8_native: int = 0
+    int8_total: int = 0
+
+    @property
+    def quantized_total(self) -> int:
+        return sum(c for fmt, c in self.counts.items() if fmt is not None)
+
+    @property
+    def dominant(self):
+        if self.total <= 0 or self.quantized_total * 2 < self.total:
+            return None
+        non_float = [(c, fmt) for fmt, c in self.counts.items() if fmt is not None and c > 0]
+        if not non_float:
+            return None
+        non_float.sort(reverse=True)
+        return non_float[0][1]
+
+    @property
+    def dominant_label(self):
+        dom = self.dominant
+        if dom is None:
+            return None
+        # Mixed GGUF checkpoints (e.g. Q4_K_M mixes Q4_K + Q6_K) display all major GGUF types cleanly.
+        gguf_types = sorted(
+            ((c, fmt.split(":", 1)[1]) for fmt, c in self.counts.items() if isinstance(fmt, str) and fmt.startswith("gguf:") and c > 0),
+            reverse=True,
+        )
+        if dom.startswith("gguf:") and len(gguf_types) > 1:
+            top = "/".join(name for _, name in gguf_types[:3])
+            return f"GGUF ({top})"
+        return self.labels.get(dom, dom)
+
+    def is_native_passthrough(self, precision: str) -> bool:
+        if precision == FP4:
+            return self.fp4_total > 0 and self.fp4_native * 5 >= self.fp4_total * 4  # >= 80%
+        if precision == FP8:
+            return self.total > 0 and self.counts.get(FP8, 0) * 5 >= self.total * 4
+        if precision == INT8:
+            return self.int8_total > 0 and self.int8_native * 5 >= self.int8_total * 4
+        return False
+
+    @property
+    def native_precision(self):
+        for p in (FP4, FP8, INT8):
+            if self.is_native_passthrough(p):
+                return p
+        return None
+
+    def is_non_native_quantized_for(self, precision: str) -> bool:
+        return self.dominant is not None and self.dominant != precision and not self.is_native_passthrough(precision)
+
+
+def checkpoint_quant_info(patcher) -> CheckpointQuantInfo:
+    """Inspects eligible 2D Linear weights in `patcher.model.diffusion_model` to detect checkpoint quantization."""
+    dm = getattr(getattr(patcher, "model", None), "diffusion_model", None) if patcher is not None else None
+    if dm is None:
+        return CheckpointQuantInfo()
+    backup = getattr(patcher, "backup", None) or {}
+    preferred = []
+    fallback_all = []
+    for mod_name, mod in dm.named_modules():
+        w_param = getattr(mod, "weight", None)
+        if w_param is None or not isinstance(w_param, torch.Tensor):
+            continue
+        w_name = f"{mod_name}.weight" if mod_name else "weight"
+        b_entry = backup.get("diffusion_model." + w_name)
+        w = getattr(b_entry, "weight", b_entry) if b_entry is not None else w_param
+        shape = tuple(getattr(w, "shape", ()))
+        if len(shape) != 2 or shape[0] < MIN_QUANT_DIM or shape[1] < MIN_QUANT_DIM:
+            continue
+        entry = (w_name, w, mod, shape)
+        fallback_all.append(entry)
+        if _eligible_weight(w_name, list(shape), FP8):
+            preferred.append(entry)
+    entries = preferred if preferred else fallback_all
+    if not entries:
+        return CheckpointQuantInfo()
+    counts = {}
+    labels = {}
+    fp4_native = fp4_total = int8_native = int8_total = 0
+    for w_name, w, mod, shape in entries:
+        fmt, lbl = compat.layer_quant_format(w, mod)
+        counts[fmt] = counts.get(fmt, 0) + 1
+        if fmt is not None and lbl and fmt not in labels:
+            labels[fmt] = lbl
+        if not _fp4_uses_fp8_fallback(w_name) and shape[1] % FP4_BLOCK_SIZE == 0:
+            fp4_total += 1
+            if fmt == FP4:
+                fp4_native += 1
+        if "ffn_down" not in w_name and "mlp.layer2" not in w_name:
+            int8_total += 1
+            if fmt == INT8:
+                int8_native += 1
+    return CheckpointQuantInfo(
+        total=len(entries),
+        counts=counts,
+        labels=labels,
+        fp4_native=fp4_native,
+        fp4_total=fp4_total,
+        int8_native=int8_native,
+        int8_total=int8_total,
+    )
+
+
+def auto_precision(arch, params: int, sm: tuple = None, total_vram: int = None, ckpt_info: CheckpointQuantInfo = None) -> str:
     if not getattr(arch, "is_dit", False):
         return FP16
     sm = sm if sm is not None else gpu_sm()
     allowed = supported_precisions(sm)
     vram = gpu_vram() if total_vram is None else int(total_vram)
     full_16 = BF16 if BF16 in allowed else FP16
+    # Match native NVFP4 / FP8 checkpoints directly when supported by this GPU and within VRAM for zero-loss
+    # pass-through and peak Tensor Core speed; GPUs without support (e.g. NVFP4 on Ada/Ampere, FP8 on Ampere/Turing)
+    # seamlessly fall through and upcast to the highest supported precision that fits VRAM.
+    native = ckpt_info.native_precision if ckpt_info is not None else None
+    if native in (FP4, FP8) and native in allowed:
+        if vram <= 0 or params <= 0 or estimated_weight_bytes(params, native) + AUTO_HEADROOM <= vram:
+            return native
     if vram <= 0 or params <= 0:
         return full_16
     if estimated_weight_bytes(params, full_16) + AUTO_HEADROOM <= vram:
@@ -250,7 +371,8 @@ def resolve_precision(arch, patcher=None, requested: str = None, sm: tuple = Non
         common.logger.warning(f"Precision {requested!r} isn't supported on sm{sm[0]}{sm[1]}; selecting automatically.")
     module = getattr(getattr(patcher, "model", None), "diffusion_model", None) if patcher is not None else None
     params = param_count(module)
-    return auto_precision(arch, params, sm=sm, total_vram=total_vram)
+    ckpt_info = checkpoint_quant_info(patcher) if patcher is not None else None
+    return auto_precision(arch, params, sm=sm, total_vram=total_vram, ckpt_info=ckpt_info)
 
 
 def compute_dtype(precision: str, sm: tuple = None) -> torch.dtype:
@@ -697,6 +819,91 @@ def unpack_fp4(packed: torch.Tensor, numel: int) -> torch.Tensor:
     lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=u.device, dtype=torch.float32)
     vals = lut[(nibs & 0x07).long()]
     return torch.where((nibs & 0x08) != 0, -vals, vals)
+
+
+def swap_fp4_nibbles(qdata: torch.Tensor) -> torch.Tensor:
+    """Converts comfy_kitchen's `(even << 4) | odd` FP4 byte packing to TensorRT's `even | (odd << 4)` layout."""
+    u = qdata.contiguous()
+    if u.dtype != torch.uint8:
+        u = u.view(torch.uint8)
+    return (((u & 0x0F) << 4) | ((u >> 4) & 0x0F)).contiguous()
+
+
+def unswizzle_nvfp4_scales(blocked: torch.Tensor, rows: int, cols: int):
+    """Exact inverse of comfy_kitchen / Forge Neo's 128x4 `to_blocked()` NVFP4 scale swizzle."""
+    if rows <= 0 or cols <= 0:
+        return None
+    n_row_blocks = (rows + 127) // 128
+    n_col_blocks = (cols + 3) // 4
+    padded_rows = n_row_blocks * 128
+    padded_cols = n_col_blocks * 4
+    if blocked.numel() != padded_rows * padded_cols:
+        return None
+    x = blocked.contiguous().reshape(n_row_blocks, n_col_blocks, 32, 4, 4)
+    x = x.transpose(2, 3).reshape(n_row_blocks, n_col_blocks, 128, 4)
+    x = x.permute(0, 2, 1, 3).reshape(padded_rows, padded_cols)
+    return x[:rows, :cols].contiguous()
+
+
+def sanitize_fp4_block_scales(
+    q_trt: torch.Tensor,
+    w_sf: torch.Tensor,
+    rows: int,
+    cols: int,
+    gscale: torch.Tensor = None,
+    *,
+    gscale_dtype: torch.dtype = None,
+) -> tuple:
+    """Ensures strictly positive valid FP8 E4M3FN block scales and global scale asynchronously on GPU.
+
+    Zero/NaN block scales are replaced by `_FP8_MIN_POS` (0x01) with their 16 nibbles zeroed (bit-exact 0.0);
+    negative finite scales clear their sign bit and flip all 16 nibble sign bits (`^ 0x88`) so values stay exact.
+    """
+    dev = q_trt.device
+    sf_u8 = w_sf.to(device=dev).contiguous().view(torch.uint8).reshape(rows, cols // FP4_BLOCK_SIZE)
+    zero_blk = (sf_u8 == 0x00) | (sf_u8 == 0x80) | (sf_u8 == 0x7F) | (sf_u8 == 0xFF)
+    safe_sf_u8 = torch.where(zero_blk, sf_u8.new_full((), 0x01), sf_u8)
+    neg_blk = (safe_sf_u8 & 0x80) != 0
+    safe_sf = (safe_sf_u8 & 0x7F).view(torch.float8_e4m3fn).contiguous()
+
+    q_blk = q_trt.contiguous().reshape(rows, cols // FP4_BLOCK_SIZE, FP4_BLOCK_SIZE // 2)
+    q_blk = torch.where(zero_blk.unsqueeze(-1), q_blk.new_zeros(()), q_blk)
+    q_blk = torch.where(neg_blk.unsqueeze(-1), torch.bitwise_xor(q_blk, 0x88), q_blk)
+
+    gs_dt = gscale_dtype or torch.bfloat16
+    if gscale is None:
+        safe_gs = torch.ones((), device=dev, dtype=gs_dt)
+    else:
+        min_gs = 1e-4 if gs_dt == torch.float16 else 1e-12
+        gs_f = gscale.to(device=dev, dtype=torch.float32).reshape(())
+        zero_gs = ~torch.isfinite(gs_f) | (gs_f == 0)
+        neg_gs = (~zero_gs) & (gs_f < 0)
+        safe_gs = torch.where(zero_gs, gs_f.new_full((), min_gs), gs_f.abs().clamp_min(min_gs)).to(gs_dt).reshape(())
+        q_blk = torch.where(zero_gs, q_blk.new_zeros(()), q_blk)
+        q_blk = torch.where(neg_gs, torch.bitwise_xor(q_blk, 0x88), q_blk)
+    return q_blk.reshape(-1).contiguous(), safe_sf, safe_gs
+
+
+def gguf_nvfp4_to_trt(raw_data: torch.Tensor, rows: int, cols: int, *, gscale_dtype: torch.dtype = None):
+    """Converts raw GGUF NVFP4 blocks (36 B / 64 elems: 4 UE4M3 scales + 32 nibble bytes) directly to TRT NVFP4."""
+    if rows <= 0 or cols <= 0 or cols % 64 != 0 or not hasattr(torch, "float8_e4m3fn"):
+        return None
+    raw = raw_data.contiguous().view(torch.uint8).reshape(-1)
+    expected = rows * (cols // 64) * 36
+    if raw.numel() != expected:
+        return None
+    blocks = raw.reshape(rows, cols // 64, 36)
+    scale_codes = blocks[..., :4].reshape(rows, cols // FP4_BLOCK_SIZE)
+    sc7 = scale_codes & 0x7F
+    zero_blk = (sc7 == 0x00) | (sc7 == 0x7F)
+    w_sf = torch.where(zero_blk, sc7.new_full((), 0x01), sc7).view(torch.float8_e4m3fn).contiguous()
+
+    packed = blocks[..., 4:].reshape(rows, cols // 64, 4, 8)
+    nibbles = torch.cat((packed & 0x0F, (packed >> 4) & 0x0F), dim=-1)
+    q_blk = (nibbles[..., ::2] | (nibbles[..., 1::2] << 4)).reshape(rows, cols // FP4_BLOCK_SIZE, FP4_BLOCK_SIZE // 2)
+    q_blk = torch.where(zero_blk.unsqueeze(-1), q_blk.new_zeros(()), q_blk)
+    w_gs = torch.ones((), device=raw.device, dtype=gscale_dtype or torch.bfloat16)
+    return q_blk.reshape(-1).contiguous(), w_sf, w_gs
 
 
 def quantize_for_refit(

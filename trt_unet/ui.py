@@ -29,7 +29,7 @@ HELP = """
 
 **Profiles** set the resolutions, batch sizes, and prompt lengths the engines are built for. Each is tuned for its optimal values, and accepts anything from min to max – narrower ranges build faster, and can run slightly faster. Anything unsupported by the engines (ControlNet, model patches like FreeU, reference-image edit modes, Skip Layer Guidance, or sizes outside every profile) is run on PyTorch instead, with a notice.
 
-**Engine precision** (in **Advanced**, for DiT models such as Anima and MOSS-Image) chooses the execution precision independently of how the checkpoint is stored on disk. `Auto` picks the highest-quality precision supported by your GPU that fits VRAM (`BF16`, `FP8`, `NVFP4` on Blackwell, `INT8`, `INT4`, or `FP16` with an FP32 residual stream on Turing). **Keep engines for other precisions** retains previously built precisions on disk so you can switch between them without rebuilding; uncheck it to remove other precisions on the next build.
+**Engine precision** (in **Advanced**, for DiT models such as Anima and MOSS-Image) chooses the execution precision. `Auto` matches dedicated `NVFP4` (Blackwell) and `FP8` (Ada/Hopper/Blackwell) checkpoints natively for zero re-quantization loss, and otherwise picks the highest-quality precision supported by your GPU that fits VRAM (`BF16`, `FP8`, `NVFP4` on Blackwell, `INT8`, `INT4`, or `FP16` with an FP32 residual stream on Turing). Pre-quantized `NVFP4`, `GGUF NVFP4`, `FP8`, and standard `INT8` weights (and calibrated `input_scale`s) pass straight through into matching engines without re-quantizing; GPUs without hardware support for a checkpoint's format upcast automatically. **Keep engines for other precisions** retains previously built precisions on disk so you can switch between them without rebuilding; uncheck it to remove other precisions on the next build.
 
 **Engine modes** are chosen on first build, and can only be changed while no engines exist:
 - *Per-profile engines* – one engine per profile, loaded as needed. Only one is loaded at a time, using about as much VRAM as the checkpoint's model. Each batch starts on the engine that fits it best, and stays on it for any later pass (ex. Hires. fix) it covers.
@@ -217,7 +217,113 @@ def _pending_neo_checkpoint():
     return None
 
 
-def _status(sd_model, arch, records, precision=None, asking=False) -> str:
+def quant_warning_state(*, sm: tuple = None, total_vram: int = None) -> dict:
+    """Returns global top-of-UI soft-red 4-bit warning banner state for GET /trt/quant-warning.
+
+    Visible only when TensorRT is actively selected (`SD Unet` is `Automatic` or `Speed Hacks`), a DiT checkpoint
+    is loaded, built engines exist and are selected to execute in 4-bit (`INT4` or `NVFP4`), and weights are being
+    quantized/re-quantized on the fly (never shown for native lossless `NVFP4` checkpoint pass-through).
+    """
+    hidden = {"visible": False, "title": "", "tooltip": "", "reason": ""}
+    try:
+        from . import runtime
+
+        if runtime.setting() not in (runtime.AUTOMATIC, runtime.SPEED_HACKS):
+            return hidden
+        sd_model = arch_mod.loaded_model()
+        if not compat.is_loaded_sd_model(sd_model):
+            return hidden
+        patcher = arch_mod.unet_patcher(sd_model)
+        arch = arch_mod.detect(patcher) if patcher is not None else None
+        if arch is None or not arch.is_dit:
+            return hidden
+        records, saved, target, effective = store.resolve_runtime_engines(arch, patcher, sm=sm, total_vram=total_vram)
+        if not records or effective not in (quant.INT4, quant.FP4):
+            return hidden
+        ckpt_info = quant.checkpoint_quant_info(patcher)
+        if ckpt_info.is_native_passthrough(effective):
+            return hidden
+        prec_label = quant.LABELS.get(effective, effective)
+        if ckpt_info.is_non_native_quantized_for(effective):
+            src_label = ckpt_info.dominant_label or "a non-TRT quantized format"
+            if ckpt_info.is_native_passthrough(quant.FP4) or ckpt_info.dominant == quant.FP4:
+                if quant.FP4 in quant.supported_precisions(sm):
+                    tip = (
+                        f"Your checkpoint uses {src_label}, which supports lossless native NVFP4 pass-through on this GPU, "
+                        f"but TensorRT is currently running {prec_label} engines and re-quantizing its weights. "
+                        f"Open the TensorRT tab, select Auto (or NVFP4 in Advanced), and build NVFP4 engines."
+                    )
+                else:
+                    tip = (
+                        f"Your checkpoint uses {src_label}, which requires an RTX 50-series (Blackwell) GPU for native "
+                        f"4-bit TensorRT pass-through, so {prec_label} is re-quantizing its weights and degrading quality. "
+                        f"Set SD Unet to None in Settings to run it on PyTorch, or build a higher-precision engine if VRAM allows."
+                    )
+            else:
+                tip = (
+                    f"Your checkpoint uses {src_label}, which TensorRT cannot execute natively in 4-bit, "
+                    f"so TensorRT is re-quantizing its weights onto {prec_label} and degrading image quality. "
+                    f"Set SD Unet to None in Settings to run this checkpoint natively on PyTorch, or download "
+                    f"a dedicated NVFP4 checkpoint on RTX 50-series for lossless TensorRT pass-through."
+                )
+            return {
+                "visible": True,
+                "title": f"Low-Quality 4-Bit Re-Quantization ({prec_label})",
+                "tooltip": tip,
+                "reason": "requant_checkpoint",
+            }
+        if saved != quant.AUTO:
+            return {
+                "visible": True,
+                "title": f"Low-Quality 4-Bit Quant Selected ({prec_label})",
+                "tooltip": (
+                    f"Engine precision is manually set to {prec_label} in the TensorRT tab (Advanced), "
+                    f"which quantizes {arch.name} on the fly and noticeably degrades image quality. "
+                    f"Switch Engine precision back to Auto (or BF16/FP8) if your GPU has enough VRAM, "
+                    f"or download a dedicated quantized checkpoint."
+                ),
+                "reason": "manual_selected",
+            }
+        if target not in (quant.INT4, quant.FP4):
+            target_label = quant.LABELS.get(target, target)
+            return {
+                "visible": True,
+                "title": f"Low-Quality 4-Bit Quant Active ({prec_label})",
+                "tooltip": (
+                    f"Your GPU has enough VRAM to run {arch.name} in {target_label}, but only {prec_label} "
+                    f"engines are built, so TensorRT is quantizing weights on the fly to 4-bit. "
+                    f"Open the TensorRT tab to build {target_label} engines, or use a dedicated quantized checkpoint."
+                ),
+                "reason": "fallback_built_4bit",
+            }
+        return {
+            "visible": True,
+            "title": f"Low-Quality 4-Bit Quant Required ({prec_label})",
+            "tooltip": (
+                f"{arch.name} doesn't fit in VRAM at 16-bit or 8-bit, so TensorRT is quantizing it on the fly "
+                f"to {prec_label}, which noticeably degrades image quality. For better quality, download a "
+                f"dedicated quantized checkpoint (a native NVFP4 checkpoint on RTX 50-series for lossless "
+                f"TensorRT pass-through, or a GGUF quant such as Q4_K_M / Q6_K and set SD Unet to None)."
+            ),
+            "reason": "vram_required",
+        }
+    except Exception:
+        return hidden
+
+
+def on_app_started(demo, app):
+    if app is None:
+        return
+    if any(getattr(r, "path", None) == "/trt/quant-warning" for r in getattr(app, "routes", ())):
+        return
+
+    def _quant_warning_route():
+        return quant_warning_state()
+
+    app.add_api_route("/trt/quant-warning", _quant_warning_route, methods=["GET"])
+
+
+def _status(sd_model, arch, records, precision=None, asking=False, patcher=None) -> str:
     try:
         version = common.trt_version()
     except Exception as e:
@@ -235,7 +341,10 @@ def _status(sd_model, arch, records, precision=None, asking=False) -> str:
     if arch is None:
         base = f"`{name}` isn't a model TensorRT engines can run (SD 1.x, SD 2.x, SDXL, Anima, and MOSS-Image architectures are supported)."
         return f"{base}\n\n{pending_note}" if pending_note else base
-    prec_badge = f" · **Precision:** {quant.LABELS.get(precision, precision)}" if arch.is_dit and precision else ""
+    ckpt_info = quant.checkpoint_quant_info(patcher) if (arch.is_dit and patcher is not None) else quant.CheckpointQuantInfo()
+    native_pt = bool(arch.is_dit and precision and ckpt_info.is_native_passthrough(precision))
+    prec_label = quant.LABELS.get(precision, precision) if precision else ""
+    prec_badge = f" · **Precision:** {prec_label}" + (" (native pass-through)" if native_pt else "") if arch.is_dit and precision else ""
     lines = [f"**Checkpoint:** `{name}` · **Architecture:** {arch.label}{prec_badge} · **TensorRT** {version}"]
     if pending_note:
         lines.append(pending_note)
@@ -248,7 +357,7 @@ def _status(sd_model, arch, records, precision=None, asking=False) -> str:
                 pass
         if other_precs:
             lines.append(
-                f"There are no {quant.LABELS.get(precision, precision)} engines for this architecture yet "
+                f"There are no {prec_label} engines for this architecture yet "
                 f"(built precisions: {', '.join(other_precs)}). Build them below, or pick a built precision in **Advanced**."
             )
         else:
@@ -262,6 +371,37 @@ def _status(sd_model, arch, records, precision=None, asking=False) -> str:
                 lines.append(
                     "There are no engines for this architecture yet. "
                     + ("Choose the engine mode below, then build them." if asking else "The profiles below cover every common size: build them.")
+                )
+        if arch.is_dit and precision in (quant.INT4, quant.FP4) and not native_pt:
+            if ckpt_info.is_non_native_quantized_for(precision):
+                src_label = ckpt_info.dominant_label or "a non-TRT quantized format"
+                if ckpt_info.is_native_passthrough(quant.FP4) or ckpt_info.dominant == quant.FP4:
+                    if quant.FP4 in quant.supported_precisions():
+                        lines.append(
+                            f"**Warning (Low-Quality 4-Bit Re-Quantization):** Your checkpoint uses `{src_label}`, which "
+                            f"supports lossless native `NVFP4` pass-through on this GPU — switch **Engine precision** to "
+                            f"`Auto` or `NVFP4` in **Advanced** instead of building `{prec_label}` engines."
+                        )
+                    else:
+                        lines.append(
+                            f"**Warning (Low-Quality 4-Bit Re-Quantization):** Your checkpoint uses `{src_label}`, which "
+                            f"requires an RTX 50-series (Blackwell) GPU for native 4-bit TensorRT pass-through. Building "
+                            f"`{prec_label}` engines will re-quantize its weights and degrade quality — consider running "
+                            f"on PyTorch (`SD Unet: None`) or a higher-precision engine if VRAM allows."
+                        )
+                else:
+                    lines.append(
+                        f"**Warning (Low-Quality 4-Bit Re-Quantization):** Your checkpoint uses `{src_label}`, which TensorRT "
+                        f"cannot execute natively in 4-bit. Building `{prec_label}` engines will re-quantize its weights and "
+                        f"degrade quality further — consider running it on PyTorch (`SD Unet: None`) or downloading a dedicated "
+                        f"`NVFP4` checkpoint (RTX 50-series)."
+                    )
+            else:
+                lines.append(
+                    f"**Warning (Low-Quality 4-Bit Quant):** Building `{prec_label}` engines quantizes weights on the fly "
+                    f"to 4-bit, which noticeably degrades image quality. For better quality, consider downloading a dedicated "
+                    f"quantized checkpoint (a native `NVFP4` checkpoint on RTX 50-series for lossless TensorRT pass-through, "
+                    f"or a GGUF quant such as `Q4_K_M` / `Q6_K` on PyTorch with `SD Unet: None`)."
                 )
         return "\n\n".join(lines)
     held, created = len(store.slots(records)), max(r.meta["created"] for r in records)
@@ -443,7 +583,7 @@ def refresh(draft=None, draft_arch=None, selected=None):
     is_dit = bool(arch is not None and arch.is_dit)
     prec_choices, prec_value = _precision_choices(arch, patcher)
     return (
-        _status(sd_model, arch, records, precision=precision, asking=not SETTLED.is_set()),
+        _status(sd_model, arch, records, precision=precision, asking=not SETTLED.is_set(), patcher=patcher),
         arch.id if arch else None,
         draft,
         *_draft_outputs(draft, records, arch=arch, precision=precision),
@@ -859,7 +999,7 @@ def on_ui_tabs():
                         choices=["Auto"],
                         value="Auto",
                         visible=False,
-                        info="Auto picks the highest-quality precision supported by your GPU that fits VRAM. Independent of checkpoint quantization.",
+                        info="Auto matches native NVFP4/FP8 checkpoints on supported GPUs (zero re-quantization) and otherwise picks the highest-quality precision that fits VRAM.",
                         elem_id="trt_precision",
                     )
                     keep_precisions_cb = gr.Checkbox(

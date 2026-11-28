@@ -4,6 +4,7 @@
 import contextlib
 import importlib
 import importlib.util
+import math
 import sys
 
 import torch
@@ -429,6 +430,217 @@ def dequantize_weight(t, converter=None) -> torch.Tensor:
     if converter is not None:
         weight = converter(weight, inplace=True)
     return weight
+
+
+def layer_quant_format(weight, module=None) -> tuple:
+    """Classifies a Linear weight's storage quantization format as `(code, display_label)` without model assumptions.
+
+    Returns `(None, None)` for standard floating-point (FP32 / FP16 / BF16) weights.
+    """
+    gguf_cls = getattr(weight, "gguf_cls", None)
+    if gguf_cls is not None:
+        qname = getattr(getattr(weight, "tensor_type", None), "name", None) or getattr(gguf_cls, "__name__", "GGUF")
+        if qname == "NVFP4":
+            return "fp4", "GGUF NVFP4"
+        if qname == "BF16":
+            return None, None
+        return f"gguf:{qname}", f"GGUF {qname}"
+    qdata = getattr(weight, "_qdata", None)
+    layout = getattr(weight, "_layout_cls", None)
+    if isinstance(qdata, torch.Tensor) and layout is not None:
+        layout_s = layout.__name__ if isinstance(layout, type) else str(layout)
+        params = getattr(weight, "_params", None)
+        if layout_s == "TensorCoreNVFP4Layout":
+            return "fp4", "NVFP4"
+        if layout_s in ("TensorCoreFP8E4M3Layout", "TensorCoreFP8Layout"):
+            return "fp8", "FP8"
+        if layout_s == "TensorCoreFP8E5M2Layout":
+            return "fp8_e5m2", "FP8 E5M2"
+        if layout_s == "TensorCoreMXFP8Layout":
+            return "mxfp8", "MXFP8"
+        if layout_s == "TensorWiseINT8Layout":
+            if getattr(params, "convrot", False):
+                return "convrot_int8", "INT8 ConvRot"
+            return "int8", "INT8"
+        if layout_s == "TensorCoreConvRotW4A4Layout":
+            return "convrot_w4a4", "ConvRot W4A4"
+        if layout_s == "AsymW4A8Int8Layout":
+            fmt = getattr(module, "quant_format", None)
+            return fmt or "asym_w4a8_int8", "W6A8" if fmt == "w6a8_int8" else "W4A8"
+        return f"other:{layout_s}", layout_s
+    raw = weight.data if isinstance(weight, torch.nn.Parameter) else weight
+    fp8_e4m3 = getattr(torch, "float8_e4m3fn", None)
+    fp8_e5m2 = getattr(torch, "float8_e5m2", None)
+    if fp8_e4m3 is not None and isinstance(raw, torch.Tensor) and raw.dtype == fp8_e4m3:
+        if module is not None and callable(getattr(module, "convert_weight", None)) and not hasattr(module, "scale_weight"):
+            return "other:fp8_custom", "FP8"
+        return "fp8", "FP8"
+    if fp8_e5m2 is not None and isinstance(raw, torch.Tensor) and raw.dtype == fp8_e5m2:
+        return "fp8_e5m2", "FP8 E5M2"
+    return None, None
+
+
+def _passthrough_per_channel(qdata: torch.Tensor, scale, kind: str, scale_dtype: torch.dtype):
+    rows = int(qdata.shape[0])
+    dev = qdata.device
+    min_scale = 1e-4 if scale_dtype == torch.float16 else 1e-12
+    if scale is None:
+        # Clone into owned storage: Engine.refit() passes views into reusable ping-pong gpu_bufs[slot] staging buffers.
+        return qdata.clone(memory_format=torch.contiguous_format), torch.ones((rows,), device=dev, dtype=scale_dtype)
+    if not isinstance(scale, torch.Tensor):
+        return None
+    if scale.numel() == 1:
+        s_f = scale.to(device=dev, dtype=torch.float32).reshape(1).expand(rows)
+    elif tuple(scale.shape) in ((rows,), (rows, 1)):
+        s_f = scale.to(device=dev, dtype=torch.float32).reshape(rows)
+    else:
+        return None
+    if scale_dtype == torch.float16:
+        nonzero_fin = torch.isfinite(s_f) & (s_f != 0)
+        if bool((nonzero_fin & ((s_f.abs() < 1e-4) | (s_f.abs() > 65504.0))).any()):
+            return None
+    bad = ~torch.isfinite(s_f) | (s_f == 0)
+    neg = (~bad) & (s_f < 0)
+    safe_s = torch.where(bad, s_f.new_full((), min_scale), s_f.abs().clamp_min(min_scale)).to(scale_dtype).contiguous()
+    if kind == "fp8":
+        q_u8 = qdata.contiguous().view(torch.uint8)
+        q_u8 = torch.where(bad.unsqueeze(1), q_u8.new_zeros(()), q_u8)
+        q_u8 = torch.where(neg.unsqueeze(1), torch.bitwise_xor(q_u8, 0x80), q_u8)
+        return q_u8.view(torch.float8_e4m3fn).contiguous(), safe_s
+    if kind == "int8":
+        q_i8 = qdata.contiguous()
+        q_neg = torch.where(q_i8 == -128, q_i8.new_full((), 127), -q_i8)
+        q_out = torch.where(neg.unsqueeze(1), q_neg, q_i8)
+        q_out = torch.where(bad.unsqueeze(1), q_out.new_zeros(()), q_out).contiguous()
+        return q_out, safe_s
+    return None
+
+
+def passthrough_quant(
+    gpu_base,
+    kind: str,
+    scale_dtype: torch.dtype,
+    *,
+    gscale_dtype: torch.dtype = None,
+    module=None,
+):
+    """Directly adapts a natively pre-quantized checkpoint weight to TRT refit tensors with zero re-quantization.
+
+    Supports Forge Neo `TensorCoreNVFP4Layout`, raw `ParameterGGUF` (`quants.NVFP4`), `TensorCoreFP8E4M3Layout` /
+    `TensorCoreFP8Layout`, non-ConvRot `TensorWiseINT8Layout`, reForge `scaled_fp8_op` / `fp8_ops`, and Forge Neo
+    plain `float8_e4m3fn` storage. Returns `None` on format mismatch or unsupported layouts so callers fall back
+    cleanly to dequantize -> quantize. Never mutates `gpu_base` or its parameter buffers.
+    """
+    from . import quant
+
+    gguf_cls = getattr(gpu_base, "gguf_cls", None)
+    if gguf_cls is not None:
+        if kind != quant.FP4:
+            return None
+        qname = getattr(getattr(gpu_base, "tensor_type", None), "name", None) or getattr(gguf_cls, "__name__", "")
+        if qname != "NVFP4":
+            return None
+        shape = tuple(getattr(gpu_base, "shape", ()))
+        if len(shape) != 2:
+            return None
+        return quant.gguf_nvfp4_to_trt(gpu_base.data, int(shape[0]), int(shape[1]), gscale_dtype=gscale_dtype)
+
+    qdata = getattr(gpu_base, "_qdata", None)
+    layout = getattr(gpu_base, "_layout_cls", None)
+    params = getattr(gpu_base, "_params", None)
+    if isinstance(qdata, torch.Tensor) and layout is not None and params is not None:
+        layout_s = layout.__name__ if isinstance(layout, type) else str(layout)
+        if getattr(params, "transposed", False):
+            return None
+        orig_shape = tuple(getattr(params, "orig_shape", ()) or getattr(gpu_base, "shape", ()))
+        if len(orig_shape) != 2:
+            return None
+        rows, cols = int(orig_shape[0]), int(orig_shape[1])
+        if rows <= 0 or cols <= 0:
+            return None
+        if kind == quant.FP4 and layout_s == "TensorCoreNVFP4Layout":
+            if (
+                not hasattr(torch, "float8_e4m3fn")
+                or cols % quant.FP4_BLOCK_SIZE != 0
+                or qdata.ndim != 2
+                or qdata.dtype != torch.uint8
+                or qdata.shape[0] < rows
+                or qdata.shape[1] < cols // 2
+            ):
+                return None
+            block_scale = getattr(params, "block_scale", None)
+            gscale = getattr(params, "scale", None)
+            if not isinstance(block_scale, torch.Tensor) or not isinstance(gscale, torch.Tensor) or gscale.numel() != 1:
+                return None
+            if block_scale.dtype not in (torch.float8_e4m3fn, torch.uint8):
+                return None
+            bs = block_scale.to(device=qdata.device)
+            if bs.dtype == torch.uint8:
+                bs = bs.view(torch.float8_e4m3fn)
+            w_sf = quant.unswizzle_nvfp4_scales(bs, rows, cols // quant.FP4_BLOCK_SIZE)
+            if w_sf is None:
+                return None
+            q_trt = quant.swap_fp4_nibbles(qdata[:rows, : cols // 2])
+            return quant.sanitize_fp4_block_scales(q_trt, w_sf, rows, cols, gscale, gscale_dtype=gscale_dtype)
+        if kind == quant.FP8 and layout_s in ("TensorCoreFP8E4M3Layout", "TensorCoreFP8Layout"):
+            if (
+                not hasattr(torch, "float8_e4m3fn")
+                or qdata.dtype != torch.float8_e4m3fn
+                or qdata.ndim != 2
+                or qdata.shape[0] < rows
+                or qdata.shape[1] < cols
+            ):
+                return None
+            return _passthrough_per_channel(qdata[:rows, :cols], getattr(params, "scale", None), quant.FP8, scale_dtype)
+        if kind == quant.INT8 and layout_s == "TensorWiseINT8Layout" and not getattr(params, "convrot", False):
+            if qdata.dtype != torch.int8 or qdata.ndim != 2 or qdata.shape[0] < rows or qdata.shape[1] < cols:
+                return None
+            return _passthrough_per_channel(qdata[:rows, :cols], getattr(params, "scale", None), quant.INT8, scale_dtype)
+        return None
+
+    raw = gpu_base.data if isinstance(gpu_base, torch.nn.Parameter) else gpu_base
+    if (
+        kind == quant.FP8
+        and hasattr(torch, "float8_e4m3fn")
+        and isinstance(raw, torch.Tensor)
+        and raw.dtype == torch.float8_e4m3fn
+        and raw.ndim == 2
+    ):
+        if module is not None and callable(getattr(module, "convert_weight", None)) and not hasattr(module, "scale_weight"):
+            return None
+        scale = getattr(module, "scale_weight", None) if module is not None else None
+        return _passthrough_per_channel(raw, scale, quant.FP8, scale_dtype)
+    return None
+
+
+def native_input_scale(module, weight, target_kind: str):
+    """Extracts a checkpoint-calibrated scalar activation scale `(raw_val, trt_val)` if compatible with `target_kind`."""
+    if module is None:
+        return None
+    sc = getattr(module, "input_scale", None)
+    if sc is None:
+        sc = getattr(module, "scale_input", None)
+    if sc is None:
+        return None
+    if isinstance(sc, torch.Tensor):
+        if sc.device.type == "meta" or sc.numel() != 1:
+            return None
+        raw_val = float(sc.detach().float().item())
+    elif isinstance(sc, (int, float)):
+        raw_val = float(sc)
+    else:
+        return None
+    if not math.isfinite(raw_val) or raw_val <= 0.0:
+        return None
+    layer_fmt, _ = layer_quant_format(weight, module)
+    if layer_fmt == "fp8" and target_kind == "fp8":
+        return raw_val, raw_val
+    if layer_fmt == "fp4" and target_kind == "fp4":
+        return raw_val, raw_val
+    # NVFP4 engines keep separate V projections in FP8: scale_fp8 = amax/448 = (amax/2688) * 6.
+    if layer_fmt == "fp4" and target_kind == "fp8":
+        return raw_val, raw_val * 6.0
+    return None
 
 
 def load_list_entries(patcher):

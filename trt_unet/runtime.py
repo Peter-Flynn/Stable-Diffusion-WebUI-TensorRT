@@ -456,12 +456,15 @@ class TrtModel:
                 ]
                 common.make_room(1 << 30, self.load_device, keep_engines)
             seconds = None
+            pt_count = 0
             dropped = False
             for attempt in (0, 1) if can_retry_unet else (0,):
                 engine_mod.LOGGER.clear()
                 failures = gpu.failures()
+                pt_before = getattr(weights, "passthrough_count", 0)
                 try:
                     seconds = engine.refit(changed, weights.tensor)
+                    pt_count = getattr(weights, "passthrough_count", 0) - pt_before
                     break
                 except Exception as e:
                     ran_out = isinstance(e, torch.cuda.OutOfMemoryError) or gpu.failures() != failures or engine_mod.LOGGER.out_of_memory
@@ -504,7 +507,12 @@ class TrtModel:
             if dropped:
                 continue
             self.applied[role] = wanted
-            refit = {"seconds": seconds, "count": len(changed), "patched": sum(weights.is_patched(name) for name in changed)}
+            refit = {
+                "seconds": seconds,
+                "count": len(changed),
+                "patched": sum(weights.is_patched(name) for name in changed),
+                "passthrough": pt_count,
+            }
             total = refit if total is None else {k: total[k] + refit[k] for k in refit}
         if total is not None and not quiet:
             logger.info(f"The {self.name} {_refit_times(total)}.")
@@ -512,8 +520,13 @@ class TrtModel:
 
 
 def _refit_times(refit: dict) -> str:
-    loras = f" ({refit['patched']} with LoRAs)" if refit["patched"] else ""
-    return f"refitted {refit['count']} weights{loras} in {refit['seconds']:.1f}s"
+    details = []
+    if refit.get("passthrough"):
+        details.append(f"{refit['passthrough']} native pass-through")
+    if refit["patched"]:
+        details.append(f"{refit['patched']} with LoRAs")
+    note = f" ({', '.join(details)})" if details else ""
+    return f"refitted {refit['count']} weights{note} in {refit['seconds']:.1f}s"
 
 
 def _loaded_entries(*models):
@@ -2404,21 +2417,8 @@ def _engine_records(patcher, x):
     prec_note = ""
     if arch is not None:
         if arch.is_dit:
-            saved = store.saved_precision(arch.id)
-            prec = store.active_precision(arch, patcher, requested=saved)
-            records = store.engines(arch.id, precision=prec)
-            if not records and saved == quant.AUTO:
-                # Auto-selected precision isn't built yet; fall back to highest-priority built loadable precision.
-                all_built = store.engines(arch.id)
-                if all_built:
-                    by_prec = {}
-                    for r in all_built:
-                        by_prec.setdefault(r.precision, []).append(r)
-                    for cand in quant.supported_precisions():
-                        if cand in by_prec:
-                            records = by_prec[cand]
-                            break
-            elif not records and saved != quant.AUTO:
+            records, saved, prec, _ = store.resolve_runtime_engines(arch, patcher)
+            if not records and saved != quant.AUTO:
                 prec_note = f" ({quant.LABELS.get(prec, prec)})"
         else:
             records = store.engines(arch.id)

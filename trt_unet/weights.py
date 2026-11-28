@@ -90,6 +90,12 @@ class EffectiveWeights:
             for p, _ in m.named_parameters(recurse=False)
             if callable(getattr(m, f"convert_{p}", None))
         }
+        self.weight_modules = {
+            (f"{n}.{p}" if n else p): m
+            for n, m in self.module.named_modules()
+            for p, _ in m.named_parameters(recurse=False)
+        }
+        self.passthrough_count = 0
         self.refresh()
         self.base_version = (_Same(self.module), self._fingerprint())
 
@@ -101,6 +107,7 @@ class EffectiveWeights:
         self.wrappers = getattr(self.patcher, "weight_wrapper_patches", {}) or {}
         self._all_patches_sig = None
         self._act_scales = {}
+        self._native_act_cache = {}
 
     def _patches_for(self, name: str):
         base_name = quant.base_weight_name(name)
@@ -165,18 +172,44 @@ class EffectiveWeights:
         base_name = quant.base_weight_name(name)
         return bool(self._patches_for(base_name) or self.converters.get(base_name) is not None or compat.is_quantized_weight(self.base(base_name)))
 
+    def _native_act_scales(self, kind: str) -> dict:
+        if kind not in (quant.FP8, quant.FP4):
+            return {}
+        cached = self._native_act_cache.get(kind)
+        if cached is not None:
+            return cached
+        raw_vals = []
+        scales = {}
+        for base_name, mod in self.weight_modules.items():
+            if not base_name.endswith(".weight") or not self.has(base_name):
+                continue
+            found = compat.native_input_scale(mod, self.base(base_name), kind)
+            if found is not None:
+                raw_v, trt_v = found
+                raw_vals.append(raw_v)
+                scales[base_name] = trt_v
+        # Reject uncalibrated checkpoints that store 1.0 as a placeholder input_scale on every layer.
+        if raw_vals and all(v == 1.0 for v in raw_vals):
+            scales = {}
+        self._native_act_cache[kind] = scales
+        return scales
+
     def act_scale(self, name: str, dtype: torch.dtype, kind: str = quant.INT8) -> torch.Tensor:
+        base_name = quant.base_weight_name(name)
+        min_scale = 1e-4 if dtype == torch.float16 else 1e-12
+        if not self.all_patches_signature():
+            native_val = self._native_act_scales(kind).get(base_name)
+            if native_val is not None and native_val > 0.0:
+                return torch.tensor(max(min_scale, float(native_val)), dtype=dtype)
         scales = self._act_scales.get(kind)
         if scales is None:
             from . import arch as arch_mod
 
             arch = arch_mod.detect(self.patcher)
             scales = self._act_scales[kind] = quant.calibrate_act_scales(arch, self, kind=kind)
-        base_name = quant.base_weight_name(name)
         val = scales.get(base_name)
         if val is None or not (val > 0.0):
             val = quant.fallback_act_scale(base_name, kind=kind)
-        min_scale = 1e-4 if dtype == torch.float16 else 1e-12
         return torch.tensor(max(min_scale, float(val)), dtype=dtype)
 
     def fast_lora(self, name: str):
@@ -261,6 +294,18 @@ class EffectiveWeights:
         *,
         gscale_dtype: torch.dtype = None,
     ) -> tuple:
+        base_name = quant.base_weight_name(name)
+        if gpu_lora is None and not self._patches_for(base_name) and not quant.is_transposed_weight(name):
+            native = compat.passthrough_quant(
+                gpu_base,
+                quant_kind,
+                scale_dtype,
+                gscale_dtype=gscale_dtype,
+                module=self.weight_modules.get(base_name),
+            )
+            if native is not None:
+                self.passthrough_count += 1
+                return native
         w_fp32 = self.apply_fp32_on_gpu(name, gpu_base, gpu_lora=gpu_lora)
         can_inplace = w_fp32 is not gpu_base and (
             type(gpu_base) is not torch.Tensor or w_fp32.untyped_storage().data_ptr() != gpu_base.untyped_storage().data_ptr()

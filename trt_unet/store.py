@@ -129,6 +129,32 @@ def active_precision(arch: Arch, patcher=None, requested: str = None) -> str:
     return quant.resolve_precision(arch, patcher, requested=req)
 
 
+def resolve_runtime_engines(arch: Arch, patcher=None, *, sm: tuple = None, total_vram: int = None) -> tuple:
+    """Resolves `(records, saved_prec, target_prec, effective_prec)` for a DiT architecture.
+
+    Shared by `runtime._engine_records()` and `ui.quant_warning_state()` so runtime execution and the global UI
+    warning banner always agree on which precision is active.
+    """
+    saved = saved_precision(arch.id)
+    supported = quant.supported_precisions(sm)
+    effective_saved = saved if (saved == quant.AUTO or saved in supported) else quant.AUTO
+    target = quant.resolve_precision(arch, patcher, requested=effective_saved, sm=sm, total_vram=total_vram)
+    recs = engines(arch.id, precision=target)
+    effective = target
+    if not recs and effective_saved == quant.AUTO:
+        all_built = engines(arch.id)
+        if all_built:
+            by_prec = {}
+            for r in all_built:
+                by_prec.setdefault(r.precision, []).append(r)
+            for cand in supported:
+                if cand in by_prec:
+                    recs = by_prec[cand]
+                    effective = cand
+                    break
+    return recs, effective_saved, target, effective
+
+
 def _prefix(arch_id: str) -> str:
     return os.path.join(root(), arch_id, f"{common.gpu_tag()}-{common.trt_tag()}")
 
